@@ -3053,6 +3053,7 @@ void verifyBdaReadFallbackFunctions() {
             std::size_t spanLoaderCalls = 0;
             std::size_t loaderLoads = 0;
             std::size_t loaderCalls = 0;
+            std::size_t spanReaderCalls = 0;
             std::array<std::size_t, 2> readerLoads{};
             for (std::size_t cursor = 5; cursor < five.size();) {
                 const auto length = five[cursor] >> 16u;
@@ -3077,7 +3078,8 @@ void verifyBdaReadFallbackFunctions() {
                 if (op == spv::OpFunctionCall && function == span && names[five[cursor + 3]] == loader) ++spanLoaderCalls;
                 if ((op == spv::OpLoad || op == spv::OpAtomicLoad) && function == loader) ++loaderLoads;
                 if (op == spv::OpFunctionCall && function == loader) ++loaderCalls;
-                if (op == spv::OpLoad && function == reader) ++readerLoads[length > 4u && (five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
+                if (op == spv::OpFunctionCall && function == span && names[five[cursor + 3]] == reader) ++spanReaderCalls;
+                if (op == spv::OpLoad && function == reader && length > 4u) ++readerLoads[(five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
                 cursor += length;
             }
             require(definitions["record_bda_fault"] == 1u && definitions[reader] == 1u && definitions[span] == 1u, "BDA read functions: the fault, byte read and span read functions are not defined");
@@ -3086,7 +3088,8 @@ void verifyBdaReadFallbackFunctions() {
             for (const auto& [name, count] : definitions) require(count == 1u, "BDA read functions: a function is defined twice");
             require(compareExchanges == 1u, "BDA read functions: a fault is recorded outside record_bda_fault");
             require(mainLookups == 0u, "BDA read functions: a read site looks up its bytes inline");
-            require(readerLoads[coherent] == 4u && readerLoads[!coherent] == 0u, "BDA read functions: the byte loads do not keep the access's coherence");
+            require(readerLoads[coherent] == 1u && readerLoads[!coherent] == 0u, "BDA read functions: the looped byte load does not keep the access's coherence");
+            require(spanReaderCalls == 1u, "BDA read functions: the span read does not call the byte read from one looped site");
             require(mainProbes == 0u, "BDA read functions: a read site probes or reads bytes outside its span read function");
             require(spanCalls == 5u, "BDA read functions: a read site does not call its span read function once");
             require(five.size() - one.size() < 4u * 150u, "BDA read functions: a read site takes 150 SPIR-V words or more");
