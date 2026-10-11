@@ -133,7 +133,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 }
                 return true;
             };
-            if (verifyHit && matched[i] != nullptr && (!sameContent(*matched[i], *variant) || !sameBindings(*matched[i]->compiled, *variant->compiled) || !sameForwardedWords(*matched[i]->compiled, matched[i]->patchedPushConstants.empty() ? matched[i]->compiled->pushConstants : matched[i]->patchedPushConstants, *variant->compiled, programs[i].hiddenUserWords))) {
+            if (verifyHit && matched[i] != nullptr && (!sameContent(*matched[i], *variant) || (programs[i].hiddenUserWords == 0 && !sameBindings(*matched[i]->compiled, *variant->compiled)) || !sameForwardedWords(*matched[i]->compiled, matched[i]->patchedPushConstants.empty() ? matched[i]->compiled->pushConstants : matched[i]->patchedPushConstants, *variant->compiled, programs[i].hiddenUserWords))) {
                 ++mismatches;
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit captured differently: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), matched[i]->words.size(), variant->runs.size(), variant->words.size());
