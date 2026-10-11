@@ -224,10 +224,22 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
 
 void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     if (variant.shaderDataPatches.empty()) return;
+    const auto patch = [&](std::vector<std::byte>& push) {
+        for (const auto& [slot, value] : variant.shaderDataPatches) {
+            const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
+            if (at + sizeof(std::uint32_t) <= push.size()) std::memcpy(push.data() + at, &value, sizeof(value));
+        }
+    };
+    const bool stored = std::any_of(variant.compiled->bindings.begin(), variant.compiled->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ShaderData; });
+    if (!stored) {
+        variant.patchedPushConstants = variant.compiled->pushConstants;
+        patch(variant.patchedPushConstants);
+        variant.shaderDataPatches.clear();
+        return;
+    }
     auto rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+    patch(rebased->pushConstants);
     for (const auto& [slot, value] : variant.shaderDataPatches) {
-        const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
-        if (at + sizeof(std::uint32_t) <= rebased->pushConstants.size()) std::memcpy(rebased->pushConstants.data() + at, &value, sizeof(value));
         for (auto& binding : rebased->bindings) {
             if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData && slot < binding.guestDescriptor.size()) binding.guestDescriptor[slot] = value;
         }

@@ -274,6 +274,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
         require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
+        if (drawHit && !matched[i]->patchedPushConstants.empty()) stages.back().pushConstants = matched[i]->patchedPushConstants;
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
