@@ -99,11 +99,13 @@ struct StageCapture {
     std::uint32_t pushOffset = 0;
     ShaderRecompiler::SrtUserDataUse userDataUse;
     std::shared_ptr<const ShaderRecompiler::SourceHandle> prepared;
+    std::vector<ShaderRecompiler::BufferBaseWord> bufferBaseWords;
 };
 
 struct RelocatableUserWord {
     std::uint32_t reg;
     std::vector<std::pair<std::int64_t, std::uint32_t>> reads;
+    std::vector<std::int64_t> dataOffsets;
 };
 
 struct DrawRelocation {
