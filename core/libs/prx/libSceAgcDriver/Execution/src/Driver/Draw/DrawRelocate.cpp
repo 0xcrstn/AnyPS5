@@ -198,10 +198,12 @@ void Driver::relocateDrawEntry(const QueueState& queue, const DrawAliasKeys& ali
     relocated->stages.resize(programs.size());
     std::vector<DrawUserPatch> current;
     bool complete = true;
+    drawStageDonorKeys.assign(programs.size(), 0);
     for (std::size_t i = 0; i < programs.size(); ++i) {
         const auto& program = programs[i];
         if (i < shared->roles.size() && shared->roles[i] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
         const auto found = i < stageKeys.size() && stageKeys[i] != 0 ? drawStageDonors.find(aliases.Key(stageKeys[i], program.userDataBase)) : drawStageDonors.end();
+        if (found != drawStageDonors.end()) drawStageDonorKeys[i] = found->first;
         const auto* donor = found != drawStageDonors.end() && found->second.variant != nullptr && found->second.variant->compiled != nullptr && found->second.userData.size() == program.userData.size() ? &found->second : nullptr;
         struct Move {
             std::uint32_t index, from, to;
@@ -335,6 +337,7 @@ std::shared_ptr<DispatchVariant> Driver::patchBufferWords(const DispatchVariant&
         copy->words[position] = fresh;
     }
     copy->compiled = std::move(rebased);
+    copy->dataPatched = true;
     return copy;
 }
 
