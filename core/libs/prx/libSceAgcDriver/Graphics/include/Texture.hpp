@@ -25,6 +25,7 @@ namespace AgcDriver::Graphics {
 class Buffer;
 class ResidentColor;
 class CommandBatch;
+class DeviceBuffer;
 class StorageTexture;
 struct HostImport;
 
@@ -38,6 +39,16 @@ bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, Dc
 std::uint64_t SampledTextureMemory();
 bool ClearKeepsDenormals(const Context& context, VkFormat format);
 bool ClearColorForTexel(VkFormat format, std::uint32_t elementBytes, std::span<const std::uint32_t, 4> pattern, VkClearColorValue& clear);
+
+void SetAliasHandOverForTests(bool enabled);
+struct AliasHandOverCounts {
+    std::uint64_t handedOver = 0;
+    std::uint64_t deviceUnits = 0;
+    std::uint64_t superseded = 0;
+    std::uint64_t storedLater = 0;
+    std::uint64_t fallbacks = 0;
+};
+AliasHandOverCounts TakeAliasHandOverCounts();
 
 // A sampled texture's own VkImage with its memory, shared with the recorder while a recorded upload
 // still writes it (see the snapshot constructor), so the texture may go before the batch completes.
@@ -354,6 +365,23 @@ public:
 
 private:
     StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
+    struct HandOver {
+        std::weak_ptr<StorageTexture> image;
+        std::uint64_t version = 0;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> units;
+        bool device = false;
+        std::uint64_t takerVersion = 0;
+        bool held = false;
+    };
+    std::vector<HandOver> handOversUnder(const StorageTexture* alias, DccKeys& keys);
+    struct DeviceUnits {
+        std::shared_ptr<DeviceBuffer> buffer;
+        std::uint64_t base = 0;
+    };
+    void retileUnitsTo(const DeviceUnits& target, const std::vector<std::uint32_t>& units);
+    std::uint64_t uploadUnitsFrom(const DeviceUnits& source, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs);
+    void supersedeHandedFrom(std::uint32_t first, std::uint32_t count);
+    const std::vector<bool>& wholeUnitsOf();
     // The regions of every array layer, or of the tracked layers `layers` selects.
     std::vector<VkBufferImageCopy> CopyRegions(const std::vector<bool>* layers = nullptr) const;
     // Uploads the surface, or only the tracked layers `layers` selects (the direct path; the others
@@ -456,7 +484,7 @@ private:
     void refreshGeneration();
     bool refreshProved();
     void takeRefreshProof(bool aliased);
-    bool otherPendingOverlaps() const;
+    bool otherPendingOverlaps(bool exceptHandOvers = false) const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);
@@ -616,6 +644,10 @@ private:
     // The generation at which a one-layer FillClear was refused as 'surface changed': the check
     // fails again until `generation` moves, so ClassifyFill skips the layer match meanwhile.
     std::uint64_t layerRefusedGeneration = ~0ull;
+    std::vector<bool> wholeUnits;
+    bool wholeUnitsKnown = false;
+    std::vector<HandOver> handedFrom;
+    std::vector<std::weak_ptr<StorageTexture>> handedTo;
 };
 
 // APS5_PROFILE_DRAW: what the image lookups on this thread did since the last reset, by outcome
