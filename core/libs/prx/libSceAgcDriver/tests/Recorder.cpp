@@ -7534,6 +7534,13 @@ void aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
     constexpr std::size_t surfaceB = 128 * 128 * 8;
     constexpr std::size_t keyCount = surfaceB / 256;
     constexpr std::size_t bytes = surfaceA + 65536;
+    const auto decided = PrepareImportWatch(base);
+#ifndef _WIN32
+    if (watched && decided == ImportWatch::Unwatch) {
+        std::cout << "host imports are compared on this device: " << what << " not tested\n";
+        return;
+    }
+#endif
     void* block = nullptr;
     if (watched) {
         block = AllocateWatched(bytes, 65536);
@@ -7549,7 +7556,6 @@ void aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
 #endif
     }
     Require(block != nullptr && reinterpret_cast<std::uint64_t>(block) % 65536 == 0, "cannot allocate the alias hand-over block");
-    const auto decided = PrepareImportWatch(base);
     if (watched) SetImportWatch(base, ImportWatch::Watch);
     struct RestoreWatch {
         const Context& context;
