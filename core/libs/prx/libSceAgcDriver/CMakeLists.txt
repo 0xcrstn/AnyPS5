@@ -416,7 +416,9 @@ if(BUILD_TESTING)
     add_test(NAME agc_write_tracking COMMAND agc_write_tracking_tests)
     set_tests_properties(agc_write_tracking PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_write_tracking PROPERTIES ENVIRONMENT_MODIFICATION
+        add_test(NAME agc_write_tracking_shared_faults COMMAND agc_write_tracking_tests)
+        set_tests_properties(agc_write_tracking_shared_faults PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_SHARED_WRITE_FAULTS=1")
+        set_tests_properties(agc_write_tracking agc_write_tracking_shared_faults PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -1263,7 +1265,9 @@ if(BUILD_TESTING)
     if(WIN32)
         add_test(NAME agc_shared_write_partial_collect_two_pass COMMAND agc_shared_write_tests --partial-collect)
         set_tests_properties(agc_shared_write_partial_collect_two_pass PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_SINGLE_PASS_COLLECT=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
-        set_tests_properties(agc_shared_write_partial_collect agc_shared_write_partial_collect_two_pass PROPERTIES ENVIRONMENT_MODIFICATION
+        add_test(NAME agc_shared_write_partial_collect_faults COMMAND agc_shared_write_tests --partial-collect)
+        set_tests_properties(agc_shared_write_partial_collect_faults PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SHARED_WRITE_FAULTS=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
+        set_tests_properties(agc_shared_write_partial_collect agc_shared_write_partial_collect_two_pass agc_shared_write_partial_collect_faults PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_target_properties(agc_driver_pipeline_optimized_readback_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
