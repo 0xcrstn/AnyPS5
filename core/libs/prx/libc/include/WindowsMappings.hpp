@@ -248,12 +248,22 @@ public:
         if (faultSharedWrites()) return;
         std::lock_guard lock(mutex);
         const auto end = address + bytes;
+        ++(bytes <= smallDeviceWriteBytes ? statistics.smallDeviceWrites : bytes <= subpageBytes ? statistics.subpageDeviceWrites : statistics.largeDeviceWrites);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
             auto& page = *it->second.page;
             const auto written = subpagesOf(it->first, address, end);
-            page.deviceWritten |= written;
-            ++statistics.deviceWrites;
             page.digested &= static_cast<std::uint8_t>(~written);
+            if (bytes > smallDeviceWriteBytes) {
+                page.deviceWritten |= written;
+                continue;
+            }
+            if (!page.excluded) page.excluded = std::make_unique<ExcludedWords>();
+            const auto from = std::max(address, it->first) & ~static_cast<std::uintptr_t>(7);
+            const auto to = std::min(end, it->first + pageBytes);
+            for (auto word = from; word < to; word += 8) {
+                const auto index = (word - it->first) / 8;
+                (*page.excluded)[index / 512][(index % 512) / 64] |= std::uint64_t{1} << (index % 64);
+            }
         }
     }
 
@@ -503,12 +513,16 @@ private:
     static constexpr std::size_t subpages = pageBytes / subpageBytes;
     static constexpr std::uint8_t allSubpages = (1u << subpages) - 1;
     static constexpr std::size_t chunkBytes = 0x200000;
+    static constexpr std::size_t smallDeviceWriteBytes = 64;
+    using ExcludedWords = std::array<std::array<std::uint64_t, subpageBytes / 8 / 64>, subpages>;
     struct Statistics {
         std::uint64_t collections = 0;
         std::uint64_t hashed = 0;
         std::uint64_t changed = 0;
         std::uint64_t faults = 0;
-        std::uint64_t deviceWrites = 0;
+        std::uint64_t smallDeviceWrites = 0;
+        std::uint64_t subpageDeviceWrites = 0;
+        std::uint64_t largeDeviceWrites = 0;
         std::chrono::steady_clock::duration hashing{};
         std::map<std::uintptr_t, std::uint64_t> regions;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
@@ -524,6 +538,7 @@ private:
         std::array<std::uint64_t, subpages> digest{};
         std::uint8_t digested = 0;
         std::uint8_t deviceWritten = 0;
+        std::unique_ptr<ExcludedWords> excluded;
     };
     struct Section {
         HANDLE handle;
@@ -755,25 +770,36 @@ private:
         return faults;
     }
 
-    static std::uint64_t subpageDigest(std::uintptr_t address) {
+    static std::uint64_t subpageDigest(std::uintptr_t address, const std::array<std::uint64_t, subpageBytes / 8 / 64>* excluded = nullptr) {
         constexpr std::uint64_t multiplier = 0x9e3779b97f4a7c15ull;
         const auto* words = reinterpret_cast<const volatile std::uint64_t*>(address);
         std::uint64_t lanes[4] = {0x243f6a8885a308d3ull, 0x13198a2e03707344ull, 0xa4093822299f31d0ull, 0x082efa98ec4e6c89ull};
-        for (std::size_t word = 0; word < subpageBytes / sizeof(std::uint64_t); word += 4) {
-            lanes[0] = (lanes[0] ^ words[word]) * multiplier;
-            lanes[1] = (lanes[1] ^ words[word + 1]) * multiplier;
-            lanes[2] = (lanes[2] ^ words[word + 2]) * multiplier;
-            lanes[3] = (lanes[3] ^ words[word + 3]) * multiplier;
+        if (excluded == nullptr) {
+            for (std::size_t word = 0; word < subpageBytes / sizeof(std::uint64_t); word += 4) {
+                lanes[0] = (lanes[0] ^ words[word]) * multiplier;
+                lanes[1] = (lanes[1] ^ words[word + 1]) * multiplier;
+                lanes[2] = (lanes[2] ^ words[word + 2]) * multiplier;
+                lanes[3] = (lanes[3] ^ words[word + 3]) * multiplier;
+            }
+        } else {
+            for (std::size_t word = 0; word < subpageBytes / sizeof(std::uint64_t); ++word) {
+                const bool skip = (((*excluded)[word / 64] >> (word % 64)) & 1u) != 0;
+                lanes[word % 4] = (lanes[word % 4] ^ (skip ? std::uint64_t{0} : words[word])) * multiplier;
+            }
         }
         std::uint64_t combined = lanes[0];
         for (std::size_t lane = 1; lane < 4; ++lane) combined = ((combined << 23) | (combined >> 41)) * multiplier ^ lanes[lane];
         return combined;
     }
 
+    static std::uint64_t subpageDigest(const SharedPage& page, std::uintptr_t base, std::size_t sub) {
+        return subpageDigest(base + sub * subpageBytes, page.excluded ? &(*page.excluded)[sub] : nullptr);
+    }
+
     static void recordDigests(SharedPage& page, std::uintptr_t base, std::uint8_t mask) {
         for (std::size_t sub = 0; sub < subpages; ++sub) {
             if ((mask & (1u << sub)) == 0) continue;
-            page.digest[sub] = subpageDigest(base + sub * subpageBytes);
+            page.digest[sub] = subpageDigest(page, base, sub);
             page.digested |= static_cast<std::uint8_t>(1u << sub);
         }
     }
@@ -786,7 +812,7 @@ private:
         for (std::size_t sub = 0; sub < subpages; ++sub) {
             const auto bit = static_cast<std::uint8_t>(1u << sub);
             if ((checked & bit) == 0) continue;
-            if (subpageDigest(base + sub * subpageBytes) != page.digest[sub]) changed |= bit;
+            if (subpageDigest(page, base, sub) != page.digest[sub]) changed |= bit;
         }
         if (changed != 0) invalidate(page, changed);
         if (!traced) return;
@@ -809,7 +835,7 @@ private:
         const auto now = std::chrono::steady_clock::now();
         if (now - statistics.since < std::chrono::seconds(5)) return;
         const auto seconds = std::chrono::duration<double>(now - statistics.since).count();
-        std::fprintf(stderr, "[write-tracking] %.0f s: %llu collections, %llu digested subpages checked (%.1f MiB) in %.1f ms, %llu changed, %llu guest write faults, %llu device writes noted\n", seconds, static_cast<unsigned long long>(statistics.collections), static_cast<unsigned long long>(statistics.hashed), static_cast<double>(statistics.hashed) * subpageBytes / 1048576.0, std::chrono::duration<double, std::milli>(statistics.hashing).count(), static_cast<unsigned long long>(statistics.changed), static_cast<unsigned long long>(statistics.faults), static_cast<unsigned long long>(statistics.deviceWrites));
+        std::fprintf(stderr, "[write-tracking] %.0f s: %llu collections, %llu digested subpages checked (%.1f MiB) in %.1f ms, %llu changed, %llu guest write faults, device writes: %llu up to %zu bytes excluded from digests, %llu up to a subpage, %llu larger\n", seconds, static_cast<unsigned long long>(statistics.collections), static_cast<unsigned long long>(statistics.hashed), static_cast<double>(statistics.hashed) * subpageBytes / 1048576.0, std::chrono::duration<double, std::milli>(statistics.hashing).count(), static_cast<unsigned long long>(statistics.changed), static_cast<unsigned long long>(statistics.faults), static_cast<unsigned long long>(statistics.smallDeviceWrites), smallDeviceWriteBytes, static_cast<unsigned long long>(statistics.subpageDeviceWrites), static_cast<unsigned long long>(statistics.largeDeviceWrites));
         std::vector<std::pair<std::uint64_t, std::uintptr_t>> busiest;
         for (const auto& [region, changes] : statistics.regions) busiest.emplace_back(changes, region);
         std::sort(busiest.rbegin(), busiest.rend());
