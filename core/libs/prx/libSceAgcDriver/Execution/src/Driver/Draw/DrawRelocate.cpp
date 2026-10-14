@@ -22,6 +22,14 @@ std::uint64_t AlignedWord(std::uint32_t word) {
 
 }
 
+std::uint64_t UserDataReads(const ShaderRecompiler::SrtUserDataUse& use, const ShaderRecompiler::RecompileResult& compiled, bool decodeFree, std::uint32_t hiddenWords) {
+    const auto walked = use.asBase | use.asValue;
+    if (walked == 0 || !decodeFree || hiddenWords >= 64) return ~std::uint64_t {0};
+    auto reads = walked | (hiddenWords == 0 ? 0 : ~std::uint64_t {0} >> (64u - hiddenWords));
+    for (const auto word : compiled.shaderDataUserWords) reads |= word < 64u ? std::uint64_t {1} << word : ~std::uint64_t {0};
+    return reads;
+}
+
 bool Driver::drawRelocationEnabled() {
     static const bool enabled = std::getenv("APS5_NO_DRAW_RELOCATION") == nullptr;
     return enabled;
@@ -121,6 +129,17 @@ void Driver::learnPendingRelocation() {
         const auto& program = programs[i];
         for (std::uint32_t index = program.hiddenUserWords; index < program.userData.size() && index < 64; ++index) {
             const auto reg = program.userDataBase + index - program.hiddenUserWords;
+            const bool readHere = (variant.userDataReads >> index & 1u) != 0;
+            const bool knownRead = std::find(shape->read.begin(), shape->read.end(), reg) != shape->read.end();
+            const auto unread = std::find(shape->unread.begin(), shape->unread.end(), reg);
+            if (readHere && !knownRead) {
+                shape->read.push_back(reg);
+                if (unread != shape->unread.end()) shape->unread.erase(unread);
+                changed = true;
+            } else if (!readHere && !knownRead && unread == shape->unread.end()) {
+                shape->unread.push_back(reg);
+                changed = true;
+            }
             const auto held = std::find_if(shape->words.begin(), shape->words.end(), [&](const RelocatableUserWord& word) { return word.reg == reg; });
             if ((variant.relocatableWords >> index & 1u) == 0) {
                 if (held == shape->words.end()) continue;
@@ -171,7 +190,8 @@ void Driver::learnPendingRelocation() {
         mix(program.userData.size());
         for (std::uint32_t index = 0; index < program.userData.size(); ++index) {
             const bool relocatable = pending.relocation != nullptr && index >= program.hiddenUserWords && std::any_of(pending.relocation->words.begin(), pending.relocation->words.end(), [&](const RelocatableUserWord& word) { return word.reg == program.userDataBase + index - program.hiddenUserWords; });
-            if (!relocatable && index >= program.hiddenUserWords) mix(program.userData[index]);
+            const bool unread = index < 64 && (variant->userDataReads >> index & 1u) == 0;
+            if (!relocatable && !unread && index >= program.hiddenUserWords) mix(program.userData[index]);
         }
         donor.stageKeys[i] = key == 0 ? 1 : key;
         drawStageDonors[pending.aliases.Key(donor.stageKeys[i], program.userDataBase)] = {variant, program.userData};
@@ -189,7 +209,10 @@ void Driver::relocateDrawEntry(const QueueState& queue, const DrawAliasKeys& ali
     auto& counters = drawRelocationCounters;
     ++counters.lookups;
     const auto known = drawDecodes.find(aliases.structure);
-    if (known == drawDecodes.end() || known->second.decode == nullptr) return;
+    if (known == drawDecodes.end() || known->second.decode == nullptr) {
+        ++counters.unknownStructure;
+        return;
+    }
     const auto shared = known->second.decode;
     const auto& stageKeys = known->second.stageKeys;
     const auto& programs = shared->programs;
@@ -214,12 +237,17 @@ void Driver::relocateDrawEntry(const QueueState& queue, const DrawAliasKeys& ali
             const auto now = readUserData(queue.shader, program.userDataBase + index - program.hiddenUserWords);
             if (now != program.userData[index]) current.push_back({i, index, now});
             if (donor == nullptr || now == donor->userData[index]) continue;
+            if (index < 64 && (donor->variant->userDataReads >> index & 1u) == 0) {
+                ++counters.unreadMoves;
+                continue;
+            }
             const auto from = donor->userData[index];
             if (index >= 64 || (donor->variant->relocatableWords >> index & 1u) == 0 || from == 0 || now == 0 || ((from ^ now) & 3u) != 0) allowed = false;
             moves.push_back({index, from, now});
         }
         if (!allowed) {
             if (donor != nullptr) ++counters.refused;
+            else ++counters.missingStage;
             complete = false;
             continue;
         }
@@ -254,6 +282,7 @@ std::shared_ptr<DispatchVariant> Driver::cloneVariant(const DispatchVariant& var
     copy->runs = variant.runs;
     copy->runBases = variant.runBases;
     copy->relocatableWords = variant.relocatableWords;
+    copy->userDataReads = variant.userDataReads;
     copy->words = variant.words;
     copy->forgetSerial = variant.forgetSerial;
     copy->compiled = variant.compiled;
@@ -369,7 +398,7 @@ void Driver::applyShaderDataPatches(DispatchVariant& variant) {
 
 void Driver::reportDrawRelocation() {
     auto& counters = drawRelocationCounters;
-    AgcDriver::ProfilePrint_nid_no_patch("[draw-relocate] %llu alias lookups: %llu donors with moved user words, %llu refusals, %llu hits through a relocated entry; %zu shader sets learned, %zu stage donors held\n", static_cast<unsigned long long>(counters.lookups), static_cast<unsigned long long>(counters.donors), static_cast<unsigned long long>(counters.refused), static_cast<unsigned long long>(counters.hits), drawRelocations.size(), drawStageDonors.size());
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-relocate] %llu alias lookups: %llu donors with moved user words, %llu refusals, %llu hits through a relocated entry; misses: %llu unknown structure, %llu stages without a donor; %llu unread user words ignored; %zu shader sets learned, %zu stage donors held\n", static_cast<unsigned long long>(counters.lookups), static_cast<unsigned long long>(counters.donors), static_cast<unsigned long long>(counters.refused), static_cast<unsigned long long>(counters.hits), static_cast<unsigned long long>(counters.unknownStructure), static_cast<unsigned long long>(counters.missingStage), static_cast<unsigned long long>(counters.unreadMoves), drawRelocations.size(), drawStageDonors.size());
     counters = {};
 }
 

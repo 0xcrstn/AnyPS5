@@ -111,6 +111,8 @@ struct RelocatableUserWord {
 struct DrawRelocation {
     std::vector<RelocatableUserWord> words;
     std::vector<std::uint32_t> banned;
+    std::vector<std::uint32_t> unread;
+    std::vector<std::uint32_t> read;
 };
 
 struct DrawUserPatch {
@@ -149,8 +151,10 @@ struct DrawRelocationTrial {
 };
 
 struct DrawRelocationCounters {
-    std::uint64_t lookups = 0, donors = 0, refused = 0, hits = 0;
+    std::uint64_t lookups = 0, donors = 0, refused = 0, hits = 0, unknownStructure = 0, missingStage = 0, unreadMoves = 0;
 };
+
+std::uint64_t UserDataReads(const ShaderRecompiler::SrtUserDataUse& use, const ShaderRecompiler::RecompileResult& compiled, bool decodeFree, std::uint32_t hiddenWords);
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
 

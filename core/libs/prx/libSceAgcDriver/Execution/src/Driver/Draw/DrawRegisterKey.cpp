@@ -118,6 +118,7 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         mixOther(shape);
         forEachKeyedUserWord(queue, allUserWords, [&](std::uint32_t offset, std::uint32_t value) {
             mixOther(offset);
+            if (std::find(relocation->unread.begin(), relocation->unread.end(), offset) != relocation->unread.end()) return;
             const auto word = std::find_if(relocation->words.begin(), relocation->words.end(), [&](const RelocatableUserWord& candidate) { return candidate.reg == offset; });
             if (word == relocation->words.end()) {
                 mixOther(value);
