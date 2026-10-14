@@ -250,6 +250,7 @@ void Driver::execute(const Submission& submission) {
         } else if (opcode == 0x3c || opcode == 0x93) {
             static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
             const auto waitStart = std::chrono::steady_clock::now();
+            if (submission.heldAtSubmit.contains(cursor)) ++waitOutcomes().heldAtSubmit;
             timed(&WorkerProfile::waitMs, [&] { waitMemory(packet, submission.queue, recent, submission.received, submission.heldAtSubmit.contains(cursor)); });
             gateOpened() = true;
             if (traceGpu && std::chrono::steady_clock::now() - waitStart > std::chrono::milliseconds(200)) {
