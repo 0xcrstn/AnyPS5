@@ -153,6 +153,15 @@ void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std:
     if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
 }
 
+bool AwaitPartialGroupPreparation(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock, const ShaderRecompiler::RecompileRequest& request) {
+    if (!prepared.partialGroupsPending || !request.context.compute.has_value() || !request.context.compute->PartialGroups()) return false;
+    static const bool trace = std::getenv("APS5_TRACE_PREPARATION_WAIT") != nullptr;
+    if (trace) std::fprintf(stderr, "[shader-prepare] a partial-group dispatch of 0x%llx waits for its queued preparation\n", static_cast<unsigned long long>(request.shader.codeAddress));
+    PrioritizeRegistrationPreparation(prepared);
+    prepared.settled.wait(lock, [&] { return !prepared.partialGroupsPending; });
+    return true;
+}
+
 bool CommittedAbi(const ShaderSnapshot& snapshot, std::span<const std::uint64_t> key) {
     std::unique_lock lock(snapshot.prepared->mutex);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
@@ -432,8 +441,15 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     ShaderRecompiler::BuildPreparedShaderKey(request, key);
     std::unique_lock lock(snapshot.prepared->mutex);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
-    for (const auto& entry : snapshot.prepared->entries) {
-        if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
+    const auto find = [&]() -> std::shared_ptr<const ShaderRecompiler::SourceHandle> {
+        for (const auto& entry : snapshot.prepared->entries) {
+            if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
+        }
+        return nullptr;
+    };
+    if (auto found = find()) return found;
+    if (AwaitPartialGroupPreparation(*snapshot.prepared, lock, request)) {
+        if (auto found = find()) return found;
     }
     ReportPreparedAtUse(snapshot, request);
     auto handle = PrepareShaderWithDiagnostics(request);
@@ -536,11 +552,18 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     ShaderRecompiler::BuildPreparedShaderKey(source, key);
     std::unique_lock lock(snapshot.prepared->mutex);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
-    for (const auto& entry : snapshot.prepared->entries) {
-        if (entry.codeOffset != codeOffset) continue;
-        invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
-        if (!linked.empty() && !std::ranges::equal(invocationRequest.shader.code, linked)) continue;
-        if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
+    const auto find = [&]() -> std::optional<ShaderRecompiler::PreparedShaderInvocation> {
+        for (const auto& entry : snapshot.prepared->entries) {
+            if (entry.codeOffset != codeOffset) continue;
+            invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
+            if (!linked.empty() && !std::ranges::equal(invocationRequest.shader.code, linked)) continue;
+            if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return invocation;
+        }
+        return std::nullopt;
+    };
+    if (auto invocation = find()) return std::move(*invocation);
+    if (AwaitPartialGroupPreparation(*snapshot.prepared, lock, source)) {
+        if (auto invocation = find()) return std::move(*invocation);
     }
     ReportPreparedAtUse(snapshot, source);
     auto handle = PrepareShaderWithDiagnostics(source);
@@ -750,7 +773,20 @@ void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Gra
     });
 }
 
-std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& plan) {
+bool PartialGroupsPossible(const RegisteredPreparation& plan) {
+    const auto& compute = plan.request->context.compute;
+    return compute.has_value() && compute->numThreads != std::array<std::uint32_t, 3>{1u, 1u, 1u};
+}
+
+std::vector<PreparedShaders::Entry> PreparePartialGroups(const RegisteredPreparation& plan) {
+    auto request = *plan.request;
+    request.context.compute->partialThreads = {1, 1, 1};
+    ShaderRecompiler::ShaderPreparationContext preparation;
+    PerformanceTimer timing("Shader.PrepareArtifact");
+    return {{plan.codeOffset, PrepareShaderWithDiagnostics(request, &preparation)}};
+}
+
+std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& plan, bool partialGroups = true) {
     auto& request = *plan.request;
     std::vector<PreparedShaders::Entry> entries;
     ShaderRecompiler::ShaderPreparationContext preparation;
@@ -767,6 +803,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
         }
     }
     if (request.context.compute) {
+        if (!partialGroups || !PartialGroupsPossible(plan)) return entries;
         request.context.compute->partialThreads = {1, 1, 1};
         append();
     } else if (request.context.pixel) {
@@ -823,11 +860,11 @@ private:
 
 public:
 
-    void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr) {
+    void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr, bool behind = false) {
         {
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
-                if (prepared != nullptr && prepared->demanded.load()) tasks.push_front({std::move(task), prepared});
+                if (!behind && prepared != nullptr && prepared->demanded.load()) tasks.push_front({std::move(task), prepared});
                 else tasks.push_back({std::move(task), prepared});
                 lock.unlock();
                 ready.notify_one();
@@ -951,21 +988,42 @@ bool RegistrationPrepareWithinBudget() {
     return false;
 }
 
-void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan) {
+void PreparePartialGroupsInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan) {
     const auto* preparedKey = snapshot->prepared.get();
     SubmitRegistrationPreparation([snapshot = std::move(snapshot), plan = std::move(plan)] {
+        PerformanceContext timingContext(FrameTiming::Preparation());
+        std::vector<PreparedShaders::Entry> entries;
+        try {
+            entries = PreparePartialGroups(*plan);
+        } catch (const std::exception& error) {
+            APS5_LOG_ERR("Shader 0x%llx could not be prepared for partial thread groups after registration: %s", static_cast<unsigned long long>(snapshot->codeAddress), error.what());
+        }
+        auto& prepared = *snapshot->prepared;
+        {
+            std::lock_guard lock(prepared.mutex);
+            prepared.entries.insert(prepared.entries.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
+            prepared.partialGroupsPending = false;
+        }
+        prepared.settled.notify_all();
+    }, preparedKey, true);
+}
+
+void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan) {
+    const auto* preparedKey = snapshot->prepared.get();
+    SubmitRegistrationPreparation([snapshot = std::move(snapshot), plan = std::move(plan)]() mutable {
         PerformanceContext timingContext(FrameTiming::Preparation());
         std::vector<PreparedShaders::Entry> entries;
         std::exception_ptr failure;
         const bool skipped = plan->budgeted && !RegistrationPrepareWithinBudget();
         try {
-            if (!skipped) entries = PrepareRegistered(*plan);
+            if (!skipped) entries = PrepareRegistered(*plan, false);
         } catch (const std::exception& error) {
             APS5_LOG_ERR("Shader 0x%llx could not be prepared after registration: %s", static_cast<unsigned long long>(snapshot->codeAddress), error.what());
             failure = std::current_exception();
         } catch (...) {
             failure = std::current_exception();
         }
+        const bool partialGroups = failure == nullptr && !skipped && PartialGroupsPossible(*plan);
         auto& prepared = *snapshot->prepared;
         {
             std::lock_guard lock(prepared.mutex);
@@ -973,9 +1031,11 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
             if (failure == nullptr && !skipped && !plan->abiKey.empty()) prepared.registeredAbis.push_back(std::move(plan->abiKey));
             if (skipped || (failure != nullptr && plan->budgeted)) prepared.deferred = true;
             prepared.failure = plan->budgeted ? nullptr : failure;
+            prepared.partialGroupsPending = partialGroups;
             prepared.pending = false;
         }
         prepared.settled.notify_all();
+        if (partialGroups) PreparePartialGroupsInBackground(std::move(snapshot), std::move(plan));
     }, preparedKey);
 }
 
@@ -1066,8 +1126,8 @@ void NoteUserDataCallees(std::uint64_t caller, std::span<const ShaderRecompiler:
 
 }
 
-void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared) {
-    RegistrationPreparePool::Instance().Submit(std::move(task), prepared);
+void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared, bool behind) {
+    RegistrationPreparePool::Instance().Submit(std::move(task), prepared, behind);
 }
 
 void PrioritizeRegistrationPreparation(PreparedShaders& prepared) {
