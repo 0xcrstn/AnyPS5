@@ -64,8 +64,9 @@ void ReleaseWatchedBlock(void* block, std::size_t bytes) {
 
 class Settings {
 public:
-    Settings() : enabled(DrawSnapshotArena::Enabled()), chunk(DrawSnapshotArena::ChunkBytes()), budget(DrawSnapshotArena::BudgetBytes()), extend(DrawSnapshotArena::ExtendBytes()), verify(DrawSnapshotArena::Verify()) {}
+    Settings() : enabled(DrawSnapshotArena::Enabled()), chunk(DrawSnapshotArena::ChunkBytes()), budget(DrawSnapshotArena::BudgetBytes()), extend(DrawSnapshotArena::ExtendBytes()), verify(DrawSnapshotArena::Verify()), twins(DrawSnapshotArena::DeviceTwins()) {}
     ~Settings() {
+        DrawSnapshotArena::SetDeviceTwins(twins);
         DrawSnapshotArena::SetEnabled(enabled);
         DrawSnapshotArena::SetChunkBytes(chunk);
         DrawSnapshotArena::SetBudgetBytes(budget);
@@ -81,6 +82,7 @@ private:
     std::size_t budget;
     std::size_t extend;
     bool verify;
+    bool twins;
 };
 
 class Fixture {
@@ -345,6 +347,60 @@ void RecycleTests(Fixture& fixture) {
     recorder.FlushDeferredReleases();
 }
 
+void DeviceTwinTests(Fixture& fixture) {
+    DrawSnapshotArena::SetEnabled(true);
+    DrawSnapshotArena::SetDeviceTwins(true);
+    const auto& context = fixture.GetContext();
+    auto& recorder = fixture.GetRecorder();
+    auto& arena = recorder.SnapshotArena();
+    static_cast<void>(arena.TakeCounters());
+    std::memset(fixture.Bytes(32768), 0x5a, 4096);
+    GuestMemory::BumpCollectEpoch();
+    const auto first = fixture.Take(32768, 1024);
+    const auto plain = [&] {
+        DrawSnapshotArena::SetDeviceTwins(false);
+        const auto view = fixture.Take(32768, 1024);
+        DrawSnapshotArena::SetDeviceTwins(true);
+        return view;
+    }();
+    Require(first.handle != plain.handle && first.offset == plain.offset && Holds(first, std::byte{0x5a}), "an arena view with device twins is not served from another buffer at the chunk's offset");
+    const auto download = [&](const Snapshot& snapshot, std::size_t bytes) {
+        auto downloaded = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::memset(downloaded->Bytes().data(), 0, bytes);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy region{snapshot.offset, 0, bytes};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, snapshot.handle, downloaded->Handle(), 1, &region);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(downloaded);
+        recorder.Submit();
+        recorder.Sync();
+        return std::vector<std::byte>(downloaded->Bytes().begin(), downloaded->Bytes().end());
+    };
+    const auto contents = download(first, 1024);
+    Require(std::all_of(contents.begin(), contents.end(), [](std::byte value) { return value == std::byte{0x5a}; }), "a device twin of an arena chunk does not hold the copied segment");
+    auto counters = arena.TakeCounters();
+    Require(counters.twinViews == 1 && counters.twinCopies == 1 && counters.twinCopiedBytes >= 1024 && counters.twinsRefused == 0, "the first twin view did not copy the chunk's segment once");
+    const auto again = fixture.Take(32768, 1024);
+    Require(again.handle == first.handle && again.offset == first.offset, "a later batch's hit did not bind the same twin bytes");
+    const auto later = download(again, 1024);
+    Require(std::all_of(later.begin(), later.end(), [](std::byte value) { return value == std::byte{0x5a}; }), "a twin read by a later batch lost the segment");
+    counters = arena.TakeCounters();
+    Require(counters.twinViews == 1 && counters.twinCopies == 0, "a hit on a settled twin copied again");
+    std::memset(fixture.Bytes(32768), 0x6b, 1024);
+    GuestMemory::BumpCollectEpoch();
+    const auto rewritten = fixture.Take(32768, 1024);
+    const auto fresh = download(rewritten, 1024);
+    Require(std::all_of(fresh.begin(), fresh.end(), [](std::byte value) { return value == std::byte{0x6b}; }), "a twin did not take a recopied segment before the batch read it");
+    const auto old = download(first, 1024);
+    Require(std::all_of(old.begin(), old.end(), [](std::byte value) { return value == std::byte{0x5a}; }), "a recopied segment overwrote the twin bytes an earlier view binds");
+    counters = arena.TakeCounters();
+    Require(counters.twinCopies == 1 && counters.twinViews == 1, "a recopied segment was not copied to the twin exactly once");
+    fixture.Release();
+    recorder.Sync();
+    DrawSnapshotArena::SetDeviceTwins(false);
+}
+
 void DisabledTests(Fixture& fixture) {
     DrawSnapshotArena::SetEnabled(false);
     std::memset(fixture.Bytes(32768), 0x5a, 1024);
@@ -406,6 +462,7 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
         ContentTests(fixture);
         PendingWriteTests(fixture);
         GpuReadTests(fixture);
+        DeviceTwinTests(fixture);
         DisabledTests(fixture);
     }
     {
