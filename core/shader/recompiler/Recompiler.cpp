@@ -287,6 +287,7 @@ struct ResultMemoEntry {
     std::uint64_t variantId;
     std::uint64_t hash;
     std::shared_ptr<const RecompileResult> result;
+    std::uint64_t bytes = 0;
 };
 
 struct EmissionFailure {
@@ -315,6 +316,29 @@ struct SourceEntry {
 };
 
 namespace {
+
+struct RetainedCounters {
+    std::atomic<std::uint64_t> sources{0}, plans{0}, planValues{0}, planBytes{0}, programs{0}, variants{0}, variantSpirvBytes{0}, bindingPlans{0}, specializedModules{0}, specializedSpirvBytes{0}, registrationModules{0};
+};
+
+RetainedCounters& retainedCounters() {
+    static RetainedCounters counters;
+    return counters;
+}
+
+void countPlan(const IrResourcePlan& plan) {
+    std::uint64_t values = 0;
+    const auto bytes = EstimatePlanBytes(plan, &values);
+    auto& counters = retainedCounters();
+    counters.plans.fetch_add(1, std::memory_order_relaxed);
+    counters.planValues.fetch_add(values, std::memory_order_relaxed);
+    counters.planBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void countProgram(bool retained) {
+    if (retained) retainedCounters().programs.fetch_add(1, std::memory_order_relaxed);
+    else retainedCounters().programs.fetch_sub(1, std::memory_order_relaxed);
+}
 
 class PrimedSharedMutex : public std::shared_mutex {
 public:
@@ -398,6 +422,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         source = find();
         if (source == nullptr) {
             source = std::make_shared<SourceEntry>();
+            retainedCounters().sources.fetch_add(1, std::memory_order_relaxed);
             source->code.assign(request.shader.code.begin(), request.shader.code.end());
             auto& bucket = sources[key];
             if (!bucket.empty()) {
@@ -423,6 +448,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                 if (ShaderDiskCache::LoadPlan(planKey, loaded)) {
                     loaded.shaderHash = request.shader.codeAddress;
                     source->plan = std::make_shared<const IrResourcePlan>(std::move(loaded));
+                    countPlan(*source->plan);
                 }
             }
             if (source->plan == nullptr) {
@@ -430,6 +456,8 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                     ResourceProgram resource(request, preparation, reclaim);
                     source->plan = std::move(resource.plan);
                     source->program = std::move(resource.program);
+                    countPlan(*source->plan);
+                    if (source->program != nullptr) countProgram(true);
                 } catch (...) {
                     if (FailureMemo()) source->planFailure = std::current_exception();
                     throw;
@@ -647,6 +675,8 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     }
     module->spirv = std::move(materialized);
     module->specializationId = constants.empty() ? 0u : nextVariantId();
+    retainedCounters().specializedModules.fetch_add(1, std::memory_order_relaxed);
+    retainedCounters().specializedSpirvBytes.fetch_add(module->spirv.Words().size() * sizeof(std::uint32_t), std::memory_order_relaxed);
     return module;
 }
 
@@ -690,7 +720,12 @@ std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t varian
     if (entry == nullptr) {
         std::unique_lock lock(mutex);
         const auto found = modules.find(key);
-        entry = found != modules.end() ? found->second : modules.emplace(key, std::make_shared<RegistrationModuleEntry>()).first->second;
+        if (found != modules.end()) {
+            entry = found->second;
+        } else {
+            entry = modules.emplace(key, std::make_shared<RegistrationModuleEntry>()).first->second;
+            retainedCounters().registrationModules.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     std::call_once(entry->ready, [&] {
         try {
@@ -740,7 +775,12 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     if (plan == nullptr) {
         std::unique_lock lock(mutex);
         const auto found = plans.find(key);
-        plan = found != plans.end() ? found->second : plans.emplace(key, std::make_shared<PreparedBindingPlan>()).first->second;
+        if (found != plans.end()) {
+            plan = found->second;
+        } else {
+            plan = plans.emplace(key, std::make_shared<PreparedBindingPlan>()).first->second;
+            retainedCounters().bindingPlans.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     std::call_once(plan->ready, [&] {
         try {
@@ -949,8 +989,10 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         }
     }
     if (variant == nullptr) {
-        auto program = source.program != nullptr ? std::move(*source.program) : PrepareResourceProgram(request, preparation);
+        const bool retained = source.program != nullptr;
+        auto program = retained ? std::move(*source.program) : PrepareResourceProgram(request, preparation);
         source.program.reset();
+        if (retained) countProgram(false);
         std::exception_ptr emissionFailure;
         try {
             variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), &emissionFailure));
@@ -960,8 +1002,13 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         }
         if (disk) ShaderDiskCache::Store(std::move(diskKey), variant);
     }
-    source.program.reset();
+    if (source.program != nullptr) {
+        source.program.reset();
+        countProgram(false);
+    }
     source.variants.push_back(variant);
+    retainedCounters().variants.fetch_add(1, std::memory_order_relaxed);
+    retainedCounters().variantSpirvBytes.fetch_add(variant->artifact.spirv.Words().size() * sizeof(std::uint32_t), std::memory_order_relaxed);
     return variant;
 }
 
@@ -1004,9 +1051,21 @@ bool ResultMemo() {
 constexpr std::size_t ResultMemoEntries = 256;
 
 struct ResultMemoCounters {
-    std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
+    std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0}, memoResults{0}, memoBytes{0};
     std::atomic<std::int64_t> lastReport{0};
 };
+
+std::uint64_t estimateResultBytes(const RecompileResult& result) {
+    std::uint64_t bytes = sizeof(RecompileResult) + result.specialization.size() * sizeof(PipelineSpecializationConstant) + result.pushConstants.size() + result.vertexAttributes.size() * sizeof(VertexAttribute);
+    bytes += result.vertexInputPatches.size() * sizeof(VertexInputPatch) + result.runtimeImageResources.size() * sizeof(std::uint32_t) + result.vertexInputs.size() * sizeof(VertexInput) + result.parameterExports.size() * sizeof(std::uint32_t) + result.fragmentParameters.size() * sizeof(FragmentParameter);
+    for (const auto& binding : result.bindings) {
+        bytes += sizeof(DescriptorBinding) + (binding.guestDescriptor.size() + binding.imageSamplers.size()) * sizeof(std::uint32_t);
+        for (const auto* flags : {&binding.samplerDepthCompare, &binding.imageWritten, &binding.imageDepthCompare, &binding.imageAtomic, &binding.imageAtomic64, &binding.bufferAtomic, &binding.bufferWritten, &binding.samplerUnnormalized, &binding.samplerIntegerBorder, &binding.imageUnnormalized, &binding.imageUnnormalizedBaseLevel, &binding.bufferRead}) {
+            bytes += (flags->size() + 63u) / 64u * sizeof(std::uint64_t);
+        }
+    }
+    return bytes;
+}
 
 ResultMemoCounters& resultMemoCounters() {
     static ResultMemoCounters counters;
@@ -1118,18 +1177,25 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
                 source.memo.splice(source.memo.begin(), source.memo, found->second);
                 shared = found->second->result;
             } else {
+                counters.memoBytes.fetch_sub(found->second->bytes, std::memory_order_relaxed);
                 source.memo.erase(found->second);
                 source.memoIndex.erase(found);
+                counters.memoResults.fetch_sub(1, std::memory_order_relaxed);
             }
         }
         if (source.memoIndex.find(index) == source.memoIndex.end()) {
-            source.memo.push_front({variant->artifact.variantId, hash, shared});
+            const auto bytes = estimateResultBytes(*shared);
+            counters.memoResults.fetch_add(1, std::memory_order_relaxed);
+            counters.memoBytes.fetch_add(bytes, std::memory_order_relaxed);
+            source.memo.push_front({variant->artifact.variantId, hash, shared, bytes});
             source.memoIndex.emplace(index, source.memo.begin());
             while (source.memo.size() > ResultMemoEntries) {
                 const auto& last = source.memo.back();
                 source.memoIndex.erase((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
+                counters.memoBytes.fetch_sub(last.bytes, std::memory_order_relaxed);
                 source.memo.pop_back();
                 counters.evictions.fetch_add(1, std::memory_order_relaxed);
+                counters.memoResults.fetch_sub(1, std::memory_order_relaxed);
             }
         }
     }
@@ -1172,6 +1238,41 @@ auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltyp
     }
 }
 
+}
+
+namespace {
+
+const IrValue& storedValue(const IrValue& value) {
+    return value;
+}
+
+const IrValue& storedValue(const std::unique_ptr<IrValue>& value) {
+    return *value;
+}
+
+}
+
+std::uint64_t EstimatePlanBytes(const IrResourcePlan& plan, std::uint64_t* values) {
+    std::uint64_t count = 0;
+    std::uint64_t bytes = sizeof(IrResourcePlan);
+    for (const auto& stored : plan.valueStorage) {
+        const auto& value = storedValue(stored);
+        ++count;
+        bytes += sizeof(IrValue) + (value.ArgumentCount() + value.UseCount() + value.PhiBlockCount()) * sizeof(void*) + value.OperandUses().size() * sizeof(IrUse);
+    }
+    for (const auto& block : plan.blockStorage) {
+        if (block != nullptr) bytes += sizeof(IrBlock) + (block->Predecessors().size() + block->Successors().size()) * sizeof(void*);
+    }
+    bytes += plan.memoryInfo.size() * sizeof(MemoryInfo) + plan.descriptorSources.size() * sizeof(DescriptorSource) + plan.controlFlow.size() * sizeof(ResourceBlock) + plan.srtReads.size() * sizeof(SrtRead);
+    bytes += (plan.materializationSources.size() + plan.guardedSrtSlots.size()) * sizeof(std::uint32_t) + plan.cleanFlatSlots.size() + plan.pureFlatSlots.size();
+    if (values != nullptr) *values = count;
+    return bytes;
+}
+
+RetainedShaderMemory GetRetainedShaderMemory() {
+    const auto& counters = retainedCounters();
+    const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    return {load(counters.sources), load(counters.plans), load(counters.planValues), load(counters.planBytes), load(counters.programs), load(counters.variants), load(counters.variantSpirvBytes), load(resultMemoCounters().memoResults), load(resultMemoCounters().memoBytes), load(counters.bindingPlans), load(counters.specializedModules), load(counters.specializedSpirvBytes), load(counters.registrationModules)};
 }
 
 std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request) {

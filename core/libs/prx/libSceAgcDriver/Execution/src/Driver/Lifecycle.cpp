@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -100,6 +101,7 @@ void Driver::stop() {
         if (worker.thread.joinable()) worker.thread.join();
     }
     StopWorkerSampler();
+    MemoryReport::Stop();
     CloseRegistrationPreparation();
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     device.Reset();
@@ -119,6 +121,10 @@ Driver::Driver() {
         stop();
         throw;
     }
+    MemoryReport::Start([] {
+        const auto current = Driver::Get().device.Load();
+        return current != nullptr ? current->DescribeMemoryHeaps() : std::string{};
+    });
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix([](const GuestAllocations::Mapped& ranges, std::uint64_t generation) {
         const auto import = [&] {
             try {

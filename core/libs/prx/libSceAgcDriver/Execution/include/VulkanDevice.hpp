@@ -41,6 +41,7 @@ public:
     VulkanDevice& operator=(const VulkanDevice&) = delete;
     std::string DeviceName() const;
     std::string DriverInfo() const;
+    std::string DescribeMemoryHeaps() const;
     bool CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const;
     ShaderRecompiler::SpirvTarget Target() const;
     std::optional<ShaderRecompiler::GeometryStageLimits> GeometryLimits() const;

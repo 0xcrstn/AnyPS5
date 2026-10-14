@@ -22,6 +22,7 @@ private:
 [[nodiscard]] IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation);
 [[nodiscard]] std::uint64_t FrontEndBuilds();
 [[nodiscard]] std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request);
+[[nodiscard]] std::uint64_t EstimatePlanBytes(const IrResourcePlan& plan, std::uint64_t* values = nullptr);
 
 struct SourceEntry;
 struct ResourceCapture {

@@ -108,6 +108,23 @@ add_custom_command(
         DEPENDS "${agcSampleDumpsShaderSource}" glslang-standalone
         VERBATIM
 )
+foreach(agcPresentationStage IN ITEMS Vert Frag)
+    string(TOLOWER "${agcPresentationStage}" agcPresentationExtension)
+    string(TOUPPER "${agcPresentationStage}" agcPresentationSymbol)
+    set(agcPresentationShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/PresentationPass.${agcPresentationExtension})
+    set(agcPresentationShaderSpv ${agcTextureDetileGeneratedDir}/PresentationPass${agcPresentationStage}.spv)
+    set(agcPresentationShaderHeader ${agcTextureDetileGeneratedDir}/PresentationPass${agcPresentationStage}_spv.h)
+    add_custom_command(
+            OUTPUT "${agcPresentationShaderHeader}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+            COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcPresentationShaderSpv}" "${agcPresentationShaderSource}"
+            COMMAND ${CMAKE_COMMAND} -DINPUT=${agcPresentationShaderSpv} -DOUTPUT=${agcPresentationShaderHeader}
+            -DSYMBOL=PRESENTATION_PASS_${agcPresentationSymbol}_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+            DEPENDS "${agcPresentationShaderSource}" glslang-standalone
+            VERBATIM
+    )
+    list(APPEND agcPresentationShaderHeaders ${agcPresentationShaderHeader})
+endforeach()
 
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
@@ -166,6 +183,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/MemoryReport.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ProcessMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -174,6 +193,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/VulkanDevice.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AspectFit.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PresentationScaler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PresentationPass.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Draw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DepthSurface.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleTarget.cpp
@@ -210,6 +230,7 @@ set(agcDriverSources
         ${agcTextureDetileImageShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}
+        ${agcPresentationShaderHeaders}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp
@@ -291,6 +312,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_profile_output PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_profile_output PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_process_memory_tests tests/ProcessMemory.cpp Execution/src/ProcessMemory.cpp)
+    target_include_directories(agc_process_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_process_memory_tests PRIVATE libc)
+    configure_windows_unwind(agc_process_memory_tests)
+    add_test(NAME agc_process_memory COMMAND agc_process_memory_tests)
+    set_tests_properties(agc_process_memory PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_process_memory PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
@@ -1021,6 +1053,34 @@ if(BUILD_TESTING)
     add_test(NAME agc_host_import_retire COMMAND agc_host_import_retire_tests)
     if(WIN32)
         set_tests_properties(agc_host_import_retire PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_driver_presentation_pass_tests EXCLUDE_FROM_ALL
+        tests/PresentationPass.cpp
+)
+
+target_include_directories(agc_driver_presentation_pass_tests PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler
+        ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
+)
+
+target_link_libraries(agc_driver_presentation_pass_tests PRIVATE
+        libSceAgcDriver
+        SDL2-static
+        libc
+)
+
+set_target_properties(agc_driver_presentation_pass_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_driver_presentation_pass_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_driver_presentation_pass_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_driver_presentation_pass COMMAND agc_driver_presentation_pass_tests)
+    set_tests_properties(agc_driver_presentation_pass PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_presentation_pass PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
