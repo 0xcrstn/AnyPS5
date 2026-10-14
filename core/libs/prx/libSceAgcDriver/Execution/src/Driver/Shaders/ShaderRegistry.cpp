@@ -766,7 +766,7 @@ class RegistrationPreparePool {
 public:
     static RegistrationPreparePool& Instance() {
         static auto* pool = [] {
-            auto* created = new RegistrationPreparePool(std::max(2u, std::thread::hardware_concurrency() / 2u));
+            auto* created = new RegistrationPreparePool(PreparationThreads());
             PreparationSlot().store(created);
             return created;
         }();
@@ -792,6 +792,15 @@ public:
     }
 
 private:
+    static unsigned PreparationThreads() {
+        const char* text = std::getenv("APS5_PREPARE_THREADS");
+        if (text == nullptr || *text == '\0') return std::max(2u, std::thread::hardware_concurrency() / 2u);
+        char* end = nullptr;
+        const auto value = std::strtoul(text, &end, 10);
+        if (end == text || *end != '\0' || value == 0 || value > 1024) throw std::runtime_error("APS5_PREPARE_THREADS is not a thread count from 1 to 1024: " + std::string(text));
+        return static_cast<unsigned>(value);
+    }
+
     static std::atomic<RegistrationPreparePool*>& PreparationSlot() {
         static std::atomic<RegistrationPreparePool*> slot{nullptr};
         return slot;
