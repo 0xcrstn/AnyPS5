@@ -835,6 +835,16 @@ void noteCopyReason(ImportRefusal reason, std::uint64_t begin, std::uint64_t byt
     totals.largest = {};
 }
 
+#ifdef _WIN32
+bool drainBeforeDemote() {
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || recorder->Idle()) return true;
+    if (!GuestMemory::GpuMutex().HeldByThisThread() || !recorder->HasTimeline()) return false;
+    recorder->WaitSerial(recorder->SubmitAndEpoch());
+    return true;
+}
+#endif
+
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
 bool importsStale(const Context& context, const HostImports& state);
 const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict);
@@ -962,6 +972,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
             std::snprintf(text, sizeof(text), "AGC graphics: host import of 0x%llx+0x%llx: memory at 0x%llx (type 0x%lx, protection 0x%lx) is neither read-write, read-only nor a shared mapping", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), reinterpret_cast<unsigned long long>(refused.BaseAddress), refused.Type, refused.Protect);
             throw std::runtime_error(text);
         }
+        if (std::uintptr_t residentBegin = 0, residentEnd = 0; GuestArena::GuestArenaResidentSpan_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes), &residentBegin, &residentEnd) && !drainBeforeDemote()) return nullptr;
         try {
             entry.alias = GuestArena::GuestArenaMapAlias_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes));
         } catch (const std::runtime_error&) {
@@ -2667,7 +2678,21 @@ const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address)
     return own;
 }
 
-void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept) {
+namespace {
+
+template<typename Regions>
+bool mirrorOverlaps(const Regions& base, std::uint64_t begin, std::uint64_t end) {
+    auto found = std::upper_bound(base.begin(), base.end(), begin, [](std::uint64_t value, const auto& region) { return value < region.begin; });
+    if (found != base.begin()) --found;
+    for (; found != base.end() && found->begin < end; ++found) {
+        if (found->end > begin && found->mirror != nullptr) return true;
+    }
+    return false;
+}
+
+}
+
+void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept, bool readOnly) {
     validate(address, bytes);
     const auto begin = address & ~std::uint64_t{3};
     const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
@@ -2680,6 +2705,10 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
             }
             return;
         case BaseOverlap::Partial:
+            if (readOnly && !mirrorOverlaps(space->base, begin, end) && !WritesOverlap(begin, static_cast<std::size_t>(end - begin))) {
+                readsOverBase.emplace_back(begin, end);
+                break;
+            }
             Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
             dissolveSpace(false);
             break;
@@ -2745,7 +2774,11 @@ bool GuestBufferMemory::bindSparseMirror(Region& region, const GuestAllocations:
 }
 
 void GuestBufferMemory::AddWritable(std::uint64_t address, std::size_t bytes, bool atomic, bool swept) {
-    addDescriptorRegion(address, bytes, atomic, swept);
+    if (space != nullptr && std::any_of(readsOverBase.begin(), readsOverBase.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; })) {
+        Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
+        dissolveSpace(false);
+    }
+    addDescriptorRegion(address, bytes, atomic, swept, false);
     writes.emplace_back(address, address + bytes);
 }
 
@@ -2753,7 +2786,7 @@ void GuestBufferMemory::AddReadable(std::uint64_t address, std::size_t bytes) {
     // Not in `writes`: no reference copy (copyRegion), no write-back, no pending-write note, no
     // direct-write mark, and UploadPrepare copies it without the device lock. A written descriptor
     // overlapping the range still covers it through its own Writes() entry.
-    addDescriptorRegion(address, bytes, false, false);
+    addDescriptorRegion(address, bytes, false, false, true);
 }
 
 void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
