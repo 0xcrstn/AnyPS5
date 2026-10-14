@@ -17,6 +17,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <map>
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -254,5 +261,27 @@ void RunUnmappedGapTests() {
     }
     Require(!GuestMemory::Accessible(guest, page) && !GuestMemory::Accessible(guest + page, page), "unmapped arena pages are still accessible");
     GuestArena::GuestArenaRelease_nid_postfix(guest, 2 * page);
+#endif
+#ifdef _WIN32
+    if (!GuestArena::GuestArenaAvailable_nid_postfix()) return;
+    std::uintptr_t arenaBase = 0;
+    std::size_t arenaBytes = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+    auto* block = GuestHeap::GuestHeapAllocate_nid_postfix(4096);
+    Require(AgcDriver::GuestMemory::Accessible(block, 4096, true), "a guest heap block is not writable");
+    Require(AgcDriver::GuestMemory::Accessible(block, 4096, true), "a guest heap block read from the page table is not writable");
+    GuestHeap::GuestHeapFree_nid_postfix(block);
+    const auto tableBytes = arenaBytes / 4096;
+    std::map<void*, std::pair<std::size_t, std::size_t>> allocations;
+    MEMORY_BASIC_INFORMATION memory{};
+    for (std::uintptr_t cursor = 0; VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) == sizeof(memory) && memory.RegionSize != 0; cursor = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize) {
+        if (memory.State == MEM_FREE || memory.Type != MEM_PRIVATE) continue;
+        auto& [reserved, committed] = allocations[memory.AllocationBase];
+        reserved += memory.RegionSize;
+        if (memory.State == MEM_COMMIT) committed += memory.RegionSize;
+    }
+    const auto table = std::ranges::find_if(allocations, [&](const auto& allocation) { return allocation.second.first >= tableBytes && allocation.second.first <= tableBytes + 65536; });
+    Require(table != allocations.end(), "the arena page table was not found");
+    Require(table->second.second < tableBytes / 8, "the arena page table commits what no guest page was recorded in");
 #endif
 }
