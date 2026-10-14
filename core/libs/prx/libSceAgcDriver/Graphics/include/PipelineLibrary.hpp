@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_PIPELINELIBRARY_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineLibraryNotes.hpp"
 #include <array>
 #include <atomic>
 #include <memory>
@@ -43,6 +44,8 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
 
 std::array<std::uint64_t, 4>& ThreadBuiltLibraryParts();
 
+std::vector<LibraryBuildNote>& ThreadLibraryBuildNotes();
+
 void WaitForOptimizedPipelines(VkDevice device);
 
 void ClearPipelineLibraries(VkDevice device);
@@ -58,9 +61,6 @@ struct PipelineLibraryCounters {
     std::array<std::uint64_t, 6> preRasterizationRebuiltFor{};
     std::array<std::uint64_t, 3> fragmentRebuiltFor{};
 };
-
-inline constexpr std::array<const char*, 6> PreRasterizationLibraryFields{"push offset", "provoking vertex", "clip range", "depth clamp", "conservative rasterization", "tessellation"};
-inline constexpr std::array<const char*, 3> FragmentLibraryFields{"push offset", "samples", "sample locations"};
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device);
 

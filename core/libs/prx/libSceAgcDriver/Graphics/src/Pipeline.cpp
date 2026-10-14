@@ -176,6 +176,20 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
     key.insert(key.end(), bytes.begin(), bytes.end());
 }
 
+const char* StageName(ShaderRecompiler::ShaderStage stage) {
+    switch (stage) {
+        case ShaderRecompiler::ShaderStage::Vertex: return "vertex";
+        case ShaderRecompiler::ShaderStage::Local: return "local";
+        case ShaderRecompiler::ShaderStage::TessellationControl: return "tessellation control";
+        case ShaderRecompiler::ShaderStage::TessellationEvaluation: return "tessellation evaluation";
+        case ShaderRecompiler::ShaderStage::Geometry: return "geometry";
+        case ShaderRecompiler::ShaderStage::Mesh: return "mesh";
+        case ShaderRecompiler::ShaderStage::Fragment: return "fragment";
+        case ShaderRecompiler::ShaderStage::Compute: return "compute";
+    }
+    return "unknown";
+}
+
 bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
     if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || state.depthBiasPerFace || state.rectList || SplitsAlternateAlpha(state)) return false;
@@ -521,12 +535,21 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             return;
         }
         const auto partsBefore = ThreadBuiltLibraryParts();
+        ThreadLibraryBuildNotes().clear();
         const SlowReport slowPipeline([&] {
             const auto& parts = ThreadBuiltLibraryParts();
             char text[224];
             if (!libraries) std::snprintf(text, sizeof(text), "graphics pipeline creation (%u stages, complete)", pipelineInfo.stageCount);
             else std::snprintf(text, sizeof(text), "graphics pipeline creation (%u stages, linked from libraries; built here: %llu vertex input, %llu pre-rasterization, %llu fragment shader, %llu fragment output)", pipelineInfo.stageCount, static_cast<unsigned long long>(parts[0] - partsBefore[0]), static_cast<unsigned long long>(parts[1] - partsBefore[1]), static_cast<unsigned long long>(parts[2] - partsBefore[2]), static_cast<unsigned long long>(parts[3] - partsBefore[3]));
-            return std::string(text);
+            std::string described(text);
+            for (const auto& shader : shaders) {
+                char stage[112];
+                std::snprintf(stage, sizeof(stage), "; %s 0x%llx (%zu SPIR-V words, push offset %u)", StageName(shader.stage), static_cast<unsigned long long>(shader.programAddress), shader.program->spirv.size(), shader.pushConstantOffset);
+                described += stage;
+            }
+            const auto builds = DescribeLibraryBuilds(ThreadLibraryBuildNotes());
+            if (!builds.empty()) described += "; " + builds;
+            return described;
         });
         if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
         else {

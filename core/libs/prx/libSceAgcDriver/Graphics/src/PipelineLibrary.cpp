@@ -59,7 +59,7 @@ struct DeviceLibraries {
     PipelineLibraryCounters counters;
 };
 
-void countLibrary(DeviceLibraries& device, std::size_t part, const Key& shaders, const Key& state, const Key& layout, const Key& rendering, std::span<const std::uint64_t> fields, std::span<std::uint64_t> rebuiltFor) {
+void countLibrary(DeviceLibraries& device, std::size_t part, const Key& shaders, const Key& state, const Key& layout, const Key& rendering, std::span<const std::uint64_t> fields, std::span<std::uint64_t> rebuiltFor, LibraryBuildNote& note) {
     if (shaders.empty()) return;
     auto& seen = device.shaders[part];
     const auto found = seen.find(shaders);
@@ -68,13 +68,20 @@ void countLibrary(DeviceLibraries& device, std::size_t part, const Key& shaders,
         ++device.counters.shaders[part];
         return;
     }
+    note.rebuilt = true;
     if (found->second.part != state) ++device.counters.rebuiltForState[part];
     if (found->second.layout != layout) ++device.counters.rebuiltForLayout[part];
     if (found->second.rendering != rendering) ++device.counters.rebuiltForRendering[part];
     for (std::size_t field = 0; field < fields.size() && field < found->second.fields.size(); ++field) {
-        if (found->second.fields[field] != fields[field]) ++rebuiltFor[field];
+        if (found->second.fields[field] == fields[field]) continue;
+        ++rebuiltFor[field];
+        note.differingFields |= std::uint64_t{1} << field;
     }
     found->second = {state, layout, rendering, {fields.begin(), fields.end()}};
+}
+
+double millisecondsSince(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 template<std::size_t Count>
@@ -262,9 +269,14 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         VkPipeline handle = VK_NULL_HANDLE;
         if (partsOnly) lock.unlock();
         VkResult created;
+        LibraryBuildNote note{part, 0.0, 0.0, optimize, false, 0u};
         {
+            const auto waiting = std::chrono::steady_clock::now();
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            note.lockWaitMs = millisecondsSince(waiting);
+            const auto creating = std::chrono::steady_clock::now();
             created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
+            note.createMs = millisecondsSince(creating);
         }
         if (partsOnly) lock.lock();
         Check(created, "vkCreateGraphicsPipelines library");
@@ -274,8 +286,9 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             continue;
         }
         cache.emplace(key, handle);
-        if (part == 1) countLibrary(device, part, keys.preRasterizationShaders, *partKeys[part], keys.preRasterizationLayout, attachmentKey, keys.preRasterizationFields, device.counters.preRasterizationRebuiltFor);
-        if (part == 2) countLibrary(device, part, keys.fragmentShaders, *partKeys[part], keys.fragmentLayout, attachmentKey, keys.fragmentFields, device.counters.fragmentRebuiltFor);
+        if (part == PreRasterizationLibraryPart) countLibrary(device, part, keys.preRasterizationShaders, *partKeys[part], keys.preRasterizationLayout, attachmentKey, keys.preRasterizationFields, device.counters.preRasterizationRebuiltFor, note);
+        if (part == FragmentShaderLibraryPart) countLibrary(device, part, keys.fragmentShaders, *partKeys[part], keys.fragmentLayout, attachmentKey, keys.fragmentFields, device.counters.fragmentRebuiltFor, note);
+        ThreadLibraryBuildNotes().push_back(note);
         reportLibraries(device);
         if (optimize) {
             for (std::uint32_t stage = 0; stage < create.stageCount; ++stage) {
@@ -299,8 +312,14 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     create.layout = info.layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
     {
+        LibraryBuildNote note{PipelineLinkPart, 0.0, 0.0, false, false, 0u};
+        const auto waiting = std::chrono::steady_clock::now();
         auto pipelineCacheLock = context.LockPipelineCacheForUse();
+        note.lockWaitMs = millisecondsSince(waiting);
+        const auto creating = std::chrono::steady_clock::now();
         Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &pipeline), "vkCreateGraphicsPipelines link");
+        note.createMs = millisecondsSince(creating);
+        ThreadLibraryBuildNotes().push_back(note);
     }
     ++device.counters.linked;
     if (optimize && optimized != nullptr) {
@@ -382,6 +401,11 @@ ShaderModuleCounters CreatedShaderModules() {
 std::array<std::uint64_t, 4>& ThreadBuiltLibraryParts() {
     thread_local std::array<std::uint64_t, 4> built{};
     return built;
+}
+
+std::vector<LibraryBuildNote>& ThreadLibraryBuildNotes() {
+    thread_local std::vector<LibraryBuildNote> notes;
+    return notes;
 }
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device) {
