@@ -97,6 +97,7 @@ struct StorageTraffic {
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
     std::array<std::pair<std::uint64_t, std::uint64_t>, 4> uploads{};
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> uploadReasons;
+    std::map<std::string, std::pair<std::uint64_t, double>> cpuUploadCauses;
     std::uint64_t directWriteBacks = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -123,6 +124,11 @@ void reportStorageTraffic(StorageTraffic& traffic) {
         std::snprintf(text, sizeof(text), " %llu/%.1f", static_cast<unsigned long long>(totals.first), totals.second / 1048576.0);
         line += " " + reason + text;
     }
+    line += "; cpu uploads by cause (count/ms):";
+    for (const auto& [cause, totals] : traffic.cpuUploadCauses) {
+        std::snprintf(text, sizeof(text), " %llu/%.1f", static_cast<unsigned long long>(totals.first), totals.second);
+        line += " " + cause + text;
+    }
     line += "; write-backs by reason (count/MiB):";
     for (const auto& [reason, totals] : traffic.writeBacks) {
         std::snprintf(text, sizeof(text), " %llu/%.1f", static_cast<unsigned long long>(totals.first), totals.second / 1048576.0);
@@ -134,7 +140,17 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
+    traffic.cpuUploadCauses.clear();
     traffic.directWriteBacks = 0;
+}
+
+void countCpuUploadCause(const char* cause, double ms) {
+    if (!LookupOutcomes::Profiled()) return;
+    auto& traffic = Traffic();
+    std::lock_guard lock(traffic.mutex);
+    auto& entry = traffic.cpuUploadCauses[cause];
+    ++entry.first;
+    entry.second += ms;
 }
 
 void countStorageUpload(std::size_t path, std::uint64_t bytes) {
@@ -2466,6 +2482,10 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         } else {
             recorder->EndGpuTiming(timing, guestBytes);
         }
+    }
+    if (profile) {
+        const char* cause = uploadedKeys != DccKeys::Uncompressed ? DccKeysName(uploadedKeys) : "no import";
+        countCpuUploadCause(cause, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     }
     countStorageUpload(2, guestBytes);
     ++version;
