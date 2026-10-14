@@ -2263,13 +2263,19 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
         Recorder snapshotRecorder(snapshotContext);
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, compute);
-        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+        ShaderResources::DrawBindingsStatistics statistics;
+        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, {}, &statistics);
         Require(bindings != nullptr, "read-only draw bindings were not prepared");
         Require(bindings->snapshots.size() == 1, "an input exceeding the draw snapshot cap was snapshotted");
         Require(bindings->snapshots[0].address == smallAddress, "the snapshotted input does not match the smaller buffer below the cap");
+        Require(statistics.snapshots == 1 && statistics.copied == 1 && statistics.reused == 0 && statistics.skipped == 1 && statistics.copiedBytes == smallBytes && statistics.descriptorWrites == 2, "the draw bindings statistics do not count one copied snapshot, one input over the cap and two descriptor writes");
         Require(snapshotRecorder.ReusableDrawSnapshot(largeAddress, largeBytes) == nullptr, "an input exceeding the draw snapshot cap was kept in the snapshot cache");
         if (Watched(address, bytes)) {
             Require(snapshotRecorder.ReusableDrawSnapshot(smallAddress, smallBytes) != nullptr, "an input below the draw snapshot cap was not kept in the snapshot cache");
+            ShaderResources::DrawBindingsStatistics repeated;
+            const auto again = resources.PrepareDrawBindings(snapshotRecorder, {}, &repeated);
+            Require(again != nullptr && again->snapshots.size() == 1 && again->snapshots[0].buffer == bindings->snapshots[0].buffer, "an unchanged input below the cap did not reuse its snapshot");
+            Require(repeated.snapshots == 1 && repeated.reused == 1 && repeated.copied == 0 && repeated.copiedBytes == 0, "the draw bindings statistics do not count the reused snapshot");
         }
         const auto contents = bindings->snapshots[0].buffer->Bytes();
         Require(contents.size() == smallBytes && std::all_of(contents.begin(), contents.end(), [](std::byte value) { return value == std::byte{0x11}; }), "a draw snapshot does not hold the guest bytes of its draw");
