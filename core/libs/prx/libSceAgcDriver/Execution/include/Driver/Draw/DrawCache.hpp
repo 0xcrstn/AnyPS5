@@ -70,7 +70,7 @@ enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiff
 
 struct DrawEntryCounters {
     std::uint64_t lookups = 0, absent = 0, hits = 0, stageValidations = 0, stageEqual = 0, variantsCompared = 0, inserts = 0, variantsInserted = 0, variantsEvicted = 0, present = 0, unstable = 0, touches = 0, verifyHits = 0, verifyMismatches = 0;
-    std::uint64_t partialStages = 0, dataPatchedStages = 0, stashed = 0;
+    std::uint64_t partialStages = 0, dataPatchedStages = 0, stashed = 0, nestedMoved = 0, nestedRefused = 0;
     double learnUs = 0, relocateUs = 0, stageValidateUs = 0, patchUs = 0, insertUs = 0, syncUs = 0, overlapUs = 0, labelUs = 0, compareUs = 0;
     std::uint64_t validatedRuns = 0, validatedWords = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrawMiss::Count)> misses{};
@@ -115,6 +115,7 @@ struct StageCapture {
     std::vector<std::pair<std::uint32_t, std::uint64_t>> dataLeaves;
     std::vector<std::uint64_t> otherReads;
     std::vector<std::uint32_t> inputExports;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> baseSlots;
 };
 
 struct RelocatableUserWord {
@@ -241,7 +242,7 @@ struct DrawMissDiagnosis {
     std::uint64_t validationMisses = 0, validationNone = 0, validationUnreadable = 0, validationRelocatedRun = 0, validationAbsoluteRun = 0, validationDataWord = 0, validationAddressLike = 0, validationOneWord = 0, validationFewWords = 0, validationManyWords = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrawStageMiss::Count)> validationRoles{};
     std::uint64_t validationDataWords = 0, validationFlatWords = 0, validationOtherWords = 0, validationOnlyData = 0;
-    std::uint64_t stagesTagged = 0, leavesOffered = 0, leavesTagged = 0, leavesUnmapped = 0, leavesMismatched = 0, leavesAliased = 0;
+    std::uint64_t stagesTagged = 0, leavesOffered = 0, leavesTagged = 0, leavesUnmapped = 0, leavesMismatched = 0, leavesAliased = 0, baseSlotsOffered = 0, nestedTagged = 0, nestedRuns = 0;
     RecentTable<bool> evictedDonors{Samples * 16};
     std::unordered_map<std::uint64_t, DrawStructureParts> learned;
     RecentTable<DrawStageSample> samples{Samples};

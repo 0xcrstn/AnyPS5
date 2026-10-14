@@ -18,6 +18,8 @@ namespace ShaderRecompiler::Detail {
 std::vector<std::uint8_t> ComputePureFlatSlots(const IrResourcePlan& plan);
 std::vector<std::uint32_t> ComputeGuardedFlatSlots(const IrResourcePlan& plan);
 
+std::vector<std::uint8_t> ComputeBaseOnlyFlatSlots(const IrResourcePlan& plan);
+
 }
 
 #endif

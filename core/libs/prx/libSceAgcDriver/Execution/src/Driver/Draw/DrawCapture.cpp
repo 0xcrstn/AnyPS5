@@ -42,6 +42,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     stageCapture.bufferBaseWords = capture->bufferBaseWords;
     stageCapture.dataLeaves = capture->readTrace.leaves;
     stageCapture.otherReads = capture->readTrace.otherReads;
+    stageCapture.baseSlots = capture->baseSlots;
     recompiled[i] = true;
     memory = shaderMemory.Regions();
 
@@ -114,7 +115,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             std::vector<ShaderRecompiler::MemoryRegion> regions(stageCapture.regions.begin(), stageCapture.regions.end());
             for (const auto& read : decodeReads[i]) regions.push_back({read.address, std::as_bytes(std::span(read.bytes))});
             std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
-            tagVariantRuns(*variant, regions, stageCapture.userDataUse, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords);
+            tagVariantRuns(*variant, regions, stageCapture.userDataUse, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords, stageCapture.baseSlots);
             variant->userDataReads = UserDataReads(stageCapture.userDataUse, *stageCapture.compiled, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords);
             tagBufferWords(*variant, stageCapture.bufferBaseWords);
             const auto leafCounts = tagDataLeaves(*variant, stageCapture.dataLeaves, stageCapture.otherReads);
@@ -127,6 +128,9 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 diagnosis.leavesAliased += leafCounts.aliased;
                 diagnosis.leavesTagged += static_cast<std::uint64_t>(std::count_if(variant->dataSlots.begin(), variant->dataSlots.end(), [](std::uint32_t slot) { return slot != DispatchVariant::NoFlatBinding; }));
                 ++diagnosis.stagesTagged;
+                diagnosis.baseSlotsOffered += stageCapture.baseSlots.size();
+                diagnosis.nestedTagged += variant->nestedBases.size();
+                diagnosis.nestedRuns += static_cast<std::uint64_t>(std::count_if(variant->runNested.begin(), variant->runNested.end(), [](std::int16_t nested) { return nested >= 0; }));
             }
             variant->inputExports = stageCapture.inputExports;
             const auto sameContent = [](const DispatchVariant& a, const DispatchVariant& b) {

@@ -133,7 +133,8 @@ private:
     void reportDrawMisses();
     void diagnoseValidationMiss(const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions);
     void putStageDonor(std::uint64_t key, const std::shared_ptr<DispatchVariant>& variant, const std::vector<std::uint32_t>& userData, std::uint64_t* evicted, bool* added, bool count);
-    static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords);
+    static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::pair<std::uint32_t, std::uint64_t>> baseSlots = {});
+    static std::shared_ptr<DispatchVariant> followNestedBases(const DispatchVariant& variant, bool& refused);
     static void applyShaderDataPatches(DispatchVariant& variant);
     static std::shared_ptr<DispatchVariant> cloneVariant(const DispatchVariant& variant);
     static void tagBufferWords(DispatchVariant& variant, std::span<const ShaderRecompiler::BufferBaseWord> bufferBaseWords);

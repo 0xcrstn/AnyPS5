@@ -35,6 +35,7 @@ struct ResourceCapture {
     SrtReadTrace readTrace;
     SrtUserDataUse userDataUse;
     std::vector<BufferBaseWord> bufferBaseWords;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> baseSlots;
     // APS5_PROFILE_DRAW: what CaptureResources spent resolving the source (the stage inputs, the
     // key over the code, the plan) before the walk.
     std::uint64_t sourceNanoseconds = 0;

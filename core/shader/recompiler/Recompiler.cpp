@@ -18,6 +18,7 @@
 #include <set>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 #include "ControlFlow/include/ControlFlow/GraphBuilder.hpp"
@@ -25,6 +26,7 @@
 #include "RdnaDecoder/include/RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "IntermediateRepresentation/include/IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/include/Optimization/BindingAllocator.hpp"
+#include "Optimization/include/Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "Optimization/include/Optimization/ConstantFolder.hpp"
 #include "Optimization/include/Optimization/DeadCodeEliminator.hpp"
 #include "Optimization/include/Optimization/DenormalFlushEliminator.hpp"
@@ -1410,6 +1412,42 @@ void noteBufferBaseWords(ResourceCapture& capture) {
     }
 }
 
+std::shared_ptr<const std::vector<std::uint8_t>> baseOnlySlots(const std::shared_ptr<const IrResourcePlan>& plan) {
+    static std::mutex mutex;
+    static std::unordered_map<const IrResourcePlan*, std::pair<std::weak_ptr<const IrResourcePlan>, std::shared_ptr<const std::vector<std::uint8_t>>>> memo;
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = memo.find(plan.get()); found != memo.end() && found->second.first.lock() == plan) return found->second.second;
+    }
+    auto computed = std::make_shared<const std::vector<std::uint8_t>>(Detail::ComputeBaseOnlyFlatSlots(*plan));
+    std::lock_guard lock(mutex);
+    if (memo.size() >= 65536) {
+        for (auto it = memo.begin(); it != memo.end();) it = it->second.first.expired() ? memo.erase(it) : std::next(it);
+    }
+    memo[plan.get()] = {plan, computed};
+    return computed;
+}
+
+void noteBaseSlots(ResourceCapture& capture) {
+    if (capture.plan == nullptr) return;
+    const auto& plan = *capture.plan;
+    if (plan.srtReads.empty()) return;
+    const auto base = baseOnlySlots(capture.plan);
+    const auto& use = capture.userDataUse;
+    for (std::uint32_t slot = 0; slot < base->size() && slot < plan.srtReads.size(); ++slot) {
+        if ((*base)[slot] == 0u || plan.srtReads[slot].value == nullptr) continue;
+        const void* inst = plan.srtReads[slot].value->Resolve();
+        std::optional<std::uint64_t> address;
+        bool single = true;
+        for (std::size_t read = 0; read < use.readInstructions.size() && read < use.reads.size(); ++read) {
+            if (use.readInstructions[read] != inst) continue;
+            if (address && *address != use.reads[read].first) single = false;
+            address = use.reads[read].first;
+        }
+        if (address && single) capture.baseSlots.emplace_back(plan.srtReads[slot].flatOffset, *address);
+    }
+}
+
 void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     const auto& plan = *capture.plan;
     SrtRuntime traced = runtime;
@@ -1417,11 +1455,13 @@ void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
         ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
         noteBufferBaseWords(capture);
+        noteBaseSlots(capture);
         return;
     }
     traced.readTrace = &capture.readTrace;
     ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
     noteBufferBaseWords(capture);
+    noteBaseSlots(capture);
     auto& other = capture.readTrace.otherReads;
     std::sort(other.begin(), other.end());
     other.erase(std::unique(other.begin(), other.end()), other.end());

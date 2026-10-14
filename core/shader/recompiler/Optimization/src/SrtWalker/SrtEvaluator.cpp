@@ -178,7 +178,24 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
         return true;
     }
     if (_runtime.userDataUse != nullptr) {
+        std::uint64_t baseAddress = 0;
+        if (origin < 0) {
+            IrValue* source = handle->Argument(0)->Resolve();
+            if (source->Opcode() == IrOpcode::ReadConst && source->ArgumentCount() >= 2 && source->Argument(1) != nullptr) {
+                const IrValue* slot = source->Argument(1)->Resolve();
+                if (slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < _program.srtReads.size() && _program.srtReads[slot->ImmediateU32()].value != nullptr) source = _program.srtReads[slot->ImmediateU32()].value->Resolve();
+            }
+            if (!source->HasImmediate() && IsRawRead(_program, *source)) {
+                const auto& instructions = _runtime.userDataUse->readInstructions;
+                for (auto index = instructions.size(); index-- > 0;) {
+                    if (instructions[index] != source) continue;
+                    baseAddress = _runtime.userDataUse->reads[index].first;
+                    break;
+                }
+            }
+        }
         _runtime.userDataUse->reads.emplace_back(address, origin);
+        _runtime.userDataUse->readBases.push_back(baseAddress);
         _runtime.userDataUse->readInstructions.push_back(&inst);
     }
     if (_inaccessible != nullptr && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t)) && LoadedFromMemory(*handle)) {
