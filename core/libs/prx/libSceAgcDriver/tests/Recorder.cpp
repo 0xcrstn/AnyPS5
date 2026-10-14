@@ -4374,11 +4374,13 @@ void queuedWriteGroupTests() {
     };
     Require(Recorder::QueuedWriteGroups({}).empty(), "no queued writes made a group");
     const std::vector<Write> query{{0x100, 0x200, false}, {0x100, 0x1f8, true}, {0x108, 0x200, true}, {0x200, 0x300, false}, {0x200, 0x2f8, true}, {0x208, 0x300, true}};
-    Require(Recorder::QueuedWriteGroups(query) == Groups{6}, "a clear, a begin dump and an end dump per query slot are not one group");
+    Require(Recorder::QueuedWriteGroups(query) == Groups{3, 6}, "the clear of the next query slot did not wait for the dumps before it");
     const std::vector<Write> reused{{0x100, 0x1f8, true}, {0x100, 0x200, false}, {0x100, 0x1f8, true}};
     Require(Recorder::QueuedWriteGroups(reused) == Groups{1, 3}, "a store over a computed write of its group did not start a new group");
     const std::vector<Write> apart{{0x100, 0x1f8, true}, {0x1f8, 0x200, false}, {0x300, 0x310, false}};
-    Require(Recorder::QueuedWriteGroups(apart) == Groups{3}, "stores beside the computed writes left their group");
+    Require(Recorder::QueuedWriteGroups(apart) == Groups{1, 3}, "stores after the computed writes joined their group");
+    const std::vector<Write> label{{0x100, 0x1f8, true}, {0x108, 0x200, true}, {0x400, 0x408, false}};
+    Require(Recorder::QueuedWriteGroups(label) == Groups{2, 3}, "a label after the dumps landed before them");
     const std::vector<Write> stores{{0x100, 0x110, false}, {0x100, 0x110, false}};
     Require(Recorder::QueuedWriteGroups(stores) == Groups{2}, "stores alone were split into groups");
     std::uint64_t seed = 0x9e3779b97f4a7c15ull;
@@ -6542,6 +6544,11 @@ void Run(Context context) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {
+            queuedWriteGroupTests();
+            std::cout << "queued write group tests passed\n";
+            return 0;
+        }
         std::unique_ptr<Device> created;
         try {
             created = std::make_unique<Device>();

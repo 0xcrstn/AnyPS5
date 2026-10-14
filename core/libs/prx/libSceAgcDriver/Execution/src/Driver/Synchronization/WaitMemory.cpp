@@ -131,7 +131,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         ~EpochPoint() {
             if (bump) bumpEpoch(&EpochBumps::waits);
         }
-    } epochPoint;
+    } epochPoint{!heldAtSubmit};
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
