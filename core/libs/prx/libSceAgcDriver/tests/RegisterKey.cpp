@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
@@ -126,10 +127,27 @@ void testFingerprints() {
 }
 
 
+void testRecentTable() {
+    RecentTable<int> table(3);
+    table.Put(1, 10);
+    table.Put(2, 20);
+    table.Put(3, 30);
+    check(table.Find(1) != nullptr && *table.Find(1) == 10, "a held entry was not found");
+    table.Put(4, 40);
+    check(table.Size() == 3, "a full table grew past its capacity");
+    check(table.Find(2) == nullptr, "the least recently used entry survived a put into a full table");
+    check(table.Find(1) != nullptr && table.Find(3) != nullptr && table.Find(4) != nullptr, "a put into a full table dropped more than the least recently used entry");
+    table.Put(3, 33);
+    check(table.Size() == 3 && *table.Find(3) == 33, "replacing an entry did not keep one entry with the new value");
+    table.Put(5, 50);
+    check(table.Find(1) == nullptr && table.Find(4) != nullptr && table.Find(3) != nullptr && table.Find(5) != nullptr, "eviction did not follow the most recent finds and puts");
+}
+
 }
 
 int main() {
     try {
+        testRecentTable();
         testFingerprints();
         std::puts("Register fingerprint dependencies and mutations passed");
         return 0;

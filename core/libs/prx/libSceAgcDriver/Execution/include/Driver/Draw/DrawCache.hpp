@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -136,6 +138,37 @@ struct DrawStageDonor {
 struct DrawDecodeDonor {
     std::shared_ptr<const DrawDecode> decode;
     std::vector<std::uint64_t> stageKeys;
+};
+
+template <typename TValue>
+class RecentTable {
+public:
+    explicit RecentTable(std::size_t capacity) : capacity(capacity) {}
+    TValue* Find(std::uint64_t key) {
+        const auto found = entries.find(key);
+        if (found == entries.end()) return nullptr;
+        order.splice(order.begin(), order, found->second.second);
+        return &found->second.first;
+    }
+    void Put(std::uint64_t key, TValue value) {
+        if (const auto found = entries.find(key); found != entries.end()) {
+            found->second.first = std::move(value);
+            order.splice(order.begin(), order, found->second.second);
+            return;
+        }
+        while (!entries.empty() && entries.size() >= capacity) {
+            entries.erase(order.back());
+            order.pop_back();
+        }
+        order.push_front(key);
+        entries.emplace(key, std::make_pair(std::move(value), order.begin()));
+    }
+    std::size_t Size() const { return entries.size(); }
+
+private:
+    std::size_t capacity;
+    std::list<std::uint64_t> order;
+    std::unordered_map<std::uint64_t, std::pair<TValue, std::list<std::uint64_t>::iterator>> entries;
 };
 
 struct DrawRelocationPending {
