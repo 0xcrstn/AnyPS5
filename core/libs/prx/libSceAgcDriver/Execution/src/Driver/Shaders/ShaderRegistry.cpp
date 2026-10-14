@@ -8,6 +8,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostThread.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "CacheKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
@@ -933,7 +935,7 @@ class RegistrationPreparePool {
 public:
     static RegistrationPreparePool& Instance() {
         static auto* pool = [] {
-            auto* created = new RegistrationPreparePool(PreparationThreads());
+            auto* created = new RegistrationPreparePool(PreparationThreads(), "shader prepare");
             PreparationSlot().store(created);
             return created;
         }();
@@ -947,7 +949,7 @@ public:
     static RegistrationPreparePool& Prebuild() {
         static auto* pool = [] {
             const char* text = std::getenv("APS5_PREBUILD_THREADS");
-            auto* created = new RegistrationPreparePool(text != nullptr ? std::max(1u, static_cast<unsigned>(std::strtoul(text, nullptr, 10))) : 1u);
+            auto* created = new RegistrationPreparePool(text != nullptr ? std::max(1u, static_cast<unsigned>(std::strtoul(text, nullptr, 10))) : 1u, "library prebuild");
             PrebuildSlot().store(created);
             return created;
         }();
@@ -1022,7 +1024,7 @@ public:
     }
 
 private:
-    explicit RegistrationPreparePool(unsigned count) {
+    RegistrationPreparePool(unsigned count, const char* role) : role(role) {
         for (unsigned index = 0; index < count; ++index) {
             if (StartDetachedHostThread(&RegistrationPreparePool::Main, this, 64u << 20u)) ++threads;
         }
@@ -1030,7 +1032,10 @@ private:
 
     static void* Main(void* argument) {
         auto& pool = *static_cast<RegistrationPreparePool*>(argument);
-        if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("shader prepare", TraceThread::DefaultCapacity / 8);
+        NameHostThread(pool.role);
+        LowerPreparationThreadPriority(pool.role);
+        PinPreparationThread(pool.role);
+        if (PerformanceTrace::Configured()) PerformanceTrace::BindThread(pool.role, TraceThread::DefaultCapacity / 8);
         for (;;) {
             std::function<void()> task;
             {
@@ -1056,6 +1061,7 @@ private:
     std::condition_variable ready;
     std::condition_variable idle;
     Queue tasks;
+    const char* role;
     unsigned threads = 0;
     unsigned running = 0;
     bool closed = false;

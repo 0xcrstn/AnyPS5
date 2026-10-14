@@ -9,6 +9,8 @@ namespace AgcDriver {
 
 enum class ThreadPriorityMode { Off, High, Realtime };
 
+enum class PreparationPriorityMode { BelowNormal, Normal };
+
 struct RttimeLimit {
     std::uint64_t soft = 0;
     std::uint64_t hard = 0;
@@ -28,6 +30,8 @@ struct RealtimePlan {
 ThreadPriorityMode ParseThreadPriorityMode(const char* text);
 RealtimePlan PlanRealtime(std::uint32_t priority, const std::optional<RtkitLimits>& rtkit, RttimeLimit current, std::uint64_t requestedUs);
 void RaiseWorkerThreadPriority(const char* role);
+PreparationPriorityMode ParsePreparationPriorityMode(const char* text);
+void LowerPreparationThreadPriority(const char* role);
 
 }
 
