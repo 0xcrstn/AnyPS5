@@ -18,6 +18,7 @@ enum class ImageType : std::uint32_t {
 };
 
 [[nodiscard]] IrTextureNumericClass VertexInputNumericClass(IrBufferFormat format);
+[[nodiscard]] bool IsDefinedImageFormat(IrBufferFormat format);
 [[nodiscard]] bool IsFmaskTextureFormat(IrBufferFormat format);
 [[nodiscard]] IrTextureNumericClass SampledTextureNumericClass(IrBufferFormat format);
 [[nodiscard]] IrBufferFormat RemapTextureFormat(IrBufferFormat format);

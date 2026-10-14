@@ -107,6 +107,11 @@ const FormatInfo* FindFormatInfo(IrBufferFormat format) {
 
 }
 
+bool IsDefinedImageFormat(IrBufferFormat format) {
+    const auto value = static_cast<std::uint32_t>(format);
+    return (value >= 1u && value <= 77u) || (value >= 128u && value <= 154u) || (value >= 156u && value <= 182u) || (value >= 265u && value <= 292u);
+}
+
 bool IsFmaskTextureFormat(IrBufferFormat format) {
     return format >= IrBufferFormat::Fmask8_S2_F1 && format <= IrBufferFormat::Fmask64_S16_F8;
 }

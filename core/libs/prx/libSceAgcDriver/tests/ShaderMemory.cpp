@@ -10,6 +10,7 @@
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
+#include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
 #include "IntermediateRepresentation/IrProgram.hpp"
@@ -1187,6 +1188,86 @@ void verifyDescriptorPhis() {
     require(planImages(splitReloads(8u)) == 4u, "descriptor Phi: separate reloads of T# dword 7 and dwords 0-6 were not split into their 4 T#s");
     expectFailure([&] { static_cast<void>(planImages(splitReloads(260u))); }, "GetImageResource dword 0 is not a valid runtime value", "descriptor Phi: a web over more than 512 descriptor tuples was accepted");
     expectFailure([&] { static_cast<void>(planImages(splitReloads(260u))); }, "; descriptor web: more than 512 descriptor states", "descriptor Phi: the failure did not name the state limit");
+}
+
+void verifyUndefinedImageFormats() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Format8888UNorm = 56;
+    constexpr std::uint32_t UndefinedFormat = 300;
+    constexpr std::uint32_t Type2D = 9;
+    struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
+    static Texture texture;
+    const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
+    const auto imageDescriptor = [&](std::uint32_t format) {
+        return std::array<std::uint32_t, 8>{static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (format << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+    };
+    const auto valid = imageDescriptor(Format8888UNorm);
+    const auto undefined = imageDescriptor(UndefinedFormat);
+    require(IsDefinedImageFormat(static_cast<IrBufferFormat>(Format8888UNorm)) && !IsDefinedImageFormat(static_cast<IrBufferFormat>(UndefinedFormat)), "undefined image formats: the GFX10 format table is wrong");
+    std::array<std::uint32_t, 4> output{};
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    const std::array<std::uint32_t, 4> outputV{static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 16u, 0xfacu};
+    std::array<std::uint32_t, 32> srt{};
+    const auto fill = [&](const std::array<std::uint32_t, 8>& first, const std::array<std::uint32_t, 8>& second) {
+        srt = {};
+        std::copy(first.begin(), first.end(), srt.begin());
+        std::copy(outputV.begin(), outputV.end(), srt.begin() + 16);
+        srt[20] = 1u;
+        std::copy(second.begin(), second.end(), srt.begin() + 24);
+    };
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    const auto makeRequest = [&](const std::vector<std::uint32_t>& code, std::uint64_t address) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, address, code, 0, {}};
+        request.context.waveSize = 32;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.target.supportedExtensions = extensions;
+        request.target.bdaAbiVersion = BdaAbi::Version;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.layout.pushConstantSizeBytes = 128;
+        return request;
+    };
+    const auto isNull = [](const DescriptorValue& value) {
+        return std::ranges::all_of(value.dwords, [](std::uint32_t word) { return word == 0u; });
+    };
+
+    const std::vector<std::uint32_t> armCode{0xf4000400u, 0xfa000050u, 0xf4080500u, 0xfa000020u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u, 0xf40c0200u, 0xfa000000u, 0xbf820002u, 0xf40c0200u, 0xfa000060u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    auto armRequest = makeRequest(armCode, 0x24000u);
+    const auto armPlan = GetResourcePlan(armRequest);
+    require(armPlan->info.images.size() == 2u && std::ranges::all_of(armPlan->info.images, [](const ImageResource& image) { return image.optionalDescriptor; }), "undefined image formats: the two arms were not planned as optional images");
+    fill(valid, undefined);
+    {
+        AgcDriver::ShaderMemory memory({});
+        const auto capture = memory.Capture(armRequest);
+        const auto& images = capture->snapshot.images;
+        const auto holdsValid = std::ranges::any_of(images, [&](const DescriptorValue& value) { return std::equal(valid.begin(), valid.end(), value.dwords.begin()); });
+        require(images.size() == 2u && holdsValid && std::ranges::count_if(images, isNull) == 1, "undefined image formats: an arm whose T# has no GFX10 format was not bound as a null image");
+        armRequest.context.memory = memory.Regions();
+        static_cast<void>(Recompile(armRequest, *capture));
+    }
+
+    const std::vector<std::uint32_t> directCode{0xf4000400u, 0xfa000050u, 0xf4080500u, 0xfa000020u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xbf068010u, 0xbf850006u, 0xf40c0200u, 0xfa000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    const auto directRequest = makeRequest(directCode, 0x25000u);
+    fill(undefined, valid);
+    {
+        AgcDriver::ShaderMemory memory({});
+        expectFailure([&] { static_cast<void>(memory.Capture(directRequest)); }, "runtime image descriptor is invalid", "undefined image formats: a sampled T# with no GFX10 format was accepted");
+    }
+    fill(valid, valid);
+    {
+        AgcDriver::ShaderMemory memory({});
+        const auto capture = memory.Capture(directRequest);
+        require(capture->snapshot.images.size() == 1u && std::equal(valid.begin(), valid.end(), capture->snapshot.images[0].dwords.begin()), "undefined image formats: a valid T# was not read");
+    }
 }
 
 void verifyLaneSelectedDescriptors() {
@@ -3656,6 +3737,7 @@ int main(int argc, char** argv) {
         verifyGuardedDescriptorSources();
         verifyBindlessTable();
         verifyDescriptorPhis();
+        verifyUndefinedImageFormats();
         verifyLaneSelectedDescriptors();
         verifyProgramCounterRelativeData();
         verifyLanesOutsideHostSubgroup();
