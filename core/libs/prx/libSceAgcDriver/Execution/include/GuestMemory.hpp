@@ -12,6 +12,8 @@
 
 namespace AgcDriver::GuestMemory {
 
+std::uint64_t HostProcessCommitBytes();
+std::uint64_t HostPhysicalMemoryBytes();
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
 // CheckRange without throwing: whether the whole range is mapped with the requested access.
 bool Accessible(const void* pointer, std::size_t bytes, bool writable = false);
