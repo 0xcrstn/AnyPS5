@@ -357,13 +357,16 @@ struct PageSpan {
     std::size_t size = 0;
     // Per page: access flags, zero while unknown.
     std::uint8_t* pages = nullptr;
+    std::unique_ptr<std::atomic<bool>[]> committed;
 
-    // Reserves and commits the table; untouched table pages cost nothing until a guest page is recorded.
+    static constexpr std::size_t ChunkBytes = 64 * 1024;
+
     bool allocate() {
         if (size == 0) return false;
-        const auto count = (size / PageBytes + 8) & ~static_cast<std::size_t>(7);
+        const auto count = (size / PageBytes + ChunkBytes) & ~(ChunkBytes - 1);
 #ifdef _WIN32
-        pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, count, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, count, MEM_RESERVE, PAGE_READWRITE));
+        if (pages != nullptr) committed = std::make_unique<std::atomic<bool>[]>(count / ChunkBytes);
 #else
         pages = static_cast<std::uint8_t*>(std::calloc(count, 1));
 #endif
@@ -371,16 +374,38 @@ struct PageSpan {
         return pages != nullptr;
     }
 
+    bool present(std::size_t index) const {
+#ifdef _WIN32
+        return committed[index / ChunkBytes].load(std::memory_order_acquire);
+#else
+        static_cast<void>(index);
+        return true;
+#endif
+    }
+
+    bool commit(std::size_t index) {
+        if (present(index)) return true;
+#ifdef _WIN32
+        if (VirtualAlloc(pages + index / ChunkBytes * ChunkBytes, ChunkBytes, MEM_COMMIT, PAGE_READWRITE) == nullptr) return false;
+        committed[index / ChunkBytes].store(true, std::memory_order_release);
+#endif
+        return true;
+    }
+
     bool covers(std::uintptr_t address) const {
         return size != 0 && address >= base && address - base < size;
     }
 
     std::uint8_t load(std::uintptr_t address) const {
-        return std::atomic_ref<const std::uint8_t>(pages[(address - base) / PageBytes]).load(std::memory_order_relaxed);
+        const auto index = (address - base) / PageBytes;
+        if (!present(index)) return 0;
+        return std::atomic_ref<const std::uint8_t>(pages[index]).load(std::memory_order_relaxed);
     }
 
     void store(std::uintptr_t address, std::uint8_t value) {
-        std::atomic_ref<std::uint8_t>(pages[(address - base) / PageBytes]).store(value, std::memory_order_relaxed);
+        const auto index = (address - base) / PageBytes;
+        if (value == 0 ? !present(index) : !commit(index)) return;
+        std::atomic_ref<std::uint8_t>(pages[index]).store(value, std::memory_order_relaxed);
     }
 
     // End of the run of pages equal to `value` that starts at `address`, at most `limit`.
@@ -389,6 +414,11 @@ struct PageSpan {
         const auto stop = std::min<std::uintptr_t>((std::min(limit, base + size) - base + PageBytes - 1) / PageBytes, size / PageBytes);
         const std::uint64_t wide = 0x0101010101010101ull * value;
         while (index < stop) {
+            if (!present(index)) {
+                if (value != 0) break;
+                index = std::min<std::size_t>(stop, (index / ChunkBytes + 1) * ChunkBytes);
+                continue;
+            }
             if (index % 8 == 0 && index + 8 <= stop && std::atomic_ref<const std::uint64_t>(*reinterpret_cast<const std::uint64_t*>(pages + index)).load(std::memory_order_relaxed) == wide) {
                 index += 8;
                 continue;
@@ -403,7 +433,13 @@ struct PageSpan {
         if (size == 0 || bytes == 0 || address >= base + size || address + bytes <= base) return;
         const auto first = (std::max(address, base) - base) / PageBytes;
         const auto last = (std::min(address + bytes, base + size) - 1 - base) / PageBytes;
-        for (auto page = first; page <= last; ++page) std::atomic_ref<std::uint8_t>(pages[page]).store(0, std::memory_order_relaxed);
+        for (auto page = first; page <= last; ++page) {
+            if (!present(page)) {
+                page = (page / ChunkBytes + 1) * ChunkBytes - 1;
+                continue;
+            }
+            std::atomic_ref<std::uint8_t>(pages[page]).store(0, std::memory_order_relaxed);
+        }
     }
 };
 
