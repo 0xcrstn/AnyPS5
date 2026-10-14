@@ -96,9 +96,11 @@ bool DrawKeySightings::SeenBefore(std::uint64_t key) {
 
 bool Driver::admitDrawKey(std::uint64_t key) {
     std::lock_guard cacheLock(drawCacheMutex);
+    drawExactKeySeen = true;
     if (drawCache.contains(key)) return true;
     if (!drawKeySightings) drawKeySightings.emplace(drawCacheLimits().maxEntries * DrawKeySightings::Ways);
     bool seen = drawKeySightings->SeenBefore(key);
+    drawExactKeySeen = seen;
     const auto& pending = drawRelocationPending;
     if (pending.key != key || pending.identity == 0) return seen;
     if (pending.aliases.structure != 0) {

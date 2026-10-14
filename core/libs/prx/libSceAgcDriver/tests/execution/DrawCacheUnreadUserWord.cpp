@@ -108,9 +108,9 @@ void UnreadWordsDoNotSplitTheCache(bool libraries) {
     for (auto& entry : same) entry = {1.0f, 0.0f, 0.0f, 0.0f};
     AgcDriver::DriverDetail::DrawEntryCounters counters{};
     for (std::size_t i = 0; i < 4; ++i) counters = draw({same[i].data()});
-    Require(counters.lookups == 4 && counters.hits == 0 && counters.inserts == 2, mode + ": the draws that teach the moved pointer and the unread word made " + std::to_string(counters.hits) + " hits and " + std::to_string(counters.inserts) + " inserts, expected 0 and 2");
+    Require(counters.lookups == 4 && counters.hits == 0 && counters.inserts + counters.stashed == 2, mode + ": the draws that teach the moved pointer and the unread word made " + std::to_string(counters.hits) + " hits and " + std::to_string(counters.inserts + counters.stashed) + " inserts or relocated learnings, expected 0 and 2");
     for (std::size_t i = 4; i < same.size(); ++i) counters = draw({same[i].data()});
-    Require(counters.lookups == 8 && counters.hits == 4 && counters.inserts == 2, mode + ": draws whose data moved and whose unread user word changed did not reuse the cached draw (" + std::to_string(counters.hits) + " hits in " + std::to_string(counters.lookups) + " lookups)");
+    Require(counters.lookups == 8 && counters.hits == 4 && counters.inserts + counters.stashed == 2, mode + ": draws whose data moved and whose unread user word changed did not reuse the cached draw (" + std::to_string(counters.hits) + " hits in " + std::to_string(counters.lookups) + " lookups)");
     const auto other = draw({Other.data()});
     Require(other.lookups == 9 && other.hits == 5 && other.dataPatchedStages != 0, mode + ": a draw whose moved data holds another value it loads as data did not reuse the cached draw with the value patched (" + std::to_string(other.hits) + " hits)");
     const auto again = draw({same[0].data()});

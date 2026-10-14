@@ -130,7 +130,14 @@ void Driver::diagnoseValidationMiss(const DispatchVariant& variant, std::span<co
     std::vector<std::uint32_t> live;
     std::size_t position = 0, differing = 0, firstRun = 0, firstPosition = 0;
     std::uint32_t before = 0, after = 0;
+    std::uint64_t dataWords = 0, flatWords = 0, otherWords = 0;
     bool unreadable = false;
+    const std::vector<std::uint32_t>* flat = nullptr;
+    if (variant.compiled != nullptr) {
+        for (const auto& binding : variant.compiled->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt) flat = &binding.guestDescriptor;
+        }
+    }
     for (std::size_t run = 0; run < regions.size(); ++run) {
         const auto& region = regions[run];
         const auto count = region.bytes.size() / sizeof(std::uint32_t);
@@ -143,6 +150,9 @@ void Driver::diagnoseValidationMiss(const DispatchVariant& variant, std::span<co
             std::uint32_t stored = 0;
             std::memcpy(&stored, region.bytes.data() + word * sizeof(std::uint32_t), sizeof(stored));
             if (stored == live[word]) continue;
+            if (std::binary_search(variant.dataPositions.begin(), variant.dataPositions.end(), static_cast<std::uint32_t>(position + word))) ++dataWords;
+            else if (flat != nullptr && std::find(flat->begin(), flat->end(), stored) != flat->end()) ++flatWords;
+            else ++otherWords;
             if (differing++ == 0) {
                 firstRun = run;
                 firstPosition = position + word;
@@ -163,6 +173,10 @@ void Driver::diagnoseValidationMiss(const DispatchVariant& variant, std::span<co
         ++diagnosis.validationNone;
         return;
     }
+    diagnosis.validationDataWords += dataWords;
+    diagnosis.validationFlatWords += flatWords;
+    diagnosis.validationOtherWords += otherWords;
+    if (flatWords == 0 && otherWords == 0) ++diagnosis.validationOnlyData;
     if (firstRun < variant.runBases.size() && variant.runBases[firstRun] >= 0) ++diagnosis.validationRelocatedRun;
     else ++diagnosis.validationAbsoluteRun;
     if (std::binary_search(variant.dataPositions.begin(), variant.dataPositions.end(), static_cast<std::uint32_t>(firstPosition))) ++diagnosis.validationDataWord;
@@ -195,6 +209,9 @@ void Driver::reportDrawMisses() {
     diagnosis.donorSame = diagnosis.donorRecurring = diagnosis.donorFresh = diagnosis.donorOptionsTried = diagnosis.donorAlternateHits = 0;
     diagnosis.validationMisses = diagnosis.validationNone = diagnosis.validationUnreadable = diagnosis.validationRelocatedRun = diagnosis.validationAbsoluteRun = diagnosis.validationDataWord = diagnosis.validationAddressLike = diagnosis.validationOneWord = diagnosis.validationFewWords = diagnosis.validationManyWords = 0;
     diagnosis.validationRoles = {};
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-miss] differing words of those stages (10 s): %llu data positions, %llu other words found in the flattened SRT, %llu other words; %llu stages differed only in data positions; tagging: %llu stages captured, %llu pure flat-SRT leaves offered, %llu tagged as data, skipped: %llu outside the captured runs, %llu unlike the flattened SRT, %llu also read by the walk\n", count(diagnosis.validationDataWords), count(diagnosis.validationFlatWords), count(diagnosis.validationOtherWords), count(diagnosis.validationOnlyData), count(diagnosis.stagesTagged), count(diagnosis.leavesOffered), count(diagnosis.leavesTagged), count(diagnosis.leavesUnmapped), count(diagnosis.leavesMismatched), count(diagnosis.leavesAliased));
+    diagnosis.validationDataWords = diagnosis.validationFlatWords = diagnosis.validationOtherWords = diagnosis.validationOnlyData = 0;
+    diagnosis.stagesTagged = diagnosis.leavesOffered = diagnosis.leavesTagged = diagnosis.leavesUnmapped = diagnosis.leavesMismatched = diagnosis.leavesAliased = 0;
     diagnosis.keys = {};
     diagnosis.stages = {};
     diagnosis.wordAddressLike = diagnosis.contentAddressLike = diagnosis.oneWord = diagnosis.fewWords = diagnosis.manyWords = 0;
