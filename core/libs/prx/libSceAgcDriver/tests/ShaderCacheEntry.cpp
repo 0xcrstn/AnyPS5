@@ -69,6 +69,70 @@ void RoundTrip(bool partial, bool floatMode) {
     Require(rebuilt == original, "the request read back does not build the stored key");
 }
 
+void RoundTripGraphics(const RecompileRequest& request) {
+    const auto file = Entry(request, 9u);
+    Require(AgcDriver::Tools::ReadComputeCacheEntry(file) == nullptr, "a graphics shader entry was read as a compute shader");
+    const auto entry = AgcDriver::Tools::ReadCacheEntry(file, true);
+    Require(entry != nullptr, "a graphics shader cache entry was not read");
+    std::uint64_t storedHash = 0xcbf29ce484222325ull;
+    for (std::size_t index = 0; index < 9u; ++index) storedHash = (storedHash ^ (index == 0u ? spv::MagicNumber : 0u)) * 0x100000001b3ull;
+    Require(entry->storedWords == 9u && entry->storedHash == storedHash, "the stored module was not hashed");
+    Require(entry->request.shader.stage == request.shader.stage, "the stage was not read back");
+    std::vector<std::byte> rebuilt;
+    ShaderDiskCache::BuildKey(entry->request, entry->hostSubgroupSize, rebuilt);
+    std::vector<std::byte> original;
+    ShaderDiskCache::BuildKey(request, 32u, original);
+    Require(rebuilt == original, "the graphics request read back does not build the stored key");
+}
+
+void GraphicsStages() {
+    const std::vector<std::uint32_t> code{0xbf800000u, 0xbf810000u};
+    const std::vector<std::uint32_t> userData(4u, 0u);
+    RecompileRequest pixel{};
+    pixel.shader = {ShaderStage::Fragment, 0x40000, code, 0, {}};
+    pixel.target = Target();
+    pixel.layout = {0, 0, 0, 128};
+    pixel.context.waveSize = 32;
+    pixel.context.userData = userData;
+    ShaderPixelStageInfo pixelInfo{};
+    pixelInfo.interpolatorCount = 2;
+    pixelInfo.interpolatorSettings[0] = 3u;
+    pixelInfo.interpolatorSettings[1] = 0x401u;
+    pixelInfo.wave32 = true;
+    pixelInfo.inputAddr = 0x2u;
+    pixelInfo.hasPerspectiveCenterVgpr = true;
+    pixelInfo.posZ = true;
+    pixelInfo.pixelKillEnable = true;
+    pixelInfo.conservativeZExport = ConservativeZExport::LessThanZ;
+    pixelInfo.alphaToCoverage = true;
+    pixelInfo.targetOutputMode[0] = 4u;
+    pixelInfo.targetOutputMode[3] = 9u;
+    for (std::uint8_t target = 0; target < pixelInfo.targetExportMapping.size(); ++target) pixelInfo.targetExportMapping[target] = target;
+    pixel.context.pixel = pixelInfo;
+    RoundTripGraphics(pixel);
+    RecompileRequest vertex{};
+    vertex.shader = {ShaderStage::Vertex, 0x40000, code, 0, {}};
+    vertex.target = Target();
+    vertex.layout = {0, 0, 0, 128};
+    vertex.context.waveSize = 64;
+    vertex.context.userData = userData;
+    ShaderVertexStageInfo vertexInfo{};
+    vertexInfo.fetchAttribReg = 4u;
+    vertexInfo.fetchBufferReg = 6u;
+    vertexInfo.paClVsOutCntl = 0x01000000u;
+    vertexInfo.resourcesNum = 3u;
+    const std::array<IrBufferFormat, 3> formats{IrBufferFormat::Format32_32_32Float, IrBufferFormat::Format8_8_8_8UInt, IrBufferFormat::Format16_16SInt};
+    for (std::uint32_t index = 0; index < vertexInfo.resourcesNum; ++index) {
+        vertexInfo.resources[index].fields = {0x1000u * index, 0x00100000u, 0x40u, static_cast<std::uint32_t>(formats[index]) << 12u};
+        vertexInfo.resourcesDst[index] = {static_cast<std::int32_t>(4u * index), 4, static_cast<std::int32_t>(index), index};
+    }
+    vertex.context.vertex = vertexInfo;
+    RoundTripGraphics(vertex);
+    vertexInfo.fetchEmbedded = true;
+    vertex.context.vertex = vertexInfo;
+    RoundTripGraphics(vertex);
+}
+
 void Rejections() {
     const std::vector<std::uint32_t> code{0xbf810000u};
     RecompileRequest request{};
@@ -98,6 +162,7 @@ int main() {
     try {
         RoundTrip(false, false);
         RoundTrip(true, true);
+        GraphicsStages();
         Rejections();
         std::printf("shader cache entry tests passed\n");
         return 0;
