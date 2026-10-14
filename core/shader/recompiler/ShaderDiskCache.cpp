@@ -132,14 +132,14 @@ constexpr std::size_t fieldCount() {
 
 static_assert(fieldCount<ShaderInfo>() == 23, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
-static_assert(fieldCount<ImageResource>() == 37, "ImageResource changed: update the info encoder");
+static_assert(fieldCount<ImageResource>() == 38, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 7, "SamplerResource changed: update the info encoder");
 static_assert(fieldCount<SampledResourcePair>() == 3, "SampledResourcePair changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
 static_assert(fieldCount<IrResourcePlan>() == 21, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
-static_assert(fieldCount<MemoryInfo>() == 30, "MemoryInfo changed: update the plan encoder");
+static_assert(fieldCount<MemoryInfo>() == 31, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource::IndirectImage>() == 7, "IndirectImage changed: update the plan encoder");
 static_assert(fieldCount<ResourceBlock>() == 4, "ResourceBlock changed: update the plan encoder");
@@ -799,6 +799,7 @@ void encodeMemoryInfo(Writer& out, const MemoryInfo& memory) {
     out.Value(memory.coherent);
     out.Value(memory.gpuDescriptor);
     out.Value(memory.flushDenormals);
+    out.Value(memory.descriptorWebArm);
 }
 
 void decodeMemoryInfo(Reader& in, MemoryInfo& memory) {
@@ -832,6 +833,7 @@ void decodeMemoryInfo(Reader& in, MemoryInfo& memory) {
     in.Value(memory.coherent);
     in.Value(memory.gpuDescriptor);
     in.Value(memory.flushDenormals);
+    in.Value(memory.descriptorWebArm);
 }
 
 bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
