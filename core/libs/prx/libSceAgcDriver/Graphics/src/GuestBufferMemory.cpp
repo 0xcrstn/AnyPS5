@@ -4247,6 +4247,23 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     return result;
 }
 
+Recorder::BoundPlacement GuestBufferMemory::Placement() const {
+    Recorder::BoundPlacement result;
+    result.addressBased = HoldsLease();
+    if (!uploaded || committed) return result;
+    const auto add = [&](const Region& region) {
+        const auto bytes = region.end - region.begin;
+        if (region.direct != nullptr) result.inPlace += bytes;
+        else if (region.gpuCopy && region.deviceLocal) result.device += bytes;
+        else result.hostCopies += bytes;
+    };
+    if (space != nullptr) {
+        for (const auto& region : space->base) add(region);
+    }
+    for (const auto& region : regions) add(region);
+    return result;
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (!uploaded || committed) return result;
