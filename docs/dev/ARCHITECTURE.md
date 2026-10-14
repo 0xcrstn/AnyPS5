@@ -118,6 +118,10 @@ A storage image over guest memory that the write watch does not cover (a host-po
 
 The comparison runs again when any of them changes. A CPU store into unwatched memory is therefore seen at the next ordering point, the same bound the collect memo gives watched memory. Driver stores into unwatched memory are recorded per 64 KiB block in a fixed table of 65,536 slots indexed by block number modulo the table size, each slot holding the newest generation stored to any of its blocks. A collision can only raise a surface's stamp, which costs one comparison and never skips one. `agc_driver_dcc_keys_first_write` (`RunUntrackedReuse`) checks that a CPU edit to an unwatched image is uploaded after the next epoch, and `agc_write_tracking` (`CheckNewestStamp`) checks which stores advance `NewestStamp`.
 
+### Prepared SPIR-V in the shader disk cache
+
+With the shader disk cache enabled, a cached variant does not keep its SPIR-V. A variant loaded from the cache drops it at once; a compiled one keeps it until the cache writer has stored it. Its `SharedSpirv` keeps the cache key and the word count, and `SharedSpirv::Resolved` reads the words back (`ShaderDiskCache::Reload`) when a result is materialized, a module is specialized or a rectangle shader is built. The words read back are shared through a weak reference, so every result alive at the same time holds one copy, and the copy is freed with the last of them. Reading the words of a spilled `SharedSpirv` without `Resolved` throws. `APS5_NO_SPIRV_SPILL=1` keeps every variant's SPIR-V in memory.
+
 ### Shader MODE register access
 
 `GuestContext::floatMode` carries the initial shader mode through `Recompile` and `TranslateOptions` into each block's `TranslationContext`. `s_getreg_b32` reads confined to MODE bits 0–3 return the selected initial rounding bits in the destination's low bits. Bits 0–1 select f32 rounding; bits 2–3 select f16/f64 rounding. Missing mode metadata retains the legacy round-to-nearest-even assumption. Reading other MODE fields or hardware registers throws.

@@ -66,7 +66,7 @@ void RunUnregistered(AgcDriver::VulkanDevice& device, ShaderRecompiler::Recompil
             runtime.userData = request.context.userData;
             const auto capture = repeated.Capture(runtime);
             const auto result = repeated.Materialize(*capture);
-            Require(snapshot.prepared->entries.size() == 1 && result->variantId == artifact.variantId && result->spirv.data() == artifact.spirv.data(), "unregistered compute invocation replaced its cached artifact");
+            Require(snapshot.prepared->entries.size() == 1 && result->variantId == artifact.variantId && result->spirv == artifact.spirv, "unregistered compute invocation replaced its cached artifact");
             device.Dispatch(*result, 1, 1, 1);
         }
         device.WaitIdle();
@@ -117,7 +117,7 @@ void Run(AgcDriver::VulkanDevice& device) {
         runtime.userData = users;
         const auto capture = ShaderRecompiler::CaptureResources(request, runtime, *ready);
         const auto result = ShaderRecompiler::MaterializeShader(request, *capture, *ready);
-        Require(result->variantId == artifact.variantId && result->spirv.data() == artifact.spirv.data(), "invocation replaced the prepared artifact");
+        Require(result->variantId == artifact.variantId && result->spirv == artifact.spirv, "invocation replaced the prepared artifact");
         device.Dispatch(*result, 1, 1, 1);
     }
     device.WaitIdle();
@@ -153,7 +153,7 @@ void Run(AgcDriver::VulkanDevice& device) {
     const auto replacementInvocation = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, replacementRequest);
     const auto replacementCapture = replacementInvocation.Capture(preparedRuntime);
     const auto replacementResult = replacementInvocation.Materialize(*replacementCapture);
-    Require(replacementResult->spirv.data() == artifact.spirv.data(), "device replacement recompiled the prepared shader");
+    Require(replacementResult->spirv == artifact.spirv, "device replacement recompiled the prepared shader");
     replacement->Dispatch(*replacementResult, 1, 1, 1);
     replacement->WaitIdle();
     replacementRequest.target.nonConstantImageOffsets = !replacementRequest.target.nonConstantImageOffsets;
@@ -256,25 +256,26 @@ void PrepareMultisampledStorage(AgcDriver::VulkanDevice& device) {
         }
         const auto handle = PrepareShader(request);
         const auto& artifact = GetPreparedArtifact(*handle);
+        const auto spirv = artifact.spirv.Resolved();
         std::vector<std::uint32_t> samples;
-        for (std::size_t offset = 5; offset < artifact.spirv.size(); offset += artifact.spirv[offset] >> 16u) {
-            const auto instruction = artifact.spirv[offset];
+        for (std::size_t offset = 5; offset < spirv.size(); offset += spirv[offset] >> 16u) {
+            const auto instruction = spirv[offset];
             if ((instruction & 0xffffu) == spv::OpImageWrite) {
-                Require(variant < 3u && (instruction >> 16u) == 6u && artifact.spirv[offset + 4] == spv::ImageOperandsSampleMask, "MSAA storage write lost its sample operand");
-                samples.push_back(artifact.spirv[offset + 5]);
+                Require(variant < 3u && (instruction >> 16u) == 6u && spirv[offset + 4] == spv::ImageOperandsSampleMask, "MSAA storage write lost its sample operand");
+                samples.push_back(spirv[offset + 5]);
             }
             if ((instruction & 0xffffu) == spv::OpImageTexelPointer) {
                 Require(variant >= 3u && (instruction >> 16u) == 6u, "MSAA atomic lost its sample operand");
-                samples.push_back(artifact.spirv[offset + 5]);
+                samples.push_back(spirv[offset + 5]);
             }
         }
         Require(!samples.empty(), "MSAA storage shader has no image writes or atomics");
         const auto expectedSample = variant == 0u ? 0u : variant % 2u != 0u ? 3u : 2u;
         for (const auto sample : samples) {
             bool found = false;
-            for (std::size_t offset = 5; offset < artifact.spirv.size(); offset += artifact.spirv[offset] >> 16u) {
-                if ((artifact.spirv[offset] & 0xffffu) != spv::OpConstant || artifact.spirv[offset + 2] != sample) continue;
-                Require(artifact.spirv[offset + 3] == expectedSample, "MSAA storage operation addresses the wrong sample");
+            for (std::size_t offset = 5; offset < spirv.size(); offset += spirv[offset] >> 16u) {
+                if ((spirv[offset] & 0xffffu) != spv::OpConstant || spirv[offset + 2] != sample) continue;
+                Require(spirv[offset + 3] == expectedSample, "MSAA storage operation addresses the wrong sample");
                 found = true;
             }
             Require(found, "MSAA sample constant is missing");
@@ -513,7 +514,7 @@ void Registration(bool indirect) {
     }
     const auto retained = ShaderRecompiler::GetRetainedShaderMemory();
     Require(retained.sources != 0 && retained.plans != 0 && retained.planBytes != 0, "the memory report counts no resource plan of a prepared shader");
-    Require(retained.variants != 0 && retained.variantSpirvBytes != 0, "the memory report counts no compiled variant of a prepared shader");
+    Require(retained.variants != 0 && retained.variantSpirvBytes + retained.spilledSpirvBytes != 0, "the memory report counts no compiled variant of a prepared shader");
     auto backlog = AgcDriver::DriverDetail::RegistrationPreparationBacklog();
     for (const auto settled = std::chrono::steady_clock::now() + std::chrono::seconds(10); (backlog.queued != 0 || backlog.running != 0 || backlog.plans != 0) && std::chrono::steady_clock::now() < settled; backlog = AgcDriver::DriverDetail::RegistrationPreparationBacklog()) std::this_thread::yield();
     Require(backlog.registered >= 33 && backlog.queued == 0 && backlog.plans == 0 && backlog.planInstructions == 0, "the memory report counts registrations or settled preparation plans wrongly");

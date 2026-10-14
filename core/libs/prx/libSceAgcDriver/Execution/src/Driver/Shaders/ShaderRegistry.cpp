@@ -1287,6 +1287,8 @@ void ResolvePreparedGraphics(const ShaderSnapshot& front, const std::shared_ptr<
                 ShaderRecompiler::RecompileResult fragmentResult;
                 static_cast<ShaderRecompiler::CompiledShaderArtifact&>(vertexResult) = vertexArtifact;
                 static_cast<ShaderRecompiler::CompiledShaderArtifact&>(fragmentResult) = fragmentArtifact;
+                vertexResult.spirv = vertexArtifact.spirv.Resolved();
+                fragmentResult.spirv = fragmentArtifact.spirv.Resolved();
                 rectangles.push_back({vertexArtifact.variantId, fragmentArtifact.variantId, std::make_shared<const ShaderRecompiler::RectListShaders>(ShaderRecompiler::BuildRectListShaders(vertexResult, fragmentResult, target))});
             }
         }

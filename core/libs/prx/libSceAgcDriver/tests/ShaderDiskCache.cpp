@@ -644,6 +644,32 @@ void verifyAcrossProcesses(const char* self) {
     require(std::system(command.c_str()) == 0, "the loading process failed");
 }
 
+void verifySpilledSpirv() {
+    ComputeRequest request(true);
+    request.request.layout.pushConstantSizeBytes = 64;
+    const auto before = GetRetainedShaderMemory();
+    const auto handle = PrepareShader(request.request);
+    const auto& artifact = GetPreparedArtifact(*handle);
+    require(artifact.spirv.Spilled() && artifact.spirv.WordCount() != 0, "a prepared variant stored in the disk cache keeps its SPIR-V in memory");
+    ShaderDiskCache::Flush();
+    const auto stored = GetRetainedShaderMemory();
+    require(stored.spilledVariants == before.spilledVariants + 1 && stored.spilledSpirvBytes == before.spilledSpirvBytes + artifact.spirv.WordCount() * sizeof(std::uint32_t), "the spilled variant is not counted");
+    const auto loaded = Recompile(request.request);
+    require(GetRetainedShaderMemory().spirvReloads == stored.spirvReloads + 1, "the spilled SPIR-V was not read back from the disk cache");
+    require(loaded.spirv.WordCount() != 0 && !loaded.spirv.Spilled(), "a result of a spilled variant has no SPIR-V of its own");
+    ComputeRequest fresh(false);
+    fresh.request.layout.pushConstantSizeBytes = 64;
+    requireSameResult(Recompile(fresh.request), loaded, "a spilled variant's result against a fresh compile");
+    const auto again = Recompile(request.request);
+    require(again.spirv == loaded.spirv && GetRetainedShaderMemory().spirvReloads == stored.spirvReloads + 1, "SPIR-V read back while a result held it was read again");
+    try {
+        static_cast<void>(artifact.spirv.Words());
+    } catch (const std::logic_error&) {
+        return;
+    }
+    throw std::runtime_error("spilled SPIR-V was read without being resolved");
+}
+
 struct ClockRequest {
     std::vector<std::uint32_t> code{0xf4900100u, 0x00000000u, 0xbf8cc07fu, 0x7e020204u, 0xe0700000u, 0x80000100u, 0xf800180fu, 0x01010101u, 0xbf810000u};
     std::array<std::uint32_t, 4> userData{0x10000000u, 0x00000000u, 0x40u, 0x00027facu};
@@ -1712,7 +1738,7 @@ std::vector<std::vector<std::byte>> preparedOutputs(std::vector<PlanFixture>& fi
         const auto capture = CaptureResources(request, view.MakeRuntime(request.context.userData, request.shader.codeAddress), *handle);
         const auto result = MaterializeShader(request, *capture, *handle);
         std::vector<std::byte> bytes;
-        appendWords(bytes, GetPreparedArtifact(*handle).spirv.Words());
+        appendWords(bytes, GetPreparedArtifact(*handle).spirv.Resolved().Words());
         ShaderDiskCache::EncodeResult(*result, bytes);
         appendSnapshot(bytes, *capture);
         require(ShaderDiskCache::EncodePlan(*capture->plan, bytes), fixture.name + ": the captured plan does not encode");
@@ -1859,6 +1885,7 @@ int main(int argc, char** argv) {
         verifyPlanKey();
         verifyStore();
         verifyAcrossProcesses(argv[0]);
+        verifySpilledSpirv();
         verifyPlanAcrossProcesses(argv[0]);
         verifyEmissionFailureMemo();
         verifyFailureMemoSwitch(argv[0]);

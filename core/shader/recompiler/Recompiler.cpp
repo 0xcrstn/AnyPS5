@@ -318,8 +318,13 @@ struct SourceEntry {
 namespace {
 
 struct RetainedCounters {
-    std::atomic<std::uint64_t> sources{0}, plans{0}, planValues{0}, planBytes{0}, programs{0}, variants{0}, variantSpirvBytes{0}, bindingPlans{0}, specializedModules{0}, specializedSpirvBytes{0}, registrationModules{0};
+    std::atomic<std::uint64_t> sources{0}, plans{0}, planValues{0}, planBytes{0}, programs{0}, variants{0}, variantSpirvBytes{0}, spilledVariants{0}, spilledSpirvBytes{0}, spirvReloads{0}, spirvReloadBytes{0}, bindingPlans{0}, specializedModules{0}, specializedSpirvBytes{0}, registrationModules{0};
 };
+
+bool SpillPreparedSpirv() {
+    static const bool spill = std::getenv("APS5_NO_SPIRV_SPILL") == nullptr;
+    return spill;
+}
 
 RetainedCounters& retainedCounters() {
     static RetainedCounters counters;
@@ -937,7 +942,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.spirv = module->spirv;
         bindingPlan = &entry->bindings;
     } else {
-        result.spirv = artifact.spirv;
+        result.spirv = artifact.spirv.Resolved();
     }
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));
@@ -979,12 +984,14 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     const bool disk = ShaderDiskCache::Enabled() && !DebugProbeActive();
     std::vector<std::byte> diskKey;
     std::shared_ptr<const CompiledVariant> variant;
+    const bool spill = disk && SpillPreparedSpirv();
     if (disk) {
         ShaderDiskCache::BuildKey(request, HostSubgroupSize(request), diskKey);
         CompiledVariant loaded;
         if (ShaderDiskCache::Load(diskKey, loaded)) {
             loaded.layout = request.layout;
             loaded.artifact.variantId = nextVariantId();
+            if (spill) loaded.artifact.spirv = loaded.artifact.spirv.Spill(diskKey, false);
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
         }
     }
@@ -1000,7 +1007,15 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
             throw;
         }
-        if (disk) ShaderDiskCache::Store(std::move(diskKey), variant);
+        if (spill) {
+            auto retained = std::make_shared<CompiledVariant>(*variant);
+            retained->artifact.spirv = variant->artifact.spirv.Spill(diskKey, true);
+            const auto spilled = retained->artifact.spirv;
+            ShaderDiskCache::Store(std::move(diskKey), variant, [spilled] { spilled.Unpin(); });
+            variant = std::move(retained);
+        } else if (disk) {
+            ShaderDiskCache::Store(std::move(diskKey), variant);
+        }
     }
     if (source.program != nullptr) {
         source.program.reset();
@@ -1008,7 +1023,13 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     }
     source.variants.push_back(variant);
     retainedCounters().variants.fetch_add(1, std::memory_order_relaxed);
-    retainedCounters().variantSpirvBytes.fetch_add(variant->artifact.spirv.Words().size() * sizeof(std::uint32_t), std::memory_order_relaxed);
+    const auto spirvBytes = variant->artifact.spirv.WordCount() * sizeof(std::uint32_t);
+    if (variant->artifact.spirv.Spilled()) {
+        retainedCounters().spilledVariants.fetch_add(1, std::memory_order_relaxed);
+        retainedCounters().spilledSpirvBytes.fetch_add(spirvBytes, std::memory_order_relaxed);
+    } else {
+        retainedCounters().variantSpirvBytes.fetch_add(spirvBytes, std::memory_order_relaxed);
+    }
     return variant;
 }
 
@@ -1252,6 +1273,56 @@ const IrValue& storedValue(const std::unique_ptr<IrValue>& value) {
 
 }
 
+struct SpilledSpirv {
+    std::mutex mutex;
+    std::vector<std::byte> key;
+    std::size_t wordCount = 0;
+    std::shared_ptr<std::vector<std::uint32_t>> pinned;
+    std::weak_ptr<std::vector<std::uint32_t>> cached;
+};
+
+std::size_t SharedSpirv::WordCount() const {
+    if (words != nullptr) return words->size();
+    return spilled != nullptr ? spilled->wordCount : 0u;
+}
+
+const std::vector<std::uint32_t>& SharedSpirv::SpilledWords() {
+    throw std::logic_error("SPIR-V kept in the shader disk cache is read without SharedSpirv::Resolved");
+}
+
+SharedSpirv SharedSpirv::Spill(std::vector<std::byte> key, bool pinned) const {
+    if (words == nullptr) return *this;
+    auto source = std::make_shared<SpilledSpirv>();
+    source->key = std::move(key);
+    source->wordCount = words->size();
+    source->cached = words;
+    if (pinned) source->pinned = words;
+    SharedSpirv result;
+    result.spilled = std::move(source);
+    return result;
+}
+
+void SharedSpirv::Unpin() const {
+    if (spilled == nullptr) return;
+    std::lock_guard lock(spilled->mutex);
+    spilled->pinned.reset();
+}
+
+SharedSpirv SharedSpirv::Resolved() const {
+    if (words != nullptr || spilled == nullptr) return *this;
+    SharedSpirv result;
+    std::lock_guard lock(spilled->mutex);
+    result.words = spilled->pinned != nullptr ? spilled->pinned : spilled->cached.lock();
+    if (result.words != nullptr) return result;
+    CompiledVariant loaded;
+    if (!ShaderDiskCache::Reload(spilled->key, loaded) || loaded.artifact.spirv.words == nullptr || loaded.artifact.spirv.words->size() != spilled->wordCount) throw std::runtime_error("SPIR-V kept in the shader disk cache could not be read back from it");
+    result.words = std::move(loaded.artifact.spirv.words);
+    spilled->cached = result.words;
+    retainedCounters().spirvReloads.fetch_add(1, std::memory_order_relaxed);
+    retainedCounters().spirvReloadBytes.fetch_add(result.words->size() * sizeof(std::uint32_t), std::memory_order_relaxed);
+    return result;
+}
+
 std::uint64_t EstimatePlanBytes(const IrResourcePlan& plan, std::uint64_t* values) {
     std::uint64_t count = 0;
     std::uint64_t bytes = sizeof(IrResourcePlan);
@@ -1272,7 +1343,7 @@ std::uint64_t EstimatePlanBytes(const IrResourcePlan& plan, std::uint64_t* value
 RetainedShaderMemory GetRetainedShaderMemory() {
     const auto& counters = retainedCounters();
     const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
-    return {load(counters.sources), load(counters.plans), load(counters.planValues), load(counters.planBytes), load(counters.programs), load(counters.variants), load(counters.variantSpirvBytes), load(resultMemoCounters().memoResults), load(resultMemoCounters().memoBytes), load(counters.bindingPlans), load(counters.specializedModules), load(counters.specializedSpirvBytes), load(counters.registrationModules)};
+    return {load(counters.sources), load(counters.plans), load(counters.planValues), load(counters.planBytes), load(counters.programs), load(counters.variants), load(counters.variantSpirvBytes), load(counters.spilledVariants), load(counters.spilledSpirvBytes), load(counters.spirvReloads), load(counters.spirvReloadBytes), load(resultMemoCounters().memoResults), load(resultMemoCounters().memoBytes), load(counters.bindingPlans), load(counters.specializedModules), load(counters.specializedSpirvBytes), load(counters.registrationModules)};
 }
 
 std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request) {
