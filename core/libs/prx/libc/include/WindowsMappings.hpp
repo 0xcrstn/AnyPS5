@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <map>
 #include <memory>
@@ -311,7 +312,7 @@ public:
                         auto& other = views.at(alias);
                         const auto arming = static_cast<std::uint8_t>(settled & ~other.armed);
                         if (!writable(other.protection) || arming == 0) continue;
-                        if (other.hostWrites != 0) {
+                        if (other.hostWrites != 0 || !armSharedWrites()) {
                             untracked |= arming;
                             continue;
                         }
@@ -360,6 +361,14 @@ public:
     }
 
 private:
+    static bool armSharedWrites() {
+        static const bool armed = [] {
+            const char* value = std::getenv("APS5_NO_SHARED_WRITE_FAULTS");
+            return value == nullptr || *value == '\0' || (value[0] == '0' && value[1] == '\0');
+        }();
+        return armed;
+    }
+
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
