@@ -788,6 +788,16 @@ ImportRun windowRun(const HostImports& state, ImportRun run, std::uint64_t begin
     return run;
 }
 
+#ifdef _WIN32
+bool drainBeforeDemote() {
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || recorder->Idle()) return true;
+    if (!GuestMemory::GpuMutex().HeldByThisThread() || !recorder->HasTimeline()) return false;
+    recorder->WaitSerial(recorder->SubmitAndEpoch());
+    return true;
+}
+#endif
+
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
 bool importsStale(const Context& context, const HostImports& state);
 const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict);
@@ -908,6 +918,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
             std::snprintf(text, sizeof(text), "AGC graphics: host import of 0x%llx+0x%llx: memory at 0x%llx (type 0x%lx, protection 0x%lx) is neither read-write, read-only nor a shared mapping", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), reinterpret_cast<unsigned long long>(refused.BaseAddress), refused.Type, refused.Protect);
             throw std::runtime_error(text);
         }
+        if (std::uintptr_t residentBegin = 0, residentEnd = 0; GuestArena::GuestArenaResidentSpan_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes), &residentBegin, &residentEnd) && !drainBeforeDemote()) return nullptr;
         try {
             entry.alias = GuestArena::GuestArenaMapAlias_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes));
         } catch (const std::runtime_error&) {
