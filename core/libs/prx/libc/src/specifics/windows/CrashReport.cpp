@@ -242,12 +242,97 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+struct HandledFault {
+    const char* kind = nullptr;
+    std::uint64_t rip = 0;
+    std::uint64_t address = 0;
+    std::uint64_t rsp = 0;
+    long long milliseconds = 0;
+};
+
+constexpr std::size_t HandledFaultHistory = 8;
+thread_local HandledFault t_handledFaults[HandledFaultHistory];
+thread_local std::size_t t_handledFaultCount = 0;
+bool g_traceHandledFaults = false;
+std::atomic<unsigned long long> g_handledFaults{0};
+
+long long SteadyMilliseconds() {
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void CurrentThreadName(char* buffer, std::size_t size) {
+    buffer[0] = '\0';
+    PWSTR description = nullptr;
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) && description) {
+        WideCharToMultiByte(CP_UTF8, 0, description, -1, buffer, static_cast<int>(size), nullptr, nullptr);
+        LocalFree(description);
+    }
+}
+
+void TraceHandledFault(const HandledFault& fault) {
+    static std::mutex mutex;
+    static std::uint64_t seen[256];
+    static std::size_t seenCount = 0;
+    {
+        std::lock_guard lock(mutex);
+        for (std::size_t i = 0; i < seenCount; ++i) {
+            if (seen[i] == fault.rip) return;
+        }
+        if (seenCount == sizeof(seen) / sizeof(seen[0])) return;
+        seen[seenCount++] = fault.rip;
+    }
+    char line[MAX_PATH + 64];
+    char threadName[128];
+    DescribeAddress(fault.rip, line, sizeof(line));
+    CurrentThreadName(threadName, sizeof(threadName));
+    Report("[handled-fault] %s at %s, fault address 0x%llx, rsp 0x%llx, thread %lu '%s' (%llu handled so far)\n", fault.kind, line, static_cast<unsigned long long>(fault.address), static_cast<unsigned long long>(fault.rsp), GetCurrentThreadId(), threadName, g_handledFaults.load());
+}
+
+void RecordHandledFault(const char* kind, const EXCEPTION_POINTERS* info) {
+    const auto* record = info->ExceptionRecord;
+    HandledFault fault;
+    fault.kind = kind;
+    fault.rip = info->ContextRecord->Rip;
+    fault.address = record->NumberParameters >= 2 ? static_cast<std::uint64_t>(record->ExceptionInformation[1]) : 0;
+    fault.rsp = info->ContextRecord->Rsp;
+    fault.milliseconds = SteadyMilliseconds();
+    t_handledFaults[t_handledFaultCount % HandledFaultHistory] = fault;
+    ++t_handledFaultCount;
+    ++g_handledFaults;
+    if (g_traceHandledFaults) TraceHandledFault(fault);
+}
+
+void ReportHandledFaults(const CONTEXT& context) {
+    if (t_handledFaultCount == 0) {
+        Report("  faults handled on this thread: none\n");
+        return;
+    }
+    Report("  faults handled on this thread (%llu in total, most recent last):\n", static_cast<unsigned long long>(t_handledFaultCount));
+    const auto now = SteadyMilliseconds();
+    const std::size_t shown = t_handledFaultCount < HandledFaultHistory ? t_handledFaultCount : HandledFaultHistory;
+    char line[MAX_PATH + 64];
+    for (std::size_t i = t_handledFaultCount - shown; i < t_handledFaultCount; ++i) {
+        const auto& fault = t_handledFaults[i % HandledFaultHistory];
+        DescribeAddress(fault.rip, line, sizeof(line));
+        Report("    %s at %s, fault address 0x%llx, rsp 0x%llx (crash rsp %+lld), %lld ms ago\n", fault.kind, line, static_cast<unsigned long long>(fault.address), static_cast<unsigned long long>(fault.rsp), static_cast<long long>(fault.rsp - context.Rsp), now - fault.milliseconds);
+    }
+}
+
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
-    if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
-    if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) {
+        RecordHandledFault("guest write", info);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (HandleWatch(info)) {
+        RecordHandledFault("watch", info);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (HandleSse4a(info)) {
+        RecordHandledFault("sse4a emulation", info);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     const auto* record = info->ExceptionRecord;
     if (!IsFatal(record->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
     if (reported.exchange(true)) {
@@ -256,12 +341,8 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     }
     const auto* context = info->ContextRecord;
     char line[MAX_PATH + 64];
-    char threadName[128] = "";
-    PWSTR description = nullptr;
-    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) && description) {
-        WideCharToMultiByte(CP_UTF8, 0, description, -1, threadName, sizeof(threadName), nullptr, nullptr);
-        LocalFree(description);
-    }
+    char threadName[128];
+    CurrentThreadName(threadName, sizeof(threadName));
     Report("\nFATAL: unhandled exception 0x%08lx on thread %lu '%s'\n", record->ExceptionCode, GetCurrentThreadId(), threadName);
     DescribeAddress(context->Rip, line, sizeof(line));
     Report("  rip %s\n", line);
@@ -280,6 +361,7 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     Report("  rsi %016llx rdi %016llx rbp %016llx rsp %016llx\n", context->Rsi, context->Rdi, context->Rbp, context->Rsp);
     Report("  r8  %016llx r9  %016llx r10 %016llx r11 %016llx\n", context->R8, context->R9, context->R10, context->R11);
     Report("  r12 %016llx r13 %016llx r14 %016llx r15 %016llx\n", context->R12, context->R13, context->R14, context->R15);
+    ReportHandledFaults(*context);
     // The words each register points at, to recognise which structure a bad pointer came from.
     {
         const std::pair<const char*, std::uint64_t> pointers[] = {{"rax", context->Rax}, {"rbx", context->Rbx}, {"rcx", context->Rcx}, {"rdx", context->Rdx}, {"rsi", context->Rsi}, {"rdi", context->Rdi}, {"r12", context->R12}, {"r13", context->R13}, {"r14", context->R14}, {"r15", context->R15}};
@@ -500,6 +582,7 @@ struct ExitReporter {
 const bool g_crashReportInstalled = [] {
     g_sse4aEmulation = !IsEnvironmentSet("APS5_NO_SSE4A_EMULATION");
     g_sse4aTrace = IsEnvironmentSet("APS5_TRACE_SSE4A");
+    g_traceHandledFaults = IsEnvironmentSet("APS5_TRACE_HANDLED_FAULTS");
     AddVectoredExceptionHandler(1, ReportCrash);
     std::signal(SIGABRT, AbortSignalHandler);
     _set_invalid_parameter_handler(InvalidParameterHandler);
