@@ -117,6 +117,8 @@ public:
         std::uint64_t bound = 0;
         std::uint64_t boundBytes = 0;
         std::uint64_t dropped = 0;
+        std::uint64_t patched = 0;
+        std::uint64_t patchedBytes = 0;
     };
     static SnapshotTwinCounters TwinCounters();
     static bool SnapshotTwinsEnabled();
@@ -892,6 +894,7 @@ private:
     std::vector<VkCommandBuffer> sparePrologues;
     VkCommandBuffer prologueCommands();
     void forgetSnapshotTwin(const Buffer* snapshot);
+    void patchSnapshotTwin(const std::shared_ptr<Buffer>& snapshot, std::span<const std::pair<std::size_t, std::size_t>> spans);
 };
 
 }

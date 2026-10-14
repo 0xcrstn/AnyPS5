@@ -2683,7 +2683,7 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         if (!differing.empty() && differing.back().first + differing.back().second == offset) differing.back().second += length;
         else differing.emplace_back(offset, length);
     }
-    if (!differing.empty()) forgetSnapshotTwin(entry.buffer.get());
+    if (!differing.empty()) patchSnapshotTwin(entry.buffer, differing);
     for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
     return true;
 }
@@ -2696,6 +2696,8 @@ struct TwinStatistics {
     std::atomic<std::uint64_t> bound{0};
     std::atomic<std::uint64_t> boundBytes{0};
     std::atomic<std::uint64_t> dropped{0};
+    std::atomic<std::uint64_t> patched{0};
+    std::atomic<std::uint64_t> patchedBytes{0};
 };
 
 TwinStatistics& Twins() {
@@ -2728,7 +2730,27 @@ bool Recorder::SnapshotTwinsEnabled() {
 
 Recorder::SnapshotTwinCounters Recorder::TwinCounters() {
     auto& twins = Twins();
-    return {twins.made.load(std::memory_order_relaxed), twins.madeBytes.load(std::memory_order_relaxed), twins.bound.load(std::memory_order_relaxed), twins.boundBytes.load(std::memory_order_relaxed), twins.dropped.load(std::memory_order_relaxed)};
+    return {twins.made.load(std::memory_order_relaxed), twins.madeBytes.load(std::memory_order_relaxed), twins.bound.load(std::memory_order_relaxed), twins.boundBytes.load(std::memory_order_relaxed), twins.dropped.load(std::memory_order_relaxed), twins.patched.load(std::memory_order_relaxed), twins.patchedBytes.load(std::memory_order_relaxed)};
+}
+
+void Recorder::patchSnapshotTwin(const std::shared_ptr<Buffer>& snapshot, std::span<const std::pair<std::size_t, std::size_t>> spans) {
+    static const bool patching = std::getenv("APS5_NO_TWIN_PATCH") == nullptr;
+    const auto found = snapshotTwins.find(snapshot.get());
+    if (!patching || found == snapshotTwins.end() || found->second.source.lock() != snapshot) {
+        forgetSnapshotTwin(snapshot.get());
+        return;
+    }
+    std::vector<VkBufferCopy> copies;
+    std::uint64_t bytes = 0;
+    for (const auto& [offset, length] : spans) {
+        copies.push_back({offset, offset, length});
+        bytes += length;
+    }
+    context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologueCommands(), snapshot->Handle(), found->second.twin->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+    open->kept.push_back(snapshot);
+    open->kept.push_back(found->second.twin);
+    Twins().patched.fetch_add(1, std::memory_order_relaxed);
+    Twins().patchedBytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void Recorder::forgetSnapshotTwin(const Buffer* snapshot) {
