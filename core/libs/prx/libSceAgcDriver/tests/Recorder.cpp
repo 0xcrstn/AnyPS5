@@ -7044,10 +7044,12 @@ void Run(Context context) {
             Require(readPixel() == 0x8d8d8d8du, "unwatched refresh returned incorrect GPU texels");
         }
         image.reset();
+        const auto copiesBefore = StorageImageHostCopyBytes();
         Context cpu = context;
         cpu.hostImportAlignment = 0;
         image = StorageTexture::Create(cpu, *context.detiler, Resource(address), 0);
         Require(image->OriginalSnapshotBytes() == SurfaceBytes, "CPU upload has no guest-byte snapshot");
+        Require(StorageImageHostCopyBytes() >= copiesBefore + SurfaceBytes, "the memory report does not count a storage image's guest-byte snapshot");
         const auto expectedPixel = watched ? 0x8d8d8d8du : 0x7c7c7c7cu;
         Require(readPixel() == expectedPixel, "CPU upload returned incorrect GPU texels");
         {

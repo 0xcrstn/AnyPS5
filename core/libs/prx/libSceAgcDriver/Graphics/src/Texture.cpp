@@ -864,6 +864,23 @@ VkImageView Texture::BaseLevelView() const {
     return baseLevelView;
 }
 
+namespace {
+
+std::atomic<std::uint64_t> storageImageHostCopies{0};
+
+}
+
+std::uint64_t StorageImageHostCopyBytes() {
+    return storageImageHostCopies.load(std::memory_order_relaxed);
+}
+
+void StorageTexture::accountHostCopies() noexcept {
+    const std::uint64_t held = original.capacity() + generationBaseline.capacity();
+    if (held >= accountedHostCopyBytes) storageImageHostCopies.fetch_add(held - accountedHostCopyBytes, std::memory_order_relaxed);
+    else storageImageHostCopies.fetch_sub(accountedHostCopyBytes - held, std::memory_order_relaxed);
+    accountedHostCopyBytes = held;
+}
+
 void Texture::release() noexcept {
     upload.reset();
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
@@ -2106,6 +2123,7 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
     original.resize(static_cast<std::size_t>(guestBytes));
+    accountHostCopies();
     comparedGuestBytes = {};
     std::vector<bool> selected(trackedLayers, true);
     if (layers != nullptr) selected = *layers;
@@ -2188,6 +2206,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             generationBaseline.resize(static_cast<std::size_t>(guestBytes));
             GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
         }
+        accountHostCopies();
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (!whole && !(*layers)[layer]) continue;
             layerGeneration[layer] = now;
@@ -2381,6 +2400,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     forgetBorrowed(0, trackedLayers);
     stampLayers(false);
     original.resize(static_cast<std::size_t>(guestBytes));
+    accountHostCopies();
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     {
             Buffer staging(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -4628,6 +4648,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         return;
     }
     original.resize(static_cast<std::size_t>(guestBytes));
+    accountHostCopies();
     // The store below compares against the guest bytes, read now when `original` does not hold
     // them (a GPU clear, a dropped or kept unit). Reading them says nothing about the image: a
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
@@ -4749,6 +4770,9 @@ StorageTexture::~StorageTexture() {
         }
     }
     release();
+    original = std::vector<std::byte>();
+    generationBaseline = std::vector<std::byte>();
+    accountHostCopies();
 }
 
 void StorageTexture::release() noexcept {
