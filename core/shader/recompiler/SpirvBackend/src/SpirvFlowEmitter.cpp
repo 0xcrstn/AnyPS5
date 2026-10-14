@@ -297,12 +297,13 @@ void InvokeOutlined(std::uint32_t (*emit)(SpirvEmitterState&, TArguments...), Sp
                 outlined = false;
                 return;
             }
-            const IrValue* resolved = argument->Resolve();
-            key.push_back(static_cast<std::uint64_t>(resolved->Type()));
             if constexpr (std::is_same_v<TArgument, const IrValue*>) {
-                if (!resolved->HasImmediate()) outlined = false;
-                key.push_back(resolved->ImmediateU64());
+                key.push_back(static_cast<std::uint64_t>(argument->Type()));
+                if (!argument->HasImmediate()) outlined = false;
+                key.push_back(argument->ImmediateU64());
             } else {
+                const IrValue* resolved = argument->Resolve();
+                key.push_back(static_cast<std::uint64_t>(resolved->Type()));
                 types[index] = TypeId(state, resolved->Type());
                 if (types[index] == 0u) outlined = false;
             }
@@ -310,7 +311,7 @@ void InvokeOutlined(std::uint32_t (*emit)(SpirvEmitterState&, TArguments...), Sp
         (describe.template operator()<TArguments>(TIndices), ...);
     }(std::index_sequence_for<TArguments...>{});
     const auto resultType = TypeId(state, inst.Type());
-    if (!outlined || resultType == 0u) return Invoke(emit, ctx, inst);
+    if (!state.sharedFloatFunctions || !outlined || resultType == 0u) return Invoke(emit, ctx, inst);
     auto function = state.outlinedFunctions.find(key);
     if (function == state.outlinedFunctions.end()) {
         std::vector<std::uint32_t> parameterTypes;
@@ -334,7 +335,7 @@ void InvokeOutlined(std::uint32_t (*emit)(SpirvEmitterState&, TArguments...), Sp
         const auto result = [&]<std::size_t... TIndices>(std::index_sequence<TIndices...>) {
             const auto argument = [&]<typename TArgument>(std::size_t index) -> TArgument {
                 if constexpr (std::is_same_v<TArgument, const IrValue*>) {
-                    return inst.Argument(index)->Resolve();
+                    return static_cast<const IrValue*>(inst.Argument(index));
                 } else {
                     return parameters[index];
                 }
@@ -941,6 +942,7 @@ bool CommunicatesThroughMemory(IrOpcode opcode) {
 }
 
 void DefineFloatIdiomFunctions(SpirvEmitterState& state) {
+    if (!state.sharedFloatFunctions) return;
     const auto& program = state.program;
     std::uint32_t count = 0;
     for (const IrBlock* block : program.BlockOrder()) {
