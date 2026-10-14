@@ -848,6 +848,40 @@ void verifyCaptureMemoDataWords() {
     const auto followed = AgcDriver::ShaderMemory::MemoizedCaptures() - movingBefore;
     require(memo ? followed >= Iterations - 1 : followed == 0, "capture memo data words: captures over a moved base word in guest memory were not served as configured");
     std::cout << "Capture memo " << (memo ? "on" : "off") << ": " << us << " us per capture over a changed pure SRT data word, " << movingUs << " us per capture over a moved base word in guest memory\n";
+    {
+        const std::array<std::uint32_t, 10> offsetCode{0xf4040004u, 0xfa000000u, 0x80009000u, 0x82018001u, 0xf4000080u, 0xfa000000u, 0x7e000202u, 0xf80008cfu, 0u, 0xbf810000u};
+        struct alignas(4096) OffsetTables {
+            std::array<std::uint32_t, 8> first{};
+            std::array<std::uint32_t, 8> second{};
+            std::uint64_t table = 0;
+        };
+        static OffsetTables offset;
+        offset.first = {0u, 0u, 0u, 0u, 0x3f800000u, 0u, 0u, 0u};
+        offset.second = {0u, 0u, 0u, 0u, 0x40000000u, 0u, 0u, 0u};
+        offset.table = reinterpret_cast<std::uintptr_t>(offset.first.data());
+        const auto tableAddress = reinterpret_cast<std::uintptr_t>(&offset.table);
+        const std::array<std::uint32_t, 2> offsetUserData{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u)};
+        auto offsetRequest = request;
+        offsetRequest.shader = {ShaderStage::Vertex, 0x27000u, offsetCode, 0, {}};
+        offsetRequest.context.userData = offsetUserData;
+        const auto offsetHandle = PrepareShader(offsetRequest);
+        const auto offsetCapture = [&] {
+            const auto before = AgcDriver::ShaderMemory::MemoizedCaptures();
+            AgcDriver::ShaderMemory memory({});
+            const auto prepared = PreparedShaderInvocation::TryCreate(offsetRequest, offsetHandle);
+            require(prepared.has_value(), "capture memo offset base: the prepared shader does not match its request");
+            const auto result = memory.Capture(*prepared);
+            AgcDriver::ShaderMemory reference({});
+            const auto expected = reference.Capture(offsetRequest);
+            require(result->snapshot.flattenedSrt == expected->snapshot.flattenedSrt && result->userDataUse.reads == expected->userDataUse.reads && result->readTrace.leaves == expected->readTrace.leaves && result->baseSlots == expected->baseSlots, "capture memo offset base: the capture differs from a fresh walk of the same memory");
+            return std::pair(result, AgcDriver::ShaderMemory::MemoizedCaptures() == before + 1);
+        };
+        const auto [first, firstServed] = offsetCapture();
+        require(!firstServed && !first->baseSlots.empty() && std::find(first->snapshot.flattenedSrt.begin(), first->snapshot.flattenedSrt.end(), 0x3f800000u) != first->snapshot.flattenedSrt.end(), "capture memo offset base: the pointer offset by scalar adds is not a base slot");
+        offset.table = reinterpret_cast<std::uintptr_t>(offset.second.data());
+        const auto [moved, movedServed] = offsetCapture();
+        require(movedServed == memo && std::find(moved->snapshot.flattenedSrt.begin(), moved->snapshot.flattenedSrt.end(), 0x40000000u) != moved->snapshot.flattenedSrt.end(), "capture memo offset base: a moved pointer offset by scalar adds before the dependent read was not followed");
+    }
 }
 
 void verifyCaptureMemo() {

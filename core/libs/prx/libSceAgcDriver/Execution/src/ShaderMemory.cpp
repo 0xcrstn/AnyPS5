@@ -58,6 +58,12 @@ struct CaptureProfile {
     std::atomic<std::uint64_t> handleMisses{0};
 };
 
+constexpr std::size_t ReadUseCount = 7;
+constexpr std::size_t ProbeUse = ReadUseCount;
+constexpr std::size_t NoReadUse = ReadUseCount + 1;
+constexpr std::size_t MissUseCount = ReadUseCount + 2;
+constexpr const char* MissUseNames[MissUseCount] = {"unclassified", "leaf", "base-only", "carry consumed", "base under arithmetic", "high word or offset", "value", "probe result", "not a walk read"};
+
 struct MemoProfile {
     std::atomic<std::uint64_t> total{0};
     std::atomic<std::uint64_t> hits{0};
@@ -67,7 +73,7 @@ struct MemoProfile {
     std::atomic<std::uint64_t> descriptorWords{0};
     std::atomic<std::uint64_t> nestedBases{0};
     std::atomic<std::uint64_t> memoryRelocated{0};
-    std::array<std::atomic<std::uint64_t>, 8> roles{};
+    std::array<std::atomic<std::uint64_t>, MissUseCount> roles{};
     std::atomic<std::uint64_t> warmWalks{0};
     std::atomic<std::uint64_t> warmNanoseconds{0};
     std::atomic<std::uint64_t> relocationRefused{0};
@@ -131,96 +137,15 @@ void ClearDerived(MemoEntry& entry) {
     entry.dataLeavesBuilt = false;
 }
 
-enum ReadRole : std::uint8_t { RoleDescriptor = 1, RoleCondition = 2, RoleUniform = 4, RoleAddress = 8, RoleFlat = 16, RoleBaseOnly = 32 };
-
-bool RawRead(const ShaderRecompiler::IrResourcePlan& plan, ShaderRecompiler::IrValue& value) {
-    const auto opcode = value.Opcode();
-    if (opcode != ShaderRecompiler::IrOpcode::LoadAddressU32 && opcode != ShaderRecompiler::IrOpcode::ReadConstBuffer) return false;
-    const auto index = value.Flags<ShaderRecompiler::MemoryFlags>().index;
-    if (index >= plan.memoryInfo.size()) return false;
-    const auto kind = plan.memoryInfo[index].kind;
-    return (opcode == ShaderRecompiler::IrOpcode::LoadAddressU32 && kind == ShaderRecompiler::ResourceKind::ScalarAddress) || (opcode == ShaderRecompiler::IrOpcode::ReadConstBuffer && kind == ShaderRecompiler::ResourceKind::ScalarBuffer);
-}
-
-std::unordered_map<const void*, std::uint8_t> ComputeReadRoles(const ShaderRecompiler::IrResourcePlan& plan) {
-    std::unordered_map<const void*, std::uint8_t> roles;
-    std::vector<ShaderRecompiler::IrValue*> raws;
-    std::unordered_set<const void*> rawSeen;
-    const auto mark = [&](ShaderRecompiler::IrValue* root, std::uint8_t role) {
-        if (root == nullptr) return;
-        std::vector<ShaderRecompiler::IrValue*> pending{root};
-        std::unordered_set<const void*> visited;
-        while (!pending.empty()) {
-            auto* value = pending.back()->Resolve();
-            pending.pop_back();
-            if (!visited.insert(value).second) continue;
-            if (value->Opcode() == ShaderRecompiler::IrOpcode::ReadConst && value->ArgumentCount() >= 2 && value->Argument(1) != nullptr) {
-                const auto* slot = value->Argument(1)->Resolve();
-                if (slot->HasImmediate() && slot->Type() == ShaderRecompiler::IrType::U32 && slot->ImmediateU32() < plan.srtReads.size() && plan.srtReads[slot->ImmediateU32()].value != nullptr) pending.push_back(plan.srtReads[slot->ImmediateU32()].value);
-                continue;
-            }
-            if (RawRead(plan, *value)) {
-                roles[value] |= role;
-                if (rawSeen.insert(value).second) raws.push_back(value);
-                continue;
-            }
-            for (std::size_t i = 0; i < value->ArgumentCount(); ++i) {
-                if (value->Argument(i) != nullptr) pending.push_back(value->Argument(i));
-            }
-        }
-    };
-    for (const auto& source : plan.descriptorSources) {
-        for (std::uint32_t i = 0; i < source.dwordCount && i < source.dwords.size(); ++i) mark(source.dwords[i], RoleDescriptor);
-    }
-    for (const auto& block : plan.controlFlow) mark(block.condition, RoleCondition);
-    if (plan.uniformFill.fill.kind != ShaderRecompiler::UniformFillKind::None) {
-        for (std::uint32_t i = 0; i < plan.uniformFill.fill.words && i < plan.uniformFill.values.size(); ++i) mark(plan.uniformFill.values[i], RoleUniform);
-    }
-    for (const auto& read : plan.srtReads) mark(read.value, RoleFlat);
-    for (std::size_t next = 0; next < raws.size(); ++next) {
-        auto* raw = raws[next];
-        auto* handle = raw->ArgumentCount() != 0 && raw->Argument(0) != nullptr ? raw->Argument(0)->Resolve() : nullptr;
-        if (handle != nullptr) {
-            for (std::size_t i = 0; i < handle->ArgumentCount(); ++i) {
-                if (handle->Argument(i) == nullptr) continue;
-                auto* argument = handle->Argument(i)->Resolve();
-                if (argument->Opcode() == ShaderRecompiler::IrOpcode::ReadConst && argument->ArgumentCount() >= 2 && argument->Argument(1) != nullptr) {
-                    const auto* slot = argument->Argument(1)->Resolve();
-                    if (slot->HasImmediate() && slot->Type() == ShaderRecompiler::IrType::U32 && slot->ImmediateU32() < plan.srtReads.size() && plan.srtReads[slot->ImmediateU32()].value != nullptr) argument = plan.srtReads[slot->ImmediateU32()].value->Resolve();
-                }
-                if (i == 0 && RawRead(plan, *argument)) {
-                    roles[argument] |= RoleBaseOnly;
-                    if (rawSeen.insert(argument).second) raws.push_back(argument);
-                    continue;
-                }
-                mark(argument, RoleAddress);
-            }
-        }
-        for (std::size_t i = 1; i < raw->ArgumentCount(); ++i) mark(raw->Argument(i), RoleAddress);
-    }
-    return roles;
-}
-
-std::uint8_t ReadRoles(const ShaderRecompiler::ResourceCapture& capture, std::uint64_t address) {
-    struct RoleCache {
-        std::unordered_map<const ShaderRecompiler::IrResourcePlan*, std::pair<std::weak_ptr<const ShaderRecompiler::IrResourcePlan>, std::unordered_map<const void*, std::uint8_t>>> plans;
-    };
-    struct RoleCacheStorage {};
-    auto& cache = HostThreadLocal<RoleCache, RoleCacheStorage>();
-    auto found = cache.plans.find(capture.plan.get());
-    if (found == cache.plans.end() || found->second.first.lock() != capture.plan) {
-        if (cache.plans.size() >= 512) cache.plans.clear();
-        found = cache.plans.insert_or_assign(capture.plan.get(), std::pair(std::weak_ptr<const ShaderRecompiler::IrResourcePlan>(capture.plan), ComputeReadRoles(*capture.plan))).first;
-    }
-    const auto& roles = found->second.second;
+std::uint32_t ReadUses(const ShaderRecompiler::ResourceCapture& capture, std::uint64_t address) {
     const auto& use = capture.userDataUse;
-    std::uint8_t result = 0;
-    for (std::size_t read = 0; read < use.reads.size() && read < use.readInstructions.size(); ++read) {
+    std::uint32_t result = 0;
+    for (std::size_t read = 0; read < use.reads.size(); ++read) {
         if (use.reads[read].first != address) continue;
-        const auto role = roles.find(use.readInstructions[read]);
-        result |= role != roles.end() ? role->second : std::uint8_t{0x80};
+        const auto kind = read < capture.readUses.size() ? capture.readUses[read] : std::uint8_t{0};
+        result |= 1u << (kind < ReadUseCount ? kind : 0u);
     }
-    return result;
+    return result != 0 ? result : 1u << NoReadUse;
 }
 
 bool FeedsDescriptorDirectly(const ShaderRecompiler::ResourceCapture& capture, std::uint64_t address) {
@@ -511,7 +436,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> FollowedCapture(const M
     return capture;
 }
 
-void traceMiss(const MemoEntry& entry, const ShaderMemory::ReplayResult& result, std::uint8_t roles) {
+void traceMiss(const MemoEntry& entry, const ShaderMemory::ReplayResult& result, std::uint32_t roles) {
     static std::atomic<std::uint64_t> reports{0};
     if (reports.fetch_add(1, std::memory_order_relaxed) >= 40) return;
     const auto& use = entry.capture->userDataUse;
@@ -522,15 +447,19 @@ void traceMiss(const MemoEntry& entry, const ShaderMemory::ReplayResult& result,
     if (access.bytes == 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(access.address), sizeof(now))) std::memcpy(&now, reinterpret_cast<const void*>(access.address), sizeof(now));
     std::size_t inReads = 0;
     std::string slots;
+    std::string uses;
     for (std::size_t read = 0; read < use.reads.size(); ++read) {
         if (use.reads[read].first == result.mismatch) ++inReads;
+    }
+    for (std::size_t use = 0; use < MissUseCount; ++use) {
+        if ((roles >> use) & 1u) uses += std::string(uses.empty() ? "" : "+") + MissUseNames[use];
     }
     for (const auto& [slot, address] : entry.capture->readTrace.leaves) {
         if (address == result.mismatch) slots += " leaf" + std::to_string(slot) + (slot < plan.pureFlatSlots.size() && plan.pureFlatSlots[slot] != 0 ? "p" : "");
     }
     const bool other = std::binary_search(entry.capture->readTrace.otherReads.begin(), entry.capture->readTrace.otherReads.end(), result.mismatch);
     const bool leafListed = std::binary_search(entry.dataLeaves.begin(), entry.dataLeaves.end(), std::pair<std::uint64_t, std::uint32_t>{result.mismatch, 0u}, [](const auto& a, const auto& b) { return a.first < b.first; });
-    std::fprintf(stderr, "[capture-memo] miss: shader 0x%llx access %zu of %zu at 0x%llx: recorded 0x%08x now 0x%08x, %s; in walk reads %zu, other read %d, data leaf %d, roles 0x%02x,%s; plan: %zu flat slots (%zu pure), %zu sources, %zu blocks\n", static_cast<unsigned long long>(entry.shaderBase), index, entry.accesses.size(), static_cast<unsigned long long>(result.mismatch), access.value, now, access.bytes == 0 ? "word" : "probe", inReads, other ? 1 : 0, leafListed ? 1 : 0, roles, slots.c_str(), plan.srtReads.size(), static_cast<std::size_t>(std::count(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), std::uint8_t{1})), plan.descriptorSources.size(), plan.controlFlow.size());
+    std::fprintf(stderr, "[capture-memo] miss: shader 0x%llx access %zu of %zu at 0x%llx: recorded 0x%08x now 0x%08x, %s; in walk reads %zu, other read %d, data leaf %d, use %s,%s; plan: %zu flat slots (%zu pure), %zu sources, %zu blocks\n", static_cast<unsigned long long>(entry.shaderBase), index, entry.accesses.size(), static_cast<unsigned long long>(result.mismatch), access.value, now, access.bytes == 0 ? "word" : "probe", inReads, other ? 1 : 0, leafListed ? 1 : 0, uses.c_str(), slots.c_str(), plan.srtReads.size(), static_cast<std::size_t>(std::count(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), std::uint8_t{1})), plan.descriptorSources.size(), plan.controlFlow.size());
 }
 
 MemoEntry& scratchEntry() {
@@ -579,8 +508,12 @@ void ReportMemo() {
     const auto descriptorWords = take(memo.descriptorWords);
     const auto nestedBases = take(memo.nestedBases);
     const auto memoryRelocated = take(memo.memoryRelocated);
-    std::array<std::uint64_t, 8> roles{};
-    for (std::size_t bit = 0; bit < roles.size(); ++bit) roles[bit] = take(memo.roles[bit]);
+    std::string roles;
+    for (std::size_t use = 0; use < MissUseCount; ++use) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "%s%s %llu", use != 0 ? ", " : "", MissUseNames[use], static_cast<unsigned long long>(take(memo.roles[use])));
+        roles += text;
+    }
     const auto warmWalks = take(memo.warmWalks);
     const auto warmNs = take(memo.warmNanoseconds);
     const auto relocationRefused = take(memo.relocationRefused);
@@ -601,7 +534,7 @@ void ReportMemo() {
     const auto phis = take(memo.phis);
     const auto served = hits + patched + relocated + dataPatched + nestedBases;
     const auto misses = total > served ? total - served : 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[capture-memo] (10 s) %llu prepared captures: %llu served from the memo (%llu with unread user words patched, %llu relocated to moved pointer words, %llu with changed pure SRT data words patched, %llu following moved base words read from guest memory; %.1f words replayed each, %.1f us each); %llu walked (%.1f us each: SRT evaluation %.1f with page setup %.1f and page reads %.1f inside; %.1f word reads, %.2f new pages, %.1f values evaluated, %.2f lane evaluators, %.1f phis each; %llu walks of the plan this thread walked last at %.1f us each), because: no entry %llu, read user words differ %llu (only pointer words %llu, %llu of them not relocatable), guest words differ %llu (%llu behind moved user pointer words; first differing word a whole descriptor dword %llu; its roles: descriptor %llu, branch condition %llu, uniform fill %llu, address or offset %llu, flat SRT data %llu, low base word of reads %llu, probe %llu, untraced %llu)\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(served), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(relocated), static_cast<unsigned long long>(dataPatched), static_cast<unsigned long long>(nestedBases), Per(replayed, served), Per(hitNs, served) / 1e3, static_cast<unsigned long long>(misses), Per(missNs, misses) / 1e3, Per(evaluationNs, misses) / 1e3, Per(setupNs, misses) / 1e3, Per(pageNs, misses) / 1e3, Per(reads, misses), Per(pages, misses), Per(values, misses), Per(laneEvaluators, misses), Per(phis, misses), static_cast<unsigned long long>(warmWalks), Per(warmNs, warmWalks) / 1e3, static_cast<unsigned long long>(absent), static_cast<unsigned long long>(valueWords + pointerWords), static_cast<unsigned long long>(pointerWords), static_cast<unsigned long long>(relocationRefused), static_cast<unsigned long long>(memory), static_cast<unsigned long long>(memoryRelocated), static_cast<unsigned long long>(descriptorWords), static_cast<unsigned long long>(roles[0]), static_cast<unsigned long long>(roles[1]), static_cast<unsigned long long>(roles[2]), static_cast<unsigned long long>(roles[3]), static_cast<unsigned long long>(roles[4]), static_cast<unsigned long long>(roles[5]), static_cast<unsigned long long>(roles[6]), static_cast<unsigned long long>(roles[7]));
+    AgcDriver::ProfilePrint_nid_no_patch("[capture-memo] (10 s) %llu prepared captures: %llu served from the memo (%llu with unread user words patched, %llu relocated to moved pointer words, %llu with changed pure SRT data words patched, %llu following moved base words read from guest memory; %.1f words replayed each, %.1f us each); %llu walked (%.1f us each: SRT evaluation %.1f with page setup %.1f and page reads %.1f inside; %.1f word reads, %.2f new pages, %.1f values evaluated, %.2f lane evaluators, %.1f phis each; %llu walks of the plan this thread walked last at %.1f us each), because: no entry %llu, read user words differ %llu (only pointer words %llu, %llu of them not relocatable), guest words differ %llu (%llu behind moved user pointer words; first differing word a whole descriptor dword %llu; by the walk's use of the read: %s)\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(served), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(relocated), static_cast<unsigned long long>(dataPatched), static_cast<unsigned long long>(nestedBases), Per(replayed, served), Per(hitNs, served) / 1e3, static_cast<unsigned long long>(misses), Per(missNs, misses) / 1e3, Per(evaluationNs, misses) / 1e3, Per(setupNs, misses) / 1e3, Per(pageNs, misses) / 1e3, Per(reads, misses), Per(pages, misses), Per(values, misses), Per(laneEvaluators, misses), Per(phis, misses), static_cast<unsigned long long>(warmWalks), Per(warmNs, warmWalks) / 1e3, static_cast<unsigned long long>(absent), static_cast<unsigned long long>(valueWords + pointerWords), static_cast<unsigned long long>(pointerWords), static_cast<unsigned long long>(relocationRefused), static_cast<unsigned long long>(memory), static_cast<unsigned long long>(memoryRelocated), static_cast<unsigned long long>(descriptorWords), roles.c_str());
 }
 
 constexpr std::uint64_t WordWaitNanoseconds = 50000;
@@ -929,7 +862,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
                 ++memo.memory;
                 if (match == MemoMatch::PointerWords) ++memo.memoryRelocated;
                 if (result.mismatch != 0 && FeedsDescriptorDirectly(*candidate->capture, result.mismatch)) ++memo.descriptorWords;
-                const auto roles = result.mismatch != 0 ? ReadRoles(*candidate->capture, result.mismatch) : std::uint8_t{0x40};
+                const auto roles = result.mismatch != 0 ? ReadUses(*candidate->capture, result.mismatch) : 1u << ProbeUse;
                 for (std::size_t bit = 0; bit < memo.roles.size(); ++bit) {
                     if ((roles >> bit) & 1u) ++memo.roles[bit];
                 }

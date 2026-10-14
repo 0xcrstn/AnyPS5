@@ -53,7 +53,13 @@ alignas(256) constexpr std::array<std::uint32_t, 16> PointerPixelCode{
     0x7e040280u, 0x7e0602f2u, 0xf800080fu, 0x03020100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 16> OffsetPixelCode{
+    0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0x80029002u, 0x82038003u, 0xf4000101u, 0xfa000000u, 0xbf8cc07fu,
+    0x7e000204u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf800080fu, 0x03020100u, 0xbf810000u, 0xbf810000u,
+};
+
 alignas(16) std::array<std::uint32_t, 4> PointerTable{};
+alignas(16) std::array<std::array<float, 8>, 3> OffsetBlocks{};
 alignas(16) std::array<std::array<float, 4>, 4> Vertices{{{-3.0f, -1.0f, 0.5f, 1.0f}, {1.0f, -1.0f, 0.5f, 1.0f}, {1.0f, 3.0f, 0.5f, 1.0f}, {1.0f, 3.0f, 0.5f, 1.0f}}};
 alignas(16) std::array<std::uint32_t, 4> VertexTable{};
 alignas(16) std::array<std::array<float, 4>, 6> Blocks{};
@@ -68,6 +74,7 @@ struct Header {
 alignas(8) Header VertexHeader{};
 alignas(8) Header LoadPixelHeader{};
 alignas(8) Header PointerPixelHeader{};
+alignas(8) Header OffsetPixelHeader{};
 
 std::byte* AllocateWatched(std::size_t bytes) {
 #ifdef _WIN32
@@ -222,6 +229,24 @@ void MovedBaseWordFollowed() {
     Draw(PointerPixelCode.data(), PointerTable.data(), 64, 2, "the value behind the moved pointer changed in place");
 }
 
+void MovedOffsetBaseWordFollowed() {
+    const auto point = [](std::size_t block) {
+        const auto address = reinterpret_cast<std::uintptr_t>(OffsetBlocks[block].data());
+        PointerTable = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0u, 0u};
+    };
+    OffsetBlocks[0] = {0.25f, 0.25f, 0.25f, 0.25f, 1.0f, 0.0f, 0.0f, 0.0f};
+    OffsetBlocks[1] = {0.25f, 0.25f, 0.25f, 0.25f, 0.5f, 0.0f, 0.0f, 0.0f};
+    OffsetBlocks[2] = {0.25f, 0.25f, 0.25f, 0.25f, 1.0f, 0.0f, 0.0f, 0.0f};
+    point(0);
+    Draw(OffsetPixelCode.data(), PointerTable.data(), 255, 1, "a pixel shader loading at an offset from a pointer read from its table");
+    point(1);
+    Draw(OffsetPixelCode.data(), PointerTable.data(), 128, 2, "the offset pointer moved to a block with another value");
+    point(2);
+    Draw(OffsetPixelCode.data(), PointerTable.data(), 255, 2, "the offset pointer moved to a block with the first value");
+    OffsetBlocks[2][4] = 0.25f;
+    Draw(OffsetPixelCode.data(), PointerTable.data(), 64, 2, "the value behind the moved offset pointer changed in place");
+}
+
 }
 
 int main() {
@@ -235,9 +260,11 @@ int main() {
         Register(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Register(LoadPixelHeader, LoadPixelCode.data(), sizeof(LoadPixelCode), 1);
         Register(PointerPixelHeader, PointerPixelCode.data(), sizeof(PointerPixelCode), 1);
+        Register(OffsetPixelHeader, OffsetPixelCode.data(), sizeof(OffsetPixelCode), 1);
         LoadedDataPatched();
         MovedUserPointerPatched();
         MovedBaseWordFollowed();
+        MovedOffsetBaseWordFollowed();
         AgcDriverShutdown_nid_postfix();
         std::cout << "Memoized captures bind the current data with the memo " << (MemoEnabled() ? "on" : "off") << "\n";
         return 0;
