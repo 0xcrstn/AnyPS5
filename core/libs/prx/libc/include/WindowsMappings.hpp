@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <map>
 #include <memory>
@@ -280,6 +281,7 @@ public:
                 }
                 if (view.protection == PAGE_NOACCESS) return false;
                 const bool pinned = view.page->pins != 0;
+                if (!pinned && view.page->digested != 0) verifyDigests(*view.page, base, subpagesOf(base, cursor, stop));
                 std::uint8_t settled = 0;
                 auto settledEnd = cursor;
                 bool full = false;
@@ -307,6 +309,7 @@ public:
                 }
                 if (clear && !pinned && settled != 0) {
                     std::uint8_t untracked = 0;
+                    std::uint8_t digesting = 0;
                     for (const auto alias : view.page->aliases) {
                         auto& other = views.at(alias);
                         const auto arming = static_cast<std::uint8_t>(settled & ~other.armed);
@@ -315,10 +318,16 @@ public:
                             untracked |= arming;
                             continue;
                         }
+                        if (!faultSharedWrites()) {
+                            digesting |= arming;
+                            continue;
+                        }
                         const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
                         protectSubpages(alias, arming, protection, "arm shared memory write tracking");
                         other.armed |= arming;
                     }
+                    digesting &= static_cast<std::uint8_t>(~untracked);
+                    recordDigests(*view.page, base, static_cast<std::uint8_t>(digesting & ~view.page->digested));
                     const auto tracked = static_cast<std::uint8_t>(settled & ~untracked);
                     auto cleanFrom = cursor;
                     auto cleanTo = cursor;
@@ -327,6 +336,7 @@ public:
                         const auto from = std::max(cursor, base + sub * subpageBytes);
                         const auto to = std::min(settledEnd, base + (sub + 1) * subpageBytes);
                         if (from == base + sub * subpageBytes && to == base + (sub + 1) * subpageBytes) view.seen[sub] = view.page->generation[sub];
+                        if ((digesting & (1u << sub)) != 0) continue;
                         if (from != cleanTo) {
                             if (cleanFrom != cleanTo) rememberClean(cleanFrom, cleanTo);
                             cleanFrom = from;
@@ -388,6 +398,8 @@ private:
         }();
         std::vector<std::uintptr_t> aliases;
         std::uint32_t pins = 0;
+        std::array<std::uint64_t, subpages> digest{};
+        std::uint8_t digested = 0;
     };
     struct Section {
         HANDLE handle;
@@ -440,11 +452,53 @@ private:
     }
 
     void invalidate(SharedPage& page, std::uint8_t mask = allSubpages) {
+        page.digested &= static_cast<std::uint8_t>(~mask);
         for (std::size_t sub = 0; sub < subpages; ++sub) {
             if ((mask & (1u << sub)) == 0) continue;
             ++page.generation[sub];
             for (const auto alias : page.aliases) forgetClean(alias + sub * subpageBytes, alias + (sub + 1) * subpageBytes);
         }
+    }
+
+    static bool faultSharedWrites() {
+        static const bool faults = [] {
+            const char* value = std::getenv("APS5_SHARED_WRITE_FAULTS");
+            return value != nullptr && *value != '\0' && !(value[0] == '0' && value[1] == '\0');
+        }();
+        return faults;
+    }
+
+    static std::uint64_t subpageDigest(std::uintptr_t address) {
+        constexpr std::uint64_t multiplier = 0x9e3779b97f4a7c15ull;
+        const auto* words = reinterpret_cast<const volatile std::uint64_t*>(address);
+        std::uint64_t lanes[4] = {0x243f6a8885a308d3ull, 0x13198a2e03707344ull, 0xa4093822299f31d0ull, 0x082efa98ec4e6c89ull};
+        for (std::size_t word = 0; word < subpageBytes / sizeof(std::uint64_t); word += 4) {
+            lanes[0] = (lanes[0] ^ words[word]) * multiplier;
+            lanes[1] = (lanes[1] ^ words[word + 1]) * multiplier;
+            lanes[2] = (lanes[2] ^ words[word + 2]) * multiplier;
+            lanes[3] = (lanes[3] ^ words[word + 3]) * multiplier;
+        }
+        std::uint64_t combined = lanes[0];
+        for (std::size_t lane = 1; lane < 4; ++lane) combined = ((combined << 23) | (combined >> 41)) * multiplier ^ lanes[lane];
+        return combined;
+    }
+
+    static void recordDigests(SharedPage& page, std::uintptr_t base, std::uint8_t mask) {
+        for (std::size_t sub = 0; sub < subpages; ++sub) {
+            if ((mask & (1u << sub)) == 0) continue;
+            page.digest[sub] = subpageDigest(base + sub * subpageBytes);
+            page.digested |= static_cast<std::uint8_t>(1u << sub);
+        }
+    }
+
+    void verifyDigests(SharedPage& page, std::uintptr_t base, std::uint8_t mask) {
+        std::uint8_t changed = 0;
+        for (std::size_t sub = 0; sub < subpages; ++sub) {
+            const auto bit = static_cast<std::uint8_t>(1u << sub);
+            if ((mask & page.digested & bit) == 0) continue;
+            if (subpageDigest(base + sub * subpageBytes) != page.digest[sub]) changed |= bit;
+        }
+        if (changed != 0) invalidate(page, changed);
     }
 
     static std::uint8_t subpagesOf(std::uintptr_t base, std::uintptr_t address, std::uintptr_t end) {
