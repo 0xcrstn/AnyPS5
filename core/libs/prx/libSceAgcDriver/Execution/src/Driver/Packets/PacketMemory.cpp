@@ -113,7 +113,26 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
         const char* outcome = "drained (unresolved)";
-        if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
+        bool copiedAhead = false;
+        if (opcode == 0x50) {
+            if (const auto copy = Pm4::DecodeMemoryCopy(packet); copy.has_value() && copy->bytes <= gpuStoreLimit) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->StoresPendingOver(copy->source, copy->bytes)) {
+                    recordDeferredLabels(localDevice.get(), submission.queue);
+                    const auto copied = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+                    if (copied.path == 1 || copied.path == 3) {
+                        wroteOnGpu = true;
+                        drained = false;
+                        copiedAhead = true;
+                        ++copiesOnGpu;
+                        outcome = "copied on the GPU (source pending)";
+                    }
+                }
+            }
+        }
+        const auto store = copiedAhead ? std::nullopt : Pm4::ResolveStore(packet, queue, gpuStoreLimit);
+        if (store.has_value()) {
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
 

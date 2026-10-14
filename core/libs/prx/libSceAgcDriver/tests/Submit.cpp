@@ -552,6 +552,47 @@ void testSmallStoresIntoHostMemory() {
     GuestHeap::GuestHeapFree_nid_postfix(produced);
 }
 
+std::array<std::uint32_t, 7> copyToGds(std::uint32_t offset, const void* source, std::uint32_t bytes) {
+    const auto from = reinterpret_cast<std::uintptr_t>(source);
+    return {0xc0055000, 0x60100000, static_cast<std::uint32_t>(from), static_cast<std::uint32_t>(static_cast<std::uint64_t>(from) >> 32u), offset, 0, bytes};
+}
+
+std::array<std::uint32_t, 7> copyFromGds(const void* destination, std::uint32_t offset, std::uint32_t bytes) {
+    const auto to = reinterpret_cast<std::uintptr_t>(destination);
+    return {0xc0055000, 0x20000000, offset, 0, static_cast<std::uint32_t>(to), static_cast<std::uint32_t>(static_cast<std::uint64_t>(to) >> 32u), bytes};
+}
+
+void testGdsStoresWithoutDrain() {
+    constexpr std::size_t busyWords = 1024u * 1024u;
+    constexpr auto busyBytes = static_cast<std::uint32_t>(busyWords * 4);
+    auto* produced = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, busyBytes));
+    auto* busy = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, busyBytes));
+    for (std::size_t i = 0; i < busyWords; ++i) produced[i] = 0x6d000000u | static_cast<std::uint32_t>(i);
+    alignas(16) static std::array<std::uint32_t, 4> first{0x11u, 0x22u, 0x33u, 0x44u};
+    alignas(16) static std::array<std::uint32_t, 4> second{0x55u, 0x66u, 0x77u, 0x88u};
+    alignas(16) static std::array<std::uint32_t, 4> firstBack{}, secondBack{};
+    auto* gpuBack = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, 65536));
+    std::fill(gpuBack, gpuBack + 4, 0u);
+    alignas(64) static volatile std::uint32_t done = 0;
+    firstBack.fill(0);
+    secondBack.fill(0);
+    done = 0;
+    const auto drainedBefore = AgcDriver::DriverDetail::storesDrained.load();
+    const auto gpuCopiesBefore = AgcDriver::DriverDetail::copiesOnGpu.load();
+    submit(0, commands(memoryCopy(busy, produced, busyBytes), copyToGds(0x200, first.data(), 16), copyFromGds(firstBack.data(), 0x200, 16), memoryCopy(busy, produced, busyBytes), copyToGds(0x200, second.data(), 16), copyFromGds(gpuBack, 0x200, 16), copyFromGds(secondBack.data(), 0x200, 16), writeData(&done, 1)));
+    waitFor(&done, 1, "the label after DMA_DATA through the GDS never landed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(firstBack == first, "a DMA_DATA read of the GDS did not see the DMA_DATA store into it before");
+    check(secondBack == second, "a DMA_DATA read of the GDS did not see the latest DMA_DATA store into it");
+    check(std::equal(second.begin(), second.end(), gpuBack), "a DMA_DATA from the GDS into GPU memory did not see the DMA_DATA store into the GDS before it");
+    check(AgcDriver::DriverDetail::copiesOnGpu.load() > gpuCopiesBefore, "a DMA_DATA from the GDS into GPU memory behind a pending store was not copied on the GPU");
+    check(AgcDriver::DriverDetail::storesDrained.load() == drainedBefore, "a DMA_DATA through the GDS behind recorded work drained the device");
+    check(std::equal(busy, busy + busyWords, produced), "a GPU copy recorded around DMA_DATA through the GDS lost bytes");
+    GuestHeap::GuestHeapFree_nid_postfix(gpuBack);
+    GuestHeap::GuestHeapFree_nid_postfix(busy);
+    GuestHeap::GuestHeapFree_nid_postfix(produced);
+}
+
 void testShaderHeaderAlignment() {
     alignas(256) static const std::array<std::uint32_t, 64> code{0xbf810000};
     struct Header {
@@ -841,6 +882,7 @@ int main(int argc, char** argv) {
         testHeaderWithoutProgramAddress();
         testCopyIntoHostMemory();
         testSmallStoresIntoHostMemory();
+        testGdsStoresWithoutDrain();
         testRegisteredFloatMode();
         testReadOnlyResummarize();
         testWorkerFailure();
