@@ -114,7 +114,8 @@ std::optional<BufferReadAnalysis::Interval> BufferReadAnalysis::compute(const Ir
 void BufferReadAnalysis::Note(BufferReadRanges& ranges, const IrValue& inst, const MemoryInfo& memory) {
     const auto op = inst.Opcode();
     if (BufferAccessOf(op) != BufferAccess::Read || !ranges.bounded) return;
-    const auto extent = static_cast<std::uint64_t>(std::max((memory.dataBits + 7u) / 8u, 1u)) * std::max(memory.dataDwords, 1u);
+    const auto plainExtent = static_cast<std::uint64_t>(std::max((memory.dataBits + 7u) / 8u, 1u)) * std::max(memory.dataDwords, 1u);
+    const auto extent = memory.formatted ? std::max(plainExtent, FormattedElementBytes) : plainExtent;
     if (op == IrOpcode::ReadConstBuffer) {
         const auto offset = inst.ArgumentCount() == 2u ? Of(inst.Argument(1)) : std::nullopt;
         if (!offset || offset->high + memory.offset > Max32) {
@@ -125,8 +126,8 @@ void BufferReadAnalysis::Note(BufferReadRanges& ranges, const IrValue& inst, con
         return;
     }
     const bool plain = op == IrOpcode::LoadBufferU8 || op == IrOpcode::LoadBufferU16 || op == IrOpcode::LoadBufferU32 || op == IrOpcode::LoadBufferU32x2 || op == IrOpcode::LoadBufferU32x3 || op == IrOpcode::LoadBufferU32x4;
-    if (!plain || memory.formatted || inst.ArgumentCount() < 4u) {
-        ranges.Unbound(plain && memory.formatted ? BufferReadUnbound::Formatted : BufferReadUnbound::Opcode);
+    if (!plain || inst.ArgumentCount() < 4u) {
+        ranges.Unbound(BufferReadUnbound::Opcode);
         return;
     }
     const auto index = Of(inst.Argument(1)).value_or(Interval{0u, BufferReadRanges::AnyIndex});

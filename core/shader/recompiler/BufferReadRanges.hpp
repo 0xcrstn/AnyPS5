@@ -17,7 +17,9 @@ struct BufferReadRange {
     bool operator==(const BufferReadRange& other) const = default;
 };
 
-enum class BufferReadUnbound : std::uint8_t { None, Offset, Soffset, ScalarOffset, Wrap, Formatted, Opcode, Alias, Count };
+enum class BufferReadUnbound : std::uint8_t { None, Offset, Soffset, ScalarOffset, Wrap, Opcode, Alias, Count };
+
+inline constexpr std::uint64_t FormattedElementBytes = 16;
 
 struct BufferReadRanges {
     static constexpr std::size_t MaxRanges = 16;

@@ -115,7 +115,13 @@ void Unbounded() {
     auto memory = Memory(0u, 1u);
     memory.formatted = true;
     analysis.Note(formatted, fixture.Load(IrOpcode::LoadBufferU32, fixture.builder.Constant(0u), fixture.builder.Constant(0u), fixture.builder.Constant(0u)), memory);
-    Require(!formatted.bounded && formatted.unbound == BufferReadUnbound::Formatted, "a formatted load was given a range or another reason");
+    Require(Holds(formatted, 0u, 0u, 0u, FormattedElementBytes), "a formatted load at offset 0 does not read the 16 bytes of its largest element");
+    BufferReadRanges typedOffset;
+    auto typed = Memory(8u, 1u);
+    typed.formatted = true;
+    typed.typed = true;
+    analysis.Note(typedOffset, fixture.Load(IrOpcode::LoadBufferU32, fixture.builder.Emit(IrOpcode::UMin32, IrType::U32, {&fixture.Unknown(), &fixture.builder.Constant(3u)}), fixture.builder.Constant(32u), fixture.builder.Constant(0u)), typed);
+    Require(Holds(typedOffset, 0u, 3u, 40u, 56u), "a typed load at index min(x, 3) and offset 32 + 8 does not read records 0 to 3, bytes 40 to 56");
     BufferReadRanges sticky;
     analysis.Note(sticky, fixture.Scalar(fixture.Unknown()), Memory(0u, 1u));
     analysis.Note(sticky, fixture.Scalar(fixture.builder.Constant(0u)), Memory(0u, 1u));

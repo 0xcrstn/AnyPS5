@@ -2503,6 +2503,24 @@ void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
         for (std::size_t i = 0; i < bytes; ++i) data[i] = static_cast<std::uint8_t>(i * 7u + 3u);
     }
     {
+        const CompiledShader limited{ShaderRecompiler::ShaderStage::Compute, &limitedProgram, 0};
+        ShaderResources resources(snapshotContext, limited);
+        const auto movedElement = element + elementBytes;
+        ShaderResources::MovedBuffer moved{0, movedElement, elementBytes};
+        moved.readRanges = ShaderResources::GuestReadRanges(words(movedElement, 0u, elementBytes, 0x31000000u), &read, elementBytes, &moved.wholeCopy);
+        Require(moved.readRanges.has_value(), "the moved element's read ranges were not placed");
+        ShaderResources::DrawBindingsStatistics statistics;
+        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, std::span(&moved, 1), &statistics);
+        Require(bindings != nullptr && bindings->snapshots.size() == 1 && bindings->snapshots[0].address == movedElement, "a moved range-limited draw input was not snapshotted at its new address");
+        Require(statistics.limited == 1 && statistics.copiedBytes == 74, "the snapshot of a moved input read in two ranges did not copy only their 74 bytes");
+        const auto contents = bindings->snapshots[0].buffer->Bytes();
+        bool same = true;
+        for (std::size_t i = 64; i < 128; ++i) same = same && contents[i] == static_cast<std::byte>(static_cast<std::uint8_t>((4096 + elementBytes + i) * 7u + 3u));
+        for (std::size_t i = 9000; i < 9010; ++i) same = same && contents[i] == static_cast<std::byte>(static_cast<std::uint8_t>((4096 + elementBytes + i) * 7u + 3u));
+        Require(same, "a moved range-limited snapshot does not hold the guest bytes at the new address");
+        snapshotRecorder.Sync();
+    }
+    {
         const CompiledShader full{ShaderRecompiler::ShaderStage::Compute, &fullProgram, 0};
         ShaderResources resources(snapshotContext, full);
         ShaderResources::DrawBindingsStatistics statistics;

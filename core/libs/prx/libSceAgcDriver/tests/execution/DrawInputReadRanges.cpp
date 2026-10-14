@@ -55,8 +55,18 @@ constexpr std::array<std::array<float, 4>, 3> Triangle{{
 
 using Color = std::array<float, 4>;
 
-alignas(256) constexpr std::array<std::uint32_t, 10> PixelCode{
+alignas(256) constexpr std::array<std::uint32_t, 10> ScalarCode{
     0xf4280100u, 0xfa000100u, 0xbf8cc07fu, 0x7e000204u, 0x7e020205u, 0x7e040206u, 0x7e060207u, 0xf800180fu, 0x03020100u, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 6> FormattedCode{
+    0xe00c0100u, 0x80000000u, 0xbf8c3f70u, 0xf800180fu, 0x03020100u, 0xbf810000u,
+};
+
+struct PixelProgram {
+    std::span<const std::uint32_t> code;
+    std::uint32_t word3;
+    const char* name;
 };
 
 constexpr std::uint32_t ReadOffset = 0x100;
@@ -134,13 +144,13 @@ AgcDriver::Graphics::ColorTarget DecodeTarget(const Block& block, std::uint32_t 
     return color;
 }
 
-ShaderRecompiler::RecompileResult CompilePixel(AgcDriver::VulkanDevice& device, std::uint32_t vertexPush, std::span<const std::uint32_t> descriptor, const AgcDriver::Graphics::State& state) {
+ShaderRecompiler::RecompileResult CompilePixel(AgcDriver::VulkanDevice& device, std::uint32_t vertexPush, std::span<const std::uint32_t> descriptor, const AgcDriver::Graphics::State& state, std::span<const std::uint32_t> pixelCode) {
     const auto target = device.Target();
-    const auto codeAddress = reinterpret_cast<std::uintptr_t>(PixelCode.data());
+    const auto codeAddress = reinterpret_cast<std::uintptr_t>(pixelCode.data());
     const AgcDriver::Registers context{{0x1b6, 0x8000}, {0x1b3, 0}, {0x1b4, 0}, {0x203, 0}, {0x1c5, Float32Export}};
-    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{codeAddress, std::as_bytes(std::span(PixelCode))}}};
+    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{codeAddress, std::as_bytes(pixelCode)}}};
     ShaderRecompiler::RecompileRequest fragment{
-        {ShaderStage::Fragment, codeAddress, PixelCode, 0, {}},
+        {ShaderStage::Fragment, codeAddress, pixelCode, 0, {}},
         {64, 0, descriptor, std::nullopt, AgcDriver::Graphics::DecodePixelStageInfo(context, AgcDriver::Graphics::ExportMappings(state)), std::nullopt, pixelMemory},
         target,
         PixelPushLayout(vertexPush, target)
@@ -149,7 +159,7 @@ ShaderRecompiler::RecompileResult CompilePixel(AgcDriver::VulkanDevice& device, 
     return ShaderRecompiler::Recompile(fragment);
 }
 
-void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> descriptor, bool checkRanges) {
+void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> descriptor, const PixelProgram& program, bool checkRanges) {
     const auto target = device.Target();
     constexpr std::uint32_t waveSize = 64;
     std::vector<std::uint32_t> vertexUserData(4, 0u);
@@ -183,12 +193,12 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     state.blends = {blend};
     state.blend = blend;
     state.blendConstants = {};
-    const auto pixelResult = CompilePixel(device, vertexPush, descriptor, state);
+    const auto pixelResult = CompilePixel(device, vertexPush, descriptor, state, program.code);
     if (checkRanges) {
         const auto binding = std::find_if(pixelResult.bindings.begin(), pixelResult.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& candidate) { return candidate.role == ShaderRecompiler::DescriptorRole::GuestBuffers; });
         Require(binding != pixelResult.bindings.end() && binding->bufferReadRanges.size() == 1, "the pixel shader has no guest buffer binding with read ranges");
         const auto& ranges = binding->bufferReadRanges.front();
-        Require(ranges.bounded && ranges.ranges.size() == 1 && ranges.ranges.front() == ShaderRecompiler::BufferReadRange{0u, 0u, ReadOffset, ReadOffset + 16u}, "s_buffer_load_dwordx4 at offset 0x100 was not analysed as reading bytes 0x100 to 0x110");
+        Require(ranges.bounded && ranges.ranges.size() == 1 && ranges.ranges.front() == ShaderRecompiler::BufferReadRange{0u, 0u, ReadOffset, ReadOffset + 16u}, std::string(program.name) + " at offset 0x100 was not analysed as reading bytes 0x100 to 0x110");
     }
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
         {ShaderStage::Vertex, &vertexResult, 0},
@@ -228,18 +238,24 @@ void ReadRangeTests(AgcDriver::VulkanDevice& device, Block& target, Block& input
         {{0.375f, 10.0f, 21.0f, 1.0f}},
         {{-6.5f, 3.0f, 10.0f, 0.0f}},
     }};
-    const std::array<std::uint32_t, 4> descriptor{static_cast<std::uint32_t>(input.Address()), static_cast<std::uint32_t>((input.Address() >> 32u) & 0xffffu), InputBytes, 0x31016facu};
-    bool first = true;
-    for (const auto& expected : cases) {
-        auto* floats = reinterpret_cast<float*>(input.data);
-        for (std::size_t i = 0; i < InputBytes / 4u; ++i) floats[i] = 0.5f;
-        std::memcpy(input.data + ReadOffset, expected.data(), sizeof(expected));
-        Draw(device, color, descriptor, first);
-        first = false;
-        std::memset(input.data, 0, InputBytes);
-        char what[200];
-        std::snprintf(what, sizeof(what), "a pixel shader exporting the four dwords it loads at 0x100 of a 16 KiB buffer (%.9g, %.9g, %.9g, %.9g)", expected[0], expected[1], expected[2], expected[3]);
-        ExpectSurface(device, target, layout, expected[0], what);
+    const std::array<PixelProgram, 2> programs{{
+        {ScalarCode, 0x31016facu, "s_buffer_load_dwordx4"},
+        {FormattedCode, (0x31016facu & ~(0x7fu << 12u)) | (77u << 12u), "buffer_load_format_xyzw of a 32_32_32_32_FLOAT V#"},
+    }};
+    for (const auto& program : programs) {
+        const std::array<std::uint32_t, 4> descriptor{static_cast<std::uint32_t>(input.Address()), static_cast<std::uint32_t>((input.Address() >> 32u) & 0xffffu), InputBytes, program.word3};
+        bool first = true;
+        for (const auto& expected : cases) {
+            auto* floats = reinterpret_cast<float*>(input.data);
+            for (std::size_t i = 0; i < InputBytes / 4u; ++i) floats[i] = 0.5f;
+            std::memcpy(input.data + ReadOffset, expected.data(), sizeof(expected));
+            Draw(device, color, descriptor, program, first);
+            first = false;
+            std::memset(input.data, 0, InputBytes);
+            char what[200];
+            std::snprintf(what, sizeof(what), "a pixel shader exporting what %s loads at 0x100 of a 16 KiB buffer (%.9g, %.9g, %.9g, %.9g)", program.name, expected[0], expected[1], expected[2], expected[3]);
+            ExpectSurface(device, target, layout, expected[0], what);
+        }
     }
 }
 
