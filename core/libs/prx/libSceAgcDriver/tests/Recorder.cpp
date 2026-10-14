@@ -940,13 +940,24 @@ void keyProofTests(const Device& device, Recorder& recorder) {
     before = KeyProofCounts();
     Require(before.scanned == after.scanned + 1 && proof.keys == DccKeys::Clear0001, "(9) the CPU write did not make a scan");
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the new keys were not proved");
-    // A recorded write over the keys (noted and stamped as the driver's key stores are): the scans
-    // are not kept until its batch signaled.
+    // A recorded write over the keys (noted and stamped as the driver's key stores are): under the
+    // device lock the scan waits for its batch and is kept; without the lock the scans are not kept
+    // until its batch signaled.
     recorder.NotePendingWrite(address, keyCount);
     MarkWritten(address, keyCount);
     before = KeyProofCounts();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a scan under a pending write was kept");
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a second scan under a pending write was kept");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0 && !recorder.PendingWriteOverlaps(address, keyCount), "(9) a scan under the lock did not wait for the pending write");
+    after = KeyProofCounts();
+    Require(after.scanned == before.scanned + 1 && after.unstable == before.unstable && after.proved == before.proved, "(9) the waited scan was miscounted");
+    recorder.NotePendingWrite(address, keyCount);
+    MarkWritten(address, keyCount);
+    before = KeyProofCounts();
+    std::array<bool, 2> unlockedKept{true, true};
+    std::thread([&] {
+        for (auto& kept : unlockedKept) kept = ProvedClearKeys(resource, surfaceBytes, proof) != DccKeys::Clear0001 || proof.generation != 0;
+    }).join();
+    Require(!unlockedKept[0], "(9) a scan under a pending write was kept");
+    Require(!unlockedKept[1], "(9) a second scan under a pending write was kept");
     after = KeyProofCounts();
     Require(after.scanned == before.scanned + 2 && after.unstable == before.unstable + 2 && after.proved == before.proved, "(9) unstable scans were miscounted");
     recorder.Submit();
