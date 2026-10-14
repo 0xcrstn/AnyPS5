@@ -92,6 +92,7 @@ inline constexpr std::size_t HeaderBytes = 48;
 
 inline std::unique_ptr<CacheEntryRequest> ReadCacheEntry(std::span<const std::byte> file, bool graphics) {
     using namespace CacheEntryDetail;
+    if (file.size() < HeaderBytes) throw std::runtime_error("shader cache entry ends early");
     Bytes bytes(file);
     if (bytes.Read<std::uint32_t>() != FileMagic) throw std::runtime_error("not a shader cache entry");
     if (bytes.Read<std::uint32_t>() != ShaderRecompiler::ShaderDiskCache::FormatVersion) throw std::runtime_error("shader cache entry has another format version");
@@ -112,7 +113,10 @@ inline std::unique_ptr<CacheEntryRequest> ReadCacheEntry(std::span<const std::by
     request.layout.firstBinding = bytes.Read<std::uint32_t>();
     request.layout.pushConstantOffsetBytes = bytes.Read<std::uint32_t>();
     request.layout.pushConstantSizeBytes = bytes.Read<std::uint32_t>();
-    bytes.Seek(HeaderBytes + keyBytes);
+    const auto keyEnd = HeaderBytes + keyBytes;
+    const auto padding = (8u - keyEnd % 8u) % 8u;
+    if (padding > file.size() - keyEnd) throw std::runtime_error("shader cache entry ends early");
+    bytes.Seek(keyEnd + padding);
     bytes.Read<std::uint32_t>();
     entry->storedWords = bytes.Read<std::uint64_t>();
     for (std::size_t index = 0; index < entry->storedWords; ++index) entry->storedHash = (entry->storedHash ^ bytes.Read<std::uint32_t>()) * 0x100000001b3ull;
@@ -173,6 +177,7 @@ inline std::unique_ptr<CacheEntryRequest> ReadCacheEntry(std::span<const std::by
         info.orderedPixelShader = key.NextBool();
         info.alphaToCoverage = key.NextBool();
         info.stencilRefExportEnable = key.NextBool();
+        info.ditheredAlphaToCoverage = key.NextBool();
         for (auto& mode : info.targetOutputMode) mode = static_cast<std::uint8_t>(key.Next());
         for (std::uint8_t target = 0; target < info.targetExportMapping.size(); ++target) info.targetExportMapping[target] = target;
         request.context.pixel = info;

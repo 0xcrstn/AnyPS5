@@ -38,8 +38,9 @@ std::vector<std::byte> Entry(const RecompileRequest& request, std::size_t words)
     return ShaderDiskCache::EncodeEntry(key, variant);
 }
 
-void RoundTrip(bool partial, bool floatMode) {
-    const std::vector<std::uint32_t> code{0xbf800000u, 0xbf810000u};
+void RoundTrip(bool partial, bool floatMode, bool oddCodeWords) {
+    std::vector<std::uint32_t> code{0xbf800000u, 0xbf810000u};
+    if (oddCodeWords) code.insert(code.begin(), 0xbf800000u);
     const std::vector<std::uint32_t> userData(6u, 0u);
     RecompileRequest request{};
     request.shader = {ShaderStage::Compute, 0x40000, code, 0, {}};
@@ -110,6 +111,8 @@ void GraphicsStages() {
     for (std::uint8_t target = 0; target < pixelInfo.targetExportMapping.size(); ++target) pixelInfo.targetExportMapping[target] = target;
     pixel.context.pixel = pixelInfo;
     RoundTripGraphics(pixel);
+    pixel.context.pixel->ditheredAlphaToCoverage = true;
+    RoundTripGraphics(pixel);
     RecompileRequest vertex{};
     vertex.shader = {ShaderStage::Vertex, 0x40000, code, 0, {}};
     vertex.target = Target();
@@ -160,8 +163,10 @@ void Rejections() {
 
 int main() {
     try {
-        RoundTrip(false, false);
-        RoundTrip(true, true);
+        for (const auto oddCodeWords : {false, true}) {
+            RoundTrip(false, false, oddCodeWords);
+            RoundTrip(true, true, oddCodeWords);
+        }
         GraphicsStages();
         Rejections();
         std::printf("shader cache entry tests passed\n");
