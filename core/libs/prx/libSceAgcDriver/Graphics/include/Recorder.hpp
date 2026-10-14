@@ -825,6 +825,7 @@ private:
     std::unordered_map<std::uint64_t, UnwrittenSnapshot> unwrittenSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    void retireSnapshot(std::shared_ptr<void> object);
     struct IndexRange {
         std::uint64_t generation;
         std::uint64_t registryGeneration;

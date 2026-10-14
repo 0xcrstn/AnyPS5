@@ -2495,11 +2495,18 @@ std::size_t SnapshotPool(Recorder::SnapshotUse use) {
 }
 }
 
+void Recorder::retireSnapshot(std::shared_ptr<void> object) {
+    if (object == nullptr || open == nullptr || object.use_count() != 1) return;
+    open->kept.push_back(std::move(object));
+}
+
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
+    auto buffer = std::move(entry->second.buffer);
     drawSnapshots.erase(entry);
+    retireSnapshot(std::move(buffer));
 }
 
 std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp) {
@@ -2510,8 +2517,13 @@ std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, s
 
 void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer) {
     constexpr std::size_t Limit = 4096;
-    if (unwrittenSnapshots.size() >= Limit) unwrittenSnapshots.clear();
-    unwrittenSnapshots[address] = {bytes, stamp, std::move(buffer)};
+    if (unwrittenSnapshots.size() >= Limit) {
+        retireSnapshot(std::make_shared<std::unordered_map<std::uint64_t, UnwrittenSnapshot>>(std::move(unwrittenSnapshots)));
+        unwrittenSnapshots.clear();
+    }
+    auto& entry = unwrittenSnapshots[address];
+    retireSnapshot(std::move(entry.buffer));
+    entry = {bytes, stamp, std::move(buffer)};
 }
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
