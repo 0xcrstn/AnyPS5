@@ -5,6 +5,7 @@
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "IntermediateRepresentation/IrOpcode.hpp"
 #include "RdnaDecoder/RdnaInstruction.hpp"
+#include "BufferReadRanges.hpp"
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -26,6 +27,7 @@ struct BufferResource {
     std::uint32_t formattedReadMask = 0;
     bool scalar = false;
     std::uint8_t typedAlignment = 1;
+    BufferReadRanges readRanges;
 
     bool operator==(const BufferResource& other) const = default;
 };

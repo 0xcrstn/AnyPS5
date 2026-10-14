@@ -1402,6 +1402,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                         const bool atomic = element < binding.bufferAtomic.size() && binding.bufferAtomic[element];
                         const bool read = element < binding.bufferRead.size() && binding.bufferRead[element];
                         const auto index = addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic, read);
+                        if (!allocations[index].written && allocations[index].guest) allocations[index].readRanges = GuestReadRanges(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), element < binding.bufferReadRanges.size() ? &binding.bufferReadRanges[element] : nullptr, allocations[index].size);
                         const auto& push = shader.program->pushConstants;
                         if (!push.empty()) {
                             const auto position = shader.program->memoryOffsetDword * 4u + element;
@@ -3634,6 +3635,36 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     return static_cast<std::size_t>(mib * 1024ull * 1024ull);
 }
 
+namespace {
+bool PartialSnapshotsDisabled() {
+    static const bool disabled = std::getenv("APS5_NO_PARTIAL_DRAW_SNAPSHOTS") != nullptr;
+    return disabled;
+}
+}
+
+std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std::span<const std::uint32_t> words, const ShaderRecompiler::BufferReadRanges* ranges, std::uint64_t size) {
+    if (ranges == nullptr || !ranges->bounded || words.size() != 4) return std::nullopt;
+    const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+    const std::uint64_t stride = descriptor.Stride();
+    if ((stride != 0 && descriptor.SwizzleEnabled()) || descriptor.AddTid()) return std::nullopt;
+    ByteRanges result;
+    for (const auto& range : ranges->ranges) {
+        if (range.firstIndex > range.lastIndex || range.begin > range.end) return std::nullopt;
+        const auto begin = static_cast<std::uint64_t>(range.firstIndex) * stride + range.begin;
+        const auto end = static_cast<std::uint64_t>(range.lastIndex) * stride + range.end;
+        if (end > std::uint64_t{0xffffffff}) return std::nullopt;
+        if (begin >= size) continue;
+        result.emplace_back(begin, std::min(end, size));
+    }
+    std::sort(result.begin(), result.end());
+    ByteRanges merged;
+    for (const auto& range : result) {
+        if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+        else merged.push_back(range);
+    }
+    return merged;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindingsStatistics* statistics) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     auto lapStart = statistics != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3721,20 +3752,35 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             lap(&DrawBindingsStatistics::collectUs);
             buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
             lap(&DrawBindingsStatistics::lookupUs);
+            bool partial = false;
             if (buffer == nullptr) {
                 buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, BufferExtent::SizeClass);
                 lap(&DrawBindingsStatistics::bufferUs);
-                std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                std::uint64_t covered = 0;
+                if (override == moved.end() && item.readRanges.has_value() && !PartialSnapshotsDisabled()) {
+                    for (const auto& [from, to] : *item.readRanges) covered += to - from;
+                    partial = covered * 2 <= bytes;
+                }
+                if (partial) {
+                    const auto bytesOut = buffer->Bytes();
+                    for (const auto& [from, to] : *item.readRanges) std::memcpy(bytesOut.data() + item.adjustment + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
+                } else {
+                    std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                }
                 lap(&DrawBindingsStatistics::copyUs);
-                recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                if (!partial) recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
                 if (statistics != nullptr) {
                     ++statistics->copied;
-                    statistics->copiedBytes += bytes;
+                    statistics->copiedBytes += partial ? covered : bytes;
+                    if (partial) {
+                        ++statistics->limited;
+                        statistics->uncopiedBytes += bytes - covered;
+                    }
                 }
             } else if (statistics != nullptr) {
                 ++statistics->reused;
             }
-            if (generation != 0 && GuestMemory::TrackerGeneration() == stamp[0]) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer);
+            if (!partial && generation != 0 && GuestMemory::TrackerGeneration() == stamp[0]) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer);
             else stamped = false;
         }
         lap(&DrawBindingsStatistics::keepUs);

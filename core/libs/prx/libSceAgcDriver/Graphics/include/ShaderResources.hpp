@@ -158,6 +158,8 @@ public:
         std::uint64_t skipped = 0;
         std::uint64_t copiedBytes = 0;
         std::uint64_t descriptorWrites = 0;
+        std::uint64_t limited = 0;
+        std::uint64_t uncopiedBytes = 0;
         double checkUs = 0;
         double collectUs = 0;
         double lookupUs = 0;
@@ -170,6 +172,8 @@ public:
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsStatistics* statistics = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     static std::size_t MaxDrawSnapshotBytes();
+    using ByteRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    static std::optional<ByteRanges> GuestReadRanges(std::span<const std::uint32_t> words, const ShaderRecompiler::BufferReadRanges* ranges, std::uint64_t size);
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
@@ -307,6 +311,7 @@ private:
         std::int32_t pushByte = -1;
         std::int64_t dataAllocation = -1;
         std::uint32_t dataByte = 0;
+        std::optional<ByteRanges> readRanges;
     };
     struct DataPatch {
         std::size_t allocation;

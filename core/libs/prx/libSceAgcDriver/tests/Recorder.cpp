@@ -2654,6 +2654,120 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& context = device.GetContext();
+    const auto words = [](std::uint64_t address, std::uint32_t stride, std::uint32_t records, std::uint32_t word3) {
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu | (stride << 16u), records, word3};
+    };
+    ShaderRecompiler::BufferReadRanges strided;
+    strided.ranges = {{1u, 3u, 0u, 8u}, {0u, 0u, 200u, 260u}, {9u, 9u, 0u, 4u}};
+    const auto plain = ShaderResources::GuestReadRanges(words(0x10000, 16u, 16u, 0u), &strided, 256u);
+    Require(plain.has_value() && *plain == ShaderResources::ByteRanges{{16u, 56u}, {144u, 148u}, {200u, 256u}}, "strided read ranges were not placed by the descriptor stride, merged and clamped to the buffer");
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 16u, 1u << 23u), &strided, 256u).has_value(), "a descriptor that adds the thread id kept the read ranges");
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u | (1u << 15u), 16u, 0u), &strided, 256u).has_value(), "a swizzled descriptor kept the read ranges");
+    ShaderRecompiler::BufferReadRanges unbounded;
+    unbounded.Unbound();
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 0u, 256u, 0u), &unbounded, 256u).has_value() && !ShaderResources::GuestReadRanges(words(0x10000, 0u, 256u, 0u), nullptr, 256u).has_value(), "an unbounded or unanalysed element was given read ranges");
+    constexpr std::size_t bytes = 65536;
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: range-limited draw snapshots not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* data = static_cast<std::uint8_t*>(block);
+    for (std::size_t i = 0; i < bytes; ++i) data[i] = static_cast<std::uint8_t>(i * 7u + 3u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the watched block refused: range-limited draw snapshots not tested\n";
+        return;
+    }
+    const auto element = address + 4096;
+    constexpr std::uint32_t elementBytes = 16384;
+    const auto binding = [&](const ShaderRecompiler::BufferReadRanges* ranges) {
+        ShaderRecompiler::DescriptorBinding result;
+        result.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        result.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        result.descriptorSet = 0;
+        result.binding = 0;
+        result.count = 1;
+        const auto descriptor = words(element, 0u, elementBytes, 0x31000000u);
+        result.guestDescriptor.assign(descriptor.begin(), descriptor.end());
+        result.bufferWritten = {false};
+        result.bufferRead = {true};
+        if (ranges != nullptr) result.bufferReadRanges = {*ranges};
+        return result;
+    };
+    ShaderRecompiler::BufferReadRanges read;
+    read.ranges = {{0u, 0u, 64u, 128u}, {0u, 0u, 9000u, 9010u}};
+    ShaderRecompiler::RecompileResult limitedProgram;
+    limitedProgram.bindings.push_back(binding(&read));
+    ShaderRecompiler::RecompileResult fullProgram;
+    fullProgram.bindings.push_back(binding(&unbounded));
+    auto snapshotContext = context;
+    DescriptorCache cache(snapshotContext);
+    snapshotContext.descriptorCache = &cache;
+    Recorder snapshotRecorder(snapshotContext);
+    snapshotRecorder.Activate();
+    {
+        const CompiledShader limited{ShaderRecompiler::ShaderStage::Compute, &limitedProgram, 0};
+        ShaderResources resources(snapshotContext, limited);
+        ShaderResources::DrawBindingsStatistics statistics;
+        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, {}, &statistics);
+        Require(bindings != nullptr && bindings->snapshots.size() == 1 && bindings->snapshots[0].address == element, "a range-limited draw input was not snapshotted");
+        Require(statistics.limited == 1 && statistics.copiedBytes == 74 && statistics.uncopiedBytes == elementBytes - 74, "the snapshot of an input read in two ranges did not copy only their 74 bytes");
+        const auto snapshot = bindings->snapshots[0].buffer;
+        Require(snapshot->Bytes().size() == elementBytes, "a range-limited snapshot does not span the whole element");
+        Require(snapshotRecorder.ReusableDrawSnapshot(element, elementBytes) == nullptr, "a range-limited snapshot was kept for draws that may read other bytes");
+        std::memset(reinterpret_cast<void*>(element), 0xee, elementBytes);
+        auto downloaded = std::make_shared<Buffer>(snapshotContext, 74, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = snapshotRecorder.Commands();
+        RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const std::array<VkBufferCopy, 2> regions{VkBufferCopy{64, 0, 64}, VkBufferCopy{9000, 64, 10}};
+        snapshotContext.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, snapshot->Handle(), downloaded->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+        RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        snapshotRecorder.Sync();
+        const auto contents = downloaded->Bytes();
+        bool same = true;
+        for (std::size_t i = 0; i < 64; ++i) same = same && contents[i] == static_cast<std::byte>(static_cast<std::uint8_t>((4096 + 64 + i) * 7u + 3u));
+        for (std::size_t i = 0; i < 10; ++i) same = same && contents[64 + i] == static_cast<std::byte>(static_cast<std::uint8_t>((4096 + 9000 + i) * 7u + 3u));
+        Require(same, "the GPU did not read the guest bytes of the read ranges from a range-limited snapshot");
+        for (std::size_t i = 0; i < bytes; ++i) data[i] = static_cast<std::uint8_t>(i * 7u + 3u);
+    }
+    {
+        const CompiledShader full{ShaderRecompiler::ShaderStage::Compute, &fullProgram, 0};
+        ShaderResources resources(snapshotContext, full);
+        ShaderResources::DrawBindingsStatistics statistics;
+        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, {}, &statistics);
+        Require(bindings != nullptr && bindings->snapshots.size() == 1 && statistics.limited == 0 && statistics.copiedBytes == elementBytes, "an input read without bound was not copied whole");
+        const auto contents = bindings->snapshots[0].buffer->Bytes();
+        bool same = true;
+        for (std::size_t i = 0; i < elementBytes; ++i) same = same && contents[i] == static_cast<std::byte>(static_cast<std::uint8_t>((4096 + i) * 7u + 3u));
+        Require(same, "a whole snapshot does not hold the guest bytes");
+        snapshotRecorder.Sync();
+    }
+    recorder.Activate();
+}
+
 void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
     constexpr std::size_t bytes = 65536;
@@ -6916,6 +7030,11 @@ int main(int argc, char** argv) {
             std::cout << "CMASK copied clear, write-back and failure tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-ranges-only") {
+            drawSnapshotRangeTests(device, recorder);
+            std::cout << "Range-limited draw snapshot tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-inputs-in-place-only") {
             drawInputInPlaceTests(device, recorder);
             std::cout << "In-place draw input tests passed\n";
@@ -6979,6 +7098,7 @@ int main(int argc, char** argv) {
         drawSnapshotRetireTests(device);
         drawInputReuseTests(device, recorder);
         drawInputInPlaceTests(device, recorder);
+        drawSnapshotRangeTests(device, recorder);
         RunResidentPresentTests(device.GetContext());
         sliceDirtyTests(device, recorder);
         presentThenStoreTests(device, recorder);
