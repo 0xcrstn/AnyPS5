@@ -928,6 +928,10 @@ public:
         task();
     }
 
+    unsigned Threads() const {
+        return threads;
+    }
+
     void Prioritize(const PreparedShaders& prepared) {
         std::lock_guard lock(mutex);
         const auto found = std::ranges::find_if(tasks, [&](const auto& task) { return task.prepared == &prepared; });
@@ -1226,6 +1230,10 @@ void SubmitRegistrationPreparation(std::function<void()> task, const PreparedSha
 
 UserDataCalleePreparations CountUserDataCalleePreparations() {
     return {calleePreparationsAhead.load(std::memory_order_relaxed), calleePreparationsAtUse.load(std::memory_order_relaxed)};
+}
+
+unsigned RegistrationPreparationThreads() {
+    return RegistrationPreparePool::Instance().Threads();
 }
 
 void PrioritizeRegistrationPreparation(PreparedShaders& prepared) {

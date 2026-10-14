@@ -307,7 +307,7 @@ void TransactionLock() {
 }
 
 void PreparationPriority(bool beforeSubmit) {
-    const auto workers = std::max(2u, std::thread::hardware_concurrency() / 2u);
+    const auto workers = RegistrationPreparationThreads();
     std::barrier started(static_cast<std::ptrdiff_t>(workers + 1u));
     std::counting_semaphore<> release(0);
     std::latch finished(static_cast<std::ptrdiff_t>(workers));

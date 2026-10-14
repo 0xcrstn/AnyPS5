@@ -111,6 +111,7 @@ std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& re
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot);
 void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared = nullptr, bool behind = false);
 void PrioritizeRegistrationPreparation(PreparedShaders& prepared);
+unsigned RegistrationPreparationThreads();
 
 struct UserDataCalleePreparations {
     std::uint64_t ahead = 0;
