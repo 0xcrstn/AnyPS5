@@ -18,7 +18,8 @@ namespace ShaderRecompiler::Detail {
 std::vector<std::uint8_t> ComputePureFlatSlots(const IrResourcePlan& plan);
 std::vector<std::uint32_t> ComputeGuardedFlatSlots(const IrResourcePlan& plan);
 
-std::vector<const IrValue*> ComputeBaseOnlyReads(const IrResourcePlan& plan);
+enum class RawReadUse : std::uint8_t { Unseen, Leaf, BaseOnly, Carry, UnderArithmetic, HighWordOrOffset, Value };
+std::vector<std::pair<const IrValue*, RawReadUse>> ClassifyRawReads(const IrResourcePlan& plan);
 
 }
 

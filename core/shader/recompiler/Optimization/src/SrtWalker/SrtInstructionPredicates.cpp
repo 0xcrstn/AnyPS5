@@ -18,6 +18,39 @@ bool IsRawRead(const IrResourcePlan& program, const IrValue& inst) {
     return (op == IrOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) || (op == IrOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer);
 }
 
+const IrValue* LowBaseRead(const IrResourcePlan& program, IrValue* low) {
+    IrValue* value = low;
+    for (int depth = 0; value != nullptr && depth < 16; ++depth) {
+        value = value->Resolve();
+        if (value->HasImmediate()) return nullptr;
+        if (value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() >= 2 && value->Argument(1) != nullptr) {
+            const IrValue* slot = value->Argument(1)->Resolve();
+            if (!slot->HasImmediate() || slot->Type() != IrType::U32 || slot->ImmediateU32() >= program.srtReads.size() || program.srtReads[slot->ImmediateU32()].value == nullptr) return nullptr;
+            value = program.srtReads[slot->ImmediateU32()].value;
+            continue;
+        }
+        if (IsRawRead(program, *value)) return value;
+        if (value->Opcode() == IrOpcode::CompositeExtractU32x2 && value->ArgumentCount() >= 2 && value->Argument(0) != nullptr && value->Argument(1) != nullptr) {
+            const IrValue* index = value->Argument(1)->Resolve();
+            IrValue* source = value->Argument(0)->Resolve();
+            if (index->HasImmediate() && index->Type() == IrType::U32 && index->ImmediateU32() == 0u && source->Opcode() == IrOpcode::IAddCarry32 && source->ArgumentCount() >= 2 && source->Argument(0) != nullptr && source->Argument(1) != nullptr && source->Argument(1)->Resolve()->HasImmediate()) {
+                value = source->Argument(0);
+                continue;
+            }
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
+bool IsCarryOfBase(const IrResourcePlan& program, IrValue& value, const IrValue* base) {
+    if (base == nullptr || value.Opcode() != IrOpcode::CompositeExtractU32x2 || value.ArgumentCount() < 2 || value.Argument(0) == nullptr || value.Argument(1) == nullptr) return false;
+    const IrValue* index = value.Argument(1)->Resolve();
+    IrValue* source = value.Argument(0)->Resolve();
+    if (!index->HasImmediate() || index->Type() != IrType::U32 || index->ImmediateU32() != 1u || source->Opcode() != IrOpcode::IAddCarry32 || source->ArgumentCount() < 2 || source->Argument(0) == nullptr || source->Argument(1) == nullptr || !source->Argument(1)->Resolve()->HasImmediate()) return false;
+    return LowBaseRead(program, source->Argument(0)) == base;
+}
+
 bool LoadedFromMemory(const IrValue& handle) {
     std::vector<const IrValue*> pending;
     std::vector<const IrValue*> visited;

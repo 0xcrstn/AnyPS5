@@ -45,6 +45,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     stageCapture.dataLeaves = capture->readTrace.leaves;
     stageCapture.otherReads = capture->readTrace.otherReads;
     stageCapture.baseSlots = capture->baseSlots;
+    stageCapture.readUses = capture->readUses;
     recompiled[i] = true;
     memory = shaderMemory.Regions();
 
@@ -131,6 +132,8 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 diagnosis.leavesTagged += static_cast<std::uint64_t>(std::count_if(variant->dataSlots.begin(), variant->dataSlots.end(), [](std::uint32_t slot) { return slot != DispatchVariant::NoFlatBinding; }));
                 ++diagnosis.stagesTagged;
                 diagnosis.baseSlotsOffered += stageCapture.baseSlots.size();
+                tagWordUses(*variant, stageCapture.userDataUse, stageCapture.readUses);
+                for (const auto use : variant->wordUses) ++diagnosis.capturedByUse[use < DrawMissDiagnosis::ReadUses ? use : 0];
                 diagnosis.nestedTagged += variant->nestedBases.size();
                 diagnosis.nestedRuns += static_cast<std::uint64_t>(std::count_if(variant->runNested.begin(), variant->runNested.end(), [](std::int16_t nested) { return nested >= 0; }));
             }

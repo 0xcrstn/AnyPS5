@@ -50,6 +50,7 @@ struct DispatchVariant {
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
     std::vector<std::uint32_t> inputExports;
     std::vector<std::int16_t> runNested;
+    std::vector<std::uint8_t> wordUses;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> nestedBases;
 
     std::shared_ptr<ShaderMemory> memory;

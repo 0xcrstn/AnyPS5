@@ -131,6 +131,14 @@ void Driver::diagnoseValidationMiss(const DispatchVariant& variant, std::span<co
     std::size_t position = 0, differing = 0, firstRun = 0, firstPosition = 0;
     std::uint32_t before = 0, after = 0;
     std::uint64_t dataWords = 0, flatWords = 0, otherWords = 0;
+    std::array<std::uint64_t, DrawMissDiagnosis::ReadUses> byUse{};
+    static const auto dumpStages = [] { const char* text = std::getenv("APS5_TRACE_DRAW_MISS_WORDS"); return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull; }();
+    struct Differing {
+        std::size_t run, position;
+        std::uint64_t address;
+        std::uint32_t stored, live;
+    };
+    std::vector<Differing> listed;
     bool unreadable = false;
     const std::vector<std::uint32_t>* flat = nullptr;
     if (variant.compiled != nullptr) {
@@ -150,9 +158,14 @@ void Driver::diagnoseValidationMiss(const DispatchVariant& variant, std::span<co
             std::uint32_t stored = 0;
             std::memcpy(&stored, region.bytes.data() + word * sizeof(std::uint32_t), sizeof(stored));
             if (stored == live[word]) continue;
+            if (dumpStages != 0 && listed.size() < 64) listed.push_back({run, position + word, region.guestAddress + word * sizeof(std::uint32_t), stored, live[word]});
             if (std::binary_search(variant.dataPositions.begin(), variant.dataPositions.end(), static_cast<std::uint32_t>(position + word))) ++dataWords;
-            else if (flat != nullptr && std::find(flat->begin(), flat->end(), stored) != flat->end()) ++flatWords;
-            else ++otherWords;
+            else {
+                if (flat != nullptr && std::find(flat->begin(), flat->end(), stored) != flat->end()) ++flatWords;
+                else ++otherWords;
+                const auto use = position + word < variant.wordUses.size() ? variant.wordUses[position + word] : std::uint8_t {0};
+                ++byUse[use < DrawMissDiagnosis::ReadUses ? use : 0];
+            }
             if (differing++ == 0) {
                 firstRun = run;
                 firstPosition = position + word;
@@ -172,6 +185,21 @@ void Driver::diagnoseValidationMiss(const DispatchVariant& variant, std::span<co
     if (differing == 0) {
         ++diagnosis.validationNone;
         return;
+    }
+    for (std::size_t use = 0; use < byUse.size(); ++use) diagnosis.differingByUse[use] += byUse[use];
+    if (dumpStages != 0 && diagnosis.dumped < dumpStages && differing != 0) {
+        ++diagnosis.dumped;
+        static const char* const useNames[DrawMissDiagnosis::ReadUses] = {"unclassified", "leaf", "base-only", "carry-consumed", "under-arithmetic", "high-word-or-offset", "value", "?"};
+        AgcDriver::ProfilePrint_nid_no_patch("[draw-miss] stage of program 0x%llx differed in %zu words (%zu runs, %zu words, %zu data positions, %zu moving bases):\n", static_cast<unsigned long long>(variant.shader != nullptr ? variant.shader->codeAddress : 0), differing, variant.runs.size(), variant.words.size(), variant.dataPositions.size(), variant.nestedBases.size());
+        for (const auto& word : listed) {
+            const bool data = std::binary_search(variant.dataPositions.begin(), variant.dataPositions.end(), static_cast<std::uint32_t>(word.position));
+            const auto use = word.position < variant.wordUses.size() ? variant.wordUses[word.position] : std::uint8_t {0};
+            const auto userBase = word.run < variant.runBases.size() ? static_cast<int>(variant.runBases[word.run]) : -1;
+            const auto nested = word.run < variant.runNested.size() ? static_cast<int>(variant.runNested[word.run]) : -1;
+            std::size_t slot = flat != nullptr ? static_cast<std::size_t>(std::find(flat->begin(), flat->end(), word.stored) - flat->begin()) : 0;
+            const bool inFlat = flat != nullptr && slot < flat->size();
+            AgcDriver::ProfilePrint_nid_no_patch("[draw-miss]   run %zu word %zu at 0x%llx: 0x%08x -> 0x%08x, %s%s, run read through user word %d / moving base %d%s%zu, %s\n", word.run, word.position, static_cast<unsigned long long>(word.address), word.stored, word.live, useNames[use < DrawMissDiagnosis::ReadUses ? use : 7], data ? " (data position)" : "", userBase, nested, inFlat ? ", flat SRT slot " : ", in no flat SRT slot ", inFlat ? slot : std::size_t {0}, DrawMissDiagnosis::AddressLike(word.stored, word.live) ? "address-like" : "not address-like");
+        }
     }
     diagnosis.validationDataWords += dataWords;
     diagnosis.validationFlatWords += flatWords;
@@ -209,6 +237,9 @@ void Driver::reportDrawMisses() {
     diagnosis.donorSame = diagnosis.donorRecurring = diagnosis.donorFresh = diagnosis.donorOptionsTried = diagnosis.donorAlternateHits = 0;
     diagnosis.validationMisses = diagnosis.validationNone = diagnosis.validationUnreadable = diagnosis.validationRelocatedRun = diagnosis.validationAbsoluteRun = diagnosis.validationDataWord = diagnosis.validationAddressLike = diagnosis.validationOneWord = diagnosis.validationFewWords = diagnosis.validationManyWords = 0;
     diagnosis.validationRoles = {};
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-miss] differing non-data words by the walk's use of the read (10 s): unclassified %llu, leaf %llu, base-only %llu, carry consumed %llu, base under arithmetic %llu, high word or offset %llu, value %llu; captured words by use: unclassified %llu, leaf %llu, base-only %llu, carry consumed %llu, base under arithmetic %llu, high word or offset %llu, value %llu\n", count(diagnosis.differingByUse[0]), count(diagnosis.differingByUse[1]), count(diagnosis.differingByUse[2]), count(diagnosis.differingByUse[3]), count(diagnosis.differingByUse[4]), count(diagnosis.differingByUse[5]), count(diagnosis.differingByUse[6]), count(diagnosis.capturedByUse[0]), count(diagnosis.capturedByUse[1]), count(diagnosis.capturedByUse[2]), count(diagnosis.capturedByUse[3]), count(diagnosis.capturedByUse[4]), count(diagnosis.capturedByUse[5]), count(diagnosis.capturedByUse[6]));
+    diagnosis.differingByUse = {};
+    diagnosis.capturedByUse = {};
     AgcDriver::ProfilePrint_nid_no_patch("[draw-miss] differing words of those stages (10 s): %llu data positions, %llu other words found in the flattened SRT, %llu other words; %llu stages differed only in data positions; tagging: %llu stages captured, %llu pure flat-SRT leaves offered, %llu tagged as data, skipped: %llu outside the captured runs, %llu unlike the flattened SRT, %llu also read by the walk; %llu base-only slots offered, %llu followed as moving bases over %llu runs\n", count(diagnosis.validationDataWords), count(diagnosis.validationFlatWords), count(diagnosis.validationOtherWords), count(diagnosis.validationOnlyData), count(diagnosis.stagesTagged), count(diagnosis.leavesOffered), count(diagnosis.leavesTagged), count(diagnosis.leavesUnmapped), count(diagnosis.leavesMismatched), count(diagnosis.leavesAliased), count(diagnosis.baseSlotsOffered), count(diagnosis.nestedTagged), count(diagnosis.nestedRuns));
     diagnosis.validationDataWords = diagnosis.validationFlatWords = diagnosis.validationOtherWords = diagnosis.validationOnlyData = 0;
     diagnosis.stagesTagged = diagnosis.leavesOffered = diagnosis.leavesTagged = diagnosis.leavesUnmapped = diagnosis.leavesMismatched = diagnosis.leavesAliased = 0;

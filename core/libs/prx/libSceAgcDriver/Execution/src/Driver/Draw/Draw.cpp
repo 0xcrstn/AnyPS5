@@ -70,6 +70,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::uint64_t drawIdentity = 0;
     DrawAliasKeys drawAliases;
     std::vector<DrawUserPatch> userPatches;
+    bool exactEntry = false;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::shared_ptr<const DrawRelocation> relocation;
@@ -99,6 +100,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             drawSizing.Hit();
             entry = found->second;
             decode = entry->decode;
+            exactEntry = true;
         } else {
             drawSizing.Miss(drawKey, drawCache.size(), drawCacheVariantBytes);
             ++drawEntryCounters.absent;
@@ -450,7 +452,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
+    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes() && !exactEntry && !verifyDrawRecipe()) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        ++drawEntryCounters.recipesSkipped;
+    } else if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();

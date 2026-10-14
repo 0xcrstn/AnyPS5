@@ -63,6 +63,11 @@ alignas(256) constexpr std::array<std::uint32_t, 16> PointerPixelCode{
     0x7e040280u, 0x7e0602f2u, 0xf800080fu, 0x03020100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 16> OffsetPixelCode{
+    0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0x80029002u, 0x82038003u, 0xf4000101u, 0xfa000000u, 0xbf8cc07fu,
+    0x7e000204u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf800080fu, 0x03020100u, 0xbf810000u, 0xbf810000u,
+};
+
 alignas(16) std::array<std::uint32_t, 4> Nested{};
 alignas(16) std::array<std::uint32_t, 4> PointerTable{};
 alignas(16) std::array<std::array<float, 4>, 4> Vertices{{{-3.0f, -1.0f, 0.5f, 1.0f}, {1.0f, -1.0f, 0.5f, 1.0f}, {1.0f, 3.0f, 0.5f, 1.0f}, {1.0f, 3.0f, 0.5f, 1.0f}}};
@@ -84,6 +89,7 @@ alignas(8) Header BufferPixelHeader{};
 alignas(8) Header LoadPixelHeader{};
 alignas(8) Header NestedPixelHeader{};
 alignas(8) Header PointerPixelHeader{};
+alignas(8) Header OffsetPixelHeader{};
 
 std::byte* AllocateWatched(std::size_t bytes) {
 #ifdef _WIN32
@@ -312,6 +318,26 @@ void MovedDescriptorBlockHits(bool libraries) {
     Require(after.nestedMoved - before.nestedMoved >= 8, "the hits did not follow the moved descriptor block (" + std::to_string(after.nestedMoved - before.nestedMoved) + " stages followed it)" + mode);
 }
 
+void MovedBasePointerWithOffsetHits(bool libraries) {
+    const auto mode = std::string(libraries ? " with" : " without") + " graphics pipeline libraries";
+    SetVertexRecords(3);
+    static std::array<std::array<float, 8>, 12> blocks{};
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    std::vector<std::uint64_t> hits;
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        const bool half = i % 2 == 1;
+        blocks[i] = {0.25f, 0.25f, 0.25f, 0.25f, half ? 0.5f : 1.0f, 0.0f, 0.0f, 0.0f};
+        const auto address = reinterpret_cast<std::uintptr_t>(blocks[i].data());
+        PointerTable = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0u, 0u};
+        const auto counters = Draw(OffsetPixelCode.data(), PointerTable.data(), half ? 128 : 255, "a draw whose table points at block " + std::to_string(i) + " read at an offset" + mode);
+        hits.push_back(counters.hits);
+    }
+    const auto late = hits.back() - hits[hits.size() - 9];
+    Require(late == 8, "draws whose pointer is offset by scalar adds before the load hit " + std::to_string(late) + " of the last 8 times" + mode);
+    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(after.nestedMoved - before.nestedMoved >= 8, "the hits did not follow the offset base word (" + std::to_string(after.nestedMoved - before.nestedMoved) + " stages followed it)" + mode);
+}
+
 int main() {
     try {
         bool libraries = false;
@@ -326,11 +352,13 @@ int main() {
         Register(LoadPixelHeader, LoadPixelCode.data(), sizeof(LoadPixelCode), 1);
         Register(NestedPixelHeader, NestedPixelCode.data(), sizeof(NestedPixelCode), 1);
         Register(PointerPixelHeader, PointerPixelCode.data(), sizeof(PointerPixelCode), 1);
+        Register(OffsetPixelHeader, OffsetPixelCode.data(), sizeof(OffsetPixelCode), 1);
         FragmentReusedAfterFrontMiss(libraries);
         LoadedValueIsData(libraries);
         AlternatingNestedTablesHit(libraries);
         MovedBasePointerHits(libraries);
         MovedDescriptorBlockHits(libraries);
+        MovedBasePointerWithOffsetHits(libraries);
         AgcDriverShutdown_nid_postfix();
         std::cout << "Draw cache hits bound the current data " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
         return 0;

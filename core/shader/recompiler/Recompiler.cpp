@@ -1535,9 +1535,14 @@ void noteBufferBaseWords(ResourceCapture& capture) {
     }
 }
 
-std::shared_ptr<const std::vector<std::pair<const void*, std::uint32_t>>> baseOnlyReads(const std::shared_ptr<const IrResourcePlan>& plan) {
+struct ClassifiedRawReads {
+    std::unordered_map<const void*, std::uint8_t> uses;
+    std::vector<std::pair<const void*, std::uint32_t>> bases;
+};
+
+std::shared_ptr<const ClassifiedRawReads> classifiedRawReads(const std::shared_ptr<const IrResourcePlan>& plan) {
     static std::mutex mutex;
-    static std::unordered_map<const IrResourcePlan*, std::pair<std::weak_ptr<const IrResourcePlan>, std::shared_ptr<const std::vector<std::pair<const void*, std::uint32_t>>>>> memo;
+    static std::unordered_map<const IrResourcePlan*, std::pair<std::weak_ptr<const IrResourcePlan>, std::shared_ptr<const ClassifiedRawReads>>> memo;
     {
         std::lock_guard lock(mutex);
         if (const auto found = memo.find(plan.get()); found != memo.end() && found->second.first.lock() == plan) return found->second.second;
@@ -1546,12 +1551,14 @@ std::shared_ptr<const std::vector<std::pair<const void*, std::uint32_t>>> baseOn
     for (const auto& read : plan->srtReads) {
         if (read.value != nullptr) slots.emplace(read.value->Resolve(), read.flatOffset);
     }
-    std::vector<std::pair<const void*, std::uint32_t>> reads;
-    for (const auto* raw : Detail::ComputeBaseOnlyReads(*plan)) {
+    auto classified = std::make_shared<ClassifiedRawReads>();
+    for (const auto& [raw, use] : Detail::ClassifyRawReads(*plan)) {
+        classified->uses[raw] = static_cast<std::uint8_t>(use);
+        if (use != Detail::RawReadUse::BaseOnly) continue;
         const auto slot = slots.find(raw);
-        reads.emplace_back(raw, slot != slots.end() ? slot->second : NoBaseSlot);
+        classified->bases.emplace_back(raw, slot != slots.end() ? slot->second : NoBaseSlot);
     }
-    auto computed = std::make_shared<const std::vector<std::pair<const void*, std::uint32_t>>>(std::move(reads));
+    std::shared_ptr<const ClassifiedRawReads> computed = std::move(classified);
     std::lock_guard lock(mutex);
     if (memo.size() >= 65536) {
         for (auto it = memo.begin(); it != memo.end();) it = it->second.first.expired() ? memo.erase(it) : std::next(it);
@@ -1562,9 +1569,14 @@ std::shared_ptr<const std::vector<std::pair<const void*, std::uint32_t>>> baseOn
 
 void noteBaseSlots(ResourceCapture& capture) {
     if (capture.plan == nullptr) return;
-    const auto reads = baseOnlyReads(capture.plan);
+    const auto classified = classifiedRawReads(capture.plan);
     const auto& use = capture.userDataUse;
-    for (const auto& [inst, slot] : *reads) {
+    capture.readUses.resize(use.readInstructions.size(), 0u);
+    for (std::size_t read = 0; read < use.readInstructions.size(); ++read) {
+        const auto found = classified->uses.find(use.readInstructions[read]);
+        if (found != classified->uses.end()) capture.readUses[read] = found->second;
+    }
+    for (const auto& [inst, slot] : classified->bases) {
         std::optional<std::uint64_t> address;
         bool single = true;
         for (std::size_t read = 0; read < use.readInstructions.size() && read < use.reads.size(); ++read) {
