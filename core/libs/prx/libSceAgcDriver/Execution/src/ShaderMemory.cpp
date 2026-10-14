@@ -15,6 +15,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace AgcDriver {
@@ -63,6 +64,8 @@ struct MemoProfile {
     std::atomic<std::uint64_t> relocated{0};
     std::atomic<std::uint64_t> dataPatched{0};
     std::atomic<std::uint64_t> descriptorWords{0};
+    std::atomic<std::uint64_t> nestedBases{0};
+    std::array<std::atomic<std::uint64_t>, 8> roles{};
     std::atomic<std::uint64_t> warmWalks{0};
     std::atomic<std::uint64_t> warmNanoseconds{0};
     std::atomic<std::uint64_t> relocationRefused{0};
@@ -108,8 +111,110 @@ struct MemoEntry {
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
     std::vector<std::pair<std::uint64_t, std::int32_t>> origins;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> dataLeaves;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> baseWords;
+    std::vector<std::uint64_t> accessBases;
     bool dataLeavesBuilt = false;
 };
+
+void ClearDerived(MemoEntry& entry) {
+    entry.origins.clear();
+    entry.dataLeaves.clear();
+    entry.baseWords.clear();
+    entry.accessBases.clear();
+    entry.dataLeavesBuilt = false;
+}
+
+enum ReadRole : std::uint8_t { RoleDescriptor = 1, RoleCondition = 2, RoleUniform = 4, RoleAddress = 8, RoleFlat = 16, RoleBaseOnly = 32 };
+
+bool RawRead(const ShaderRecompiler::IrResourcePlan& plan, ShaderRecompiler::IrValue& value) {
+    const auto opcode = value.Opcode();
+    if (opcode != ShaderRecompiler::IrOpcode::LoadAddressU32 && opcode != ShaderRecompiler::IrOpcode::ReadConstBuffer) return false;
+    const auto index = value.Flags<ShaderRecompiler::MemoryFlags>().index;
+    if (index >= plan.memoryInfo.size()) return false;
+    const auto kind = plan.memoryInfo[index].kind;
+    return (opcode == ShaderRecompiler::IrOpcode::LoadAddressU32 && kind == ShaderRecompiler::ResourceKind::ScalarAddress) || (opcode == ShaderRecompiler::IrOpcode::ReadConstBuffer && kind == ShaderRecompiler::ResourceKind::ScalarBuffer);
+}
+
+std::unordered_map<const void*, std::uint8_t> ComputeReadRoles(const ShaderRecompiler::IrResourcePlan& plan) {
+    std::unordered_map<const void*, std::uint8_t> roles;
+    std::vector<ShaderRecompiler::IrValue*> raws;
+    std::unordered_set<const void*> rawSeen;
+    const auto mark = [&](ShaderRecompiler::IrValue* root, std::uint8_t role) {
+        if (root == nullptr) return;
+        std::vector<ShaderRecompiler::IrValue*> pending{root};
+        std::unordered_set<const void*> visited;
+        while (!pending.empty()) {
+            auto* value = pending.back()->Resolve();
+            pending.pop_back();
+            if (!visited.insert(value).second) continue;
+            if (value->Opcode() == ShaderRecompiler::IrOpcode::ReadConst && value->ArgumentCount() >= 2 && value->Argument(1) != nullptr) {
+                const auto* slot = value->Argument(1)->Resolve();
+                if (slot->HasImmediate() && slot->Type() == ShaderRecompiler::IrType::U32 && slot->ImmediateU32() < plan.srtReads.size() && plan.srtReads[slot->ImmediateU32()].value != nullptr) pending.push_back(plan.srtReads[slot->ImmediateU32()].value);
+                continue;
+            }
+            if (RawRead(plan, *value)) {
+                roles[value] |= role;
+                if (rawSeen.insert(value).second) raws.push_back(value);
+                continue;
+            }
+            for (std::size_t i = 0; i < value->ArgumentCount(); ++i) {
+                if (value->Argument(i) != nullptr) pending.push_back(value->Argument(i));
+            }
+        }
+    };
+    for (const auto& source : plan.descriptorSources) {
+        for (std::uint32_t i = 0; i < source.dwordCount && i < source.dwords.size(); ++i) mark(source.dwords[i], RoleDescriptor);
+    }
+    for (const auto& block : plan.controlFlow) mark(block.condition, RoleCondition);
+    if (plan.uniformFill.fill.kind != ShaderRecompiler::UniformFillKind::None) {
+        for (std::uint32_t i = 0; i < plan.uniformFill.fill.words && i < plan.uniformFill.values.size(); ++i) mark(plan.uniformFill.values[i], RoleUniform);
+    }
+    for (const auto& read : plan.srtReads) mark(read.value, RoleFlat);
+    for (std::size_t next = 0; next < raws.size(); ++next) {
+        auto* raw = raws[next];
+        auto* handle = raw->ArgumentCount() != 0 && raw->Argument(0) != nullptr ? raw->Argument(0)->Resolve() : nullptr;
+        if (handle != nullptr) {
+            for (std::size_t i = 0; i < handle->ArgumentCount(); ++i) {
+                if (handle->Argument(i) == nullptr) continue;
+                auto* argument = handle->Argument(i)->Resolve();
+                if (argument->Opcode() == ShaderRecompiler::IrOpcode::ReadConst && argument->ArgumentCount() >= 2 && argument->Argument(1) != nullptr) {
+                    const auto* slot = argument->Argument(1)->Resolve();
+                    if (slot->HasImmediate() && slot->Type() == ShaderRecompiler::IrType::U32 && slot->ImmediateU32() < plan.srtReads.size() && plan.srtReads[slot->ImmediateU32()].value != nullptr) argument = plan.srtReads[slot->ImmediateU32()].value->Resolve();
+                }
+                if (i == 0 && RawRead(plan, *argument)) {
+                    roles[argument] |= RoleBaseOnly;
+                    if (rawSeen.insert(argument).second) raws.push_back(argument);
+                    continue;
+                }
+                mark(argument, RoleAddress);
+            }
+        }
+        for (std::size_t i = 1; i < raw->ArgumentCount(); ++i) mark(raw->Argument(i), RoleAddress);
+    }
+    return roles;
+}
+
+std::uint8_t ReadRoles(const ShaderRecompiler::ResourceCapture& capture, std::uint64_t address) {
+    struct RoleCache {
+        std::unordered_map<const ShaderRecompiler::IrResourcePlan*, std::pair<std::weak_ptr<const ShaderRecompiler::IrResourcePlan>, std::unordered_map<const void*, std::uint8_t>>> plans;
+    };
+    struct RoleCacheStorage {};
+    auto& cache = HostThreadLocal<RoleCache, RoleCacheStorage>();
+    auto found = cache.plans.find(capture.plan.get());
+    if (found == cache.plans.end() || found->second.first.lock() != capture.plan) {
+        if (cache.plans.size() >= 512) cache.plans.clear();
+        found = cache.plans.insert_or_assign(capture.plan.get(), std::pair(std::weak_ptr<const ShaderRecompiler::IrResourcePlan>(capture.plan), ComputeReadRoles(*capture.plan))).first;
+    }
+    const auto& roles = found->second.second;
+    const auto& use = capture.userDataUse;
+    std::uint8_t result = 0;
+    for (std::size_t read = 0; read < use.reads.size() && read < use.readInstructions.size(); ++read) {
+        if (use.reads[read].first != address) continue;
+        const auto role = roles.find(use.readInstructions[read]);
+        result |= role != roles.end() ? role->second : std::uint8_t{0x80};
+    }
+    return result;
+}
 
 bool FeedsDescriptorDirectly(const ShaderRecompiler::ResourceCapture& capture, std::uint64_t address) {
     const auto& use = capture.userDataUse;
@@ -145,6 +250,41 @@ const std::vector<std::pair<std::uint64_t, std::uint32_t>>& DataLeaves(MemoEntry
         entry.dataLeaves.emplace_back(address, slot);
     }
     std::sort(entry.dataLeaves.begin(), entry.dataLeaves.end());
+    const auto& use = entry.capture->userDataUse;
+    if (use.readBases.size() != use.reads.size() || use.readInstructions.size() != use.reads.size()) return entry.dataLeaves;
+    for (const auto& [flatOffset, address] : entry.capture->baseSlots) {
+        if (flatOffset >= entry.capture->snapshot.flattenedSrt.size()) continue;
+        const void* instruction = nullptr;
+        for (const auto& read : plan.srtReads) {
+            if (read.flatOffset == flatOffset && read.value != nullptr) instruction = read.value->Resolve();
+        }
+        bool only = instruction != nullptr;
+        for (std::size_t read = 0; only && read < use.reads.size(); ++read) {
+            if (use.reads[read].first == address && use.readInstructions[read] != instruction) only = false;
+        }
+        if (only) entry.baseWords.emplace_back(address, flatOffset);
+    }
+    std::sort(entry.baseWords.begin(), entry.baseWords.end());
+    if (entry.baseWords.empty()) return entry.dataLeaves;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> bases;
+    bases.reserve(use.reads.size());
+    for (std::size_t read = 0; read < use.reads.size(); ++read) bases.emplace_back(use.reads[read].first, use.readBases[read]);
+    std::sort(bases.begin(), bases.end());
+    entry.accessBases.reserve(entry.accesses.size());
+    for (const auto& access : entry.accesses) {
+        auto first = std::lower_bound(bases.begin(), bases.end(), std::pair<std::uint64_t, std::uint64_t>{access.address, 0});
+        std::uint64_t base = 0;
+        bool seen = false;
+        for (; first != bases.end() && first->first == access.address; ++first) {
+            if (seen && first->second != base) {
+                base = ~std::uint64_t{0};
+                break;
+            }
+            base = first->second;
+            seen = true;
+        }
+        entry.accessBases.push_back(base);
+    }
     return entry.dataLeaves;
 }
 
@@ -178,7 +318,12 @@ bool WordRead(const ShaderRecompiler::SrtUserDataUse& use, std::size_t word) {
     return AllWordsRead(use) || (word < ShaderRecompiler::SrtUserDataUse::TrackedWords && (((use.asBase | use.asValue) >> word) & 1u) != 0u);
 }
 
-enum class MemoMatch { Other, Exact, UnreadWords, PointerWords, ValueWords, DataWords };
+enum class MemoMatch { Other, Exact, UnreadWords, PointerWords, ValueWords, DataWords, NestedBases };
+
+ShaderMemory::ReplayResult& scratchReplay() {
+    struct ReplayStorage {};
+    return HostThreadLocal<ShaderMemory::ReplayResult, ReplayStorage>();
+}
 
 std::vector<std::pair<std::size_t, std::uint32_t>>& scratchChanged() {
     struct ChangedStorage {};
@@ -259,6 +404,17 @@ bool RelocatedAddress(std::span<const std::pair<std::uint64_t, std::int32_t>> or
     return true;
 }
 
+void RewriteGuardTail(ShaderRecompiler::ResourceCapture& capture) {
+    auto& flattened = capture.snapshot.flattenedSrt;
+    const auto& poison = capture.snapshot.srtPoison;
+    if (poison.empty() || flattened.size() < poison.size() * 3u) return;
+    const auto first = flattened.size() - poison.size() * 3u;
+    for (std::size_t record = 0; record < poison.size(); ++record) {
+        flattened[first + record * 3u + 1u] = static_cast<std::uint32_t>(poison[record].address);
+        flattened[first + record * 3u + 2u] = static_cast<std::uint32_t>(poison[record].address >> 32u);
+    }
+}
+
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> RelocatedCapture(const MemoEntry& entry, std::span<const std::uint32_t> userData, const Relocation& relocation) {
     auto capture = std::make_shared<ShaderRecompiler::ResourceCapture>(*entry.capture);
     std::copy_n(userData.begin(), capture->snapshot.userData.size(), capture->snapshot.userData.begin());
@@ -286,6 +442,66 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> RelocatedCapture(const 
     for (auto& poison : capture->snapshot.srtPoison) {
         if (!move(poison.address)) return nullptr;
     }
+    for (auto& base : capture->userDataUse.readBases) {
+        if (base != 0 && !move(base)) return nullptr;
+    }
+    for (auto& [slot, address] : capture->baseSlots) {
+        if (!move(address)) return nullptr;
+    }
+    RewriteGuardTail(*capture);
+    return capture;
+}
+
+std::shared_ptr<const ShaderRecompiler::ResourceCapture> FollowedCapture(const MemoEntry& entry, std::span<const std::uint32_t> userData, const ShaderMemory::ReplayResult& result) {
+    auto capture = std::make_shared<ShaderRecompiler::ResourceCapture>(*entry.capture);
+    std::copy_n(userData.begin(), capture->snapshot.userData.size(), capture->snapshot.userData.begin());
+    const auto patch = [&](std::span<const std::pair<std::uint64_t, std::uint32_t>> list, std::uint64_t address, std::uint32_t word) {
+        auto first = std::lower_bound(list.begin(), list.end(), std::pair<std::uint64_t, std::uint32_t>{address, 0u});
+        for (; first != list.end() && first->first == address; ++first) {
+            if (first->second < capture->snapshot.flattenedSrt.size()) capture->snapshot.flattenedSrt[first->second] = word;
+        }
+    };
+    for (const auto& [index, word] : result.changed) {
+        const auto address = entry.accesses[index].address;
+        patch(entry.dataLeaves, address, word);
+        patch(entry.baseWords, address, word);
+    }
+    if (result.moved.empty()) return capture;
+    if (result.addresses.size() != entry.accesses.size()) return nullptr;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> map;
+    map.reserve(entry.accesses.size());
+    for (std::size_t index = 0; index < entry.accesses.size(); ++index) map.emplace_back(entry.accesses[index].address, result.addresses[index]);
+    std::sort(map.begin(), map.end());
+    map.erase(std::unique(map.begin(), map.end()), map.end());
+    for (std::size_t index = 1; index < map.size(); ++index) {
+        if (map[index].first == map[index - 1].first) return nullptr;
+    }
+    bool consistent = true;
+    const auto move = [&](std::uint64_t& address) {
+        const auto found = std::lower_bound(map.begin(), map.end(), std::pair<std::uint64_t, std::uint64_t>{address, 0});
+        if (found != map.end() && found->first == address) {
+            address = found->second;
+            return;
+        }
+        const auto& use = entry.capture->userDataUse;
+        for (std::size_t read = 0; read < use.reads.size() && read < use.readBases.size(); ++read) {
+            if (use.reads[read].first != address || use.readBases[read] == 0) continue;
+            if (std::any_of(result.moved.begin(), result.moved.end(), [&](const std::pair<std::uint64_t, std::int64_t>& moved) { return moved.first == use.readBases[read]; })) consistent = false;
+        }
+    };
+    for (auto& [address, origin] : capture->userDataUse.reads) move(address);
+    for (auto& base : capture->userDataUse.readBases) {
+        if (base != 0) move(base);
+    }
+    for (auto& [slot, address] : capture->readTrace.leaves) move(address);
+    for (auto& address : capture->readTrace.otherReads) move(address);
+    std::sort(capture->readTrace.otherReads.begin(), capture->readTrace.otherReads.end());
+    capture->readTrace.otherReads.erase(std::unique(capture->readTrace.otherReads.begin(), capture->readTrace.otherReads.end()), capture->readTrace.otherReads.end());
+    for (auto& word : capture->bufferBaseWords) move(word.address);
+    for (auto& poison : capture->snapshot.srtPoison) move(poison.address);
+    for (auto& [slot, address] : capture->baseSlots) move(address);
+    if (!consistent) return nullptr;
+    RewriteGuardTail(*capture);
     return capture;
 }
 
@@ -307,6 +523,9 @@ void ReportMemo() {
     const auto relocated = take(memo.relocated);
     const auto dataPatched = take(memo.dataPatched);
     const auto descriptorWords = take(memo.descriptorWords);
+    const auto nestedBases = take(memo.nestedBases);
+    std::array<std::uint64_t, 8> roles{};
+    for (std::size_t bit = 0; bit < roles.size(); ++bit) roles[bit] = take(memo.roles[bit]);
     const auto warmWalks = take(memo.warmWalks);
     const auto warmNs = take(memo.warmNanoseconds);
     const auto relocationRefused = take(memo.relocationRefused);
@@ -325,9 +544,9 @@ void ReportMemo() {
     const auto values = take(memo.values);
     const auto laneEvaluators = take(memo.laneEvaluators);
     const auto phis = take(memo.phis);
-    const auto served = hits + patched + relocated + dataPatched;
+    const auto served = hits + patched + relocated + dataPatched + nestedBases;
     const auto misses = total > served ? total - served : 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[capture-memo] (10 s) %llu prepared captures: %llu served from the memo (%llu with unread user words patched, %llu relocated to moved pointer words, %llu with changed pure SRT data words patched; %.1f words replayed each, %.1f us each); %llu walked (%.1f us each: SRT evaluation %.1f with page setup %.1f and page reads %.1f inside; %.1f word reads, %.2f new pages, %.1f values evaluated, %.2f lane evaluators, %.1f phis each; %llu walks of the plan this thread walked last at %.1f us each), because: no entry %llu, read user words differ %llu (only pointer words %llu, %llu of them not relocatable), guest words differ %llu (first differing word a whole descriptor dword %llu)\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(served), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(relocated), static_cast<unsigned long long>(dataPatched), Per(replayed, served), Per(hitNs, served) / 1e3, static_cast<unsigned long long>(misses), Per(missNs, misses) / 1e3, Per(evaluationNs, misses) / 1e3, Per(setupNs, misses) / 1e3, Per(pageNs, misses) / 1e3, Per(reads, misses), Per(pages, misses), Per(values, misses), Per(laneEvaluators, misses), Per(phis, misses), static_cast<unsigned long long>(warmWalks), Per(warmNs, warmWalks) / 1e3, static_cast<unsigned long long>(absent), static_cast<unsigned long long>(valueWords + pointerWords), static_cast<unsigned long long>(pointerWords), static_cast<unsigned long long>(relocationRefused), static_cast<unsigned long long>(memory), static_cast<unsigned long long>(descriptorWords));
+    AgcDriver::ProfilePrint_nid_no_patch("[capture-memo] (10 s) %llu prepared captures: %llu served from the memo (%llu with unread user words patched, %llu relocated to moved pointer words, %llu with changed pure SRT data words patched, %llu following moved base words read from guest memory; %.1f words replayed each, %.1f us each); %llu walked (%.1f us each: SRT evaluation %.1f with page setup %.1f and page reads %.1f inside; %.1f word reads, %.2f new pages, %.1f values evaluated, %.2f lane evaluators, %.1f phis each; %llu walks of the plan this thread walked last at %.1f us each), because: no entry %llu, read user words differ %llu (only pointer words %llu, %llu of them not relocatable), guest words differ %llu (first differing word a whole descriptor dword %llu; its roles: descriptor %llu, branch condition %llu, uniform fill %llu, address or offset %llu, flat SRT data %llu, low base word of reads %llu, probe %llu, untraced %llu)\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(served), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(relocated), static_cast<unsigned long long>(dataPatched), static_cast<unsigned long long>(nestedBases), Per(replayed, served), Per(hitNs, served) / 1e3, static_cast<unsigned long long>(misses), Per(missNs, misses) / 1e3, Per(evaluationNs, misses) / 1e3, Per(setupNs, misses) / 1e3, Per(pageNs, misses) / 1e3, Per(reads, misses), Per(pages, misses), Per(values, misses), Per(laneEvaluators, misses), Per(phis, misses), static_cast<unsigned long long>(warmWalks), Per(warmNs, warmWalks) / 1e3, static_cast<unsigned long long>(absent), static_cast<unsigned long long>(valueWords + pointerWords), static_cast<unsigned long long>(pointerWords), static_cast<unsigned long long>(relocationRefused), static_cast<unsigned long long>(memory), static_cast<unsigned long long>(descriptorWords), static_cast<unsigned long long>(roles[0]), static_cast<unsigned long long>(roles[1]), static_cast<unsigned long long>(roles[2]), static_cast<unsigned long long>(roles[3]), static_cast<unsigned long long>(roles[4]), static_cast<unsigned long long>(roles[5]), static_cast<unsigned long long>(roles[6]), static_cast<unsigned long long>(roles[7]));
 }
 
 constexpr std::uint64_t WordWaitNanoseconds = 50000;
@@ -542,23 +761,50 @@ std::uint64_t ShaderMemory::MemoizedCaptures() {
     return memoizedCaptures.load(std::memory_order_relaxed);
 }
 
-bool ShaderMemory::replay(std::span<const RecordedAccess> accesses, std::span<const std::pair<std::uint64_t, std::uint32_t>> dataLeaves, std::vector<std::pair<std::size_t, std::uint32_t>>* changed, std::uint64_t* mismatch) {
+bool ShaderMemory::replay(std::span<const RecordedAccess> accesses, const ReplayPlan* plan, ReplayResult* result) {
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
+    const auto listed = [](std::span<const std::pair<std::uint64_t, std::uint32_t>> list, std::uint64_t address) {
+        const auto found = std::lower_bound(list.begin(), list.end(), address, [](const std::pair<std::uint64_t, std::uint32_t>& entry, std::uint64_t value) { return entry.first < value; });
+        return found != list.end() && found->first == address;
+    };
+    if (result != nullptr) {
+        result->changed.clear();
+        result->moved.clear();
+        result->addresses.clear();
+        result->mismatch = 0;
+    }
     for (std::size_t index = 0; index < accesses.size(); ++index) {
         const auto& access = accesses[index];
+        auto address = access.address;
+        if (plan != nullptr && result != nullptr && !result->moved.empty() && index < plan->accessBases.size() && plan->accessBases[index] != 0) {
+            const auto base = plan->accessBases[index];
+            if (base == ~std::uint64_t{0}) return false;
+            const auto moved = std::find_if(result->moved.begin(), result->moved.end(), [base](const std::pair<std::uint64_t, std::int64_t>& entry) { return entry.first == base; });
+            if (moved != result->moved.end()) {
+                const auto delta = moved->second;
+                if (delta < 0 ? address < static_cast<std::uint64_t>(-delta) : address > GuestAddressMask - static_cast<std::uint64_t>(delta)) return false;
+                address += static_cast<std::uint64_t>(delta);
+            }
+        }
+        if (result != nullptr) result->addresses.push_back(address);
         if (access.bytes == 0) {
             std::uint32_t word = 0;
-            if (!read(this, access.address, &word)) return false;
+            if (!read(this, address, &word)) return false;
             if (word == access.value) continue;
-            const auto leaf = std::lower_bound(dataLeaves.begin(), dataLeaves.end(), access.address, [](const std::pair<std::uint64_t, std::uint32_t>& entry, std::uint64_t address) { return entry.first < address; });
-            if (changed == nullptr || leaf == dataLeaves.end() || leaf->first != access.address) {
-                if (mismatch != nullptr) *mismatch = access.address;
-                return false;
+            if (plan == nullptr || result == nullptr) return false;
+            if (listed(plan->dataLeaves, access.address)) {
+                result->changed.emplace_back(index, word);
+                continue;
             }
-            changed->emplace_back(index, word);
-            continue;
+            if (listed(plan->baseWords, access.address) && access.value != 0u && word != 0u) {
+                result->moved.emplace_back(access.address, static_cast<std::int64_t>(word & ~3u) - static_cast<std::int64_t>(access.value & ~3u));
+                result->changed.emplace_back(index, word);
+                continue;
+            }
+            result->mismatch = access.address;
+            return false;
         }
-        if (probe(access.address, access.bytes == ~std::uint64_t{0} ? 0 : access.bytes) != (access.value != 0u)) return false;
+        if (probe(address, access.bytes == ~std::uint64_t{0} ? 0 : access.bytes) != (access.value != 0u)) return false;
     }
     return true;
 }
@@ -595,7 +841,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
         memoizedCaptures.fetch_add(1, std::memory_order_relaxed);
         if (profile) {
             ++memo.total;
-            ++(match == MemoMatch::Exact ? memo.hits : match == MemoMatch::UnreadWords ? memo.patched : match == MemoMatch::DataWords ? memo.dataPatched : memo.relocated);
+            ++(match == MemoMatch::Exact ? memo.hits : match == MemoMatch::UnreadWords ? memo.patched : match == MemoMatch::DataWords ? memo.dataPatched : match == MemoMatch::NestedBases ? memo.nestedBases : memo.relocated);
             memo.replayed += replayed;
             memo.hitNanoseconds += NanosecondsSince(started);
             ReportMemo();
@@ -606,31 +852,39 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
         if (entry.handle != handle) continue;
         const auto match = MatchUserData(entry, shaderBase, userData);
         if (match == MemoMatch::Exact || match == MemoMatch::UnreadWords) {
-            auto& changed = scratchChanged();
-            changed.clear();
-            std::uint64_t mismatch = 0;
-            if (!replay(entry.accesses, DataLeaves(entry), &changed, &mismatch)) {
+            auto& result = scratchReplay();
+            DataLeaves(entry);
+            const ReplayPlan plan{entry.dataLeaves, entry.baseWords, entry.accessBases};
+            if (!replay(entry.accesses, &plan, &result)) {
                 if (slot == nullptr) slot = &entry;
                 if (profile) {
                     ++memo.memory;
-                    if (mismatch != 0 && FeedsDescriptorDirectly(*entry.capture, mismatch)) ++memo.descriptorWords;
+                    if (result.mismatch != 0 && FeedsDescriptorDirectly(*entry.capture, result.mismatch)) ++memo.descriptorWords;
+                    const auto roles = result.mismatch != 0 ? ReadRoles(*entry.capture, result.mismatch) : std::uint8_t{0x40};
+                    for (std::size_t bit = 0; bit < memo.roles.size(); ++bit) {
+                        if ((roles >> bit) & 1u) ++memo.roles[bit];
+                    }
                 }
                 reason = MemoMatch::Exact;
                 continue;
             }
-            if (match == MemoMatch::UnreadWords || !changed.empty()) {
-                auto patched = std::make_shared<ShaderRecompiler::ResourceCapture>(*entry.capture);
-                std::copy_n(userData.begin(), patched->snapshot.userData.size(), patched->snapshot.userData.begin());
-                for (const auto& [index, word] : changed) {
-                    auto& access = entry.accesses[index];
-                    access.value = word;
-                    const auto first = std::lower_bound(entry.dataLeaves.begin(), entry.dataLeaves.end(), std::pair<std::uint64_t, std::uint32_t>{access.address, 0u});
-                    for (auto leaf = first; leaf != entry.dataLeaves.end() && leaf->first == access.address; ++leaf) patched->snapshot.flattenedSrt[leaf->second] = word;
+            if (match == MemoMatch::UnreadWords || !result.changed.empty()) {
+                auto patched = FollowedCapture(entry, userData, result);
+                if (patched == nullptr) {
+                    if (slot == nullptr) slot = &entry;
+                    if (profile) ++memo.memory;
+                    reason = MemoMatch::Exact;
+                    continue;
+                }
+                for (const auto& [index, word] : result.changed) entry.accesses[index].value = word;
+                if (!result.moved.empty()) {
+                    for (std::size_t index = 0; index < entry.accesses.size(); ++index) entry.accesses[index].address = result.addresses[index];
+                    ClearDerived(entry);
                 }
                 entry.capture = std::move(patched);
                 entry.userData.assign(userData.begin(), userData.end());
             }
-            return serve(entry, !changed.empty() ? MemoMatch::DataWords : match, entry.accesses.size());
+            return serve(entry, !result.moved.empty() ? MemoMatch::NestedBases : !result.changed.empty() ? MemoMatch::DataWords : match, entry.accesses.size());
         }
         if (match == MemoMatch::PointerWords) {
             Relocation relocation;
@@ -665,9 +919,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
                 if (reason != MemoMatch::Exact) reason = MemoMatch::PointerWords;
                 continue;
             }
-            entry.origins.clear();
-            entry.dataLeaves.clear();
-            entry.dataLeavesBuilt = false;
+            ClearDerived(entry);
             entry.accesses = std::move(moved);
             entry.userData.assign(userData.begin(), userData.end());
             entry.capture = std::move(capture);
@@ -683,9 +935,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
     if (slot == nullptr) slot = &shader.ways[shader.next++ % MemoWays];
     slot->capture = nullptr;
     slot->accesses.clear();
-    slot->origins.clear();
-    slot->dataLeaves.clear();
-    slot->dataLeavesBuilt = false;
+    ClearDerived(*slot);
     const auto pagesBefore = profile ? pages.size() : 0;
     const auto setupBefore = pageSetupNanoseconds;
     const auto pageReadBefore = pageReadNanoseconds;
