@@ -34,7 +34,15 @@ struct SrtRuntime {
     SrtReadTrace* readTrace = nullptr;
     SrtMemoryProbe accessible = nullptr;
     SrtUserDataUse* userDataUse = nullptr;
+    bool compiledWalk = false;
 };
+
+struct SrtCompiledWalkCounts {
+    std::uint64_t runs = 0;
+    std::uint64_t fallbacks = 0;
+    std::uint64_t uncompiled = 0;
+};
+[[nodiscard]] SrtCompiledWalkCounts CompiledWalkCounts();
 
 struct SrtEvaluationCounts {
     std::uint64_t values = 0;

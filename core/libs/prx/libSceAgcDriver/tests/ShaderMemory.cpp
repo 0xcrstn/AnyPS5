@@ -1049,6 +1049,159 @@ void verifyCaptureMemo() {
     std::cout << "Capture memo " << (memo ? "on" : "off") << ": " << unchangedUs << " us per capture over unchanged guest words, " << movedUs << " us per capture over a moved pointer to equal guest words, " << changedUs << " us per capture over changed guest words\n";
 }
 
+void verifyCaptureValues() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Format8888UNorm = 56;
+    constexpr std::uint32_t Type2D = 9;
+    struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
+    static Texture firstTexture;
+    static Texture secondTexture;
+    const auto imageAt = [&](const Texture& texture) {
+        const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
+        return std::array<std::uint32_t, 8>{static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+    };
+    const auto first = imageAt(firstTexture);
+    const auto second = imageAt(secondTexture);
+    static std::array<std::uint32_t, 8> output{};
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    struct alignas(4096) Tables {
+        std::array<std::uint32_t, 32> first{};
+        std::array<std::uint32_t, 32> second{};
+    };
+    static Tables tables;
+    const auto fill = [&](std::array<std::uint32_t, 32>& srt, const std::array<std::uint32_t, 8>& image, std::uint32_t mode, std::uint32_t outputOffset) {
+        srt.fill(0u);
+        std::copy(image.begin(), image.end(), srt.begin());
+        const auto address = outputAddress + outputOffset;
+        const std::array<std::uint32_t, 4> outputV{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), 16u, 0xfacu};
+        std::copy(outputV.begin(), outputV.end(), srt.begin() + 16);
+        srt[20] = mode;
+    };
+    const auto pointerTo = [](const std::array<std::uint32_t, 32>& srt) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data())); };
+    std::array<std::uint32_t, 3> userData{static_cast<std::uint32_t>(pointerTo(tables.first)), static_cast<std::uint32_t>(pointerTo(tables.first) >> 32u), 7u};
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    const std::vector<std::uint32_t> code{0xf4000400u, 0xfa000050u, 0xf4080500u, 0xfa000020u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xbf068010u, 0xbf850006u, 0xf40c0200u, 0xfa000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x26000u, code, 0, {}};
+    request.context.waveSize = 32;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    fill(tables.first, first, 1u, 0u);
+    fill(tables.second, second, 1u, 16u);
+    const auto handle = PrepareShader(request);
+    const auto sameSnapshot = [](const ResourceSnapshot& a, const ResourceSnapshot& b) {
+        return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers && a.flattenedSrt == b.flattenedSrt && a.userData == b.userData && a.uniformFill == b.uniformFill && a.srtPoison == b.srtPoison && a.nullRootReads == b.nullRootReads;
+    };
+    const auto check = [&](const char* what) {
+        const auto prepared = PreparedShaderInvocation::TryCreate(request, handle);
+        require(prepared.has_value(), "capture values: the prepared shader does not match its request");
+        AgcDriver::ShaderMemory values({});
+        const auto lean = values.CaptureValues(*prepared);
+        AgcDriver::ShaderMemory full({});
+        const auto reference = full.Capture(*prepared);
+        if (!sameSnapshot(lean->snapshot, reference->snapshot)) std::cerr << "capture values: " << what << std::endl;
+        require(sameSnapshot(lean->snapshot, reference->snapshot), "capture values: the values-only snapshot differs from the full capture");
+        const auto leanRegions = values.Regions();
+        const auto fullRegions = full.Regions();
+        require(leanRegions.size() == fullRegions.size(), "capture values: the values-only capture read other guest words");
+        for (std::size_t index = 0; index < leanRegions.size(); ++index) require(leanRegions[index].guestAddress == fullRegions[index].guestAddress && leanRegions[index].bytes.size() == fullRegions[index].bytes.size(), "capture values: the values-only capture read other guest words");
+        verifyResult(*prepared->MaterializeValues(*lean), *prepared->Materialize(*reference));
+        require(lean->userDataUse.reads.empty() && lean->readTrace.otherReads.empty() && lean->bufferBaseWords.empty() && lean->baseSlots.empty(), "capture values: the values-only capture traced its reads");
+        return lean;
+    };
+    const auto initial = check("initial tables");
+    require(initial->snapshot.images.at(0).dwords[0] == first[0], "capture values: the first T# was not captured");
+    fill(tables.first, second, 1u, 4u);
+    const auto changed = check("changed T# and V#");
+    require(changed->snapshot.images.at(0).dwords[0] == second[0], "capture values: a changed T# was not captured");
+    fill(tables.first, second, 0u, 4u);
+    const auto skipped = check("branch condition off");
+    require(std::ranges::all_of(skipped->snapshot.images.at(0).dwords, [](std::uint32_t word) { return word == 0u; }), "capture values: a skipped branch kept its T#");
+    userData[0] = static_cast<std::uint32_t>(pointerTo(tables.second));
+    userData[1] = static_cast<std::uint32_t>(pointerTo(tables.second) >> 32u);
+    const auto moved = check("moved SRT pointer");
+    require(moved->snapshot.images.at(0).dwords[0] == second[0], "capture values: a moved SRT pointer was not followed");
+    userData[2] = 9u;
+    require(check("changed unread user word")->snapshot.userData.at(2) == 9u, "capture values: a changed user word was not captured");
+
+    constexpr int Iterations = 20000;
+    const auto prepared = PreparedShaderInvocation::TryCreate(request, handle);
+    require(prepared.has_value(), "capture values: the prepared shader stopped matching its request");
+    const auto time = [&](auto&& body) {
+        const auto started = std::chrono::steady_clock::now();
+        for (int i = 0; i < Iterations; ++i) {
+            fill(tables.second, i % 2 == 0 ? first : second, 1u, static_cast<std::uint32_t>(i % 4096) * 16u);
+            body();
+        }
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / Iterations;
+    };
+    const auto fullUs = time([&] {
+        AgcDriver::ShaderMemory memory({});
+        static_cast<void>(prepared->Materialize(*memory.Capture(*prepared)));
+    });
+    const auto valuesUs = time([&] {
+        AgcDriver::ShaderMemory memory({});
+        static_cast<void>(prepared->MaterializeValues(*memory.CaptureValues(*prepared)));
+    });
+    std::cout << "Capture and materialize over changed guest words: " << fullUs << " us traced and memoized, " << valuesUs << " us values only" << std::endl;
+
+    std::vector<std::uint32_t> straight(code.begin(), code.end());
+    straight.erase(straight.begin() + 7, straight.begin() + 9);
+    auto plain = request;
+    plain.shader = {ShaderStage::Compute, 0x27000u, straight, 0, {}};
+    std::array<std::uint32_t, 3> plainUser{static_cast<std::uint32_t>(pointerTo(tables.first)), static_cast<std::uint32_t>(pointerTo(tables.first) >> 32u), 7u};
+    plain.context.userData = plainUser;
+    const auto plainHandle = PrepareShader(plain);
+    const auto checkPlain = [&] {
+        const auto plainPrepared = PreparedShaderInvocation::TryCreate(plain, plainHandle);
+        require(plainPrepared.has_value(), "capture values: the straight-line shader does not match its request");
+        AgcDriver::ShaderMemory values({});
+        const auto lean = values.CaptureValues(*plainPrepared);
+        AgcDriver::ShaderMemory full({});
+        const auto reference = full.Capture(*plainPrepared);
+        require(sameSnapshot(lean->snapshot, reference->snapshot), "capture values: the compiled walk differs from the traced walk");
+        const auto leanRegions = values.Regions();
+        const auto fullRegions = full.Regions();
+        require(leanRegions.size() == fullRegions.size(), "capture values: the compiled walk read other guest words");
+        for (std::size_t index = 0; index < leanRegions.size(); ++index) require(leanRegions[index].guestAddress == fullRegions[index].guestAddress && leanRegions[index].bytes.size() == fullRegions[index].bytes.size(), "capture values: the compiled walk read other guest words");
+        verifyResult(*plainPrepared->MaterializeValues(*lean), *plainPrepared->Materialize(*reference));
+        return lean;
+    };
+    const auto compiledBefore = CompiledWalkCounts();
+    fill(tables.first, first, 1u, 0u);
+    require(checkPlain()->snapshot.images.at(0).dwords[0] == first[0], "capture values: the compiled walk missed the first T#");
+    fill(tables.first, second, 0u, 8u);
+    require(checkPlain()->snapshot.images.at(0).dwords[0] == second[0], "capture values: the compiled walk missed a changed T#");
+    plainUser[0] = static_cast<std::uint32_t>(pointerTo(tables.second));
+    plainUser[1] = static_cast<std::uint32_t>(pointerTo(tables.second) >> 32u);
+    fill(tables.second, first, 1u, 12u);
+    require(checkPlain()->snapshot.images.at(0).dwords[0] == first[0], "capture values: the compiled walk did not follow a moved SRT pointer");
+    const auto compiledAfter = CompiledWalkCounts();
+    const bool compiledWalk = std::getenv("APS5_NO_COMPILED_WALK") == nullptr;
+    require(compiledAfter.runs - compiledBefore.runs == (compiledWalk ? 3u : 0u) && compiledAfter.fallbacks == compiledBefore.fallbacks, "capture values: the compiled walk did not serve the straight-line plan as configured");
+    const auto plainPrepared = PreparedShaderInvocation::TryCreate(plain, plainHandle);
+    require(plainPrepared.has_value(), "capture values: the straight-line shader stopped matching its request");
+    const auto plainFullUs = time([&] {
+        AgcDriver::ShaderMemory memory({});
+        static_cast<void>(plainPrepared->Materialize(*memory.Capture(*plainPrepared)));
+    });
+    const auto plainValuesUs = time([&] {
+        AgcDriver::ShaderMemory memory({});
+        static_cast<void>(plainPrepared->MaterializeValues(*memory.CaptureValues(*plainPrepared)));
+    });
+    std::cout << "Straight-line shader over changed guest words: " << plainFullUs << " us traced and memoized, " << plainValuesUs << " us values only (compiled walk " << (compiledWalk ? "on" : "off") << ")" << std::endl;
+}
+
 // A compute program sampling a T# loaded from a table buffer at a runtime key (a bindless image
 // table): mode M enumerates the keys from the material records, mode T binds the whole table.
 void verifyBindlessTable() {
@@ -4031,6 +4184,11 @@ int main(int argc, char** argv) {
             verifyCaptureMemo();
             verifyCaptureMemoDataWords();
             std::cout << "Capture memo serves only captures whose read user words and guest words are unchanged\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--capture-values") {
+            verifyCaptureValues();
+            std::cout << "Values-only captures equal traced captures and materialize to the same results" << std::endl;
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--srt-read-patching") {

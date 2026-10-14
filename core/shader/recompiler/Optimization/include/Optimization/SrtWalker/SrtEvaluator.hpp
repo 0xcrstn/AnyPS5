@@ -4,7 +4,10 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -107,6 +110,9 @@ private:
     int _nested = 0;
     SrtEvaluationCounts _counts;
 };
+
+bool ApplySrtOperation(IrOpcode opcode, const std::array<std::uint64_t, 4>& values, std::uint64_t& result);
+std::optional<std::size_t> SrtOperationArguments(IrOpcode opcode);
 
 SrtEvaluationCounts& ThreadEvaluationCounts();
 

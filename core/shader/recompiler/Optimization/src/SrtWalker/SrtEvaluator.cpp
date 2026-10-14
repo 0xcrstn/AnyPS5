@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <string>
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -363,6 +364,301 @@ std::optional<bool> evaluableAlone(const IrResourcePlan& program, const IrValue&
 
 }
 
+namespace {
+
+float OperationFloat(std::uint64_t bits) { return std::bit_cast<float>(static_cast<std::uint32_t>(bits)); }
+
+std::uint64_t OperationFloatBits(float value) { return std::bit_cast<std::uint32_t>(value); }
+
+}
+
+bool ApplySrtOperation(IrOpcode opcode, const std::array<std::uint64_t, 4>& values, std::uint64_t& result) {
+    const auto a = values[0];
+    const auto b = values[1];
+    const auto c = values[2];
+    const auto d = values[3];
+    switch (opcode) {
+        case IrOpcode::CompositeConstructU64:
+            result = static_cast<std::uint32_t>(a) | (static_cast<std::uint64_t>(static_cast<std::uint32_t>(b)) << 32u);
+            return true;
+        case IrOpcode::IAdd32:
+            {
+                result = static_cast<std::uint32_t>(a + b);
+                return true;
+            }
+            return false;
+        case IrOpcode::IAdd64:
+            {
+                result = a + b;
+                return true;
+            }
+            return false;
+        case IrOpcode::ISub32:
+            {
+                result = static_cast<std::uint32_t>(a - b);
+                return true;
+            }
+            return false;
+        case IrOpcode::ISub64:
+            {
+                result = a - b;
+                return true;
+            }
+            return false;
+        case IrOpcode::IMul32:
+            {
+                result = static_cast<std::uint32_t>(a * b);
+                return true;
+            }
+            return false;
+        case IrOpcode::IMul64:
+            {
+                result = a * b;
+                return true;
+            }
+            return false;
+        case IrOpcode::SMin32:
+            {
+                result = static_cast<std::uint32_t>(std::min(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(a)), std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(b))));
+                return true;
+            }
+            return false;
+        case IrOpcode::UMin32:
+            {
+                result = std::min(static_cast<std::uint32_t>(a), static_cast<std::uint32_t>(b));
+                return true;
+            }
+            return false;
+        case IrOpcode::ConvertF32U32:
+            {
+                result = OperationFloatBits(static_cast<float>(static_cast<std::uint32_t>(a)));
+                return true;
+            }
+            return false;
+        case IrOpcode::ConvertU32F32:
+            {
+                const auto value = OperationFloat(a);
+                if (!std::isfinite(value) || value < 0.0f || static_cast<double>(value) > 4294967295.0) {
+                    return false;
+                }
+                result = static_cast<std::uint32_t>(value);
+                return true;
+            }
+            return false;
+        case IrOpcode::FPMul32:
+            {
+                result = OperationFloatBits(OperationFloat(a) * OperationFloat(b));
+                return true;
+            }
+            return false;
+        case IrOpcode::FPTrunc32:
+            {
+                result = OperationFloatBits(std::trunc(OperationFloat(a)));
+                return true;
+            }
+            return false;
+        case IrOpcode::FPIsNan32:
+            {
+                result = std::isnan(OperationFloat(a)) ? 1u : 0u;
+                return true;
+            }
+            return false;
+        case IrOpcode::FPOrdLessThanEqual32:
+            {
+                result = OperationFloat(a) <= OperationFloat(b) ? 1u : 0u;
+                return true;
+            }
+            return false;
+        case IrOpcode::FPOrdGreaterThanEqual32:
+            {
+                result = OperationFloat(a) >= OperationFloat(b) ? 1u : 0u;
+                return true;
+            }
+            return false;
+        case IrOpcode::BitwiseAnd32:
+            {
+                result = static_cast<std::uint32_t>(a & b);
+                return true;
+            }
+            return false;
+        case IrOpcode::BitwiseAnd64:
+            {
+                result = a & b;
+                return true;
+            }
+            return false;
+        case IrOpcode::BitwiseOr32:
+            {
+                result = static_cast<std::uint32_t>(a | b);
+                return true;
+            }
+            return false;
+        case IrOpcode::BitwiseXor32:
+            {
+                result = static_cast<std::uint32_t>(a ^ b);
+                return true;
+            }
+            return false;
+        case IrOpcode::BitwiseNot32:
+            {
+                result = ~static_cast<std::uint32_t>(a);
+                return true;
+            }
+            return false;
+        case IrOpcode::ShiftLeftLogical32:
+            {
+                result = static_cast<std::uint32_t>(a) << (b & 31u);
+                return true;
+            }
+            return false;
+        case IrOpcode::ShiftLeftLogical64:
+            {
+                result = a << (b & 63u);
+                return true;
+            }
+            return false;
+        case IrOpcode::ShiftRightLogical32:
+            {
+                result = static_cast<std::uint32_t>(a) >> (b & 31u);
+                return true;
+            }
+            return false;
+        case IrOpcode::ShiftRightLogical64:
+            {
+                result = a >> (b & 63u);
+                return true;
+            }
+            return false;
+        case IrOpcode::ShiftRightArithmetic32:
+            {
+                result = static_cast<std::uint32_t>(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(a)) >> (b & 31u));
+                return true;
+            }
+            return false;
+        case IrOpcode::ShiftRightArithmetic64:
+            {
+                result = static_cast<std::uint64_t>(std::bit_cast<std::int64_t>(a) >> (b & 63u));
+                return true;
+            }
+            return false;
+        case IrOpcode::BitFieldUExtract:
+            {
+                const auto offset = static_cast<std::uint32_t>(b);
+                const auto width = static_cast<std::uint32_t>(c);
+                if (offset > 32u || width > 32u - offset) {
+                    return false;
+                }
+                const auto mask = width == 32u ? 0xffffffffu : width == 0u ? 0u : (std::uint32_t {1} << width) - 1u;
+                result = width == 0u ? 0u : (static_cast<std::uint32_t>(a) >> offset) & mask;
+                return true;
+            }
+            return false;
+        case IrOpcode::BitFieldSExtract:
+            {
+                const auto offset = static_cast<std::uint32_t>(b);
+                const auto width = static_cast<std::uint32_t>(c);
+                if (offset > 32u || width > 32u - offset) {
+                    return false;
+                }
+                if (width == 0u) {
+                    result = 0;
+                    return true;
+                }
+                const auto mask = width == 32u ? 0xffffffffu : (std::uint32_t {1} << width) - 1u;
+                auto bits = (static_cast<std::uint32_t>(a) >> offset) & mask;
+                if (width < 32u && (bits & (std::uint32_t {1} << (width - 1u))) != 0u) {
+                    bits |= ~mask;
+                }
+                result = bits;
+                return true;
+            }
+            return false;
+        case IrOpcode::BitFieldInsert: {
+            const auto offset = static_cast<std::uint32_t>(c);
+            const auto width = static_cast<std::uint32_t>(d);
+            if (offset > 32u || width > 32u - offset) {
+                return false;
+            }
+            if (width == 0u) {
+                result = static_cast<std::uint32_t>(a);
+                return true;
+            }
+            const auto mask = width == 32u ? 0xffffffffu : ((std::uint32_t {1} << width) - 1u) << offset;
+            result = (static_cast<std::uint32_t>(a) & ~mask) | ((static_cast<std::uint32_t>(b) << offset) & mask);
+            return true;
+        }
+        case IrOpcode::SelectU32:
+        case IrOpcode::SelectU1:
+        case IrOpcode::SelectF32:
+            {
+                result = a != 0u ? b : c;
+                return true;
+            }
+            return false;
+        case IrOpcode::IEqual32:
+            {
+                result = static_cast<std::uint32_t>(a) == static_cast<std::uint32_t>(b) ? 1u : 0u;
+                return true;
+            }
+            return false;
+        case IrOpcode::INotEqual32:
+            {
+                result = static_cast<std::uint32_t>(a) != static_cast<std::uint32_t>(b) ? 1u : 0u;
+                return true;
+            }
+            return false;
+        case IrOpcode::SLessThan32:
+            {
+                result = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(a)) < std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(b)) ? 1u : 0u;
+                return true;
+            }
+            return false;
+        case IrOpcode::ULessThan32:
+            {
+                result = static_cast<std::uint32_t>(a) < static_cast<std::uint32_t>(b) ? 1u : 0u;
+                return true;
+            }
+            return false;
+        case IrOpcode::UGreaterThan32:
+            {
+                result = static_cast<std::uint32_t>(a) > static_cast<std::uint32_t>(b) ? 1u : 0u;
+                return true;
+            }
+            return false;
+        case IrOpcode::LogicalAnd:
+            {
+                result = (a != 0u) && (b != 0u) ? 1u : 0u;
+                return true;
+            }
+            return false;
+        case IrOpcode::LogicalOr:
+            {
+                result = (a != 0u) || (b != 0u) ? 1u : 0u;
+                return true;
+            }
+            return false;
+        case IrOpcode::LogicalXor:
+            {
+                result = (a != 0u) != (b != 0u) ? 1u : 0u;
+                return true;
+            }
+            return false;
+        case IrOpcode::LogicalNot:
+            {
+                result = a == 0u ? 1u : 0u;
+                return true;
+            }
+            return false;
+        default: break;
+    }
+    return false;
+}
+
+std::optional<std::size_t> SrtOperationArguments(IrOpcode opcode) {
+    if (opcode == IrOpcode::BitCastU32F32 || opcode == IrOpcode::BitCastF32U32) return std::nullopt;
+    return evaluatedArguments(opcode);
+}
+
 bool Evaluator::MayEvaluate(const IrResourcePlan& program, IrValue* value) {
     std::unordered_map<const IrValue*, bool> known;
     const auto requirements = [&program](IrValue* current) {
@@ -416,11 +712,15 @@ bool Evaluator::MayEvaluate(const IrResourcePlan& program, IrValue* value) {
 }
 
 bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
-    std::uint64_t a = 0;
-    std::uint64_t b = 0;
-    std::uint64_t c = 0;
-    const auto binary = [&]() { return Arg(inst, 0, a) && Arg(inst, 1, b); };
-    const auto ternary = [&]() { return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c); };
+    if (const auto count = SrtOperationArguments(inst.Opcode())) {
+        std::array<std::uint64_t, 4> values{};
+        for (std::size_t index = 0; index < *count; ++index) {
+            if (!Arg(inst, index, values[index])) {
+                return false;
+            }
+        }
+        return ApplySrtOperation(inst.Opcode(), values, result);
+    }
     switch (inst.Opcode()) {
         case IrOpcode::GetUserData: {
             const auto reg = RegIndex(static_cast<ScalarReg>(inst.Argument(0)->Register().index));
@@ -448,12 +748,6 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
         case IrOpcode::BitCastF32U32: return Arg(inst, 0, result);
         case IrOpcode::CompositeExtractU64:
         case IrOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
-        case IrOpcode::CompositeConstructU64:
-            if (!binary()) {
-                return false;
-            }
-            result = static_cast<std::uint32_t>(a) | (static_cast<std::uint64_t>(static_cast<std::uint32_t>(b)) << 32u);
-            return true;
         case IrOpcode::ReadConst: {
             IrValue* slot = inst.Argument(1)->Resolve();
             if (!slot->HasImmediate() || slot->Type() != IrType::U32 || slot->ImmediateU32() >= _program.srtReads.size()) {
@@ -473,278 +767,6 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
                 return EvaluateRawRead(inst, result);
             }
             break;
-        case IrOpcode::IAdd32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(a + b);
-                return true;
-            }
-            return false;
-        case IrOpcode::IAdd64:
-            if (binary()) {
-                result = a + b;
-                return true;
-            }
-            return false;
-        case IrOpcode::ISub32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(a - b);
-                return true;
-            }
-            return false;
-        case IrOpcode::ISub64:
-            if (binary()) {
-                result = a - b;
-                return true;
-            }
-            return false;
-        case IrOpcode::IMul32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(a * b);
-                return true;
-            }
-            return false;
-        case IrOpcode::IMul64:
-            if (binary()) {
-                result = a * b;
-                return true;
-            }
-            return false;
-        case IrOpcode::SMin32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(std::min(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(a)), std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(b))));
-                return true;
-            }
-            return false;
-        case IrOpcode::UMin32:
-            if (binary()) {
-                result = std::min(static_cast<std::uint32_t>(a), static_cast<std::uint32_t>(b));
-                return true;
-            }
-            return false;
-        case IrOpcode::ConvertF32U32:
-            if (Arg(inst, 0, a)) {
-                result = Float32Bits(static_cast<float>(static_cast<std::uint32_t>(a)));
-                return true;
-            }
-            return false;
-        case IrOpcode::ConvertU32F32:
-            if (Arg(inst, 0, a)) {
-                const auto value = Float32(a);
-                if (!std::isfinite(value) || value < 0.0f || static_cast<double>(value) > 4294967295.0) {
-                    return false;
-                }
-                result = static_cast<std::uint32_t>(value);
-                return true;
-            }
-            return false;
-        case IrOpcode::FPMul32:
-            if (binary()) {
-                result = Float32Bits(Float32(a) * Float32(b));
-                return true;
-            }
-            return false;
-        case IrOpcode::FPTrunc32:
-            if (Arg(inst, 0, a)) {
-                result = Float32Bits(std::trunc(Float32(a)));
-                return true;
-            }
-            return false;
-        case IrOpcode::FPIsNan32:
-            if (Arg(inst, 0, a)) {
-                result = std::isnan(Float32(a)) ? 1u : 0u;
-                return true;
-            }
-            return false;
-        case IrOpcode::FPOrdLessThanEqual32:
-            if (binary()) {
-                result = Float32(a) <= Float32(b) ? 1u : 0u;
-                return true;
-            }
-            return false;
-        case IrOpcode::FPOrdGreaterThanEqual32:
-            if (binary()) {
-                result = Float32(a) >= Float32(b) ? 1u : 0u;
-                return true;
-            }
-            return false;
-        case IrOpcode::BitwiseAnd32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(a & b);
-                return true;
-            }
-            return false;
-        case IrOpcode::BitwiseAnd64:
-            if (binary()) {
-                result = a & b;
-                return true;
-            }
-            return false;
-        case IrOpcode::BitwiseOr32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(a | b);
-                return true;
-            }
-            return false;
-        case IrOpcode::BitwiseXor32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(a ^ b);
-                return true;
-            }
-            return false;
-        case IrOpcode::BitwiseNot32:
-            if (Arg(inst, 0, a)) {
-                result = ~static_cast<std::uint32_t>(a);
-                return true;
-            }
-            return false;
-        case IrOpcode::ShiftLeftLogical32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(a) << (b & 31u);
-                return true;
-            }
-            return false;
-        case IrOpcode::ShiftLeftLogical64:
-            if (binary()) {
-                result = a << (b & 63u);
-                return true;
-            }
-            return false;
-        case IrOpcode::ShiftRightLogical32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(a) >> (b & 31u);
-                return true;
-            }
-            return false;
-        case IrOpcode::ShiftRightLogical64:
-            if (binary()) {
-                result = a >> (b & 63u);
-                return true;
-            }
-            return false;
-        case IrOpcode::ShiftRightArithmetic32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(a)) >> (b & 31u));
-                return true;
-            }
-            return false;
-        case IrOpcode::ShiftRightArithmetic64:
-            if (binary()) {
-                result = static_cast<std::uint64_t>(std::bit_cast<std::int64_t>(a) >> (b & 63u));
-                return true;
-            }
-            return false;
-        case IrOpcode::BitFieldUExtract:
-            if (ternary()) {
-                const auto offset = static_cast<std::uint32_t>(b);
-                const auto width = static_cast<std::uint32_t>(c);
-                if (offset > 32u || width > 32u - offset) {
-                    return false;
-                }
-                const auto mask = width == 32u ? 0xffffffffu : width == 0u ? 0u : (std::uint32_t {1} << width) - 1u;
-                result = width == 0u ? 0u : (static_cast<std::uint32_t>(a) >> offset) & mask;
-                return true;
-            }
-            return false;
-        case IrOpcode::BitFieldSExtract:
-            if (ternary()) {
-                const auto offset = static_cast<std::uint32_t>(b);
-                const auto width = static_cast<std::uint32_t>(c);
-                if (offset > 32u || width > 32u - offset) {
-                    return false;
-                }
-                if (width == 0u) {
-                    result = 0;
-                    return true;
-                }
-                const auto mask = width == 32u ? 0xffffffffu : (std::uint32_t {1} << width) - 1u;
-                auto bits = (static_cast<std::uint32_t>(a) >> offset) & mask;
-                if (width < 32u && (bits & (std::uint32_t {1} << (width - 1u))) != 0u) {
-                    bits |= ~mask;
-                }
-                result = bits;
-                return true;
-            }
-            return false;
-        case IrOpcode::BitFieldInsert: {
-            std::uint64_t d = 0;
-            if (!ternary() || !Arg(inst, 3, d)) {
-                return false;
-            }
-            const auto offset = static_cast<std::uint32_t>(c);
-            const auto width = static_cast<std::uint32_t>(d);
-            if (offset > 32u || width > 32u - offset) {
-                return false;
-            }
-            if (width == 0u) {
-                result = static_cast<std::uint32_t>(a);
-                return true;
-            }
-            const auto mask = width == 32u ? 0xffffffffu : ((std::uint32_t {1} << width) - 1u) << offset;
-            result = (static_cast<std::uint32_t>(a) & ~mask) | ((static_cast<std::uint32_t>(b) << offset) & mask);
-            return true;
-        }
-        case IrOpcode::SelectU32:
-        case IrOpcode::SelectU1:
-        case IrOpcode::SelectF32:
-            if (ternary()) {
-                result = a != 0u ? b : c;
-                return true;
-            }
-            return false;
-        case IrOpcode::IEqual32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(a) == static_cast<std::uint32_t>(b) ? 1u : 0u;
-                return true;
-            }
-            return false;
-        case IrOpcode::INotEqual32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(a) != static_cast<std::uint32_t>(b) ? 1u : 0u;
-                return true;
-            }
-            return false;
-        case IrOpcode::SLessThan32:
-            if (binary()) {
-                result = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(a)) < std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(b)) ? 1u : 0u;
-                return true;
-            }
-            return false;
-        case IrOpcode::ULessThan32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(a) < static_cast<std::uint32_t>(b) ? 1u : 0u;
-                return true;
-            }
-            return false;
-        case IrOpcode::UGreaterThan32:
-            if (binary()) {
-                result = static_cast<std::uint32_t>(a) > static_cast<std::uint32_t>(b) ? 1u : 0u;
-                return true;
-            }
-            return false;
-        case IrOpcode::LogicalAnd:
-            if (binary()) {
-                result = (a != 0u) && (b != 0u) ? 1u : 0u;
-                return true;
-            }
-            return false;
-        case IrOpcode::LogicalOr:
-            if (binary()) {
-                result = (a != 0u) || (b != 0u) ? 1u : 0u;
-                return true;
-            }
-            return false;
-        case IrOpcode::LogicalXor:
-            if (binary()) {
-                result = (a != 0u) != (b != 0u) ? 1u : 0u;
-                return true;
-            }
-            return false;
-        case IrOpcode::LogicalNot:
-            if (Arg(inst, 0, a)) {
-                result = a == 0u ? 1u : 0u;
-                return true;
-            }
-            return false;
         case IrOpcode::UndefU1:
         case IrOpcode::UndefU8:
         case IrOpcode::UndefU16:

@@ -67,6 +67,7 @@ public:
     static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request);
     DrawEntryCounters DrawCacheCounters();
+    BindingPlanCounters PlanCounters();
     DispatchCacheTotals DispatchCacheCounters();
 
 private:
@@ -131,6 +132,11 @@ private:
     void reportDispatchRelocation();
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool drawEntries();
+    static bool bindingPlan();
+    static bool verifyBindingPlan();
+    void planDrawDecode(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial, std::shared_ptr<const DrawDecode>& decode, bool profile);
+    void notePlannedStage(bool verified, bool mismatch);
+    void reportBindingPlan();
     static bool verifyDrawEntries();
     static bool registerKeyEnabled();
     static bool verifyDrawRecipe();
@@ -378,6 +384,9 @@ private:
     Graphics::CacheSizing drawSizing{drawCacheLimits()};
 
     DrawEntryCounters drawEntryCounters;
+    RecentTable<std::shared_ptr<const DrawDecode>> plannedDecodes{MaxDrawAliases};
+    BindingPlanCounters bindingPlanCounters;
+    std::mutex bindingPlanMutex;
 
     std::mutex driverPhasesMutex;
     std::array<DriverPhaseTotals, DispatchClassCount> driverPhaseTotals{};

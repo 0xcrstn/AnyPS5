@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <utility>
@@ -107,6 +108,11 @@ private:
     std::size_t capacity = 0;
 };
 
+struct CompiledWalkCell {
+    std::once_flag once;
+    std::shared_ptr<const void> walk;
+};
+
 struct IrResourcePlan {
     IrShaderStage stage = IrShaderStage::Unknown;
     std::uint64_t shaderHash = 0;
@@ -131,6 +137,7 @@ struct IrResourcePlan {
     bool resourceTrackingComplete = false;
     ShaderInfo info;
     UniformFillPlan uniformFill;
+    std::shared_ptr<CompiledWalkCell> compiledWalk = std::make_shared<CompiledWalkCell>();
 };
 
 }
