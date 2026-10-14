@@ -53,6 +53,12 @@ alignas(256) constexpr std::array<std::uint32_t, 12> LoadPixelCode{
     0x7e0602f2u, 0xf800080fu, 0x03020100u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 20> NestedPixelCode{
+    0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0xf4080101u, 0xfa000000u, 0xbf8cc07fu, 0xf4200202u, 0xfa000000u, 0xbf8cc07fu, 0x7e000208u,
+    0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf800080fu, 0x03020100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
+};
+
+alignas(16) std::array<std::uint32_t, 4> Nested{};
 alignas(16) std::array<std::array<float, 4>, 4> Vertices{{{-3.0f, -1.0f, 0.5f, 1.0f}, {1.0f, -1.0f, 0.5f, 1.0f}, {1.0f, 3.0f, 0.5f, 1.0f}, {1.0f, 3.0f, 0.5f, 1.0f}}};
 alignas(16) std::array<std::uint32_t, 4> VertexTable{};
 alignas(16) std::array<std::uint32_t, 4> PixelTable{};
@@ -70,6 +76,7 @@ struct Header {
 alignas(8) Header VertexHeader{};
 alignas(8) Header BufferPixelHeader{};
 alignas(8) Header LoadPixelHeader{};
+alignas(8) Header NestedPixelHeader{};
 
 std::byte* AllocateWatched(std::size_t bytes) {
 #ifdef _WIN32
@@ -231,6 +238,25 @@ void LoadedValueIsData(bool libraries) {
 
 }
 
+void AlternatingNestedTablesHit(bool libraries) {
+    const auto mode = std::string(libraries ? " with" : " without") + " graphics pipeline libraries";
+    SetVertexRecords(3);
+    static std::array<std::array<std::uint32_t, 2>, 24> tables{};
+    const auto nested = reinterpret_cast<std::uintptr_t>(Nested.data());
+    std::vector<std::uint64_t> hits;
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        tables[i] = std::array<std::uint32_t, 2>{static_cast<std::uint32_t>(nested), static_cast<std::uint32_t>(nested >> 32u)};
+        Nested = BufferDescriptor(i % 2 == 0 ? First.data() : Moved.data(), 0, i % 2 == 0 ? 16u : 8u, 0x31016facu);
+        const auto counters = Draw(NestedPixelCode.data(), tables[i].data(), i % 2 == 0 ? 255 : 128, "alternating nested pixel table " + std::to_string(i) + mode);
+        hits.push_back(counters.hits);
+    }
+    const auto late = hits.back() - hits[hits.size() - 9];
+    if (std::getenv("APS5_DRAW_CACHE_TEST_TRACE") != nullptr) {
+        for (std::size_t i = 1; i < hits.size(); ++i) std::cout << "alternating draw " << i << ": " << hits[i] - hits[i - 1] << " hits\n";
+    }
+    Require(late == 8, "draws whose moved pixel table points at a table alternating between two contents hit " + std::to_string(late) + " of the last 8 times" + mode);
+}
+
 int main() {
     try {
         bool libraries = false;
@@ -243,8 +269,10 @@ int main() {
         Register(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Register(BufferPixelHeader, BufferPixelCode.data(), sizeof(BufferPixelCode), 1);
         Register(LoadPixelHeader, LoadPixelCode.data(), sizeof(LoadPixelCode), 1);
+        Register(NestedPixelHeader, NestedPixelCode.data(), sizeof(NestedPixelCode), 1);
         FragmentReusedAfterFrontMiss(libraries);
         LoadedValueIsData(libraries);
+        AlternatingNestedTablesHit(libraries);
         AgcDriverShutdown_nid_postfix();
         std::cout << "Draw cache hits bound the current data " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
         return 0;

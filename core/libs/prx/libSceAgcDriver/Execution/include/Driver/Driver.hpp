@@ -130,6 +130,8 @@ private:
     void diagnoseStructureMiss(const DrawAliasKeys& aliases);
     void diagnoseStageMiss(const DrawAliasKeys& aliases, std::size_t stage, std::uint32_t userDataBase, std::uint64_t donorKey, bool refused);
     void reportDrawMisses();
+    void diagnoseValidationMiss(const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions);
+    void putStageDonor(std::uint64_t key, const std::shared_ptr<DispatchVariant>& variant, const std::vector<std::uint32_t>& userData, std::uint64_t* evicted, bool* added, bool count);
     static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords);
     static void applyShaderDataPatches(DispatchVariant& variant);
     static std::shared_ptr<DispatchVariant> cloneVariant(const DispatchVariant& variant);

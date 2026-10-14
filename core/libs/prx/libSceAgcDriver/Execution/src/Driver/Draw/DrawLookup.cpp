@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <chrono>
 
 namespace AgcDriver::DriverDetail {
 
@@ -82,7 +83,11 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             std::optional<DrawMiss> miss;
             std::vector<std::size_t> ranks(programs.size(), 0);
-            std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, partial = 0, dataPatched = 0;
+            std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, partial = 0, dataPatched = 0, validatedRuns = 0, validatedWords = 0;
+            double stageValidateUs = 0, patchUs = 0;
+            auto& split = ThreadDrawValidateSplit();
+            split = DrawValidateSplit{profile};
+            const auto since = [](std::chrono::steady_clock::time_point start) { return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count(); };
             if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
 
             std::uint32_t cursor = 0;
@@ -108,10 +113,19 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         ++compared;
                         std::vector<std::pair<std::uint32_t, std::uint32_t>> live;
                         const bool data = drawRelocationEnabled() && !variant->dataPositions.empty();
+                        const auto validateStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, data ? &live : nullptr);
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, data ? &live : nullptr);
+                        if (profile) {
+                            stageValidateUs += since(validateStart);
+                            validatedRuns += variant->runs.size();
+                            validatedWords += variant->words.size();
+                        }
+                        if (result == EntryOutcome::Differing && rank == 0 && drawMissDiagnosisEnabled()) diagnoseValidationMiss(*variant, regions);
                         if (result == EntryOutcome::EqualData) {
+                            const auto patchStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                             auto patched = patchBufferWords(*variant, live);
+                            if (profile) patchUs += since(patchStart);
                             result = patched != nullptr ? EntryOutcome::Equal : EntryOutcome::Differing;
                             if (patched != nullptr) {
                                 ++dataPatched;
@@ -148,6 +162,20 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             counters.variantsCompared += compared;
             counters.partialStages += drawHit ? 0 : partial;
             counters.dataPatchedStages += dataPatched;
+            counters.stageValidateUs += stageValidateUs;
+            counters.patchUs += patchUs;
+            counters.validatedRuns += validatedRuns;
+            counters.validatedWords += validatedWords;
+            counters.syncUs += split.syncUs;
+            counters.overlapUs += split.overlapUs;
+            counters.labelUs += split.labelUs;
+            counters.compareUs += split.compareUs;
+            split = DrawValidateSplit{};
+            for (std::size_t i = 0; i < programs.size() && i < drawStageDonorKeys.size(); ++i) {
+                if (matched[i] == nullptr || ranks[i] == 0 || drawStageDonorKeys[i] == 0) continue;
+                putStageDonor(drawStageDonorKeys[i], matched[i], programs[i].userData, nullptr, nullptr, false);
+                if (drawMissDiagnosisEnabled()) ++drawMissDiagnosis.donorAlternateHits;
+            }
             if (drawHit) {
                 ++counters.hits;
                 if (registerKey) ++counters.registerKeyHits;

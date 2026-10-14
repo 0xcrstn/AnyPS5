@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -89,6 +90,13 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
 }
 
 void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto insertStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto chargeInsert = [&] {
+        if (!profile) return;
+        std::lock_guard cacheLock(drawCacheMutex);
+        drawEntryCounters.insertUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - insertStart).count();
+    };
     if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu) && (verifyHit || admitDrawKey(drawKey))) {
         phaseTiming.Phase(DrawRowVectors);
         std::uint64_t unstable = 0, mismatches = 0;
@@ -158,8 +166,11 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             drawEntryCounters.unstable += unstable;
             drawEntryCounters.verifyMismatches += mismatches;
         }
+        chargeInsert();
         phaseTiming.Phase(DrawRowKeyLookupValidate);
+        return;
     }
+    if (useDrawEntries && !drawHit) chargeInsert();
 }
 
 }

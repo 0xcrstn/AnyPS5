@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -67,13 +68,28 @@ bool Driver::syncPendingRuns(std::uint64_t program, std::uint32_t queue, const S
     return true;
 }
 
+DrawValidateSplit& ThreadDrawValidateSplit() {
+    thread_local DrawValidateSplit split;
+    return split;
+}
+
 EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
+    auto& split = ThreadDrawValidateSplit();
+    auto lap = split.timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto charge = [&](double& bucket) {
+        if (!split.timed) return;
+        const auto now = std::chrono::steady_clock::now();
+        bucket += std::chrono::duration<double, std::micro>(now - lap).count();
+        lap = now;
+    };
     if (live != nullptr) live->clear();
     const bool masked = live != nullptr && !variant.dataPositions.empty();
     const DataMask mask{variant.dataPositions, live};
     PendingView pending;
     pending.Load();
-    if (!syncPendingRuns(program, queue, *variant.compiled, regions, runsSynced, pending, sampling)) return EntryOutcome::Differing;
+    const bool synced = syncPendingRuns(program, queue, *variant.compiled, regions, runsSynced, pending, sampling);
+    charge(split.syncUs);
+    if (!synced) return EntryOutcome::Differing;
     auto publish = Graphics::Recorder::PublishGeneration();
     auto pendingSerial = Graphics::StorageTexture::PendingSerial();
     auto forget = GuestMemory::ForgetSerial();
@@ -89,12 +105,14 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
         forget = GuestMemory::ForgetSerial();
         if (Graphics::StorageTexture::AnyPendingOverlaps(variant.runs) || Graphics::AnyShadowedOverlaps(variant.runs)) return EntryOutcome::FlushingImage;
     }
+    charge(split.overlapUs);
     if ((forget & 1) != 0) return EntryOutcome::ForgetMoved;
     for (const auto& label : deferredLabels().labels) {
         for (const auto& [begin, end] : variant.runs) {
             if (label.address < end && begin < label.address + label.size) return EntryOutcome::QueuedLabel;
         }
     }
+    charge(split.labelUs);
     if (validateLegacy()) {
         for (const auto& region : regions) {
             if (!GuestMemory::Accessible(reinterpret_cast<const void*>(region.guestAddress), region.bytes.size())) return EntryOutcome::Inaccessible;
@@ -103,7 +121,9 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
 
     pending.Load();
     bool unmapped = false;
-    if (!validateCaptured(program, queue, regions, *variant.compiled, true, pending, &unmapped, &sampling, masked ? &mask : nullptr)) return unmapped ? EntryOutcome::Inaccessible : EntryOutcome::Differing;
+    const bool equal = validateCaptured(program, queue, regions, *variant.compiled, true, pending, &unmapped, &sampling, masked ? &mask : nullptr);
+    charge(split.compareUs);
+    if (!equal) return unmapped ? EntryOutcome::Inaccessible : EntryOutcome::Differing;
     if (Graphics::Recorder::PublishGeneration() != publish) return EntryOutcome::PublishMoved;
     if (Graphics::StorageTexture::PendingSerial() != pendingSerial) return EntryOutcome::PendingMoved;
     if (GuestMemory::ForgetSerial() != forget) return EntryOutcome::ForgetMoved;
