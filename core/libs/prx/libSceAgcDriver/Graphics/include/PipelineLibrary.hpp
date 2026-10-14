@@ -21,6 +21,8 @@ struct PipelineLibraryKeys {
     std::vector<std::byte> layout;
     std::vector<std::byte> preRasterizationLayout;
     std::vector<std::byte> fragmentLayout;
+    std::vector<std::byte> preRasterizationShaders;
+    std::vector<std::byte> fragmentShaders;
     std::uint32_t preRasterizationSets = 0;
     std::uint32_t fragmentSets = 0;
 };
@@ -45,6 +47,10 @@ struct PipelineLibraryCounters {
     std::array<std::uint64_t, 4> built{};
     std::uint64_t linked = 0;
     std::uint64_t optimized = 0;
+    std::array<std::uint64_t, 4> shaders{};
+    std::array<std::uint64_t, 4> rebuiltForState{};
+    std::array<std::uint64_t, 4> rebuiltForLayout{};
+    std::array<std::uint64_t, 4> rebuiltForRendering{};
 };
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device);

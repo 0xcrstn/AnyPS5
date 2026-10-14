@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -35,6 +37,12 @@ constexpr std::array<VkDynamicState, 15> dynamicStates{
 
 using Key = std::vector<std::byte>;
 
+struct BuiltLibrary {
+    Key part;
+    Key layout;
+    Key rendering;
+};
+
 struct DeviceLibraries {
     PFN_vkDestroyPipeline destroyPipeline = nullptr;
     PFN_vkDestroyPipelineLayout destroyLayout = nullptr;
@@ -42,8 +50,38 @@ struct DeviceLibraries {
     std::vector<VkShaderModule> modules;
     std::map<Key, VkPipelineLayout> layouts;
     std::array<std::map<Key, VkPipeline>, 4> parts;
+    std::array<std::map<Key, BuiltLibrary>, 4> shaders;
     PipelineLibraryCounters counters;
 };
+
+void countLibrary(DeviceLibraries& device, std::size_t part, const Key& shaders, const Key& state, const Key& layout, const Key& rendering) {
+    if (shaders.empty()) return;
+    auto& seen = device.shaders[part];
+    const auto found = seen.find(shaders);
+    if (found == seen.end()) {
+        seen.emplace(shaders, BuiltLibrary{state, layout, rendering});
+        ++device.counters.shaders[part];
+        return;
+    }
+    if (found->second.part != state) ++device.counters.rebuiltForState[part];
+    if (found->second.layout != layout) ++device.counters.rebuiltForLayout[part];
+    if (found->second.rendering != rendering) ++device.counters.rebuiltForRendering[part];
+    found->second = {state, layout, rendering};
+}
+
+void reportLibraries(const DeviceLibraries& device) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::chrono::steady_clock::time_point last{};
+    if (!profile) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    const auto& counters = device.counters;
+    std::fprintf(stderr, "[pipeline-libraries] pre-rasterization %llu libraries for %llu shaders, fragment %llu for %llu; built again for a shader by what differed: fixed state %llu/%llu, layout %llu/%llu, rendering formats %llu/%llu; linked %llu\n",
+        static_cast<unsigned long long>(counters.built[1]), static_cast<unsigned long long>(counters.shaders[1]), static_cast<unsigned long long>(counters.built[2]), static_cast<unsigned long long>(counters.shaders[2]),
+        static_cast<unsigned long long>(counters.rebuiltForState[1]), static_cast<unsigned long long>(counters.rebuiltForState[2]), static_cast<unsigned long long>(counters.rebuiltForLayout[1]), static_cast<unsigned long long>(counters.rebuiltForLayout[2]),
+        static_cast<unsigned long long>(counters.rebuiltForRendering[1]), static_cast<unsigned long long>(counters.rebuiltForRendering[2]), static_cast<unsigned long long>(counters.linked));
+}
 
 struct LibraryStore {
     std::mutex mutex;
@@ -218,6 +256,9 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             continue;
         }
         cache.emplace(key, handle);
+        if (part == 1) countLibrary(device, part, keys.preRasterizationShaders, *partKeys[part], keys.preRasterizationLayout, attachmentKey);
+        if (part == 2) countLibrary(device, part, keys.fragmentShaders, *partKeys[part], keys.fragmentLayout, attachmentKey);
+        reportLibraries(device);
         if (optimize) {
             for (std::uint32_t stage = 0; stage < create.stageCount; ++stage) {
                 for (auto& module : modules) {

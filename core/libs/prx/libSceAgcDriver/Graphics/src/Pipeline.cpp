@@ -180,9 +180,12 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     for (const auto& shader : shaders) {
         if (shader.stage == Stage::Geometry || shader.program->PipelineVariantId() == 0) return false;
         auto& key = shader.stage == Stage::Fragment ? keys.fragmentShader : keys.preRasterization;
+        auto& identity = shader.stage == Stage::Fragment ? keys.fragmentShaders : keys.preRasterizationShaders;
         appendKey(key, shader.stage);
         appendKey(key, shader.program->PipelineVariantId());
         appendKey(key, shader.pushConstantOffset);
+        appendKey(identity, shader.stage);
+        appendKey(identity, shader.program->PipelineVariantId());
         if (resources.split) {
             auto& sets = shader.stage == Stage::Fragment ? keys.fragmentSets : keys.preRasterizationSets;
             for (const auto& binding : shader.program->bindings) {

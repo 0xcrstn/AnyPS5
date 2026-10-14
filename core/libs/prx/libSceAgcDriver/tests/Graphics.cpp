@@ -3980,6 +3980,17 @@ void pipelineLibrarySetTests() {
             Require(after[2] == before[2] + ((mask & (1u << set)) != 0u ? 1u : 0u), "fragment library reuse ignored descriptor set usage");
             before = after;
         }
+        const auto withoutDepth = PipelineLibraryCountersOf(context.device);
+        for (const auto format : {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D24_UNORM_S8_UINT}) {
+            state.depth = DepthTarget{};
+            state.depth->format = format;
+            prebuild();
+        }
+        state.depth.reset();
+        const auto withDepth = PipelineLibraryCountersOf(context.device);
+        Require(withDepth.built[1] == withoutDepth.built[1] + 2u && withDepth.built[2] == withoutDepth.built[2] + 2u && withDepth.built[3] == withoutDepth.built[3] + 2u, "each depth target format did not get its own libraries");
+        Require(withDepth.shaders[1] == 1u && withDepth.shaders[2] == 1u && withDepth.rebuiltForRendering[1] == 2u && withDepth.rebuiltForRendering[2] == 2u && withDepth.rebuiltForState == std::array<std::uint64_t, 4>{}, "shader libraries built again for rendering formats were not counted as such");
+        Require(withDepth.rebuiltForLayout[1] + withDepth.rebuiltForLayout[2] == 2u, "a shader library built again for another descriptor layout was not counted");
         ShaderRecompiler::DescriptorBinding invalid{};
         invalid.descriptorSet = 32;
         fragment.bindings.push_back(invalid);
