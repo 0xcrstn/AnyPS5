@@ -39,12 +39,26 @@ void Draws() {
     Expect(text == " vs 0x5000 x1 3ms 3000us ps 0x4000 x10 1ms 100us", "draw programs are not printed by stage and address: '" + text + "'");
 }
 
+void Placements() {
+    Recorder::GpuProgramTotals program{0x6000, 2, 4.0, 3815};
+    program.placements = 2;
+    program.inPlaceBytes = 2.0 * 1048576.0 * 3.0;
+    program.hostCopyBytes = 1048576.0;
+    program.deviceBytes = 0.0;
+    auto text = Recorder::FormatGpuPrograms({program}, false, 12);
+    Expect(text == " 0x6000 x2 4ms 2000us 3815w [in place 3.00 host copy 0.50 device 0.00 MiB]", "the bound bytes of a program are not printed per placement note: '" + text + "'");
+    program.addressBased = 1;
+    text = Recorder::FormatGpuPrograms({program}, false, 12);
+    Expect(text == " 0x6000 x2 4ms 2000us 3815w [in place 3.00 host copy 0.50 device 0.00 MiB address-based]", "an address-based build is not marked: '" + text + "'");
+}
+
 }
 
 int main() {
     Keys();
     Dispatches();
     Draws();
+    Placements();
     if (failures != 0) return 1;
     std::printf("gpu timing report tests passed\n");
     return 0;
