@@ -2597,7 +2597,6 @@ void Recorder::retireSnapshot(std::shared_ptr<void> object) {
 }
 
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
-    forgetSnapshotTwin(entry->second.buffer.get());
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
@@ -2683,7 +2682,6 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         if (!differing.empty() && differing.back().first + differing.back().second == offset) differing.back().second += length;
         else differing.emplace_back(offset, length);
     }
-    if (!differing.empty()) patchSnapshotTwin(entry.buffer, differing);
     for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
     return true;
 }
@@ -2698,6 +2696,7 @@ struct TwinStatistics {
     std::atomic<std::uint64_t> dropped{0};
     std::atomic<std::uint64_t> patched{0};
     std::atomic<std::uint64_t> patchedBytes{0};
+    std::atomic<std::uint64_t> unkept{0};
 };
 
 TwinStatistics& Twins() {
@@ -2730,50 +2729,15 @@ bool Recorder::SnapshotTwinsEnabled() {
 
 Recorder::SnapshotTwinCounters Recorder::TwinCounters() {
     auto& twins = Twins();
-    return {twins.made.load(std::memory_order_relaxed), twins.madeBytes.load(std::memory_order_relaxed), twins.bound.load(std::memory_order_relaxed), twins.boundBytes.load(std::memory_order_relaxed), twins.dropped.load(std::memory_order_relaxed), twins.patched.load(std::memory_order_relaxed), twins.patchedBytes.load(std::memory_order_relaxed)};
+    return {twins.made.load(std::memory_order_relaxed), twins.madeBytes.load(std::memory_order_relaxed), twins.bound.load(std::memory_order_relaxed), twins.boundBytes.load(std::memory_order_relaxed), twins.dropped.load(std::memory_order_relaxed), twins.patched.load(std::memory_order_relaxed), twins.patchedBytes.load(std::memory_order_relaxed), twins.unkept.load(std::memory_order_relaxed)};
 }
 
-void Recorder::patchSnapshotTwin(const std::shared_ptr<Buffer>& snapshot, std::span<const std::pair<std::size_t, std::size_t>> spans) {
-    static const bool patching = std::getenv("APS5_NO_TWIN_PATCH") == nullptr;
-    const auto found = snapshotTwins.find(snapshot.get());
-    if (!patching || found == snapshotTwins.end() || found->second.source.lock() != snapshot) {
-        forgetSnapshotTwin(snapshot.get());
-        return;
-    }
-    std::vector<VkBufferCopy> copies;
-    std::uint64_t bytes = 0;
-    for (const auto& [offset, length] : spans) {
-        copies.push_back({offset, offset, length});
-        bytes += length;
-    }
-    context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologueCommands(), snapshot->Handle(), found->second.twin->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
-    open->kept.push_back(snapshot);
-    open->kept.push_back(found->second.twin);
-    Twins().patched.fetch_add(1, std::memory_order_relaxed);
-    Twins().patchedBytes.fetch_add(bytes, std::memory_order_relaxed);
-}
-
-void Recorder::forgetSnapshotTwin(const Buffer* snapshot) {
-    if (snapshotTwins.empty()) return;
-    const auto found = snapshotTwins.find(snapshot);
-    if (found == snapshotTwins.end()) return;
-    snapshotTwinBytes -= std::min(snapshotTwinBytes, found->second.twin->Size());
-    retireSnapshot(std::move(found->second.twin));
-    snapshotTwins.erase(found);
+void Recorder::dropSnapshotTwin(std::map<DrawSnapshotKey, SnapshotTwinEntry>::iterator entry) {
+    snapshotTwinBytes -= std::min(snapshotTwinBytes, entry->second.twin->Size());
+    snapshotTwinRecency.erase(entry->second.recent);
+    retireSnapshot(std::move(entry->second.twin));
+    snapshotTwins.erase(entry);
     Twins().dropped.fetch_add(1, std::memory_order_relaxed);
-}
-
-void Recorder::sweepSnapshotTwins() {
-    for (auto it = snapshotTwins.begin(); it != snapshotTwins.end();) {
-        if (!it->second.source.expired()) {
-            ++it;
-            continue;
-        }
-        snapshotTwinBytes -= std::min(snapshotTwinBytes, it->second.twin->Size());
-        retireSnapshot(std::move(it->second.twin));
-        it = snapshotTwins.erase(it);
-        Twins().dropped.fetch_add(1, std::memory_order_relaxed);
-    }
 }
 
 VkCommandBuffer Recorder::prologueCommands() {
@@ -2801,17 +2765,22 @@ VkCommandBuffer Recorder::prologueCommands() {
     return commands;
 }
 
-std::shared_ptr<Buffer> Recorder::SnapshotTwin(const std::shared_ptr<Buffer>& snapshot) {
+std::shared_ptr<Buffer> Recorder::SnapshotTwin(std::uint64_t address, SnapshotUse use, const std::shared_ptr<Buffer>& snapshot, bool reused) {
     if (!SnapshotTwinsEnabled() || snapshot == nullptr || !snapshot->Mapped()) return {};
     const auto bytes = snapshot->Bytes().size();
     if (bytes == 0 || bytes > SnapshotTwinMaxBytes()) return {};
-    auto found = snapshotTwins.find(snapshot.get());
-    if (found != snapshotTwins.end() && found->second.source.lock() != snapshot) {
-        forgetSnapshotTwin(snapshot.get());
-        found = snapshotTwins.end();
+    const DrawSnapshotKey key{address, use, bytes};
+    const auto kept = drawSnapshots.find(key);
+    if (kept == drawSnapshots.end() || kept->second.buffer != snapshot) {
+        Twins().unkept.fetch_add(1, std::memory_order_relaxed);
+        return {};
     }
+    const auto generation = kept->second.generation;
+    const auto registryGeneration = kept->second.registryGeneration;
+    auto found = snapshotTwins.find(key);
     if (found == snapshotTwins.end()) {
-        if (snapshotTwinBytes + bytes > SnapshotTwinBudget()) sweepSnapshotTwins();
+        if (!reused) return {};
+        while (!snapshotTwinRecency.empty() && snapshotTwinBytes + bytes > SnapshotTwinBudget()) dropSnapshotTwin(snapshotTwins.find(snapshotTwinRecency.front()));
         if (snapshotTwinBytes + bytes > SnapshotTwinBudget()) return {};
         std::shared_ptr<Buffer> twin;
         try {
@@ -2821,10 +2790,49 @@ std::shared_ptr<Buffer> Recorder::SnapshotTwin(const std::shared_ptr<Buffer>& sn
         }
         CopyBuffer(context, prologueCommands(), snapshot->Handle(), 0, twin->Handle(), 0, bytes);
         open->kept.push_back(snapshot);
-        found = snapshotTwins.emplace(snapshot.get(), SnapshotTwinEntry{snapshot, std::move(twin)}).first;
+        snapshotTwinRecency.push_back(key);
+        found = snapshotTwins.emplace(key, SnapshotTwinEntry{std::move(twin), snapshot.get(), generation, registryGeneration, std::prev(snapshotTwinRecency.end())}).first;
         snapshotTwinBytes += bytes;
         Twins().made.fetch_add(1, std::memory_order_relaxed);
         Twins().madeBytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else {
+        auto& entry = found->second;
+        if (entry.source != snapshot.get() || entry.generation != generation || entry.registryGeneration != registryGeneration) {
+            constexpr std::uint64_t block = 65536;
+            const auto aligned = address / block * block;
+            const auto end = address + bytes;
+            const auto count = static_cast<std::size_t>((end - 1) / block - address / block + 1);
+            std::vector<VkBufferCopy> copies;
+            const bool whole = entry.generation == 0 || generation == 0 || entry.registryGeneration != registryGeneration;
+            if (!whole) {
+                std::vector<std::uint64_t> generations(count, entry.generation);
+                std::vector<std::uint8_t> changed(count, GuestMemory::BlockWritten);
+                GuestMemory::ChangedBlocks(address, bytes, generations, changed);
+                for (std::size_t k = 0; k < count; ++k) {
+                    if (changed[k] == GuestMemory::BlockUnchanged) continue;
+                    const auto from = std::max(address, aligned + k * block);
+                    const auto to = std::min(end, aligned + (k + 1) * block);
+                    const VkDeviceSize offset = from - address;
+                    if (!copies.empty() && copies.back().srcOffset + copies.back().size == offset) copies.back().size += to - from;
+                    else copies.push_back({offset, offset, to - from});
+                }
+            } else {
+                copies.push_back({0, 0, bytes});
+            }
+            std::uint64_t copied = 0;
+            for (const auto& copy : copies) copied += copy.size;
+            if (!copies.empty()) {
+                context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologueCommands(), snapshot->Handle(), entry.twin->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+                open->kept.push_back(snapshot);
+                open->kept.push_back(entry.twin);
+            }
+            entry.source = snapshot.get();
+            entry.generation = generation;
+            entry.registryGeneration = registryGeneration;
+            Twins().patched.fetch_add(1, std::memory_order_relaxed);
+            Twins().patchedBytes.fetch_add(copied, std::memory_order_relaxed);
+        }
+        snapshotTwinRecency.splice(snapshotTwinRecency.end(), snapshotTwinRecency, entry.recent);
     }
     Twins().bound.fetch_add(1, std::memory_order_relaxed);
     Twins().boundBytes.fetch_add(bytes, std::memory_order_relaxed);

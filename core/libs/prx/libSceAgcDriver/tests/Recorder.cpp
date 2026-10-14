@@ -1725,13 +1725,49 @@ void snapshotTwinTests(const Device& device, Recorder& recorder) {
         std::cout << "snapshot twins are off: not tested\n";
         return;
     }
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "write watching unavailable: snapshot twins not tested\n";
+        return;
+    }
     recorder.Sync();
-    constexpr std::size_t bytes = 64 * 1024;
-    const auto fill = [](Buffer& buffer, std::uint32_t seed) {
-        auto* words = reinterpret_cast<std::uint32_t*>(buffer.Bytes().data());
-        for (std::size_t i = 0; i < bytes / 4; ++i) words[i] = seed * 0x9e3779b9u + static_cast<std::uint32_t>(i);
+    constexpr std::size_t bytes = 3 * 64 * 1024;
+    constexpr std::size_t words = bytes / 4;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no watched block: snapshot twins not tested\n";
+        return;
+    }
+    struct ReleaseBlock {
+        void* block;
+        ~ReleaseBlock() { ReleaseWatched(block, bytes); }
+    } releaseBlock{block};
+    auto* guest = static_cast<std::uint32_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        Recorder& recorder;
+        void* block;
+        ~Unregister() {
+            recorder.Sync();
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+    } unregister{recorder, block};
+    const auto seed = [&](std::uint32_t value) {
+        for (std::size_t i = 0; i < words; ++i) guest[i] = value * 0x9e3779b9u + static_cast<std::uint32_t>(i);
     };
-    const auto readBack = [&](const std::shared_ptr<Buffer>& twin, std::uint32_t seed) {
+    const auto keep = [&]() {
+        const auto generation = AgcDriver::GuestMemory::CollectWrites(address, bytes);
+        Require(generation != 0, "the twin test block is not write-watched");
+        auto held = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memcpy(held->Bytes().data(), block, bytes);
+        recorder.KeepDrawSnapshot(address, bytes, generation, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), held);
+        return held;
+    };
+    const auto readBack = [&](const std::shared_ptr<Buffer>& twin) {
         auto target = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         std::memset(target->Bytes().data(), 0, bytes);
         const auto commands = recorder.Commands();
@@ -1742,91 +1778,54 @@ void snapshotTwinTests(const Device& device, Recorder& recorder) {
         recorder.Keep(twin);
         recorder.Submit();
         recorder.Sync();
-        const auto* words = reinterpret_cast<const std::uint32_t*>(target->Bytes().data());
-        for (std::size_t i = 0; i < bytes / 4; ++i) {
-            if (words[i] != seed * 0x9e3779b9u + static_cast<std::uint32_t>(i)) return false;
-        }
-        return true;
+        return std::memcmp(target->Bytes().data(), block, bytes) == 0;
     };
     const auto before = Recorder::TwinCounters();
-    auto snapshot = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    fill(*snapshot, 1);
-    const auto first = recorder.SnapshotTwin(snapshot);
-    Require(first != nullptr && first.get() != snapshot.get() && !first->Mapped(), "a reused snapshot got no device-local twin");
-    const auto again = recorder.SnapshotTwin(snapshot);
+    seed(1);
+    auto snapshot = keep();
+    auto loose = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    Require(recorder.SnapshotTwin(address, Recorder::SnapshotUse::Storage, loose) == nullptr && Recorder::TwinCounters().unkept - before.unkept == 1, "a snapshot the recorder does not keep got a twin");
+    Require(recorder.SnapshotTwin(address, Recorder::SnapshotUse::Storage, snapshot, false) == nullptr && Recorder::TwinCounters().made == before.made, "a snapshot copied for the first time got a twin before any reuse");
+    const auto first = recorder.SnapshotTwin(address, Recorder::SnapshotUse::Storage, snapshot);
+    Require(first != nullptr && first.get() != snapshot.get() && !first->Mapped(), "a kept snapshot got no device-local twin");
+    const auto again = recorder.SnapshotTwin(address, Recorder::SnapshotUse::Storage, snapshot);
     Require(again == first, "a second use of the same snapshot made another twin");
     auto counters = Recorder::TwinCounters();
-    Require(counters.made - before.made == 1 && counters.madeBytes - before.madeBytes == bytes && counters.bound - before.bound == 2, "twin counters do not count one copy and two bindings");
-    Require(readBack(first, 1), "the twin does not hold the snapshot's bytes before the batch's own commands");
-    const auto later = recorder.SnapshotTwin(snapshot);
-    Require(later == first && Recorder::TwinCounters().made == counters.made, "a twin made by an earlier batch was copied again");
-    Require(readBack(later, 1), "a twin read by a later batch lost the snapshot's bytes");
-    constexpr std::uint64_t address = 0x7a0000;
-    recorder.KeepDrawSnapshot(address, bytes, 1, 0, snapshot);
-    auto replacement = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    recorder.KeepDrawSnapshot(address, bytes, 1, 0, replacement);
-    Require(Recorder::TwinCounters().dropped - counters.dropped == 1, "an erased draw snapshot kept its twin");
-    fill(*snapshot, 2);
-    const auto refreshed = recorder.SnapshotTwin(snapshot);
-    Require(refreshed != nullptr && refreshed != first && Recorder::TwinCounters().made - counters.made == 1, "a snapshot whose twin was dropped did not get a new one");
-    Require(readBack(refreshed, 2), "a new twin does not hold the snapshot's current bytes");
-    auto deviceOnly = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    Require(recorder.SnapshotTwin(deviceOnly) == nullptr && recorder.SnapshotTwin(nullptr) == nullptr, "a buffer without host bytes got a twin");
-    recorder.KeepDrawSnapshot(address, bytes, 1, 0, std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
-    if (AgcDriver::GuestMemory::WriteWatched() && std::getenv("APS5_RELEASE_UNDER_LOCK") != nullptr) {
-        void* block = AllocateWatched(bytes, 65536);
-        struct ReleaseBlock {
-            void* block;
-            ~ReleaseBlock() { if (block != nullptr) ReleaseWatched(block, bytes); }
-        } releaseBlock{block};
-        if (block != nullptr) {
-            auto* guest = static_cast<std::uint32_t*>(block);
-            for (std::size_t i = 0; i < bytes / 4; ++i) guest[i] = 3u * 0x9e3779b9u + static_cast<std::uint32_t>(i);
-            const auto guestAddress = reinterpret_cast<std::uint64_t>(block);
-            {
-                GuestAllocations::Mutation mutation;
-                mutation.Add(block, bytes, true, true, true);
-            }
-            struct Unregister {
-                void* block;
-                ~Unregister() {
-                    GuestAllocations::Mutation mutation;
-                    mutation.Remove(block);
-                }
-            } unregister{block};
-            const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-            auto held = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            const auto generation = AgcDriver::GuestMemory::CollectWrites(guestAddress, bytes);
-            std::memcpy(held->Bytes().data(), block, bytes);
-            recorder.KeepDrawSnapshot(guestAddress, bytes, generation, registry, held);
-            auto twin = recorder.SnapshotTwin(held);
-            Require(twin != nullptr && readBack(twin, 3), "a kept snapshot's twin does not hold its bytes");
-            const auto* heldPointer = held.get();
-            const auto* twinPointer = twin.get();
-            held.reset();
-            twin.reset();
-            for (std::size_t i = 100; i < 200; ++i) guest[i] = 4u * 0x9e3779b9u + static_cast<std::uint32_t>(i);
-            const auto patchesBefore = Recorder::TwinCounters();
-            const auto refreshed = recorder.ReusableDrawSnapshot(guestAddress, bytes, Recorder::SnapshotUse::Storage, nullptr, AgcDriver::GuestMemory::CollectWrites(guestAddress, bytes));
-            Require(refreshed != nullptr && refreshed.get() == heldPointer, "a snapshot changed in a few words was not refreshed in place");
-            const auto patchedTwin = recorder.SnapshotTwin(refreshed);
-            const auto patchesAfter = Recorder::TwinCounters();
-            const bool patching = std::getenv("APS5_NO_TWIN_PATCH") == nullptr;
-            Require(patchedTwin != nullptr && (!patching || patchedTwin.get() == twinPointer), "a refreshed snapshot did not keep its twin");
-            Require(patchesAfter.made - patchesBefore.made == (patching ? 0u : 1u) && patchesAfter.patched - patchesBefore.patched == (patching ? 1u : 0u) && (patching ? patchesAfter.patchedBytes - patchesBefore.patchedBytes >= 400u && patchesAfter.patchedBytes - patchesBefore.patchedBytes <= bytes : patchesAfter.patchedBytes == patchesBefore.patchedBytes), "a refreshed snapshot's twin was not patched with the changed bytes alone");
-            std::vector<std::uint32_t> expected(guest, guest + bytes / 4);
-            auto target = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-            const auto commands = recorder.Commands();
-            AgcDriver::Graphics::CopyBuffer(context, commands, patchedTwin->Handle(), 0, target->Handle(), 0, bytes);
-            AgcDriver::Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-            recorder.Keep(target);
-            recorder.Keep(patchedTwin);
-            recorder.Submit();
-            recorder.Sync();
-            Require(std::memcmp(target->Bytes().data(), expected.data(), bytes) == 0, "a patched twin does not hold the refreshed snapshot's bytes");
-            recorder.KeepDrawSnapshot(guestAddress, bytes, 1, 0, std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
-        }
+    Require(counters.made - before.made == 1 && counters.madeBytes - before.madeBytes == bytes && counters.bound - before.bound == 2 && counters.patched == before.patched, "twin counters do not count one copy and two bindings");
+    Require(readBack(first), "the twin does not hold the snapshot's bytes before the batch's own commands");
+    Require(recorder.SnapshotTwin(address, Recorder::SnapshotUse::Storage, snapshot) == first && Recorder::TwinCounters().made == counters.made, "a twin made by an earlier batch was copied again");
+    Require(readBack(first), "a twin read by a later batch lost the snapshot's bytes");
+    guest[65536 / 4 + 7] = 0x11111111u;
+    guest[65536 / 4 + 9] = 0x22222222u;
+    auto replacement = keep();
+    Require(replacement != snapshot, "the replacement snapshot is the old object");
+    const auto patched = recorder.SnapshotTwin(address, Recorder::SnapshotUse::Storage, replacement, false);
+    counters = Recorder::TwinCounters();
+    Require(patched == first && counters.made - before.made == 1 && counters.patched - before.patched == 1 && counters.patchedBytes - before.patchedBytes == 65536, "a replaced snapshot did not refresh its twin with the changed block alone");
+    Require(readBack(first), "a refreshed twin does not hold the replacement's bytes");
+    Require(recorder.SnapshotTwin(address, Recorder::SnapshotUse::Storage, replacement) == first && Recorder::TwinCounters().patched == counters.patched, "an unchanged replacement was refreshed again");
+    guest[0] = 0x33333333u;
+    guest[words - 1] = 0x44444444u;
+    auto both = keep();
+    Require(recorder.SnapshotTwin(address, Recorder::SnapshotUse::Storage, both) == first, "a second replacement lost the twin");
+    counters = Recorder::TwinCounters();
+    Require(counters.patched - before.patched == 2 && counters.patchedBytes - before.patchedBytes == 3 * 65536, "two changed blocks were not refreshed as two blocks");
+    Require(readBack(first), "a twin refreshed in two blocks does not hold the guest bytes");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        mutation.Add(block, bytes, true, true, true);
     }
+    seed(5);
+    auto remapped = keep();
+    Require(recorder.SnapshotTwin(address, Recorder::SnapshotUse::Storage, remapped) == first, "a remapped range lost the twin");
+    counters = Recorder::TwinCounters();
+    Require(counters.patched - before.patched == 3 && counters.patchedBytes - before.patchedBytes == 6 * 65536, "a snapshot of a remapped range was not copied whole");
+    Require(readBack(first), "a twin of a remapped range does not hold the guest bytes");
+    recorder.KeepDrawSnapshot(address, bytes, 1, 0, std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    Require(Recorder::TwinCounters().dropped == before.dropped, "replacing the kept snapshot evicted its twin");
+    auto deviceOnly = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    Require(recorder.SnapshotTwin(address, Recorder::SnapshotUse::Storage, deviceOnly) == nullptr && recorder.SnapshotTwin(address, Recorder::SnapshotUse::Storage, nullptr) == nullptr, "a buffer without host bytes got a twin");
     recorder.Submit();
     recorder.Sync();
     std::cout << "snapshot twin tests passed\n";
