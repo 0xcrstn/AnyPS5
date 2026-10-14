@@ -889,6 +889,27 @@ bool AsyncRegistrationPrepare() {
     return !sync;
 }
 
+std::uint64_t RegistrationPrepareLimit() {
+    static const std::uint64_t limit = [] {
+        const char* text = std::getenv("APS5_REGISTRATION_PREPARE_LIMIT");
+        if (text == nullptr || *text == '\0') return std::uint64_t{1024};
+        char* end = nullptr;
+        const auto value = std::strtoull(text, &end, 10);
+        if (end == text || *end != '\0') throw std::runtime_error("APS5_REGISTRATION_PREPARE_LIMIT is not a whole number: " + std::string(text));
+        return static_cast<std::uint64_t>(value);
+    }();
+    return limit;
+}
+
+bool RegistrationPrepareAdmitted() {
+    static std::atomic<std::uint64_t> admitted{0};
+    const auto limit = RegistrationPrepareLimit();
+    if (admitted.fetch_add(1, std::memory_order_relaxed) < limit) return true;
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) APS5_LOG_OUT("%llu registered shaders were prepared ahead of use; later ones are prepared when they are first used (APS5_REGISTRATION_PREPARE_LIMIT)", static_cast<unsigned long long>(limit));
+    return false;
+}
+
 void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan) {
     const auto* preparedKey = snapshot->prepared.get();
     SubmitRegistrationPreparation([snapshot = std::move(snapshot), plan = std::move(plan)] {
@@ -1311,6 +1332,10 @@ void Driver::RegisterShader(const Shader* shader) {
     std::shared_ptr<RegisteredPreparation> preparation;
     if (AsyncRegistrationPrepare()) {
         preparation = PlanRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
+        if (preparation != nullptr && !RegistrationPrepareAdmitted()) {
+            preparation = nullptr;
+            snapshot.prepared->deferred = true;
+        }
         if (preparation != nullptr) preparation->prebuildDevice = localDevice;
         if (preparation != nullptr && (snapshot.type == 0 || snapshot.type == 1)) BuildRegisteredAbiKey(registered, *localDevice, preparation->abiKey);
         snapshot.prepared->pending = preparation != nullptr;
