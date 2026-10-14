@@ -73,6 +73,13 @@ void importCrossingTests(const Context& context, const BdaTestAccess& access) {
         Require(crossing.offset + crossing.range <= crossingBytes.size(), "a view crossing into the next registered range is bound past its host import");
         Require(secondImport.base == first && secondImport.bytes == 2 * half, "adjacent registered ranges with the same access were not imported as one span");
         Require(crossing.buffer == secondImport.buffer && crossing.offset + adjustment == second - 16 - secondImport.base, "a view crossing into the next registered range is not bound in place in the spanning import");
+        const auto crossingAt = static_cast<std::size_t>(crossing.offset + adjustment);
+        Require(crossingBytes[crossingAt] == std::byte{0x11} && crossingBytes[crossingAt + 16] == std::byte{0x22}, "an imported view does not expose its host bytes");
+        guest[half] = 0x33;
+        Require(crossingBytes[crossingAt + 16] == std::byte{0x33}, "an imported view does not observe a host store");
+        crossingBytes[crossingAt + 16] = std::byte{0x44};
+        Require(guest[half] == 0x44, "an imported view store does not reach its host bytes");
+        guest[half] = 0x22;
         const auto inside = leased.Descriptor(second + 64, 16, adjustment);
         const auto insideBytes = access.bytes(inside.buffer);
         Require(inside.offset + inside.range <= insideBytes.size() && (inside.buffer == secondImport.buffer ? inside.offset + adjustment == second + 64 - secondImport.base : insideBytes[inside.offset + adjustment] == std::byte{0x22}), "a view in the second registered range is bound past its buffer or misses its bytes");
@@ -508,7 +515,7 @@ void spaceReadAcrossImportsTests(const Context& context, const BdaTestAccess& ac
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
     };
     for (std::size_t index = 0; index < 3; ++index) change(guest + index * piece, true);
-    for (int build = 0; build < 2; ++build) {
+    for (int build = 0; build < 3; ++build) {
         const auto before = AddressSpaceCounters();
         GuestBufferMemory leased(importing);
         leased.AcquireRegistered();
@@ -523,7 +530,10 @@ void spaceReadAcrossImportsTests(const Context& context, const BdaTestAccess& ac
         Require(std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= first && boundary <= range.end; }) && std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= boundary && boundary + piece <= range.end; }), "an import is missing from the BDA table of a build with a read-only V# across it");
         leased.WriteBack();
         const auto after = AddressSpaceCounters();
-        if (after.enabled && build == 1) Require(after.hits == before.hits + 1 && after.dissolvedOverlap == before.dissolvedOverlap, "a read-only V# across two imports dissolved the cached address space");
+        if (after.enabled) {
+            Require(after.dissolvedOverlap == before.dissolvedOverlap, "a read-only V# across two imports dissolved the cached address space for an overlap");
+            if (build == 2) Require(after.hits == before.hits + 1, "a read-only V# across two imports did not reuse the settled cached address space (hits " + std::to_string(before.hits) + " -> " + std::to_string(after.hits) + ")");
+        }
     }
     for (std::size_t index = 0; index < 3; ++index) change(guest + index * piece, false);
     SetHostImportWindow(0);
