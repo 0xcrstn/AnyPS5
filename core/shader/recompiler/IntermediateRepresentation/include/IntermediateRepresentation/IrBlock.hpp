@@ -76,34 +76,6 @@ private:
     std::vector<IrBlock*> successors;
 };
 
-inline std::uint32_t IrBlock::Id() const {
-    return id;
-}
-
-inline std::list<IrValue*>& IrBlock::Instructions() {
-    return instructions;
-}
-
-inline const std::list<IrValue*>& IrBlock::Instructions() const {
-    return instructions;
-}
-
-inline std::vector<IrBlock*>& IrBlock::Predecessors() {
-    return predecessors;
-}
-
-inline std::vector<IrBlock*>& IrBlock::Successors() {
-    return successors;
-}
-
-inline const std::vector<IrBlock*>& IrBlock::Predecessors() const {
-    return predecessors;
-}
-
-inline const std::vector<IrBlock*>& IrBlock::Successors() const {
-    return successors;
-}
-
 }
 
 #endif

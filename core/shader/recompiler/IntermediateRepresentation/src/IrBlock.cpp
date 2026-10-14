@@ -7,6 +7,26 @@ namespace ShaderRecompiler {
 IrBlock::IrBlock(std::uint32_t id) : id(id) {
 }
 
+std::uint32_t IrBlock::Id() const {
+    return id;
+}
+
+std::list<IrValue*>& IrBlock::Instructions() {
+    return instructions;
+}
+
+const std::list<IrValue*>& IrBlock::Instructions() const {
+    return instructions;
+}
+
+std::vector<IrBlock*>& IrBlock::Predecessors() {
+    return predecessors;
+}
+
+std::vector<IrBlock*>& IrBlock::Successors() {
+    return successors;
+}
+
 void IrBlock::AppendInstruction(IrValue* value) {
     if (value == nullptr) {
         throw std::invalid_argument("IrBlock::AppendInstruction value cannot be null");
@@ -62,6 +82,14 @@ void IrBlock::AddSuccessor(IrBlock* block) {
         throw std::invalid_argument("IrBlock::AddSuccessor block cannot be null");
     }
     successors.push_back(block);
+}
+
+const std::vector<IrBlock*>& IrBlock::Predecessors() const {
+    return predecessors;
+}
+
+const std::vector<IrBlock*>& IrBlock::Successors() const {
+    return successors;
 }
 
 void IrBlock::SsaSeal() {

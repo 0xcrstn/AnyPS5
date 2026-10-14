@@ -141,7 +141,6 @@ public:
 private:
     static constexpr std::size_t DeclarationCacheSize = 512;
     static constexpr std::size_t MaxCachedDeclarationWords = 4;
-    static constexpr std::size_t DeclarationCacheProbes = 8;
 
     struct DeclarationSlot {
         std::array<std::uint32_t, MaxCachedDeclarationWords> words = {};
@@ -162,7 +161,7 @@ private:
     std::uint32_t interned(const std::uint32_t* words, std::uint32_t length, TDeclare&& declare) {
         const auto start = declarationCacheSlot(words, length);
         std::size_t target = start;
-        for (std::size_t probe = 0; probe < DeclarationCacheProbes; ++probe) {
+        for (std::size_t probe = 0; probe < DeclarationCacheSize; ++probe) {
             target = (start + probe) & (DeclarationCacheSize - 1u);
             auto& slot = declarationCache[target];
             if (slot.id == 0) {
