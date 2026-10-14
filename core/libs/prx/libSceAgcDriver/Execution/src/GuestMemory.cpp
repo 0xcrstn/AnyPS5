@@ -1483,10 +1483,9 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     return tracker.generation;
 }
 
-bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
-    auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
-    tracker.initialize();
+namespace {
+
+bool storedOverLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return true;
 #ifdef _WIN32
     if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes)) return true;
@@ -1518,6 +1517,67 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
         }
     }
     return false;
+}
+
+}
+
+bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    return storedOverLocked(tracker, address, bytes, generation);
+}
+
+MarkedWrites MarkWrittenUnlessStored(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t since) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    MarkedWrites result{0, true};
+    ++tracker.generation;
+    const auto unstamped = [&] {
+        for (const auto& [begin, end] : ranges) {
+            if (begin < end) tracker.noteUnstampedStore(begin, end);
+        }
+        return MarkedWrites{0, true};
+    };
+    bool any = false;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        any = true;
+        if (!tracker.watched || !tracker.covers(begin, static_cast<std::size_t>(end - begin))) return unstamped();
+    }
+    if (!any) return result;
+    std::size_t stamped = 0;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        const auto blockFirst = begin & ~(std::uint64_t{WriteBlockBytes} - 1);
+        const auto blockStop = (end + WriteBlockBytes - 1) & ~(std::uint64_t{WriteBlockBytes} - 1);
+        StampRuns runs{tracker, StampKind::Fresh};
+#ifdef _WIN32
+        const bool complete = collectWindowsWrites(runs, blockFirst, blockStop, false);
+#else
+        const bool complete = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
+#endif
+        if (!complete) {
+            unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
+            return unstamped();
+        }
+        stamped += runs.stamped;
+    }
+    if (stamped != 0) ++tracker.generation;
+    result.storedOver = since == 0;
+    for (const auto& [begin, end] : ranges) {
+        if (!result.storedOver && end > begin && storedOverLocked(tracker, begin, static_cast<std::size_t>(end - begin), since)) result.storedOver = true;
+    }
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) {
+            tracker.stamp(block, tracker.generation, StampKind::Driver);
+            tracker.noteDriverStore(block, begin, end, tracker.generation);
+        }
+    }
+    result.generation = tracker.generation;
+    return result;
 }
 
 std::uint64_t TrackerGeneration() {

@@ -14,6 +14,14 @@ namespace AgcDriver::Graphics {
 
 void ShutdownGuestBufferWorkers();
 
+struct StagingStats {
+    std::uint64_t staged = 0;
+    std::uint64_t copiedInBytes = 0;
+    std::uint64_t skipped = 0;
+    std::uint64_t skippedBytes = 0;
+};
+StagingStats StagingCounters();
+
 struct GuestMemorySnapshot {
     std::uint64_t address;
     std::span<const std::byte> bytes;
@@ -78,6 +86,7 @@ std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 // A persistent device copy of one registered range of the main guest image (which cannot be host
 // imported); see GuestBufferMemory.cpp.
 struct ImageMirror;
+struct StagingShadow;
 class Recorder;
 
 // Identity of the import serving [address, address + bytes): a serial unique for the life of one
@@ -324,6 +333,8 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        std::shared_ptr<StagingShadow> shadow {};
+        mutable bool shadowBegun = false;
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -371,6 +382,10 @@ private:
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    bool writesCover(std::uint64_t begin, std::uint64_t end) const;
+    bool shadowReusable(const Region& region) const;
+    bool takeShadow(Region& region, bool addressable);
+    static void settleShadow(const Region& region, std::uint64_t generation);
     void takeHeapReferences();
     Context context;
     bool stagingAllowed = false;
