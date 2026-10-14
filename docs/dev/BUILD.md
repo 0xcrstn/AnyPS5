@@ -118,6 +118,17 @@ Each invocation creates one pipeline. With no `--cache-in`, its application pipe
 
 `--fixture` compiles a tiny synthetic compute shader with specialization, sparse descriptor binding and push constant metadata; `--write-fixture DIRECTORY` saves it without opening Vulkan. It performs no GPU work and does not reproduce a title's compile workload. With `BUILD_TESTING=ON`, `agc_compute_pipeline_capture` checks serialization and rejected inputs. With SPIRV-Tools also enabled, `agc_compute_pipeline_replay` compiles the fixture with fresh and imported application caches, verifies cache rejection, and checks required subgroup support. `agc_compute_pipeline_capture_run` verifies the existing branch-past-endpgm compute fixture's output with capture disabled and enabled, then replays the captured pipelines and checks their identities and metadata. Each test has a 30-second timeout. Runtime tests skip when Vulkan is absent; set `ANYPS5_REQUIRE_VULKAN=1` to require execution. There is no performance pass threshold.
 
+## Shader cache replay
+
+`agc_shader_cache_replay` prepares compute shaders again from the entries of a shader disk cache (`shader_cache/<SourceVersion>/*.bin`, see `ANYPS5_SHADER_CACHE_DIR`), without the title. An entry's key holds the code, the stage information and the device target, so the tool rebuilds the request that registration prepared: zero user data, no shader header, and partial groups as `{1, 1, 1}` when the key has them. It refuses an entry whose key this build does not rebuild exactly (another key layout, or a cache written with `APS5_NO_CODE_HASH_KEY`), and skips resource plan entries and other stages. Each replay prints the code size, the prepared SPIR-V word count next to the stored one, the wall and CPU time of `PrepareShader`, and hashes of the SPIR-V and of the encoded resource plan, so two builds can be compared for speed and identical output over the same entries. `--front-end` also times the front end alone. Set `ANYPS5_NO_SHADER_CACHE=1` so the replay neither reads nor writes the cache.
+
+```sh
+cmake --build build --target agc_shader_cache_replay
+ANYPS5_NO_SHADER_CACHE=1 build/core/libs/prx/libSceAgcDriver/agc_shader_cache_replay game/shader_cache/<SourceVersion>/*.bin
+```
+
+On Windows prepend `build/core/libs/libs/unpatched` to the process `PATH`. The entries hold the title's shader code; do not share them.
+
 ## Pipeline statistics
 
 Set `APS5_PIPELINE_STATS=1` to capture and print driver statistics for each newly created graphics or compute pipeline. This requires `VK_KHR_pipeline_executable_properties` and `pipelineExecutableInfo`; an unsupported device fails with an error. Statistic names and units are driver-specific. Capturing statistics can increase pipeline compilation cost. The setting is disabled by default.

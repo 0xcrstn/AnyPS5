@@ -1,0 +1,213 @@
+#ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_TOOLS_SHADERCACHEENTRY_HPP
+#define CORE_LIBS_PRX_LIBSCEAGCDRIVER_TOOLS_SHADERCACHEENTRY_HPP
+
+#include "CacheKey.hpp"
+#include "Recompiler.hpp"
+#include "ShaderDiskCache.hpp"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace AgcDriver::Tools {
+
+inline constexpr std::uint64_t CacheEntryCodeAddress = 0x1000000000ull;
+
+struct CacheEntryRequest {
+    std::vector<std::uint32_t> code;
+    std::vector<std::uint32_t> capabilities;
+    std::vector<std::string> extensionText;
+    std::vector<std::string_view> extensions;
+    std::vector<std::uint32_t> userData;
+    std::vector<ShaderRecompiler::MemoryRegion> memory;
+    std::vector<std::uint64_t> key;
+    ShaderRecompiler::RecompileRequest request{};
+    std::uint32_t hostSubgroupSize = 0;
+    std::size_t storedWords = 0;
+};
+
+namespace CacheEntryDetail {
+
+class Bytes {
+public:
+    explicit Bytes(std::span<const std::byte> bytes) : bytes(bytes) {}
+
+    template<typename TValue>
+    TValue Read() {
+        if (bytes.size() - cursor < sizeof(TValue)) throw std::runtime_error("shader cache entry ends early");
+        TValue value;
+        std::memcpy(&value, bytes.data() + cursor, sizeof(TValue));
+        cursor += sizeof(TValue);
+        return value;
+    }
+
+    void Seek(std::size_t offset) {
+        if (offset > bytes.size()) throw std::runtime_error("shader cache entry ends early");
+        cursor = offset;
+    }
+
+private:
+    std::span<const std::byte> bytes;
+    std::size_t cursor = 0;
+};
+
+class Words {
+public:
+    explicit Words(std::span<const std::uint64_t> words) : words(words) {}
+
+    std::uint64_t Next() {
+        if (cursor >= words.size()) throw std::runtime_error("shader cache key ends early");
+        return words[cursor++];
+    }
+
+    std::uint32_t Next32() {
+        return static_cast<std::uint32_t>(Next());
+    }
+
+    bool NextBool() {
+        return Next() != 0u;
+    }
+
+    [[nodiscard]] bool Done() const {
+        return cursor == words.size();
+    }
+
+private:
+    std::span<const std::uint64_t> words;
+    std::size_t cursor = 0;
+};
+
+inline constexpr std::uint32_t FileMagic = 0x43535041u;
+inline constexpr std::size_t HeaderBytes = 48;
+
+}
+
+inline std::unique_ptr<CacheEntryRequest> ReadComputeCacheEntry(std::span<const std::byte> file) {
+    using namespace CacheEntryDetail;
+    Bytes bytes(file);
+    if (bytes.Read<std::uint32_t>() != FileMagic) throw std::runtime_error("not a shader cache entry");
+    if (bytes.Read<std::uint32_t>() != ShaderRecompiler::ShaderDiskCache::FormatVersion) throw std::runtime_error("shader cache entry has another format version");
+    bytes.Read<std::uint64_t>();
+    const auto keyBytes = bytes.Read<std::uint64_t>();
+    if (keyBytes > file.size() - HeaderBytes) throw std::runtime_error("shader cache entry ends early");
+    bytes.Seek(HeaderBytes + 16u);
+    const auto count = bytes.Read<std::uint64_t>();
+    if (count == 0u || count > keyBytes / sizeof(std::uint64_t)) return nullptr;
+    auto entry = std::make_unique<CacheEntryRequest>();
+    entry->key.resize(count);
+    for (auto& word : entry->key) word = bytes.Read<std::uint64_t>();
+    entry->code.resize(bytes.Read<std::uint64_t>());
+    for (auto& word : entry->code) word = bytes.Read<std::uint32_t>();
+    entry->hostSubgroupSize = bytes.Read<std::uint32_t>();
+    auto& request = entry->request;
+    request.layout.descriptorSet = bytes.Read<std::uint32_t>();
+    request.layout.firstBinding = bytes.Read<std::uint32_t>();
+    request.layout.pushConstantOffsetBytes = bytes.Read<std::uint32_t>();
+    request.layout.pushConstantSizeBytes = bytes.Read<std::uint32_t>();
+    bytes.Seek(HeaderBytes + keyBytes);
+    bytes.Read<std::uint32_t>();
+    entry->storedWords = bytes.Read<std::uint64_t>();
+
+    Words key(entry->key);
+    if (key.Next32() != ShaderRecompiler::RuntimeAbi::Version) throw std::runtime_error("shader cache entry has another runtime ABI version");
+    const auto stage = static_cast<ShaderRecompiler::ShaderStage>(key.Next());
+    if (stage != ShaderRecompiler::ShaderStage::Compute) return nullptr;
+    if (key.Next() != entry->code.size()) throw std::runtime_error("shader cache key holds code words; it was written with APS5_NO_CODE_HASH_KEY");
+    key.Next();
+    request.context.waveSize = key.Next32();
+    request.context.userDataBaseRegister = key.Next32();
+    entry->userData.assign(key.Next(), 0u);
+    if (!key.NextBool()) throw std::runtime_error("compute shader cache key has no compute stage information");
+    ShaderRecompiler::ShaderComputeStageInfo compute{};
+    for (auto& value : compute.numThreads) value = key.Next32();
+    compute.ldsSizeDwords = key.Next32();
+    for (auto& value : compute.groupIdEnable) value = key.NextBool();
+    compute.tgSizeEnable = key.NextBool();
+    compute.threadIdComponentCount = key.Next32();
+    if (key.NextBool()) compute.partialThreads = {1u, 1u, 1u};
+    compute.scratchDwords = key.Next32();
+    request.context.compute = compute;
+    if (key.NextBool() || key.NextBool()) throw std::runtime_error("compute shader cache key has pixel or vertex stage information");
+    if (key.NextBool()) {
+        ShaderRecompiler::ShaderFloatMode floatMode{};
+        floatMode.floatMode = key.Next32();
+        floatMode.dx10Clamp = key.NextBool();
+        floatMode.ieeeMode = key.NextBool();
+        floatMode.fp16Overflow = key.NextBool();
+        request.context.floatMode = floatMode;
+    }
+    auto& target = request.target;
+    target.vulkanVersion = key.Next32();
+    target.spirvVersion = key.Next32();
+    target.subgroupSize = key.Next32();
+    target.bdaAbiVersion = key.Next32();
+    entry->capabilities.resize(key.Next());
+    for (auto& capability : entry->capabilities) capability = key.Next32();
+    entry->extensionText.resize(key.Next());
+    for (auto& text : entry->extensionText) {
+        text.resize(key.Next());
+        for (auto& character : text) character = static_cast<char>(key.Next());
+    }
+    for (const auto& text : entry->extensionText) entry->extensions.emplace_back(text);
+    target.supportedCapabilities = entry->capabilities;
+    target.supportedExtensions = entry->extensions;
+    target.fragmentShaderBarycentricEnabled = key.NextBool();
+    for (auto& value : target.maxWorkgroupSize) value = key.Next32();
+    target.maxWorkgroupInvocations = key.Next32();
+    target.maxWorkgroupSharedMemoryBytes = key.Next32();
+    if (key.NextBool()) {
+        ShaderRecompiler::MeshTargetLimits mesh{};
+        for (auto& value : mesh.maxWorkgroupSize) value = key.Next32();
+        mesh.maxWorkgroupInvocations = key.Next32();
+        mesh.maxSharedMemoryBytes = key.Next32();
+        mesh.maxOutputVertices = key.Next32();
+        mesh.maxOutputPrimitives = key.Next32();
+        mesh.maxOutputComponents = key.Next32();
+        mesh.maxOutputMemoryBytes = key.Next32();
+        mesh.outputPerVertexGranularity = key.Next32();
+        mesh.outputPerPrimitiveGranularity = key.Next32();
+        target.mesh = mesh;
+    }
+    if (key.NextBool()) {
+        ShaderRecompiler::TessellationTargetLimits tessellation{};
+        tessellation.maxPatchSize = key.Next32();
+        tessellation.maxControlPerVertexInputComponents = key.Next32();
+        tessellation.maxControlPerVertexOutputComponents = key.Next32();
+        tessellation.maxControlPerPatchOutputComponents = key.Next32();
+        tessellation.maxControlTotalOutputComponents = key.Next32();
+        tessellation.maxEvaluationInputComponents = key.Next32();
+        tessellation.maxEvaluationOutputComponents = key.Next32();
+        target.tessellation = tessellation;
+    }
+    target.nonConstantImageOffsets = key.NextBool();
+    target.srgbDecodeFormats = key.Next32();
+    target.narrowSubgroupClock = key.NextBool();
+    target.float64DenormPreserve = key.NextBool();
+    target.registrationModules = key.NextBool();
+    target.registrationWordLimit = key.Next32();
+    target.vertexSubgroups = key.NextBool();
+    target.float16DenormPreserve = key.NextBool();
+    key.Next();
+    key.Next();
+    key.Next();
+    if (!key.Done()) throw std::runtime_error("shader cache key has more fields than this build writes");
+    entry->memory.push_back({CacheEntryCodeAddress, std::as_bytes(std::span<const std::uint32_t>(entry->code))});
+    request.shader = {stage, CacheEntryCodeAddress, entry->code, 0, {}};
+    request.context.userData = entry->userData;
+    request.context.memory = entry->memory;
+    std::vector<std::uint64_t> rebuilt;
+    ShaderRecompiler::RecompileCacheKey::Build(request, rebuilt);
+    if (rebuilt != entry->key) throw std::runtime_error("shader cache key does not match the request this build rebuilds from it");
+    return entry;
+}
+
+}
+
+#endif
