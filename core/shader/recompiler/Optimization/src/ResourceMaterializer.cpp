@@ -151,8 +151,9 @@ bool nullsUnreadableSampledImage(const DescriptorValue& descriptor, const ImageR
     if (StrictImageFormats() || !unreadableSampledImage(descriptor, base)) return false;
     static std::array<std::atomic<bool>, 1024> reported{};
     const auto format = static_cast<std::uint32_t>(rawImageFormat(descriptor));
-    if (!reported[(format & 0x1ffu) | (base.depthCompare ? 0x200u : 0u)].exchange(true)) {
-        std::fprintf(stderr, "[gpu] sampled image descriptor uses unsupported format %u; it is bound as a null image (APS5_STRICT_IMAGE_FORMATS refuses it)%s\n", format, describeImageDescriptor(descriptor, base).c_str());
+    static std::atomic<std::uint32_t> reports{0};
+    if (!reported[(format & 0x1ffu) | (base.depthCompare ? 0x200u : 0u)].exchange(true) && reports.fetch_add(1) < 16u) {
+        std::fprintf(stderr, "[gpu] sampled image descriptor uses unsupported format %u; it is bound as a null image (APS5_STRICT_IMAGE_FORMATS refuses it; the first 16 formats are reported)%s\n", format, describeImageDescriptor(descriptor, base).c_str());
     }
     return true;
 }
