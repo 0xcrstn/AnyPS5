@@ -70,6 +70,12 @@ public:
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> TakeRecentRegions();
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
+    static std::uint64_t MemoizedCaptures();
+    struct RecordedAccess {
+        std::uint64_t address;
+        std::uint64_t bytes;
+        std::uint32_t value;
+    };
 
 private:
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
@@ -87,6 +93,8 @@ private:
     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
     static bool accessible(void* context, std::uint64_t address, std::uint64_t bytes);
     Page& page(std::uint64_t base);
+    bool replay(std::span<const RecordedAccess> accesses);
+    bool probe(std::uint64_t address, std::uint64_t bytes);
 
     // Regions given at construction (the registered shader's code and header), referenced as given:
     // the caller keeps them alive for as long as the capture is used.
@@ -95,6 +103,9 @@ private:
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
+    std::vector<RecordedAccess>* recording = nullptr;
+    std::uint64_t pageSetupNanoseconds = 0;
+    std::uint64_t pageReadNanoseconds = 0;
 };
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a

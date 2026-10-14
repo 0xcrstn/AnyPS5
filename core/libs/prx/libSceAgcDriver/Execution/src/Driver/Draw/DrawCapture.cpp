@@ -27,6 +27,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
     timing.Mark("prepared_invocation");
+    phaseTiming.Phase(DrawRowCaptureInvocation);
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
@@ -34,6 +35,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         const SampledReadScope sampling(evidenceReads);
         return shaderMemory.Capture(invocation);
     }();
+    phaseTiming.Phase(DrawRowCapture);
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     stageCapture.userDataUse = capture->userDataUse;
@@ -51,7 +53,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     if (traceCapSync()) traceCapture("draw-capture", program.binary.codeAddress, submission.queue, memory, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     if (profile) {
         ++captures;
-        phaseTiming.Phase(DrawRowCapture);
+        phaseTiming.Phase(DrawRowCaptureRegions);
 
         const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBefore, phaseMs[DrawRowCapture]);
         phaseMs[DrawRowCapture] -= waited;
@@ -76,7 +78,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         }
     }
 
-    phaseTiming.Phase(DrawRowCapture);
+    phaseTiming.Phase(DrawRowCaptureRegions);
 
     timing.Mark("capture_resources");
     stageCapture.compiled = invocation.Materialize(*capture);

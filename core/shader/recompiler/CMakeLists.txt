@@ -241,6 +241,7 @@ function(add_shader_recompiler target runtimeTarget)
             RegistrationResult
             ResolveSource
             ResourceMaterializer::SpecializationNanoseconds
+            ResourceMaterializer::ThreadEvaluationNanoseconds
             RuntimeAbi::RequireVersion
             RuntimeAbi::HeapCapacity
             SetDebugProbeActive
@@ -250,6 +251,7 @@ function(add_shader_recompiler target runtimeTarget)
             SrgbDecodeBit
             SrgbUnormFormat
             ThreadOwned
+            ThreadSrtEvaluationCounts
             UnresolvableSwappcTarget
             ValidateAndOptimizeSpirv
             FindUserDataCalls

@@ -80,6 +80,7 @@ public:
     bool EvaluateWide(IrValue* raw, std::uint64_t& result);
     void ReportInaccessibleReads(InaccessibleRead* sink) { _inaccessible = sink; }
     void ReportNullRootReads(std::uint32_t* sink) { _nullRoots = sink; }
+    [[nodiscard]] const SrtEvaluationCounts& Counts() const { return _counts; }
 
 private:
     static float Float32(std::uint64_t bits);
@@ -101,7 +102,10 @@ private:
     EvaluatedValues _cache;
     std::vector<IrValue*> _visiting;
     int _nested = 0;
+    SrtEvaluationCounts _counts;
 };
+
+SrtEvaluationCounts& ThreadEvaluationCounts();
 
 }
 

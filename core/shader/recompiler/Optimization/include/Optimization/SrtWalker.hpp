@@ -36,6 +36,13 @@ struct SrtRuntime {
     SrtUserDataUse* userDataUse = nullptr;
 };
 
+struct SrtEvaluationCounts {
+    std::uint64_t values = 0;
+    std::uint64_t laneEvaluators = 0;
+    std::uint64_t phis = 0;
+};
+[[nodiscard]] SrtEvaluationCounts ThreadSrtEvaluationCounts();
+
 enum class RuntimeValueType {
     Any,
     Integer
