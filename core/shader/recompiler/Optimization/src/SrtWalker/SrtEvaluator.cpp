@@ -46,6 +46,7 @@ bool Evaluator::EvaluateWide(IrValue* raw, std::uint64_t& result) {
     if (_activeMask != nullptr && IsRuntimeSelect(inst->Opcode()) && inst->ArgumentCount() == 3 && inst->Argument(0)->Resolve() == _activeMask) {
         return EvaluateWide(inst->Argument(1), result);
     }
+    if (_nested > 0 && _runtime.userDataUse != nullptr && (inst->Opcode() == IrOpcode::LoadAddressU32 || inst->Opcode() == IrOpcode::ReadConstBuffer) && IsRawRead(_program, *inst)) _runtime.userDataUse->operandReads.push_back(inst);
     if (_cache.Find(inst, result)) {
         return true;
     }
@@ -54,7 +55,10 @@ bool Evaluator::EvaluateWide(IrValue* raw, std::uint64_t& result) {
     }
     _visiting.push_back(inst);
     std::uint64_t out = 0;
+    const bool forwards = inst->Opcode() == IrOpcode::ReadConst || inst->Opcode() == IrOpcode::BitCastU32F32 || inst->Opcode() == IrOpcode::BitCastF32U32;
+    if (!forwards) ++_nested;
     const bool evaluated = EvaluateInst(*inst, out);
+    if (!forwards) --_nested;
     _visiting.pop_back();
     if (!evaluated) {
         static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
@@ -127,7 +131,18 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
     std::uint64_t low = 0;
     std::uint64_t high = 0;
     std::uint64_t offset = 0;
-    if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
+    std::int32_t origin = -1;
+    const auto baseWord = [&] {
+        IrValue* source = handle->Argument(0)->Resolve();
+        if (_runtime.userDataUse == nullptr || source->HasImmediate() || source->Opcode() != IrOpcode::GetUserData) return Arg(*handle, 0, low);
+        const auto reg = RegIndex(static_cast<ScalarReg>(source->Argument(0)->Register().index));
+        if (reg < _program.userDataBase || reg - _program.userDataBase >= _runtime.userData.size() || reg - _program.userDataBase >= SrtUserDataUse::TrackedWords) return Arg(*handle, 0, low);
+        origin = static_cast<std::int32_t>(reg - _program.userDataBase);
+        low = _runtime.userData[reg - _program.userDataBase];
+        _runtime.userDataUse->asBase |= std::uint64_t {1} << origin;
+        return true;
+    };
+    if (!baseWord() || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
         return false;
     }
     const auto base = ((high << 32u) | static_cast<std::uint32_t>(low)) & AddressMask;
@@ -161,6 +176,10 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
         ++*_nullRoots;
         result = 0;
         return true;
+    }
+    if (_runtime.userDataUse != nullptr) {
+        _runtime.userDataUse->reads.emplace_back(address, origin);
+        _runtime.userDataUse->readInstructions.push_back(&inst);
     }
     if (_inaccessible != nullptr && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t)) && LoadedFromMemory(*handle)) {
         *_inaccessible = {&inst, address};
@@ -338,6 +357,7 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
             if (reg < _program.userDataBase || reg - _program.userDataBase >= _runtime.userData.size()) {
                 return false;
             }
+            if (_runtime.userDataUse != nullptr) _runtime.userDataUse->asValue |= reg - _program.userDataBase < SrtUserDataUse::TrackedWords ? std::uint64_t {1} << (reg - _program.userDataBase) : ~std::uint64_t {0};
             result = _runtime.userData[reg - _program.userDataBase];
             return true;
         }
@@ -345,6 +365,7 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
         case IrOpcode::Phi: return EvaluatePhi(inst, result);
         case IrOpcode::ReadFirstLane: {
             Evaluator active(_program, _runtime, _cleanFlatSlots, _cleanEvaluator, inst.Argument(1));
+            active._nested = _nested;
             active.ReportInaccessibleReads(_inaccessible);
             active.ReportNullRootReads(_nullRoots);
             return active.EvaluateWide(inst.Argument(0), result);
@@ -365,7 +386,10 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
                 return false;
             }
             if (slot->ImmediateU32() < _cleanFlatSlots.size() && _cleanFlatSlots[slot->ImmediateU32()] != 0u && _cleanEvaluator != nullptr) {
-                return _cleanEvaluator->EvaluateWide(_program.srtReads[slot->ImmediateU32()].value, result);
+                _cleanEvaluator->_nested += _nested;
+                const bool clean = _cleanEvaluator->EvaluateWide(_program.srtReads[slot->ImmediateU32()].value, result);
+                _cleanEvaluator->_nested -= _nested;
+                return clean;
             }
             return EvaluateWide(_program.srtReads[slot->ImmediateU32()].value, result);
         }

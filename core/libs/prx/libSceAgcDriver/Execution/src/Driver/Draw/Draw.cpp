@@ -67,10 +67,28 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
+    std::uint64_t drawIdentity = 0;
+    DrawAliasKeys drawAliases;
+    std::vector<DrawUserPatch> userPatches;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
-        std::lock_guard cacheLock(drawCacheMutex);
+        std::shared_ptr<const DrawRelocation> relocation;
+        bool aliasFirst = false;
+        if (drawRelocationEnabled()) {
+            drawIdentity = drawIdentityKey(queue, *submission.shaders);
+            std::lock_guard cacheLock(drawCacheMutex);
+            learnPendingRelocation();
+            drawStageDonorKeys.clear();
+            const auto known = drawRelocations.find(drawIdentity);
+            if (known != drawRelocations.end()) {
+                auto& trial = drawRelocationTrials[drawIdentity];
+                if (trial.idle != 0) --trial.idle;
+                else relocation = known->second;
+                aliasFirst = relocation != nullptr && trial.productive;
+            }
+        }
+        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAliases : nullptr);
+        std::unique_lock cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
         if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
@@ -80,9 +98,27 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             decode = entry->decode;
         } else {
             ++drawEntryCounters.absent;
+            if (relocation != nullptr && !aliasFirst) {
+                cacheLock.unlock();
+                drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), relocation.get(), &drawAliases);
+                cacheLock.lock();
+            }
+            if (drawIdentity != 0) drawRelocationPending = {drawKey, drawIdentity, drawAliases, relocation};
+            if (drawAliases.structure != 0) relocateDrawEntry(queue, drawAliases, entry, decode, userPatches);
+            if (relocation != nullptr) {
+                auto& trial = drawRelocationTrials[drawIdentity];
+                ++trial.lookups;
+                if (decode != nullptr) ++trial.hits;
+                if (trial.lookups >= DrawRelocationTrial::Window) {
+                    trial.productive = trial.hits * DrawRelocationTrial::MinimumHitShare >= trial.lookups;
+                    if (!trial.productive) trial.idle = DrawRelocationTrial::IdleDraws;
+                    trial.lookups = trial.hits = 0;
+                }
+            }
         }
     }
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
+        userPatches.clear();
         std::lock_guard cacheLock(drawCacheMutex);
         eraseDrawEntry(drawKey, entry);
         ++drawEntryCounters.absent;
@@ -95,6 +131,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto& graphics = decode->state;
     auto pixel = decode->pixel;
     std::vector<DrawProgram> programs = decode->programs;
+    for (const auto& patch : userPatches) programs[patch.program].userData[patch.index] = patch.value;
     if (const auto skipped = SkippedShader(); skipped != 0 && std::any_of(programs.begin(), programs.end(), [skipped](const DrawProgram& program) { return program.binary.codeAddress == skipped; })) return drawn();
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
@@ -172,6 +209,28 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool drawHit = false;
     bool verifyHit = false;
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs);
+    for (auto& variant : matched) {
+        if (variant != nullptr) applyShaderDataPatches(*variant);
+    }
+    const auto relocatedDecode = decode;
+    if (!userPatches.empty()) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        if (drawHit) ++drawRelocationCounters.hits;
+        if (profile && drawRelocationCounters.lookups >= 100000) reportDrawRelocation();
+    }
+    if (drawHit && std::any_of(matched.begin(), matched.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant != nullptr && variant->dataPatched; })) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        for (std::size_t i = 0; i < matched.size() && i < drawStageDonorKeys.size() && i < programs.size(); ++i) {
+            if (matched[i] == nullptr || !matched[i]->dataPatched || drawStageDonorKeys[i] == 0) continue;
+            matched[i]->dataPatched = false;
+            drawStageDonors[drawStageDonorKeys[i]] = {matched[i], programs[i].userData};
+        }
+    }
+    if (!userPatches.empty() && !drawHit) {
+        auto current = std::make_shared<DrawDecode>(*decode);
+        for (const auto& patch : userPatches) current->programs[patch.program].userData[patch.index] = patch.value;
+        decode = std::move(current);
+    }
 
     if (registerKey) {
 
@@ -201,7 +260,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& program = programs[i];
         pushCursorBytes = Graphics::StagePushOffset(pushCursorBytes, program.binary.stage, localDevice->GraphicsPipelineLibraries());
         pushOffsets[i] = pushCursorBytes;
-        if (drawHit) {
+        const bool reused = !drawHit && !verifyHit && drawRelocationEnabled() && matched[i] != nullptr;
+        if (reused) fresh[i] = matched[i];
+        if (drawHit || reused) {
 
             programResults[i] = matched[i]->compiled.get();
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
@@ -227,6 +288,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
         require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
+        if ((drawHit || reused) && !matched[i]->patchedPushConstants.empty()) stages.back().pushConstants = matched[i]->patchedPushConstants;
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 

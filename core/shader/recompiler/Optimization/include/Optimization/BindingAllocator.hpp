@@ -19,6 +19,8 @@ struct BindingAllocationResult : CompiledBindingLayout {
     std::vector<PipelineSpecializationConstant> specialization;
     std::vector<DescriptorBinding> bindings;
     std::vector<std::byte> pushConstants;
+    std::vector<std::uint32_t> shaderDataUserWords;
+    std::vector<std::array<std::uint32_t, 3>> bufferBaseSlots;
 };
 
 class BindingAllocator {

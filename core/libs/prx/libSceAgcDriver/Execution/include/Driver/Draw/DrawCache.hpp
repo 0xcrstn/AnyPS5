@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAWCACHE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAWCACHE_HPP
 
+#include "UserDataUse.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include <array>
@@ -23,6 +24,7 @@ struct DrawProgram {
 
     std::shared_ptr<const ShaderSnapshot> snapshot;
     std::size_t codeOffset = 0;
+    std::uint32_t hiddenUserWords = 0;
 };
 
 struct DrawDecode {
@@ -95,6 +97,59 @@ struct StageCapture {
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
+    ShaderRecompiler::SrtUserDataUse userDataUse;
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> prepared;
+    std::vector<ShaderRecompiler::BufferBaseWord> bufferBaseWords;
+};
+
+struct RelocatableUserWord {
+    std::uint32_t reg;
+    std::vector<std::pair<std::int64_t, std::uint32_t>> reads;
+    std::vector<std::int64_t> dataOffsets;
+};
+
+struct DrawRelocation {
+    std::vector<RelocatableUserWord> words;
+    std::vector<std::uint32_t> banned;
+};
+
+struct DrawUserPatch {
+    std::size_t program;
+    std::uint32_t index, value;
+};
+
+struct DrawAliasKeys {
+    static constexpr std::size_t Stages = 3;
+    std::uint64_t structure = 0;
+    std::array<std::uint64_t, Stages> content{};
+    static std::size_t Stage(std::uint32_t reg) { return reg >= 0x10cu ? 2 : reg >= 0x08cu ? 1 : 0; }
+    std::uint64_t Key(std::uint64_t stageKey, std::uint32_t userDataBase) const { return (stageKey ^ (content[Stage(userDataBase)] + 0x9e3779b97f4a7c15ull)) * 0x100000001b3ull + userDataBase; }
+};
+
+struct DrawStageDonor {
+    std::shared_ptr<DispatchVariant> variant;
+    std::vector<std::uint32_t> userData;
+};
+
+struct DrawDecodeDonor {
+    std::shared_ptr<const DrawDecode> decode;
+    std::vector<std::uint64_t> stageKeys;
+};
+
+struct DrawRelocationPending {
+    std::uint64_t key = 0, identity = 0;
+    DrawAliasKeys aliases;
+    std::shared_ptr<const DrawRelocation> relocation;
+};
+
+struct DrawRelocationTrial {
+    static constexpr std::uint32_t Window = 1024, MinimumHitShare = 16, IdleDraws = 16384;
+    std::uint32_t lookups = 0, hits = 0, idle = 0;
+    bool productive = false;
+};
+
+struct DrawRelocationCounters {
+    std::uint64_t lookups = 0, donors = 0, refused = 0, hits = 0;
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
