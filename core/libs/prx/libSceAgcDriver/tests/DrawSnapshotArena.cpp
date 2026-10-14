@@ -309,6 +309,7 @@ void WaitForReleases(Fixture& fixture) {
 
 void RecycleTests(Fixture& fixture) {
     DrawSnapshotArena::SetEnabled(true);
+    DrawSnapshotArena::SetExtendBytes(0);
     auto& recorder = fixture.GetRecorder();
     recorder.Sync();
     recorder.FlushDeferredReleases();

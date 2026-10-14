@@ -33,7 +33,7 @@ std::atomic<std::size_t>& BudgetSetting() {
 }
 
 std::atomic<std::size_t>& ExtendSetting() {
-    static std::atomic<std::size_t> bytes{EnvironmentBytes("APS5_DRAW_SNAPSHOT_ARENA_EXTEND_KIB", 1024, 0)};
+    static std::atomic<std::size_t> bytes{EnvironmentBytes("APS5_DRAW_SNAPSHOT_ARENA_EXTEND_KIB", 1024, std::size_t{1} << 20u)};
     return bytes;
 }
 
