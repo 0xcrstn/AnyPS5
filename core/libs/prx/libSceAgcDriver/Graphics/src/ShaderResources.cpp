@@ -2543,7 +2543,7 @@ struct ChurnCounts {
 struct ChurnProfile {
     std::mutex mutex;
     std::unordered_map<std::uint64_t, ResourceCache::Key> lastByVariant;
-    ChurnCounts dispatch;
+    std::array<ChurnCounts, 2> dispatch;
     ChurnCounts draws;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -2629,7 +2629,7 @@ void ResourceCache::noteMiss(const Key& key) {
     }
     auto& churn = Churn();
     std::lock_guard lock(churn.mutex);
-    auto& counts = draw ? churn.draws : churn.dispatch;
+    auto& counts = draw ? churn.draws : churn.dispatch[GuestMemory::GpuLockThreadTag() == 0 ? 0 : 1];
     const auto found = churn.lastByVariant.find(variants);
     if (found == churn.lastByVariant.end()) {
         ++counts.firstSeen;
@@ -2677,7 +2677,8 @@ void ResourceCache::noteMiss(const Key& key) {
         line += item;
         AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
     };
-    report("dispatch", churn.dispatch);
+    report("dispatch, queue 0", churn.dispatch[0]);
+    report("dispatch, other queues", churn.dispatch[1]);
     report("draws", churn.draws);
 }
 
