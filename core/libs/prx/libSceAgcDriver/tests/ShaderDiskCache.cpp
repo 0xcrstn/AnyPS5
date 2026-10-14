@@ -1732,6 +1732,56 @@ std::filesystem::path planEntryPath(PlanFixture& fixture) {
     return ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key);
 }
 
+std::filesystem::path planFailurePath(PlanFixture& fixture) {
+    std::vector<std::byte> planKey;
+    ShaderDiskCache::BuildPlanKey(fixture.Request(true), 32u, planKey);
+    std::vector<std::byte> key;
+    ShaderDiskCache::BuildPlanFailureKey(planKey, key);
+    return ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key);
+}
+
+std::filesystem::path refusalPath() {
+    return ShaderCacheDirectory() / "plan-outputs" / "refusal.txt";
+}
+
+PlanFixture refusedFixture() {
+    auto refused = planFixtures()[1];
+    refused.codeAddress = 0x200000u;
+    refused.code = {0xf40c0200u, 0xfa000000u, 0xf4000400u, 0xfa000050u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u, 0xf4080500u, 0xfa000020u, 0xbf820002u, 0xf4080500u, 0x20000000u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    return refused;
+}
+
+std::string refusalMessage(PlanFixture& refused) {
+    try {
+        static_cast<void>(PrepareShader(refused.Request(true)));
+    } catch (const std::runtime_error& error) {
+        return error.what();
+    }
+    return {};
+}
+
+void verifyPlanFailureEntry() {
+    auto refused = refusedFixture();
+    std::vector<std::byte> planKey;
+    ShaderDiskCache::BuildPlanKey(refused.Request(true), 32u, planKey);
+    std::vector<std::byte> key;
+    ShaderDiskCache::BuildPlanFailureKey(planKey, key);
+    require(key != planKey && ShaderDiskCache::EntryName(key) != ShaderDiskCache::EntryName(planKey), "a refusal entry shares its plan's name");
+    const std::string message = "GetImageResource dword 0 is not a valid runtime value";
+    const auto entry = ShaderDiskCache::EncodePlanFailureEntry(key, message);
+    std::string decoded;
+    require(ShaderDiskCache::DecodePlanFailureEntry(entry, key, decoded) == ShaderDiskCache::LoadStatus::Loaded && decoded == message, "a refusal entry did not round-trip");
+    IrResourcePlan plan;
+    require(ShaderDiskCache::DecodePlanEntry(entry, planKey, plan) != ShaderDiskCache::LoadStatus::Loaded, "a refusal entry decoded as a plan");
+    require(ShaderDiskCache::DecodePlanFailureEntry(entry, planKey, decoded) == ShaderDiskCache::LoadStatus::KeyMismatch, "a refusal entry matched its plan's key");
+    auto damaged = entry;
+    damaged.back() ^= std::byte{0x01};
+    require(ShaderDiskCache::DecodePlanFailureEntry(damaged, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "a damaged refusal entry was accepted");
+    const std::span<const std::byte> truncated(entry.data(), entry.size() - 1u);
+    require(ShaderDiskCache::DecodePlanFailureEntry(truncated, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "a truncated refusal entry was accepted");
+    require(ShaderDiskCache::EncodePlanFailureEntry(key, {}).empty() && ShaderDiskCache::EncodePlanFailureEntry(key, std::string(64u * 1024u + 1u, 'x')).empty(), "an empty or oversized refusal was encoded");
+}
+
 int runPlanLoadingProcess(std::string_view mode) {
     if (mode == "--load-plan-switch") setEnvironment("APS5_TRACE_BINDLESS", "1");
     if (mode == "--load-plan-off") setEnvironment("APS5_NO_PERF_DISK_PLANS", "1");
@@ -1769,6 +1819,15 @@ int runPlanLoadingProcess(std::string_view mode) {
         const auto after = ShaderDiskCache::Totals();
         require(FrontEndBuilds() == 1u && after.planHits == count && after.planMisses == 1u, "a changed code word reused a stored plan");
         std::cout << "second process prepared " << count << " shaders from stored plans without running the front end\n";
+        auto refused = refusedFixture();
+        std::vector<std::byte> expected;
+        require(ReadWholeFile(refusalPath(), expected), "cannot read the first process's refusal");
+        const auto refusal = refusalMessage(refused);
+        const auto replayed = ShaderDiskCache::Totals();
+        require(refusal == std::string(reinterpret_cast<const char*>(expected.data()), expected.size()), "the replayed refusal differs from the first process's: " + refusal.substr(0, refusal.find("RecompileRequest:")));
+        require(FrontEndBuilds() == 1u && replayed.planFailureHits == 1u && replayed.planFailureWrites == 0u, "the second process ran the front end for a stored refusal");
+        require(refusalMessage(refused) == refusal && FrontEndBuilds() == 1u && ShaderDiskCache::Totals().planFailureHits == 1u, "a replayed refusal was looked up again");
+        std::cout << "second process replayed a stored refusal without running the front end\n";
     } else if (mode == "--load-plan-off") {
         std::cout << "APS5_NO_PERF_DISK_PLANS=1 ran the front end for all " << count << " shaders with the same output\n";
     } else {
@@ -1792,17 +1851,14 @@ void verifyPlanAcrossProcesses(const char* self) {
     require(FrontEndBuilds() - builds == fixtures.size() && after.planMisses - before.planMisses == fixtures.size() && after.planWrites - before.planWrites == fixtures.size(), "the first process did not build and store every plan");
     std::filesystem::create_directories(planOutputPath(0).parent_path());
     for (std::size_t index = 0; index < outputs.size(); ++index) require(WriteFileAtomically(planOutputPath(index), outputs[index]), "cannot write the first process's output");
-    auto refused = fixtures[1];
-    refused.codeAddress = 0x200000u;
-    refused.code = {0xf40c0200u, 0xfa000000u, 0xf4000400u, 0xfa000050u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u, 0xf4080500u, 0xfa000020u, 0xbf820002u, 0xf4080500u, 0x20000000u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
-    bool threw = false;
-    try {
-        static_cast<void>(PrepareShader(refused.Request(true)));
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
+    auto refused = refusedFixture();
+    const auto refusal = refusalMessage(refused);
     ShaderDiskCache::Flush();
-    require(threw && ShaderDiskCache::Totals().planWrites == after.planWrites && !std::filesystem::exists(planEntryPath(refused)), "a plan the front end refused was stored");
+    const auto stored = ShaderDiskCache::Totals();
+    require(!refusal.empty() && stored.planWrites == after.planWrites && !std::filesystem::exists(planEntryPath(refused)), "a plan the front end refused was stored as a plan");
+    require(stored.planFailureWrites == after.planFailureWrites + 1u && std::filesystem::exists(planFailurePath(refused)), "the front end's refusal was not stored");
+    require(refusalMessage(refused) == refusal && FrontEndBuilds() - builds == fixtures.size() + 1u, "a repeated refusal in one process ran the front end again");
+    require(WriteFileAtomically(refusalPath(), std::as_bytes(std::span(refusal.data(), refusal.size()))), "cannot write the first process's refusal");
     std::uintmax_t planBytes = 0;
     for (auto& fixture : fixtures) planBytes += std::filesystem::file_size(planEntryPath(fixture));
     std::cout << fixtures.size() << " plan entries, " << planBytes / fixtures.size() << " bytes per entry on average\n";
@@ -1857,6 +1913,7 @@ int main(int argc, char** argv) {
         verifyFloatModeSerialization();
         verifyPlanRoundTrip();
         verifyPlanKey();
+        verifyPlanFailureEntry();
         verifyStore();
         verifyAcrossProcesses(argv[0]);
         verifyPlanAcrossProcesses(argv[0]);

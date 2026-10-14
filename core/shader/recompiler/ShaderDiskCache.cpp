@@ -764,6 +764,8 @@ void decodeAllocation(Reader& reader, CompiledBindingLayout& allocation) {
 }
 
 constexpr std::uint32_t PlanEntryKind = 0x4e414c50u;
+constexpr std::uint32_t PlanFailureEntryKind = 0x4c494146u;
+constexpr std::size_t PlanFailureMessageLimit = 64u * 1024u;
 constexpr std::uint32_t NoPlanIndex = std::numeric_limits<std::uint32_t>::max();
 
 void encodeMemoryInfo(Writer& out, const MemoryInfo& memory) {
@@ -1157,12 +1159,20 @@ public:
         return load(key, [&](std::span<const std::byte> file) { return DecodePlanEntry(file, key, plan); }, planHits, planMisses, planLoadFailures);
     }
 
+    bool LoadPlanFailure(std::span<const std::byte> key, std::string& message) {
+        return load(key, [&](std::span<const std::byte> file) { return DecodePlanFailureEntry(file, key, message); }, planFailureHits, planFailureMisses, planLoadFailures);
+    }
+
     void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant) {
-        enqueue({std::move(key), std::move(variant), nullptr});
+        enqueue({std::move(key), std::move(variant), nullptr, {}});
     }
 
     void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan) {
-        enqueue({std::move(key), nullptr, std::move(plan)});
+        enqueue({std::move(key), nullptr, std::move(plan), {}});
+    }
+
+    void StorePlanFailure(std::vector<std::byte> key, std::string message) {
+        enqueue({std::move(key), nullptr, nullptr, std::move(message)});
     }
 
     void Flush() {
@@ -1183,6 +1193,8 @@ public:
         counters.planMisses = planMisses.load(std::memory_order_relaxed);
         counters.planWrites = planWrites.load(std::memory_order_relaxed);
         counters.planLoadFailures = planLoadFailures.load(std::memory_order_relaxed);
+        counters.planFailureHits = planFailureHits.load(std::memory_order_relaxed);
+        counters.planFailureWrites = planFailureWrites.load(std::memory_order_relaxed);
         return counters;
     }
 
@@ -1191,6 +1203,7 @@ private:
         std::vector<std::byte> key;
         std::shared_ptr<const CompiledVariant> variant;
         std::shared_ptr<const IrResourcePlan> plan;
+        std::string failure;
     };
 
     template<typename TDecode>
@@ -1258,9 +1271,9 @@ private:
     }
 
     void write(const Job& job) {
-        const auto file = job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : EncodeEntry(job.key, *job.variant);
+        const auto file = job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : job.variant != nullptr ? EncodeEntry(job.key, *job.variant) : EncodePlanFailureEntry(job.key, job.failure);
         if (!file.empty() && WriteFileAtomically(directory / EntryName(job.key), file)) {
-            (job.plan != nullptr ? planWrites : writes).fetch_add(1, std::memory_order_relaxed);
+            (job.plan != nullptr ? planWrites : job.variant != nullptr ? writes : planFailureWrites).fetch_add(1, std::memory_order_relaxed);
             bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
         } else {
             const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
@@ -1310,11 +1323,12 @@ private:
         const auto totals = Totals();
         const auto loadNs = loadNanoseconds.load(std::memory_order_relaxed);
         const auto delta = [](std::uint64_t after, std::uint64_t before) { return static_cast<unsigned long long>(after - before); };
-        if (totals.hits == reported.hits && totals.misses == reported.misses && totals.writes == reported.writes && totals.loadFailures == reported.loadFailures && totals.writeFailures == reported.writeFailures && totals.planHits == reported.planHits && totals.planMisses == reported.planMisses && totals.planWrites == reported.planWrites && totals.planLoadFailures == reported.planLoadFailures) return;
-        std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses)\n",
+        if (totals.hits == reported.hits && totals.misses == reported.misses && totals.writes == reported.writes && totals.loadFailures == reported.loadFailures && totals.writeFailures == reported.writeFailures && totals.planHits == reported.planHits && totals.planMisses == reported.planMisses && totals.planWrites == reported.planWrites && totals.planLoadFailures == reported.planLoadFailures && totals.planFailureHits == reported.planFailureHits && totals.planFailureWrites == reported.planFailureWrites) return;
+        std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; refused plans: %llu replayed, %llu stored; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses)\n",
                      delta(totals.hits, reported.hits), delta(totals.misses, reported.misses), delta(totals.writes, reported.writes), static_cast<double>(totals.bytesWritten - reported.bytesWritten) / (1024.0 * 1024.0),
                      delta(totals.loadFailures, reported.loadFailures), delta(totals.writeFailures, reported.writeFailures),
                      delta(totals.planHits, reported.planHits), delta(totals.planMisses, reported.planMisses), delta(totals.planWrites, reported.planWrites), delta(totals.planLoadFailures, reported.planLoadFailures),
+                     delta(totals.planFailureHits, reported.planFailureHits), delta(totals.planFailureWrites, reported.planFailureWrites),
                      static_cast<double>(totals.bytesRead - reported.bytesRead) / (1024.0 * 1024.0), static_cast<double>(loadNs - reportedLoadNs) / 1e6,
                      static_cast<unsigned long long>(totals.hits), static_cast<unsigned long long>(totals.misses), static_cast<unsigned long long>(totals.writes), static_cast<unsigned long long>(totals.planHits), static_cast<unsigned long long>(totals.planMisses));
         reported = totals;
@@ -1330,6 +1344,7 @@ private:
     bool writing = false;
     std::atomic<std::uint64_t> hits{0}, misses{0}, writes{0}, loadFailures{0}, writeFailures{0}, bytesRead{0}, bytesWritten{0}, loadNanoseconds{0};
     std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0};
+    std::atomic<std::uint64_t> planFailureHits{0}, planFailureMisses{0}, planFailureWrites{0};
     std::atomic<std::int64_t> lastReport{0};
     std::mutex reportMutex;
     Counters reported;
@@ -1456,6 +1471,33 @@ LoadStatus DecodePlanEntry(std::span<const std::byte> file, std::span<const std:
     return DecodePlan(payload, plan) ? LoadStatus::Loaded : LoadStatus::Rejected;
 }
 
+void BuildPlanFailureKey(std::span<const std::byte> planKey, std::vector<std::byte>& key) {
+    key.clear();
+    Writer writer(key);
+    writer.Value(PlanFailureEntryKind);
+    key.insert(key.end(), planKey.begin(), planKey.end());
+}
+
+std::vector<std::byte> EncodePlanFailureEntry(std::span<const std::byte> key, const std::string& message) {
+    if (message.empty() || message.size() > PlanFailureMessageLimit) return {};
+    std::vector<std::byte> payload;
+    Writer writer(payload);
+    writer.Text(message);
+    return wrapEntry(key, payload);
+}
+
+LoadStatus DecodePlanFailureEntry(std::span<const std::byte> file, std::span<const std::byte> key, std::string& message) {
+    std::span<const std::byte> payload;
+    const auto status = unwrapEntry(file, key, payload);
+    if (status != LoadStatus::Loaded) return status;
+    Reader reader(payload);
+    std::string decoded;
+    reader.Text(decoded);
+    if (!reader.Done() || decoded.empty() || decoded.size() > PlanFailureMessageLimit) return LoadStatus::Rejected;
+    message = std::move(decoded);
+    return LoadStatus::Loaded;
+}
+
 bool Enabled() {
     return store().Enabled();
 }
@@ -1482,6 +1524,22 @@ bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
 void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan) {
     auto& instance = store();
     if (instance.Enabled() && plan != nullptr) instance.StorePlan(std::move(key), std::move(plan));
+}
+
+bool LoadPlanFailure(std::span<const std::byte> planKey, std::string& message) {
+    auto& instance = store();
+    if (!instance.Enabled()) return false;
+    std::vector<std::byte> key;
+    BuildPlanFailureKey(planKey, key);
+    return instance.LoadPlanFailure(key, message);
+}
+
+void StorePlanFailure(std::span<const std::byte> planKey, std::string message) {
+    auto& instance = store();
+    if (!instance.Enabled() || message.empty() || message.size() > PlanFailureMessageLimit) return;
+    std::vector<std::byte> key;
+    BuildPlanFailureKey(planKey, key);
+    instance.StorePlanFailure(std::move(key), std::move(message));
 }
 
 void Flush() {
