@@ -208,9 +208,11 @@ void KernelTraceWait_nid_postfix(const char* kind, const void* caller, std::uint
     if (!enabled) return;
     struct Site { std::uint64_t calls = 0; std::uint64_t timeouts = 0; std::uint64_t nanos = 0; std::uint64_t longest = 0; unsigned long lastThread = 0; };
     static std::mutex mutex;
-    static std::unordered_map<std::string, Site> sites;
+    struct KeyHash {
+        std::size_t operator()(const std::pair<const char*, std::uintptr_t>& key) const { return std::hash<std::uintptr_t>{}(key.second) ^ std::hash<const void*>{}(key.first); }
+    };
+    static std::unordered_map<std::pair<const char*, std::uintptr_t>, Site, KeyHash> sites;
     static std::uint64_t lastReport = 0;
-    char key[96];
 #ifdef _WIN32
     const auto image = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     const unsigned long thread = GetCurrentThreadId();
@@ -218,9 +220,8 @@ void KernelTraceWait_nid_postfix(const char* kind, const void* caller, std::uint
     const std::uintptr_t image = 0;
     const unsigned long thread = 0;
 #endif
-    std::snprintf(key, sizeof(key), "%s exe+0x%llx", kind, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(caller) - image));
     std::lock_guard lock(mutex);
-    auto& site = sites[key];
+    auto& site = sites[{kind, reinterpret_cast<std::uintptr_t>(caller)}];
     ++site.calls;
     site.timeouts += timedOut ? 1u : 0u;
     site.nanos += waitedNanos;
@@ -230,12 +231,12 @@ void KernelTraceWait_nid_postfix(const char* kind, const void* caller, std::uint
     if (lastReport == 0) lastReport = now;
     if (now - lastReport < 3000000000ULL) return;
     lastReport = now;
-    std::vector<std::pair<std::string, Site>> hot(sites.begin(), sites.end());
+    std::vector<std::pair<std::pair<const char*, std::uintptr_t>, Site>> hot(sites.begin(), sites.end());
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.nanos > b.second.nanos; });
     std::fprintf(stderr, "[waits]");
     for (std::size_t i = 0; i < hot.size() && i < 8; ++i) {
         const auto& s = hot[i].second;
-        std::fprintf(stderr, " | %s x%llu %.1fs (avg %.1f ms, max %.0f ms, %llu timeouts, tid %lu)", hot[i].first.c_str(), static_cast<unsigned long long>(s.calls), s.nanos / 1e9, s.nanos / 1e6 / static_cast<double>(s.calls), s.longest / 1e6, static_cast<unsigned long long>(s.timeouts), s.lastThread);
+        std::fprintf(stderr, " | %s exe+0x%llx x%llu %.1fs (avg %.1f ms, max %.0f ms, %llu timeouts, tid %lu)", hot[i].first.first, static_cast<unsigned long long>(hot[i].first.second - image), static_cast<unsigned long long>(s.calls), s.nanos / 1e9, s.nanos / 1e6 / static_cast<double>(s.calls), s.longest / 1e6, static_cast<unsigned long long>(s.timeouts), s.lastThread);
     }
     std::fprintf(stderr, "\n");
     for (auto& [name, s] : sites) s = Site{};
