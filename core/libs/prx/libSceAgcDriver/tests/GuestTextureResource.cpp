@@ -445,6 +445,11 @@ void RunGuestTextureResourceTests() {
     Require(!MatchesGuestDimension(Shape::Image3D, TextureDimension::k2D), "3D shape must never match a guest dimension");
     Require(!MatchesGuestDimension(Shape::Image3D, TextureDimension::k2DArray), "3D shape must never match a guest dimension");
     Require(!MatchesGuestDimension(Shape::Image3D, TextureDimension::kCube), "3D shape must never match a guest dimension");
+    for (const auto shape : {Shape::Image2DMultisample, Shape::Image2DMultisampleArray}) {
+        for (const auto dimension : {TextureDimension::k1D, TextureDimension::k2D, TextureDimension::k2DArray, TextureDimension::kCube, TextureDimension::k3D, TextureDimension::k1DArray}) {
+            Require(!MatchesGuestDimension(shape, dimension), "a multisampled shape must not match a single-sampled guest dimension");
+        }
+    }
 
     Fields streamed = base;
     streamed.minLodWarn = 0xabc;
