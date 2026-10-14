@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -296,6 +297,7 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     // size); the holder below outlives the batch that copies them.
     RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
     forgetStagingShadows(device, it->second.base, it->second.base + it->second.bytes);
+    ForgetMirrors(device, it->second.base, it->second.base + it->second.bytes);
     ++state.epoch;
     state.liveBytes -= it->second.bytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
@@ -2131,6 +2133,7 @@ void ClearHostImports(VkDevice device) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     clearStagingShadows(device);
+    ClearMirrors(device);
     state.parked.erase(device);
     if (state.device != device) return;
     for (const auto& [address, entry] : state.imports) {
@@ -4282,6 +4285,29 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     }
     for (const auto& region : regions) {
         if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
+    }
+    return result;
+}
+
+std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::MirroredRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::vector<std::shared_ptr<ResidentMirror>>& mirrors) const {
+    std::vector<ShaderRecompiler::BdaAbi::Range> result(ranges.begin(), ranges.end());
+    if (!ResidentMirrorsEnabled() || context.recorder == nullptr) return result;
+    std::map<std::uint64_t, std::shared_ptr<ResidentMirror>> byImport;
+    for (auto& range : result) {
+        if ((range.permissions & ShaderRecompiler::BdaAbi::Read) == 0 || range.end <= range.begin) continue;
+        if (std::any_of(writes.begin(), writes.end(), [&](const auto& write) { return write.first < range.end && range.begin < write.second; })) continue;
+        const auto* region = owner(range.begin);
+        if (region == nullptr || region->direct == nullptr || range.end > region->end) continue;
+        const auto& import = *region->direct;
+        if (range.begin < import.base || range.end > import.base + import.bytes || range.deviceAddress != import.address + (range.begin - import.base)) continue;
+        auto found = byImport.find(import.base);
+        if (found == byImport.end()) found = byImport.emplace(import.base, MirrorOfImport(context, import)).first;
+        if (found->second == nullptr) continue;
+        range.deviceAddress = MirrorDeviceAddress(*found->second) + (range.begin - import.base);
+        range.permissions = ShaderRecompiler::BdaAbi::Read;
+    }
+    for (auto& [base, mirror] : byImport) {
+        if (mirror != nullptr) mirrors.push_back(std::move(mirror));
     }
     return result;
 }

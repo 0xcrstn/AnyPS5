@@ -1,4 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 
@@ -22,6 +25,7 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         usesBda = usesBda || tables != 0;
         usesFaultBuffer = usesFaultBuffer || faults != 0;
     }
+    mirrorReads = usesBda && context.recorder != nullptr && ResidentMirrorsEnabled() && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.program->bdaWrites; });
     if (usesBda) {
         Require(context.bufferDeviceAddress, "buffer device address is not enabled");
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -30,6 +34,14 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         for (const auto& snapshot : snapshots) guestMemory.AddSnapshot(snapshot);
         if (profile) GuestBufferMemory::CountAddressBuild(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - snapshotsStart).count());
     }
+}
+
+void ShaderResources::UseMirrors(Recorder& recorder) const {
+    if (bda != nullptr) Graphics::UseMirrors(recorder, bda->Mirrors());
+}
+
+void ShaderResources::RefreshMirrorsForDirectUse(Recorder& recorder) const {
+    if (bda != nullptr) Graphics::RefreshMirrorsForDirectUse(recorder, bda->Mirrors());
 }
 
 VkDescriptorBufferInfo ShaderResources::descriptor(Allocation& allocation) {

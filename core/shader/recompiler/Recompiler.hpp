@@ -537,6 +537,7 @@ struct ShaderInvocation {
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     bool cacheHit = false;
+    bool bdaWrites = true;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;
     std::vector<std::array<std::uint32_t, 3>> bufferBaseSlots;

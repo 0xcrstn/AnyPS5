@@ -228,6 +228,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/CacheSizing.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidentMirrors.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
         ${agcCmaskClearShaderHeader}
@@ -935,6 +936,19 @@ target_link_libraries(agc_driver_cmask_fast_clear_tests PRIVATE
 set_target_properties(agc_driver_cmask_fast_clear_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_cmask_fast_clear_tests)
 
+set(agcAddressCopySource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/AddressCopy.comp)
+set(agcAddressCopySpv ${agcTestShaderGeneratedRoot}/AddressCopy.spv)
+set(agcAddressCopyHeader ${agcTestShaderGeneratedRoot}/AddressCopy_spv.h)
+add_custom_command(
+        OUTPUT "${agcAddressCopyHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.2 -o "${agcAddressCopySpv}" "${agcAddressCopySource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcAddressCopySpv} -DOUTPUT=${agcAddressCopyHeader}
+        -DSYMBOL=ADDRESS_COPY_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcAddressCopySource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcBufferUpdateSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/BufferUpdate.comp)
 set(agcBufferUpdateSpv ${agcTestShaderGeneratedRoot}/BufferUpdate.spv)
 set(agcBufferUpdateHeader ${agcTestShaderGeneratedRoot}/BufferUpdate_spv.h)
@@ -956,6 +970,7 @@ add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         ${agcSampleArrayShaderHeader}
         ${agcCoverShaderHeaders}
         ${agcBufferUpdateHeader}
+        ${agcAddressCopyHeader}
 )
 
 target_include_directories(agc_driver_recorder_tests PRIVATE
@@ -1043,6 +1058,8 @@ if(BUILD_TESTING)
     add_test(NAME agc_draw_input_twins_sync COMMAND agc_driver_recorder_tests --draw-input-twins-only)
     set_tests_properties(agc_draw_input_twins agc_draw_input_twins_sync PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     set_tests_properties(agc_draw_input_twins_sync PROPERTIES ENVIRONMENT "APS5_SYNC_DRAWS=1")
+    add_test(NAME agc_resident_mirrors COMMAND agc_driver_recorder_tests --resident-mirrors-only)
+    set_tests_properties(agc_resident_mirrors PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_RESIDENT_MIRRORS=1")
     add_test(NAME agc_unit_shadow COMMAND agc_driver_recorder_tests --unit-shadow-only)
     set_tests_properties(agc_unit_shadow PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
     if(WIN32)
@@ -1066,7 +1083,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_present_then_store COMMAND agc_driver_recorder_tests --present-then-store-only)
     set_tests_properties(agc_slice_dirty agc_present_then_store PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_unit_shadow agc_snapshot_twins agc_draw_input_twins agc_draw_input_twins_sync agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_retire agc_multisample_guest_access agc_draw_inputs_in_place agc_resident_present agc_slice_dirty agc_queued_write_groups agc_present_then_store agc_staging_reuse PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_unit_shadow agc_snapshot_twins agc_draw_input_twins agc_draw_input_twins_sync agc_resident_mirrors agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_retire agc_multisample_guest_access agc_draw_inputs_in_place agc_resident_present agc_slice_dirty agc_queued_write_groups agc_present_then_store agc_staging_reuse PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         add_test(NAME agc_host_import_second_mapping COMMAND agc_driver_recorder_tests --host-import-second-mapping-only)
         set_tests_properties(agc_host_import_second_mapping PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT_MODIFICATION

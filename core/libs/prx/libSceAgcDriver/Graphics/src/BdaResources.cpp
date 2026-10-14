@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -127,10 +128,17 @@ BdaResources::BdaResources(const Context& context) {
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
 }
 
-BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
-    const auto cached = memory.CachedAddressTable();
+BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool mirrorReads) : BdaResources(context) {
+    auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
+    if (mirrorReads && ResidentMirrorsEnabled()) {
+        auto mirrored = memory.MirroredRanges(cached.has_value() ? std::span<const ShaderRecompiler::BdaAbi::Range>(*cached->ranges) : std::span<const ShaderRecompiler::BdaAbi::Range>(built), mirrors);
+        if (!mirrors.empty()) {
+            built = std::move(mirrored);
+            cached.reset();
+        }
+    }
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");

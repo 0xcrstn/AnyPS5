@@ -29,6 +29,8 @@ struct GuestMemorySnapshot {
 };
 
 // A guest allocation imported with VK_EXT_external_memory_host, usable by the GPU in place.
+struct ResidentMirror;
+
 struct HostImport {
     std::uint64_t base;
     std::uint64_t bytes;
@@ -283,6 +285,7 @@ public:
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
     Recorder::BoundPlacement Placement() const;
+    std::vector<ShaderRecompiler::BdaAbi::Range> MirroredRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::vector<std::shared_ptr<ResidentMirror>>& mirrors) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
 
 private:

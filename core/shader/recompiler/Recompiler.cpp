@@ -1097,6 +1097,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     result.shaderDataUserWords = std::move(bindings.shaderDataUserWords);
     result.bufferBaseSlots = std::move(bindings.bufferBaseSlots);
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
+    result.bdaWrites = variant.info.info.bdaWrites || variant.info.info.usesDma;
     return result;
 }
 

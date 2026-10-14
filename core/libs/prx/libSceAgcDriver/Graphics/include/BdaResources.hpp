@@ -10,7 +10,8 @@ bool LoopGuardTripped();
 class BdaResources {
 public:
     explicit BdaResources(const Context& context);
-    BdaResources(const Context& context, const GuestBufferMemory& memory);
+    BdaResources(const Context& context, const GuestBufferMemory& memory, bool mirrorReads = false);
+    std::span<const std::shared_ptr<ResidentMirror>> Mirrors() const { return mirrors; }
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
     void CheckFault() const;
@@ -44,6 +45,7 @@ private:
     std::shared_ptr<Buffer> table;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
+    std::vector<std::shared_ptr<ResidentMirror>> mirrors;
 };
 
 }
