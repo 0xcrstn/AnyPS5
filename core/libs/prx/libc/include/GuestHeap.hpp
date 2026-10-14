@@ -2,8 +2,15 @@
 #define CORE_LIBS_PRX_LIBC_INCLUDE_GUESTHEAP_HPP
 
 #include <cstddef>
+#include <cstdint>
 
 namespace GuestHeap {
+
+struct GuestHeapStatistics {
+    std::uint64_t largeLiveBytes;
+    std::uint64_t largeCachedBytes;
+    std::uint64_t smallSpanBytes;
+};
 
 extern "C" {
 
@@ -14,6 +21,7 @@ void* GuestHeapReallocate_nid_postfix(void* pointer, std::size_t bytes);
 void* GuestHeapAlign_nid_postfix(std::size_t alignment, std::size_t bytes);
 void* GuestHeapRealign_nid_postfix(void* pointer, std::size_t bytes, std::size_t alignment);
 void* GuestHeapAlignForGpu_nid_postfix(std::size_t alignment, std::size_t bytes);
+void GuestHeapGetStatistics_nid_no_patch(GuestHeapStatistics* statistics);
 
 }
 

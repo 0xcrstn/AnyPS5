@@ -3,6 +3,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +68,7 @@ public:
         if (sizeClass.bump == nullptr || sizeClass.bytes > static_cast<std::size_t>(sizeClass.bumpEnd - sizeClass.bump)) {
             auto* span = static_cast<std::uint8_t*>(arenaAllocate(SpanBytes, PageBytes));
             commit(span, SpanBytes);
+            _smallSpanBytes.fetch_add(SpanBytes, std::memory_order_relaxed);
             sizeClass.bump = span;
             sizeClass.bumpEnd = span + SpanBytes;
         }
@@ -84,6 +86,16 @@ public:
         std::lock_guard lock(sizeClass.lock);
         *static_cast<void**>(raw) = sizeClass.freeList;
         sizeClass.freeList = raw;
+    }
+
+    void CountLarge(std::size_t blockBytes, bool live) {
+        if (blockBytes <= MaximumSmallBytes) return;
+        if (live) _largeLiveBytes.fetch_add(blockBytes, std::memory_order_relaxed);
+        else _largeLiveBytes.fetch_sub(blockBytes, std::memory_order_relaxed);
+    }
+
+    GuestHeapStatistics Statistics() const {
+        return {_largeLiveBytes.load(std::memory_order_relaxed), _large.CachedBytes(), _smallSpanBytes.load(std::memory_order_relaxed)};
     }
 
 private:
@@ -165,6 +177,7 @@ private:
             found->second.pop_back();
             void* raw = entry->raw;
             _cachedBytes -= entry->bytes;
+            _publishedBytes.store(_cachedBytes, std::memory_order_relaxed);
             _order.erase(entry);
             return raw;
         }
@@ -182,6 +195,11 @@ private:
                 _cachedBytes -= oldest.bytes;
                 release(oldest.raw, oldest.bytes);
             }
+            _publishedBytes.store(_cachedBytes, std::memory_order_relaxed);
+        }
+
+        std::uint64_t CachedBytes() const {
+            return _publishedBytes.load(std::memory_order_relaxed);
         }
 
     private:
@@ -208,14 +226,22 @@ private:
         std::list<Entry> _order;
         std::unordered_map<std::size_t, std::vector<std::list<Entry>::iterator>> _bySize;
         std::size_t _cachedBytes = 0;
+        std::atomic<std::uint64_t> _publishedBytes{0};
     };
 
     std::array<SizeClass, ClassCount> _classes;
     LargeCache _large;
+    std::atomic<std::uint64_t> _largeLiveBytes{0};
+    std::atomic<std::uint64_t> _smallSpanBytes{0};
 };
 
 void* rawAllocate(std::size_t total, std::size_t& blockBytes) {
-    if (GuestArena::GuestArenaAvailable_nid_postfix()) return ArenaHeap::Get().Allocate(total, blockBytes);
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) {
+        auto& heap = ArenaHeap::Get();
+        void* raw = heap.Allocate(total, blockBytes);
+        heap.CountLarge(blockBytes, true);
+        return raw;
+    }
     blockBytes = total;
     void* raw = std::malloc(total);
     if (raw == nullptr) throw std::bad_alloc();
@@ -223,8 +249,13 @@ void* rawAllocate(std::size_t total, std::size_t& blockBytes) {
 }
 
 void rawFree(void* raw, std::size_t blockBytes) {
-    if (GuestArena::GuestArenaAvailable_nid_postfix()) ArenaHeap::Get().Free(raw, blockBytes);
-    else std::free(raw);
+    if (GuestArena::GuestArenaAvailable_nid_postfix()) {
+        auto& heap = ArenaHeap::Get();
+        heap.CountLarge(blockBytes, false);
+        heap.Free(raw, blockBytes);
+    } else {
+        std::free(raw);
+    }
 }
 
 void* allocate(GuestAllocations::Mutation& mutation, std::size_t alignment, std::size_t bytes, bool gpu) {
@@ -306,6 +337,11 @@ std::size_t GuestHeapUsableSize_nid_postfix(const void* pointer) {
 void* GuestHeapAlign_nid_postfix(std::size_t alignment, std::size_t bytes) {
     GuestAllocations::Mutation mutation;
     return allocate(mutation, alignment, bytes, false);
+}
+
+void GuestHeapGetStatistics_nid_no_patch(GuestHeapStatistics* statistics) {
+    if (statistics == nullptr) throw std::invalid_argument("GuestHeapGetStatistics: null statistics");
+    *statistics = GuestArena::GuestArenaAvailable_nid_postfix() ? ArenaHeap::Get().Statistics() : GuestHeapStatistics{};
 }
 
 void* GuestHeapAlignForGpu_nid_postfix(std::size_t alignment, std::size_t bytes) {

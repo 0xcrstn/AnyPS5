@@ -556,6 +556,24 @@ struct GeometryStageLimits {
 
 [[nodiscard]] RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
 
+struct RetainedShaderMemory {
+    std::uint64_t sources = 0;
+    std::uint64_t plans = 0;
+    std::uint64_t planValues = 0;
+    std::uint64_t planBytes = 0;
+    std::uint64_t programs = 0;
+    std::uint64_t variants = 0;
+    std::uint64_t variantSpirvBytes = 0;
+    std::uint64_t memoResults = 0;
+    std::uint64_t memoBytes = 0;
+    std::uint64_t bindingPlans = 0;
+    std::uint64_t specializedModules = 0;
+    std::uint64_t specializedSpirvBytes = 0;
+    std::uint64_t registrationModules = 0;
+};
+
+[[nodiscard]] RetainedShaderMemory GetRetainedShaderMemory();
+
 }
 
 #endif

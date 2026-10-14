@@ -113,6 +113,18 @@ void PrioritizeRegistrationPreparation(PreparedShaders& prepared);
 void SubmitLibraryPrebuild(std::function<void()> task);
 void CloseRegistrationPreparation();
 
+struct RegistrationBacklog {
+    std::uint64_t registered = 0;
+    std::uint64_t queued = 0;
+    std::uint64_t running = 0;
+    std::uint64_t threads = 0;
+    std::uint64_t prebuildsQueued = 0;
+    std::uint64_t plans = 0;
+    std::uint64_t planInstructions = 0;
+    std::uint64_t planInstructionBytes = 0;
+};
+RegistrationBacklog RegistrationPreparationBacklog();
+
 void ResolvePreparedGraphics(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, std::uint32_t primitiveType, const ShaderRecompiler::SpirvTarget& target);
 
 ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, std::uint64_t vertexId, std::uint64_t fragmentId);

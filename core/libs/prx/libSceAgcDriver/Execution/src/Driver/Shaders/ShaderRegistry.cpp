@@ -607,7 +607,43 @@ void BuildRegisteredAbiKey(const QueueState& state, const VulkanDevice& device, 
     }
 }
 
+struct PlanCounters {
+    std::atomic<std::uint64_t> registered{0}, plans{0}, instructions{0};
+};
+
+PlanCounters& planCounters() {
+    static PlanCounters counters;
+    return counters;
+}
+
+class PlanCount {
+public:
+    PlanCount() {
+        planCounters().plans.fetch_add(1, std::memory_order_relaxed);
+    }
+    PlanCount(const PlanCount& other) : PlanCount() {
+        Keep(other.instructions);
+    }
+    PlanCount& operator=(const PlanCount& other) {
+        Keep(other.instructions);
+        return *this;
+    }
+    ~PlanCount() {
+        planCounters().plans.fetch_sub(1, std::memory_order_relaxed);
+        planCounters().instructions.fetch_sub(instructions, std::memory_order_relaxed);
+    }
+    void Keep(std::uint64_t count) {
+        planCounters().instructions.fetch_add(count, std::memory_order_relaxed);
+        planCounters().instructions.fetch_sub(instructions, std::memory_order_relaxed);
+        instructions = count;
+    }
+
+private:
+    std::uint64_t instructions = 0;
+};
+
 struct RegisteredPreparation {
+    PlanCount counted;
     std::size_t codeOffset = 0;
     ShaderRecompiler::RdnaProgram decoded;
     ShaderRecompiler::SwappcInfo swappc{};
@@ -716,6 +752,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     if (graphics && graphics->mesh) request.layout.pushConstantSizeBytes = ShaderRecompiler::MeshDrawPushOffsetBytes;
     if (graphics && graphics->tessellation) request.layout.pushConstantSizeBytes = ShaderRecompiler::TessellationLevelPushOffsetBytes;
     if (pixel && device.GraphicsPipelineLibraries()) request.layout.pushConstantOffsetBytes = Graphics::FixedPushOffset(Stage::Fragment);
+    plan->counted.Keep(plan->decoded.instructions.size());
     return plan;
 }
 
@@ -826,6 +863,17 @@ public:
         std::rotate(tasks.begin(), found, std::next(found));
     }
 
+    void Count(RegistrationBacklog& backlog, bool prebuild) {
+        std::lock_guard lock(mutex);
+        if (prebuild) {
+            backlog.prebuildsQueued = tasks.size();
+            return;
+        }
+        backlog.queued = tasks.size();
+        backlog.running = running;
+        backlog.threads = threads;
+    }
+
     void Close() {
         std::unique_lock lock(mutex);
         closed = true;
@@ -928,6 +976,18 @@ void PrioritizeRegistrationPreparation(PreparedShaders& prepared) {
 
 void SubmitLibraryPrebuild(std::function<void()> task) {
     RegistrationPreparePool::Prebuild().Submit(std::move(task));
+}
+
+RegistrationBacklog RegistrationPreparationBacklog() {
+    RegistrationBacklog backlog;
+    if (auto* pool = RegistrationPreparePool::Existing()) pool->Count(backlog, false);
+    if (auto* prebuild = RegistrationPreparePool::ExistingPrebuild()) prebuild->Count(backlog, true);
+    const auto& counters = planCounters();
+    backlog.registered = counters.registered.load(std::memory_order_relaxed);
+    backlog.plans = counters.plans.load(std::memory_order_relaxed);
+    backlog.planInstructions = counters.instructions.load(std::memory_order_relaxed);
+    backlog.planInstructionBytes = backlog.planInstructions * sizeof(ShaderRecompiler::RdnaInstruction);
+    return backlog;
 }
 
 void CloseRegistrationPreparation() {
@@ -1261,6 +1321,7 @@ void Driver::RegisterShader(const Shader* shader) {
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.Register");
     ShaderPreparationTransaction transaction;
+    planCounters().registered.fetch_add(1, std::memory_order_relaxed);
     CheckFailure();
     require(!RawGraphicsDrawn(), "a shader was registered after graphics programs were drawn without registration");
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);

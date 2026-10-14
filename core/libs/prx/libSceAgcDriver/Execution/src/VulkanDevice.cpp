@@ -26,6 +26,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -95,6 +96,8 @@ bool CoreVulkanCapability(std::uint32_t capability) {
     }
 }
 
+std::atomic<std::uint64_t> computePipelinesCreated{0};
+
 void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr) {
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.flags = flags;
@@ -110,6 +113,7 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     info.layout = layout;
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
     check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
+    computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool CaptureComputePipeline(std::size_t words) {
@@ -3016,6 +3020,33 @@ std::string VulkanDevice::DeviceName() const {
 
 std::string VulkanDevice::DriverInfo() const {
     return state->driverInfo.empty() ? std::to_string(state->properties.driverVersion) : state->driverInfo;
+}
+
+std::string VulkanDevice::DescribeMemoryHeaps() const {
+    const auto context = graphicsContext();
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    const bool budget = state->memoryBudget && context.memoryProperties2 != nullptr && context.physical != VK_NULL_HANDLE;
+    if (budget) {
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+        properties.pNext = &reported;
+        context.memoryProperties2(context.physical, &properties);
+    }
+    std::string text;
+    char part[160];
+    for (std::uint32_t heap = 0; heap < context.memory.memoryHeapCount; ++heap) {
+        const bool local = (context.memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+        if (budget) std::snprintf(part, sizeof(part), "%sheap %u (%s) uses %.0f of %.0f MiB", heap == 0 ? "" : ", ", heap, local ? "device" : "host", static_cast<double>(reported.heapUsage[heap]) / 1048576.0, static_cast<double>(reported.heapBudget[heap]) / 1048576.0);
+        else std::snprintf(part, sizeof(part), "%sheap %u (%s) of %.0f MiB, usage unknown", heap == 0 ? "" : ", ", heap, local ? "device" : "host", static_cast<double>(context.memory.memoryHeaps[heap].size) / 1048576.0);
+        text += part;
+    }
+    std::snprintf(part, sizeof(part), "; sampled textures %.0f MiB", static_cast<double>(Graphics::SampledTextureMemory()) / 1048576.0);
+    text += part;
+    const auto libraries = Graphics::PipelineLibraryCountersOf(state->device);
+    std::uint64_t built = 0;
+    for (const auto count : libraries.built) built += count;
+    std::snprintf(part, sizeof(part), "; pipelines created: compute %llu, graphics libraries %llu, linked %llu, optimized %llu", static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(built), static_cast<unsigned long long>(libraries.linked), static_cast<unsigned long long>(libraries.optimized));
+    text += part;
+    return text;
 }
 
 bool VulkanDevice::CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const {
