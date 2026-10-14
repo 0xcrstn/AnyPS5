@@ -258,6 +258,7 @@ function(add_shader_recompiler target runtimeTarget)
             RuntimeAbi::HeapCapacity
             SetDebugProbeActive
             ShaderCacheDirectory
+            SharedSpirv
             ShaderDiskCache::LoadUserDataCallees
             ShaderDiskCache::StoreUserDataCallee
             ShaderDiskCache::EarlierShaderUses

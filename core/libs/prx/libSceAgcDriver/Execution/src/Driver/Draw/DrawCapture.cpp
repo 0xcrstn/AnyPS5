@@ -65,7 +65,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[binding-plan] verify: stage %zu (program 0x%llx) differs from the full capture and materialize, first in: %s%c", i, static_cast<unsigned long long>(program.binary.codeAddress), SnapshotPartNames[static_cast<std::size_t>(part)], 10);
             }
-            phaseTiming.Phase(DrawRowVectors);
+            phaseTiming.Phase(DrawRowStageVerify);
         }
         notePlannedStage(verifyBindingPlan(), mismatch, part, templateHit, ShaderRecompiler::CountSpecializationWords(values->snapshot));
         return stageCapture.compiled;

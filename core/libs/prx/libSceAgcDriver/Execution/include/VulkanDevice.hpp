@@ -58,6 +58,13 @@ public:
     // three-step form below so the GPU wait happens without the mutex.
     void WaitIdle();
     void PrepareForReplacement();
+    static bool PipelineCompileAheadEnabled();
+    void BuildComputePipelineAhead(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress);
+    struct PipelineAheadStatistics {
+        std::uint64_t accepted, built, present, failed, refused, duplicate, demanded, cancelled, useful, joined;
+        std::size_t retainedBytes, peakBytes, outstanding;
+    };
+    PipelineAheadStatistics PipelineAheadCounters() const;
     bool ImportGuestMemory(const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
     // Sends recorded work to the GPU without waiting for it. With `reapFirst` it first retires batches
     // that already finished, so the in-flight list stays short (APS5_NO_OPPORTUNISTIC_REAP=1 skips

@@ -531,14 +531,14 @@ DrawProfile& Profile() {
     return profile;
 }
 
-void reportRecordParts(const DrawProfile& profile) {
+void reportRecordParts(const DrawProfile& profile, double elapsedSeconds) {
     if (profile.recordDraws == 0) return;
     const auto draws = static_cast<double>(profile.recordDraws);
     const auto& bindings = profile.bindings;
     double totalUs = 0;
     for (const auto us : profile.recordUs) totalUs += us;
     char line[1536];
-    int n = std::snprintf(line, sizeof(line), "[draw-record] %llu recorded draws (10 s), us per draw: total %.1f,", static_cast<unsigned long long>(profile.recordDraws), totalUs / draws);
+    int n = std::snprintf(line, sizeof(line), "[draw-record] %llu recorded draws (%.3f s), us per draw: total %.1f,", static_cast<unsigned long long>(profile.recordDraws), elapsedSeconds, totalUs / draws);
     for (std::size_t i = 0; i < RecordPartCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.1f", RecordPartNames[i], profile.recordUs[i] / draws);
         if (i == RecordBindings && n > 0 && static_cast<std::size_t>(n) < sizeof(line)) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (checks %.1f, write collects %.1f, snapshot lookups %.1f, buffers %.1f, copies %.1f, snapshot keeps %.1f, set allocations %.1f, set updates %.1f)", bindings.checkUs / draws, bindings.collectUs / draws, bindings.lookupUs / draws, bindings.bufferUs / draws, bindings.copyUs / draws, bindings.keepUs / draws, bindings.allocateUs / draws, bindings.updateUs / draws);
@@ -645,11 +645,12 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     if (outcome.validateMemoized) ++(outcome.validateHit ? profile.validateHits : profile.validateMisses);
     const auto now = std::chrono::steady_clock::now();
     if (now - profile.lastReport < std::chrono::seconds(10)) return;
+    const auto elapsedSeconds = std::chrono::duration<double>(now - profile.lastReport).count();
     profile.lastReport = now;
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
     char line[4096];
-    int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued));
+    int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over %.3f s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), elapsedSeconds, static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     for (std::size_t i = SyncNone + 1; i < SyncCount && room(); ++i) {
         if (profile.reasons[i] != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", SyncReasonNames[i], static_cast<unsigned long long>(profile.reasons[i]));
@@ -697,8 +698,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
-    reportRecordParts(profile);
-    DrawSnapshotArena::ReportActive();
+    reportRecordParts(profile, elapsedSeconds);
+    DrawSnapshotArena::ReportActive(elapsedSeconds);
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
@@ -2202,7 +2203,11 @@ void PrewarmPipeline(const Context& context, const State& state, std::span<const
     const auto masked = maskedState(state, fragmentOutputs);
     const State& pipelineState = masked.has_value() ? *masked : state;
     const auto& attributes = shaders.front().program->vertexAttributes;
-    const auto vertexInput = BuildVertexInputLayout(context, attributes);
+    std::shared_ptr<const VertexInputLayout> retainedVertexInput;
+    if (context.vertexInputs != nullptr) retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+    VertexInputLayout uncachedVertexInput;
+    if (retainedVertexInput == nullptr) uncachedVertexInput = BuildVertexInputLayout(context, attributes);
+    const auto& vertexInput = retainedVertexInput != nullptr ? *retainedVertexInput : uncachedVertexInput;
     const auto described = DescribeSetLayouts(context, shaders);
     static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
     static const bool recordDraws = std::getenv("APS5_SYNC_DRAWS") == nullptr;
