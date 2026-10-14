@@ -616,6 +616,7 @@ struct RegisteredPreparation {
     std::optional<ShaderRecompiler::RecompileRequest> request;
     std::vector<std::uint64_t> abiKey;
     std::shared_ptr<VulkanDevice> prebuildDevice;
+    bool budgeted = false;
 };
 
 std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, bool* deferred = nullptr) {
@@ -889,14 +890,58 @@ bool AsyncRegistrationPrepare() {
     return !sync;
 }
 
+std::uint64_t RegistrationPrepareLimit() {
+    static const std::uint64_t limit = [] {
+        const char* text = std::getenv("APS5_REGISTRATION_PREPARE_LIMIT");
+        if (text == nullptr || *text == '\0') return std::uint64_t{1024};
+        char* end = nullptr;
+        const auto value = std::strtoull(text, &end, 10);
+        if (end == text || *end != '\0') throw std::runtime_error("APS5_REGISTRATION_PREPARE_LIMIT is not a whole number: " + std::string(text));
+        return static_cast<std::uint64_t>(value);
+    }();
+    return limit;
+}
+
+std::uint64_t RegistrationPrepareCommitBudget();
+
+bool RegistrationPrepareAdmitted() {
+    static std::atomic<std::uint64_t> admitted{0};
+    const auto limit = RegistrationPrepareLimit();
+    if (admitted.fetch_add(1, std::memory_order_relaxed) < limit) return true;
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) APS5_LOG_OUT("%llu registered shaders were prepared ahead of use; later ones are prepared in the background while the process commits less than %.1f GiB, else when they are first used (APS5_REGISTRATION_PREPARE_LIMIT, APS5_REGISTRATION_PREPARE_COMMIT_GB)", static_cast<unsigned long long>(limit), static_cast<double>(RegistrationPrepareCommitBudget()) / 1073741824.0);
+    return false;
+}
+
+std::uint64_t RegistrationPrepareCommitBudget() {
+    static const std::uint64_t budget = [] {
+        const char* text = std::getenv("APS5_REGISTRATION_PREPARE_COMMIT_GB");
+        if (text == nullptr || *text == '\0') return GuestMemory::HostPhysicalMemoryBytes() / 2u;
+        char* end = nullptr;
+        const auto value = std::strtod(text, &end);
+        if (end == text || *end != '\0' || value < 0) throw std::runtime_error("APS5_REGISTRATION_PREPARE_COMMIT_GB is not a number of GiB: " + std::string(text));
+        return static_cast<std::uint64_t>(value * 1073741824.0);
+    }();
+    return budget;
+}
+
+bool RegistrationPrepareWithinBudget() {
+    const auto budget = RegistrationPrepareCommitBudget();
+    if (budget != 0 && GuestMemory::HostProcessCommitBytes() < budget) return true;
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) APS5_LOG_OUT("the process commits %.1f GiB, the registration preparation budget is %.1f GiB; registered shaders past APS5_REGISTRATION_PREPARE_LIMIT are prepared when they are first used from now on", static_cast<double>(GuestMemory::HostProcessCommitBytes()) / 1073741824.0, static_cast<double>(budget) / 1073741824.0);
+    return false;
+}
+
 void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan) {
     const auto* preparedKey = snapshot->prepared.get();
     SubmitRegistrationPreparation([snapshot = std::move(snapshot), plan = std::move(plan)] {
         PerformanceContext timingContext(FrameTiming::Preparation());
         std::vector<PreparedShaders::Entry> entries;
         std::exception_ptr failure;
+        const bool skipped = plan->budgeted && !RegistrationPrepareWithinBudget();
         try {
-            entries = PrepareRegistered(*plan);
+            if (!skipped) entries = PrepareRegistered(*plan);
         } catch (const std::exception& error) {
             APS5_LOG_ERR("Shader 0x%llx could not be prepared after registration: %s", static_cast<unsigned long long>(snapshot->codeAddress), error.what());
             failure = std::current_exception();
@@ -907,7 +952,8 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
         {
             std::lock_guard lock(prepared.mutex);
             prepared.entries.insert(prepared.entries.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
-            if (failure == nullptr && !plan->abiKey.empty()) prepared.registeredAbis.push_back(std::move(plan->abiKey));
+            if (failure == nullptr && !skipped && !plan->abiKey.empty()) prepared.registeredAbis.push_back(std::move(plan->abiKey));
+            if (skipped) prepared.deferred = true;
             prepared.failure = failure;
             prepared.pending = false;
         }
@@ -1311,6 +1357,14 @@ void Driver::RegisterShader(const Shader* shader) {
     std::shared_ptr<RegisteredPreparation> preparation;
     if (AsyncRegistrationPrepare()) {
         preparation = PlanRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
+        if (preparation != nullptr && !RegistrationPrepareAdmitted()) {
+            if (RegistrationPrepareCommitBudget() == 0) {
+                preparation = nullptr;
+                snapshot.prepared->deferred = true;
+            } else {
+                preparation->budgeted = true;
+            }
+        }
         if (preparation != nullptr) preparation->prebuildDevice = localDevice;
         if (preparation != nullptr && (snapshot.type == 0 || snapshot.type == 1)) BuildRegisteredAbiKey(registered, *localDevice, preparation->abiKey);
         snapshot.prepared->pending = preparation != nullptr;
