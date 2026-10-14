@@ -29,6 +29,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
 #else
 #include <cerrno>
 #include <cstdint>
@@ -683,6 +684,31 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
         if (trace) std::fprintf(stderr, "[unreadable] %s from +0x%llx\n", reason.c_str(), ModuleOffset(__builtin_return_address(0)));
         require(false, reason.c_str());
     }
+}
+
+std::uint64_t HostProcessCommitBytes() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters)) == 0) return 0;
+    return counters.PrivateUsage;
+#else
+    std::ifstream statm("/proc/self/statm");
+    std::uint64_t size = 0;
+    std::uint64_t resident = 0;
+    if (!(statm >> size >> resident)) return 0;
+    return resident * static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+#endif
+}
+
+std::uint64_t HostPhysicalMemoryBytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) != 0 ? status.ullTotalPhys : 0;
+#else
+    return static_cast<std::uint64_t>(sysconf(_SC_PHYS_PAGES)) * static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+#endif
 }
 
 bool Accessible(const void* pointer, std::size_t bytes, bool writable) {
