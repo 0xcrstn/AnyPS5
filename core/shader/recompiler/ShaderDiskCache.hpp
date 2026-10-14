@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -63,6 +64,19 @@ void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> va
 void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan);
 void Flush();
 [[nodiscard]] Counters Totals();
+
+struct UserDataCallee {
+    std::uint32_t userDataRegister = 0;
+    std::uint32_t linkRegister = 0;
+    std::vector<std::uint32_t> code;
+};
+
+[[nodiscard]] std::vector<std::byte> EncodeUserDataCallee(const UserDataCallee& callee);
+[[nodiscard]] std::optional<UserDataCallee> DecodeUserDataCallee(std::span<const std::byte> file);
+[[nodiscard]] std::string UserDataCalleeName(const UserDataCallee& callee);
+[[nodiscard]] std::filesystem::path UserDataCalleeDirectory();
+void StoreUserDataCallee(const UserDataCallee& callee);
+[[nodiscard]] std::vector<UserDataCallee> LoadUserDataCallees();
 
 }
 

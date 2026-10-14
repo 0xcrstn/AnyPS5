@@ -1,12 +1,18 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "SceShaders.hpp"
+#include "ShaderDiskCache.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <filesystem>
 #include <iostream>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -105,15 +111,71 @@ void ExpectFailure(TAction action, const char* expected) {
     throw std::runtime_error(std::string("expected a failure containing ") + expected);
 }
 
+void SetEnvironment(const char* name, const std::string& value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
+}
+
+void RequireCounts(std::uint64_t ahead, std::uint64_t atUse, const std::string& what) {
+    const auto counts = AgcDriver::DriverDetail::CountUserDataCalleePreparations();
+    Require(counts.ahead == ahead && counts.atUse == atUse, what + ": " + std::to_string(counts.ahead) + " preparations ahead of use and " + std::to_string(counts.atUse) + " at use, expected " + std::to_string(ahead) + " and " + std::to_string(atUse));
+}
+
+void PersistCallees(const char* self) {
+    Register(true, Caller);
+    Check(AddFive.data(), AddSixtyFour.data(), true, 3u * (5u + 64u), "the first process linking two user-data callees");
+    RequireCounts(0, 1, "the first process");
+    ShaderRecompiler::ShaderDiskCache::Flush();
+    const auto stored = ShaderRecompiler::ShaderDiskCache::LoadUserDataCallees();
+    Require(stored.size() == 2 && stored[0].linkRegister == 14u && stored[1].linkRegister == 14u && stored[0].userDataRegister != stored[1].userDataRegister, "the first process did not store both linked callees, it stored " + std::to_string(stored.size()));
+    const std::string command = "\"" + std::string(self) + "\" --persisted-load";
+    Require(std::system(command.c_str()) == 0, "the process loading the persisted callees failed");
+}
+
+void LoadPersistedCallees() {
+    Register(true, SecondCaller);
+    Check(AddFive.data(), AddSixtyFour.data(), true, 3u * (5u + 64u), "a registered caller prepared with the callees an earlier process linked", SecondCaller.data());
+    RequireCounts(1, 0, "a registered caller with persisted callees");
+    Check(AddOne.data(), AddSixtyFour.data(), true, 3u * (1u + 64u), "a persisted callee whose guest code changed", SecondCaller.data());
+    RequireCounts(1, 1, "a persisted callee whose guest code changed");
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 1 || (argc == 2 && std::string(argv[1]) == "--registered"), "usage: [--registered]");
+        const std::string mode = argc == 2 ? argv[1] : "";
+        Require(argc == 1 || (argc == 2 && (mode == "--registered" || mode == "--persisted" || mode == "--persisted-load")), "usage: [--registered | --persisted]");
         const bool registered = argc == 2;
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
+        }
+        if (mode == "--persisted-load") {
+            LoadPersistedCallees();
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (mode == "--persisted") {
+            const auto directory = std::filesystem::temp_directory_path() / ("aps5-user-data-callees-test-" + std::to_string(std::random_device{}()));
+            std::filesystem::remove_all(directory);
+            SetEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
+            SetEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
+            std::exception_ptr failure;
+            try {
+                PersistCallees(argv[0]);
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            AgcDriverShutdown_nid_postfix();
+            std::error_code error;
+            std::filesystem::remove_all(directory, error);
+            if (failure != nullptr) std::rethrow_exception(failure);
+            std::puts("persisted user-data callee tests passed");
+            return 0;
         }
         if (registered) {
             Register(true, Caller);
