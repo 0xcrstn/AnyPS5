@@ -531,6 +531,7 @@ endif()
 
 add_test_executable(agc_pipeline_library_notes_tests EXCLUDE_FROM_ALL tests/PipelineLibraryNotes.cpp)
 target_include_directories(agc_pipeline_library_notes_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_pipeline_library_notes_tests PRIVATE libc)
 set_target_properties(agc_pipeline_library_notes_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_pipeline_library_notes_tests)
 if(BUILD_TESTING)
