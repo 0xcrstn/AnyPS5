@@ -2378,6 +2378,59 @@ void drawSnapshotEvictionTests(const Device& device) {
     Require(cache.ReusableDrawSnapshot(address, 16) == nullptr && cache.ReusableDrawSnapshot(address, 16) == nullptr, "a snapshot outlived a CPU store");
 }
 
+void drawSnapshotRetireTests(const Device& device) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t bytes = 65536;
+    void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "write watching unavailable: draw snapshot retirement not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto generation = CollectWrites(address, 4096);
+    Require(generation != 0, "the watched block has no generation");
+    const auto& context = device.GetContext();
+    const auto snapshot = [&] { return std::make_shared<Buffer>(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); };
+    std::weak_ptr<Buffer> closed;
+    std::weak_ptr<Buffer> displaced;
+    std::weak_ptr<Buffer> evicted;
+    std::weak_ptr<Buffer> unwritten;
+    {
+        Recorder cache(context);
+        auto first = snapshot();
+        closed = first;
+        cache.KeepDrawSnapshot(address, 16, generation, registry, std::move(first));
+        cache.KeepDrawSnapshot(address, 16, generation, registry, snapshot());
+        Require(closed.expired(), "a snapshot displaced without an open batch was not released at once");
+        static_cast<void>(cache.Commands());
+        auto second = snapshot();
+        displaced = second;
+        cache.KeepDrawSnapshot(address + 64, 16, generation, registry, std::move(second));
+        cache.KeepDrawSnapshot(address + 64, 16, generation, registry, snapshot());
+        Require(!displaced.expired(), "a displaced snapshot was released on the recording thread instead of with the open batch");
+        Require(cache.ReusableDrawSnapshot(address + 64, 16) != displaced.lock(), "the displaced snapshot is still served");
+        auto third = snapshot();
+        evicted = third;
+        cache.KeepDrawSnapshot(address + 128, 16, generation, registry, std::move(third));
+        for (std::size_t size = 1; size <= Recorder::DrawSnapshotEntries; ++size) cache.KeepDrawSnapshot(address + 256, size, generation, registry, snapshot());
+        Require(cache.ReusableDrawSnapshot(address + 128, 16) == nullptr && !evicted.expired(), "an evicted snapshot was not retired with the open batch");
+        const std::array<std::uint64_t, 3> stamp{1, 2, 3};
+        auto fourth = snapshot();
+        unwritten = fourth;
+        cache.NoteUnwrittenDrawSnapshot(address, 16, stamp, std::move(fourth));
+        cache.NoteUnwrittenDrawSnapshot(address, 16, stamp, snapshot());
+        Require(!unwritten.expired() && cache.UnwrittenDrawSnapshot(address, 16, stamp) != unwritten.lock(), "a replaced unwritten snapshot was not retired with the open batch");
+        cache.Submit();
+        cache.Sync();
+    }
+    Require(displaced.expired() && evicted.expired() && unwritten.expired(), "retired snapshots outlived their batch");
+}
+
 void drawInputReuseTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     using Use = Recorder::SnapshotUse;
@@ -6491,6 +6544,11 @@ int main(int argc, char** argv) {
             std::cout << "Draw descriptor writes and snapshot overrides passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-retire-only") {
+            drawSnapshotRetireTests(device);
+            std::cout << "Draw snapshot retirement tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-cap-only") {
             drawSnapshotCapTests(device, recorder);
             std::cout << "Draw snapshot cap tests passed\n";
@@ -6531,6 +6589,7 @@ int main(int argc, char** argv) {
         drawDescriptorWriteTests(device, recorder);
         drawSnapshotCapTests(device, recorder);
         drawSnapshotEvictionTests(device);
+        drawSnapshotRetireTests(device);
         drawInputReuseTests(device, recorder);
         drawInputInPlaceTests(device, recorder);
         RunResidentPresentTests(device.GetContext());

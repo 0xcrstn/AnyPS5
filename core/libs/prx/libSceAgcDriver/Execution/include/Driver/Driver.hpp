@@ -322,8 +322,9 @@ private:
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawCache;
     std::list<std::uint64_t> drawOrder;
     std::unordered_map<std::uint64_t, std::shared_ptr<const DrawRelocation>> drawRelocations;
-    std::unordered_map<std::uint64_t, DrawStageDonor> drawStageDonors;
-    std::unordered_map<std::uint64_t, DrawDecodeDonor> drawDecodes;
+    static constexpr std::size_t MaxDrawAliases = 16384;
+    RecentTable<DrawStageDonor> drawStageDonors{MaxDrawAliases};
+    RecentTable<DrawDecodeDonor> drawDecodes{MaxDrawAliases};
     DrawRelocationPending drawRelocationPending;
     std::unordered_map<std::uint64_t, DrawRelocationTrial> drawRelocationTrials;
     DrawRelocationCounters drawRelocationCounters;

@@ -13,7 +13,6 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-constexpr std::size_t MaxAliases = 16384;
 constexpr std::size_t MaxContentWords = 64;
 
 std::uint64_t AlignedWord(std::uint32_t word) {
@@ -173,8 +172,6 @@ void Driver::learnPendingRelocation() {
         drawRelocations[pending.identity] = std::move(shape);
     }
     if (pending.aliases.structure == 0) return;
-    if (drawStageDonors.size() >= MaxAliases) drawStageDonors.clear();
-    if (drawDecodes.size() >= MaxAliases) drawDecodes.clear();
     DrawDecodeDonor donor{entry.decode, std::vector<std::uint64_t>(programs.size(), 0)};
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (entry.stages[i].empty() || entry.stages[i].front() == nullptr || entry.stages[i].front()->prepared == nullptr) continue;
@@ -194,27 +191,27 @@ void Driver::learnPendingRelocation() {
             if (!relocatable && !unread && index >= program.hiddenUserWords) mix(program.userData[index]);
         }
         donor.stageKeys[i] = key == 0 ? 1 : key;
-        drawStageDonors[pending.aliases.Key(donor.stageKeys[i], program.userDataBase)] = {variant, program.userData};
+        drawStageDonors.Put(pending.aliases.Key(donor.stageKeys[i], program.userDataBase), {variant, program.userData});
     }
-    const auto held = drawDecodes.find(pending.aliases.structure);
-    if (held != drawDecodes.end() && held->second.stageKeys.size() == donor.stageKeys.size()) {
+    const auto* held = drawDecodes.Find(pending.aliases.structure);
+    if (held != nullptr && held->stageKeys.size() == donor.stageKeys.size()) {
         for (std::size_t i = 0; i < donor.stageKeys.size(); ++i) {
-            if (donor.stageKeys[i] == 0) donor.stageKeys[i] = held->second.stageKeys[i];
+            if (donor.stageKeys[i] == 0) donor.stageKeys[i] = held->stageKeys[i];
         }
     }
-    drawDecodes[pending.aliases.structure] = std::move(donor);
+    drawDecodes.Put(pending.aliases.structure, std::move(donor));
 }
 
 void Driver::relocateDrawEntry(const QueueState& queue, const DrawAliasKeys& aliases, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches) {
     auto& counters = drawRelocationCounters;
     ++counters.lookups;
-    const auto known = drawDecodes.find(aliases.structure);
-    if (known == drawDecodes.end() || known->second.decode == nullptr) {
+    const auto* known = drawDecodes.Find(aliases.structure);
+    if (known == nullptr || known->decode == nullptr) {
         ++counters.unknownStructure;
         return;
     }
-    const auto shared = known->second.decode;
-    const auto& stageKeys = known->second.stageKeys;
+    const auto shared = known->decode;
+    const auto& stageKeys = known->stageKeys;
     const auto& programs = shared->programs;
     auto relocated = std::make_shared<DrawEntry>();
     relocated->decode = shared;
@@ -225,9 +222,10 @@ void Driver::relocateDrawEntry(const QueueState& queue, const DrawAliasKeys& ali
     for (std::size_t i = 0; i < programs.size(); ++i) {
         const auto& program = programs[i];
         if (i < shared->roles.size() && shared->roles[i] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
-        const auto found = i < stageKeys.size() && stageKeys[i] != 0 ? drawStageDonors.find(aliases.Key(stageKeys[i], program.userDataBase)) : drawStageDonors.end();
-        if (found != drawStageDonors.end()) drawStageDonorKeys[i] = found->first;
-        const auto* donor = found != drawStageDonors.end() && found->second.variant != nullptr && found->second.variant->compiled != nullptr && found->second.userData.size() == program.userData.size() ? &found->second : nullptr;
+        const auto donorKey = i < stageKeys.size() && stageKeys[i] != 0 ? aliases.Key(stageKeys[i], program.userDataBase) : 0;
+        const auto* found = donorKey != 0 ? drawStageDonors.Find(donorKey) : nullptr;
+        if (found != nullptr) drawStageDonorKeys[i] = donorKey;
+        const auto* donor = found != nullptr && found->variant != nullptr && found->variant->compiled != nullptr && found->userData.size() == program.userData.size() ? found : nullptr;
         struct Move {
             std::uint32_t index, from, to;
         };
@@ -398,7 +396,7 @@ void Driver::applyShaderDataPatches(DispatchVariant& variant) {
 
 void Driver::reportDrawRelocation() {
     auto& counters = drawRelocationCounters;
-    AgcDriver::ProfilePrint_nid_no_patch("[draw-relocate] %llu alias lookups: %llu donors with moved user words, %llu refusals, %llu hits through a relocated entry; misses: %llu unknown structure, %llu stages without a donor; %llu unread user words ignored; %zu shader sets learned, %zu stage donors held\n", static_cast<unsigned long long>(counters.lookups), static_cast<unsigned long long>(counters.donors), static_cast<unsigned long long>(counters.refused), static_cast<unsigned long long>(counters.hits), static_cast<unsigned long long>(counters.unknownStructure), static_cast<unsigned long long>(counters.missingStage), static_cast<unsigned long long>(counters.unreadMoves), drawRelocations.size(), drawStageDonors.size());
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-relocate] %llu alias lookups: %llu donors with moved user words, %llu refusals, %llu hits through a relocated entry; misses: %llu unknown structure, %llu stages without a donor; %llu unread user words ignored; %zu shader sets learned, %zu stage donors held\n", static_cast<unsigned long long>(counters.lookups), static_cast<unsigned long long>(counters.donors), static_cast<unsigned long long>(counters.refused), static_cast<unsigned long long>(counters.hits), static_cast<unsigned long long>(counters.unknownStructure), static_cast<unsigned long long>(counters.missingStage), static_cast<unsigned long long>(counters.unreadMoves), drawRelocations.size(), drawStageDonors.Size());
     counters = {};
 }
 
