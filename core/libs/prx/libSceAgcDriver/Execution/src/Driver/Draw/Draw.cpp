@@ -221,7 +221,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::size_t i = 0; i < matched.size() && i < drawStageDonorKeys.size() && i < programs.size(); ++i) {
             if (matched[i] == nullptr || !matched[i]->dataPatched || drawStageDonorKeys[i] == 0) continue;
             matched[i]->dataPatched = false;
-            drawStageDonors[drawStageDonorKeys[i]] = {matched[i], programs[i].userData};
+            drawStageDonors.Put(drawStageDonorKeys[i], {matched[i], programs[i].userData});
         }
     }
     if (!userPatches.empty() && !drawHit) {
