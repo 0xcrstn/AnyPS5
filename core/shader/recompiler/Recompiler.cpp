@@ -50,6 +50,7 @@
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <ControlFlow/RequestSerializer.hpp>
 
 namespace ShaderRecompiler {
@@ -454,6 +455,9 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                     loaded.shaderHash = request.shader.codeAddress;
                     source->plan = std::make_shared<const IrResourcePlan>(std::move(loaded));
                     countPlan(*source->plan);
+                } else if (std::string refused; FailureMemo() && ShaderDiskCache::LoadPlanFailure(planKey, refused)) {
+                    source->planFailure = std::make_exception_ptr(std::runtime_error(refused));
+                    std::rethrow_exception(source->planFailure);
                 }
             }
             if (source->plan == nullptr) {
@@ -463,6 +467,10 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                     source->program = std::move(resource.program);
                     countPlan(*source->plan);
                     if (source->program != nullptr) countProgram(true);
+                } catch (const std::runtime_error& error) {
+                    if (FailureMemo()) source->planFailure = std::current_exception();
+                    if (disk && FailureMemo() && typeid(error) == typeid(std::runtime_error)) ShaderDiskCache::StorePlanFailure(planKey, error.what());
+                    throw;
                 } catch (...) {
                     if (FailureMemo()) source->planFailure = std::current_exception();
                     throw;
