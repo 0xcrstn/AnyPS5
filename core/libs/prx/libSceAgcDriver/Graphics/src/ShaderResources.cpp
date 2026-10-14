@@ -3769,6 +3769,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (!same) differing.fetch_add(1);
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
+        bool reused = buffer != nullptr;
         if (buffer != nullptr) {
             if (statistics != nullptr) ++statistics->reused;
         } else {
@@ -3808,15 +3809,18 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                         statistics->wholeBytes[static_cast<std::size_t>(wholeCopy)] += bytes;
                     }
                 }
-            } else if (statistics != nullptr) {
-                ++statistics->reused;
+            } else {
+                reused = true;
+                if (statistics != nullptr) ++statistics->reused;
             }
             if (!partial && generation != 0 && GuestMemory::TrackerGeneration() == stamp[0]) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer);
             else stamped = false;
         }
         lap(&DrawBindingsStatistics::keepUs);
         selected.push_back(index);
-        result->snapshots.push_back({begin, std::move(buffer)});
+        auto twin = reused ? recorder.SnapshotTwin(buffer) : std::shared_ptr<Buffer>{};
+        if (twin != nullptr && statistics != nullptr) ++statistics->twins;
+        result->snapshots.push_back({begin, std::move(buffer), std::move(twin)});
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
@@ -3851,7 +3855,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
             if (snapshotIndex == selected.size()) continue;
             const auto& snapshot = result->snapshots[snapshotIndex];
-            buffers[offset + element] = {snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()};
+            buffers[offset + element] = {snapshot.twin != nullptr ? snapshot.twin->Handle() : snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()};
         }
     }
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);

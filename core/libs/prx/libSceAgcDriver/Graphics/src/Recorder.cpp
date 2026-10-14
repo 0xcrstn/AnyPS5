@@ -1175,6 +1175,8 @@ Recorder::~Recorder() {
         context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     }
     spare.clear();
+    for (auto& commands : sparePrologues) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+    sparePrologues.clear();
     for (const auto pool : sparePools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
     sparePools.clear();
     // Sync() above waited for every batch, so no submission still signals the timeline.
@@ -2550,6 +2552,7 @@ void Recorder::retireSnapshot(std::shared_ptr<void> object) {
 }
 
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
+    forgetSnapshotTwin(entry->second.buffer.get());
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
@@ -2635,8 +2638,130 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         if (!differing.empty() && differing.back().first + differing.back().second == offset) differing.back().second += length;
         else differing.emplace_back(offset, length);
     }
+    if (!differing.empty()) forgetSnapshotTwin(entry.buffer.get());
     for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
     return true;
+}
+
+namespace {
+
+struct TwinStatistics {
+    std::atomic<std::uint64_t> made{0};
+    std::atomic<std::uint64_t> madeBytes{0};
+    std::atomic<std::uint64_t> bound{0};
+    std::atomic<std::uint64_t> boundBytes{0};
+    std::atomic<std::uint64_t> dropped{0};
+};
+
+TwinStatistics& Twins() {
+    static TwinStatistics statistics;
+    return statistics;
+}
+
+std::size_t SnapshotTwinBudget() {
+    static const std::size_t bytes = [] {
+        const char* text = std::getenv("APS5_SNAPSHOT_TWIN_MIB");
+        return static_cast<std::size_t>(text != nullptr ? std::strtoull(text, nullptr, 10) : 2048ull) << 20u;
+    }();
+    return bytes;
+}
+
+std::size_t SnapshotTwinMaxBytes() {
+    static const std::size_t bytes = [] {
+        const char* text = std::getenv("APS5_SNAPSHOT_TWIN_MAX_MIB");
+        return static_cast<std::size_t>(text != nullptr ? std::strtoull(text, nullptr, 10) : 16ull) << 20u;
+    }();
+    return bytes;
+}
+
+}
+
+bool Recorder::SnapshotTwinsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_SNAPSHOT_TWINS") == nullptr && SnapshotTwinMaxBytes() != 0 && SnapshotTwinBudget() != 0;
+    return enabled;
+}
+
+Recorder::SnapshotTwinCounters Recorder::TwinCounters() {
+    auto& twins = Twins();
+    return {twins.made.load(std::memory_order_relaxed), twins.madeBytes.load(std::memory_order_relaxed), twins.bound.load(std::memory_order_relaxed), twins.boundBytes.load(std::memory_order_relaxed), twins.dropped.load(std::memory_order_relaxed)};
+}
+
+void Recorder::forgetSnapshotTwin(const Buffer* snapshot) {
+    if (snapshotTwins.empty()) return;
+    const auto found = snapshotTwins.find(snapshot);
+    if (found == snapshotTwins.end()) return;
+    snapshotTwinBytes -= std::min(snapshotTwinBytes, found->second.twin->Size());
+    retireSnapshot(std::move(found->second.twin));
+    snapshotTwins.erase(found);
+    Twins().dropped.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Recorder::sweepSnapshotTwins() {
+    for (auto it = snapshotTwins.begin(); it != snapshotTwins.end();) {
+        if (!it->second.source.expired()) {
+            ++it;
+            continue;
+        }
+        snapshotTwinBytes -= std::min(snapshotTwinBytes, it->second.twin->Size());
+        retireSnapshot(std::move(it->second.twin));
+        it = snapshotTwins.erase(it);
+        Twins().dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+VkCommandBuffer Recorder::prologueCommands() {
+    ensureOpen();
+    if (open->prologue != VK_NULL_HANDLE) return open->prologue;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (!sparePrologues.empty()) {
+        commands = sparePrologues.back();
+        sparePrologues.pop_back();
+    } else {
+        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocation.commandPool = context.pool;
+        allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocation.commandBufferCount = 1;
+        Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &commands), "vkAllocateCommandBuffers recorder prologue");
+    }
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (function(beginCommandBuffer, "vkBeginCommandBuffer")(commands, &begin) != VK_SUCCESS) {
+        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+        throw std::runtime_error("AGC graphics: vkBeginCommandBuffer recorder prologue failed");
+    }
+    open->prologue = commands;
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    return commands;
+}
+
+std::shared_ptr<Buffer> Recorder::SnapshotTwin(const std::shared_ptr<Buffer>& snapshot) {
+    if (!SnapshotTwinsEnabled() || snapshot == nullptr || !snapshot->Mapped()) return {};
+    const auto bytes = snapshot->Bytes().size();
+    if (bytes == 0 || bytes > SnapshotTwinMaxBytes()) return {};
+    auto found = snapshotTwins.find(snapshot.get());
+    if (found != snapshotTwins.end() && found->second.source.lock() != snapshot) {
+        forgetSnapshotTwin(snapshot.get());
+        found = snapshotTwins.end();
+    }
+    if (found == snapshotTwins.end()) {
+        if (snapshotTwinBytes + bytes > SnapshotTwinBudget()) sweepSnapshotTwins();
+        if (snapshotTwinBytes + bytes > SnapshotTwinBudget()) return {};
+        std::shared_ptr<Buffer> twin;
+        try {
+            twin = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        } catch (const std::exception&) {
+            return {};
+        }
+        CopyBuffer(context, prologueCommands(), snapshot->Handle(), 0, twin->Handle(), 0, bytes);
+        open->kept.push_back(snapshot);
+        found = snapshotTwins.emplace(snapshot.get(), SnapshotTwinEntry{snapshot, std::move(twin)}).first;
+        snapshotTwinBytes += bytes;
+        Twins().made.fetch_add(1, std::memory_order_relaxed);
+        Twins().madeBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    Twins().bound.fetch_add(1, std::memory_order_relaxed);
+    Twins().boundBytes.fetch_add(bytes, std::memory_order_relaxed);
+    return found->second.twin;
 }
 
 void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
@@ -3237,9 +3362,15 @@ void Recorder::Submit() {
     }
     auto batch = std::move(open);
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
+    std::array<VkCommandBuffer, 2> submitted{batch->commands, VK_NULL_HANDLE};
+    if (batch->prologue != VK_NULL_HANDLE) {
+        recordBarrier(batch->prologue, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->prologue), "vkEndCommandBuffer recorder prologue");
+        submitted = {batch->prologue, batch->commands};
+    }
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submission.commandBufferCount = 1;
-    submission.pCommandBuffers = &batch->commands;
+    submission.commandBufferCount = batch->prologue != VK_NULL_HANDLE ? 2u : 1u;
+    submission.pCommandBuffers = submitted.data();
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
     CaptureTrace::Log("submit batch=%llu reads=%zu writes=%zu", static_cast<unsigned long long>(serial), batch->reads.size(), batch->writes.size());
@@ -3806,6 +3937,17 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 }
 
 void Recorder::release(Batch& batch) noexcept {
+    if (batch.prologue != VK_NULL_HANDLE) {
+        if (sparePrologues.size() < 64) {
+            try {
+                sparePrologues.push_back(batch.prologue);
+                batch.prologue = VK_NULL_HANDLE;
+            } catch (...) {
+            }
+        }
+        if (batch.prologue != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &batch.prologue);
+        batch.prologue = VK_NULL_HANDLE;
+    }
     if (batch.queries != VK_NULL_HANDLE) {
         if (!GpuTimingEnabled() && sparePools.size() < 64) {
             try {

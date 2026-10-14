@@ -21,6 +21,7 @@ public:
     std::span<std::byte> Bytes();
     bool Mapped() const { return mapping != nullptr; }
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
+    std::size_t Size() const { return size; }
     void Invalidate();
 
 private:

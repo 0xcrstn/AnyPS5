@@ -105,6 +105,16 @@ public:
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer);
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    std::shared_ptr<Buffer> SnapshotTwin(const std::shared_ptr<Buffer>& snapshot);
+    struct SnapshotTwinCounters {
+        std::uint64_t made = 0;
+        std::uint64_t madeBytes = 0;
+        std::uint64_t bound = 0;
+        std::uint64_t boundBytes = 0;
+        std::uint64_t dropped = 0;
+    };
+    static SnapshotTwinCounters TwinCounters();
+    static bool SnapshotTwinsEnabled();
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
@@ -536,6 +546,7 @@ public:
 private:
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
+        VkCommandBuffer prologue = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
@@ -853,6 +864,16 @@ private:
     std::map<DrawSnapshotKey, IndexRange> indexRanges;
     std::list<DrawSnapshotKey> indexRangeRecency;
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
+    struct SnapshotTwinEntry {
+        std::weak_ptr<Buffer> source;
+        std::shared_ptr<Buffer> twin;
+    };
+    std::unordered_map<const Buffer*, SnapshotTwinEntry> snapshotTwins;
+    std::size_t snapshotTwinBytes = 0;
+    void sweepSnapshotTwins();
+    std::vector<VkCommandBuffer> sparePrologues;
+    VkCommandBuffer prologueCommands();
+    void forgetSnapshotTwin(const Buffer* snapshot);
 };
 
 }

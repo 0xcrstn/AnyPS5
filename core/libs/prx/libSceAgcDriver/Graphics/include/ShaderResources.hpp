@@ -138,6 +138,7 @@ public:
         struct Snapshot {
             std::uint64_t address;
             std::shared_ptr<Buffer> buffer;
+            std::shared_ptr<Buffer> twin = {};
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation fragmentAllocation;
@@ -159,6 +160,7 @@ public:
         std::uint64_t copied = 0;
         std::uint64_t skipped = 0;
         std::uint64_t copiedBytes = 0;
+        std::uint64_t twins = 0;
         std::uint64_t descriptorWrites = 0;
         std::uint64_t limited = 0;
         std::uint64_t uncopiedBytes = 0;
