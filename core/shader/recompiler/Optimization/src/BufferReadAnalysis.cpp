@@ -118,7 +118,7 @@ void BufferReadAnalysis::Note(BufferReadRanges& ranges, const IrValue& inst, con
     if (op == IrOpcode::ReadConstBuffer) {
         const auto offset = inst.ArgumentCount() == 2u ? Of(inst.Argument(1)) : std::nullopt;
         if (!offset || offset->high + memory.offset > Max32) {
-            ranges.Unbound();
+            ranges.Unbound(offset ? BufferReadUnbound::Wrap : BufferReadUnbound::ScalarOffset);
             return;
         }
         ranges.Add({0u, 0u, (offset->low + memory.offset) & ~std::uint64_t{3}, ((offset->high + memory.offset) & ~std::uint64_t{3}) + 4u});
@@ -126,17 +126,17 @@ void BufferReadAnalysis::Note(BufferReadRanges& ranges, const IrValue& inst, con
     }
     const bool plain = op == IrOpcode::LoadBufferU8 || op == IrOpcode::LoadBufferU16 || op == IrOpcode::LoadBufferU32 || op == IrOpcode::LoadBufferU32x2 || op == IrOpcode::LoadBufferU32x3 || op == IrOpcode::LoadBufferU32x4;
     if (!plain || memory.formatted || inst.ArgumentCount() < 4u) {
-        ranges.Unbound();
+        ranges.Unbound(plain && memory.formatted ? BufferReadUnbound::Formatted : BufferReadUnbound::Opcode);
         return;
     }
-    const auto index = Of(inst.Argument(1));
+    const auto index = Of(inst.Argument(1)).value_or(Interval{0u, BufferReadRanges::AnyIndex});
     const auto offset = Of(inst.Argument(2));
     const auto soffset = Of(inst.Argument(3));
-    if (!index || !offset || !soffset || offset->high + memory.offset > Max32) {
-        ranges.Unbound();
+    if (!offset || !soffset || offset->high + memory.offset > Max32) {
+        ranges.Unbound(!offset ? BufferReadUnbound::Offset : !soffset ? BufferReadUnbound::Soffset : BufferReadUnbound::Wrap);
         return;
     }
-    ranges.Add({static_cast<std::uint32_t>(index->low), static_cast<std::uint32_t>(index->high), offset->low + memory.offset + soffset->low, offset->high + memory.offset + soffset->high + extent});
+    ranges.Add({static_cast<std::uint32_t>(index.low), static_cast<std::uint32_t>(index.high), offset->low + memory.offset + soffset->low, offset->high + memory.offset + soffset->high + extent});
 }
 
 }

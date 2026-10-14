@@ -1592,7 +1592,7 @@ private:
                 }
                 if (alias) {
                     buffer.imageAlias = image;
-                    buffer.readRanges.Unbound();
+                    buffer.readRanges.Unbound(BufferReadUnbound::Alias);
                     break;
                 }
             }

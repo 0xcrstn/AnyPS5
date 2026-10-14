@@ -1402,7 +1402,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                         const bool atomic = element < binding.bufferAtomic.size() && binding.bufferAtomic[element];
                         const bool read = element < binding.bufferRead.size() && binding.bufferRead[element];
                         const auto index = addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic, read);
-                        if (!allocations[index].written && allocations[index].guest) allocations[index].readRanges = GuestReadRanges(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), element < binding.bufferReadRanges.size() ? &binding.bufferReadRanges[element] : nullptr, allocations[index].size);
+                        if (!allocations[index].written && allocations[index].guest) allocations[index].readRanges = GuestReadRanges(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), element < binding.bufferReadRanges.size() ? &binding.bufferReadRanges[element] : nullptr, allocations[index].size, &allocations[index].wholeCopy);
                         const auto& push = shader.program->pushConstants;
                         if (!push.empty()) {
                             const auto position = shader.program->memoryOffsetDword * 4u + element;
@@ -3642,17 +3642,41 @@ bool PartialSnapshotsDisabled() {
 }
 }
 
-std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std::span<const std::uint32_t> words, const ShaderRecompiler::BufferReadRanges* ranges, std::uint64_t size) {
-    if (ranges == nullptr || !ranges->bounded || words.size() != 4) return std::nullopt;
+const char* ShaderResources::WholeCopyName(WholeCopy reason) {
+    static constexpr std::array<const char*, static_cast<std::size_t>(WholeCopy::Count)> names{"not analysed", "unbounded index", "unbounded offset", "unbounded soffset", "unbounded scalar offset", "offset past 32 bits", "formatted load", "other read", "image alias", "swizzled", "add tid", "past 4 GiB", "over half", "moved", "disabled"};
+    const auto index = static_cast<std::size_t>(reason);
+    return index < names.size() ? names[index] : "?";
+}
+
+std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std::span<const std::uint32_t> words, const ShaderRecompiler::BufferReadRanges* ranges, std::uint64_t size, WholeCopy* reason) {
+    const auto whole = [&](WholeCopy why) -> std::optional<ByteRanges> {
+        if (reason != nullptr) *reason = why;
+        return std::nullopt;
+    };
+    if (ranges == nullptr || words.size() != 4) return whole(WholeCopy::NotAnalysed);
+    if (!ranges->bounded) {
+        using Unbound = ShaderRecompiler::BufferReadUnbound;
+        switch (ranges->unbound) {
+        case Unbound::Offset: return whole(WholeCopy::Offset);
+        case Unbound::Soffset: return whole(WholeCopy::Soffset);
+        case Unbound::ScalarOffset: return whole(WholeCopy::ScalarOffset);
+        case Unbound::Wrap: return whole(WholeCopy::Wrap);
+        case Unbound::Formatted: return whole(WholeCopy::Formatted);
+        case Unbound::Alias: return whole(WholeCopy::Alias);
+        default: return whole(WholeCopy::Opcode);
+        }
+    }
     const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
     const std::uint64_t stride = descriptor.Stride();
-    if ((stride != 0 && descriptor.SwizzleEnabled()) || descriptor.AddTid()) return std::nullopt;
+    if (stride != 0 && descriptor.SwizzleEnabled()) return whole(WholeCopy::Swizzled);
+    if (descriptor.AddTid()) return whole(WholeCopy::AddTid);
     ByteRanges result;
     for (const auto& range : ranges->ranges) {
-        if (range.firstIndex > range.lastIndex || range.begin > range.end) return std::nullopt;
+        if (range.firstIndex > range.lastIndex || range.begin > range.end) return whole(WholeCopy::Opcode);
+        if (range.lastIndex == ShaderRecompiler::BufferReadRanges::AnyIndex && stride != 0) return whole(WholeCopy::Index);
         const auto begin = static_cast<std::uint64_t>(range.firstIndex) * stride + range.begin;
         const auto end = static_cast<std::uint64_t>(range.lastIndex) * stride + range.end;
-        if (end > std::uint64_t{0xffffffff}) return std::nullopt;
+        if (end > std::uint64_t{0xffffffff}) return whole(WholeCopy::BeyondFourGiB);
         if (begin >= size) continue;
         result.emplace_back(begin, std::min(end, size));
     }
@@ -3757,9 +3781,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, BufferExtent::SizeClass);
                 lap(&DrawBindingsStatistics::bufferUs);
                 std::uint64_t covered = 0;
-                if (override == moved.end() && item.readRanges.has_value() && !PartialSnapshotsDisabled()) {
+                auto wholeCopy = item.wholeCopy;
+                if (override != moved.end()) wholeCopy = WholeCopy::Moved;
+                else if (PartialSnapshotsDisabled()) wholeCopy = WholeCopy::Disabled;
+                else if (item.readRanges.has_value()) {
                     for (const auto& [from, to] : *item.readRanges) covered += to - from;
                     partial = covered * 2 <= bytes;
+                    wholeCopy = WholeCopy::OverHalf;
                 }
                 if (partial) {
                     const auto bytesOut = buffer->Bytes();
@@ -3775,6 +3803,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     if (partial) {
                         ++statistics->limited;
                         statistics->uncopiedBytes += bytes - covered;
+                    } else {
+                        ++statistics->wholeCopies[static_cast<std::size_t>(wholeCopy)];
+                        statistics->wholeBytes[static_cast<std::size_t>(wholeCopy)] += bytes;
                     }
                 }
             } else if (statistics != nullptr) {
