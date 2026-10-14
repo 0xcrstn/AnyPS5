@@ -535,6 +535,16 @@ ImportWatchRequest importWatchRequest() {
 }
 #endif
 
+#ifdef _WIN32
+bool residentlyWatched(std::uint64_t base, std::uint64_t bytes) {
+    static const bool compared = std::getenv("APS5_COMPARE_RESIDENT_IMPORTS") != nullptr;
+    if (compared || !GuestMemory::WriteWatched()) return false;
+    std::uintptr_t start = 0;
+    std::uintptr_t end = 0;
+    return GuestArena::GuestArenaResidentSpan_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes), &start, &end) && start <= base && end >= base + bytes;
+}
+#endif
+
 void decideImportWatch(const Context& context, HostImports& state) {
     if (state.watchDevice == context.device) return;
 #ifdef _WIN32
@@ -930,7 +940,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     VkResult result = VK_SUCCESS;
     const char* step = nullptr;
 #ifdef _WIN32
-    const bool watchedHostPointer = entry.alias != nullptr || !state.unwatchImports;
+    const bool watchedHostPointer = entry.alias != nullptr || !state.unwatchImports || residentlyWatched(base, bytes);
     const bool watchedDmaBuf = watchedHostPointer;
 #else
     const bool watchedHostPointer = !state.unwatchImports;
