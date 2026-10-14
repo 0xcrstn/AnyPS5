@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -186,6 +187,8 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
         appendKey(key, shader.pushConstantOffset);
         appendKey(identity, shader.stage);
         appendKey(identity, shader.program->PipelineVariantId());
+        auto& offsets = shader.stage == Stage::Fragment ? keys.fragmentFields[0] : keys.preRasterizationFields[0];
+        offsets = offsets * 31u + shader.pushConstantOffset + 1u;
         if (resources.split) {
             auto& sets = shader.stage == Stage::Fragment ? keys.fragmentSets : keys.preRasterizationSets;
             for (const auto& binding : shader.program->bindings) {
@@ -212,6 +215,12 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     appendKey(keys.preRasterization, state.negativeOneToOne);
     appendKey(keys.preRasterization, state.depthClamp && context.depthClamp);
     appendKey(keys.preRasterization, state.conservativeRasterization);
+    keys.preRasterizationFields[1] = state.provokingVertexMode;
+    keys.preRasterizationFields[2] = state.negativeOneToOne;
+    keys.preRasterizationFields[3] = state.depthClamp && context.depthClamp;
+    keys.preRasterizationFields[4] = state.conservativeRasterization;
+    keys.preRasterizationFields[5] = state.stages.tessellation ? 1u + state.stages.tessellation->inputControlPoints : 0u;
+    keys.fragmentFields[1] = state.samples;
     appendKey(keys.preRasterization, state.stages.tessellation.has_value());
     if (state.stages.tessellation) appendKey(keys.preRasterization, state.stages.tessellation->inputControlPoints);
     appendKey(keys.fragmentShader, state.samples);
@@ -221,6 +230,14 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     appendKey(keys.fragmentOutput, sampleLocationsEnabled);
     appendKey(keys.fragmentShader, state.customSampleLocations);
     appendKey(keys.fragmentOutput, state.customSampleLocations);
+    keys.fragmentFields[2] = sampleLocationsEnabled ? 1u : 0u;
+    if (state.customSampleLocations) {
+        for (std::uint32_t sample = 0; sample < state.samples; ++sample) {
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &state.sampleLocations[sample], std::min(sizeof(bits), sizeof(state.sampleLocations[sample])));
+            keys.fragmentFields[2] = keys.fragmentFields[2] * 1000003u + bits + 2u;
+        }
+    }
     if (state.customSampleLocations) {
         for (std::uint32_t sample = 0; sample < state.samples; ++sample) {
             appendKey(keys.fragmentShader, state.sampleLocations[sample]);

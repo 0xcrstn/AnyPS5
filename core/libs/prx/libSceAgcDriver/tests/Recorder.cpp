@@ -6276,10 +6276,12 @@ void pipelineLibraryTests(const Device& device) {
     state.colors.front().format = VK_FORMAT_R16G16B16A16_SFLOAT;
     static_cast<void>(lookup());
     Require(counters().built == std::array<std::uint64_t, 4>{2, 2, 3, 3}, "another target format rebuilt more than the fragment output library");
+    const auto samplesBefore = counters().fragmentRebuiltFor;
     state.samples = 4;
     state.colors.front().samples = 4;
     const auto multisampled = lookup();
     Require(counters().built == std::array<std::uint64_t, 4>{2, 2, 4, 4}, "a 4x pipeline shared the 1x fragment shader or fragment output library");
+    Require(counters().fragmentRebuiltFor[1] == samplesBefore[1] + 1u && counters().fragmentRebuiltFor[0] == samplesBefore[0] && counters().fragmentRebuiltFor[2] == samplesBefore[2], "a fragment library built again for a sample count was not counted under samples");
     state.samples = 1;
     state.colors.front().samples = 1;
     Require(lookup() != multisampled && counters().built == std::array<std::uint64_t, 4>{2, 2, 4, 4}, "the 1x pipeline after a 4x one built its libraries again");
