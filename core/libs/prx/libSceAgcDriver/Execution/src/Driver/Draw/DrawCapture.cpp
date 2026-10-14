@@ -39,6 +39,8 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     stageCapture.userDataUse = capture->userDataUse;
     stageCapture.prepared = invocation.Handle();
     stageCapture.bufferBaseWords = capture->bufferBaseWords;
+    stageCapture.dataLeaves = capture->readTrace.leaves;
+    stageCapture.otherReads = capture->readTrace.otherReads;
     recompiled[i] = true;
     memory = shaderMemory.Regions();
 
@@ -107,6 +109,8 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             tagVariantRuns(*variant, regions, stageCapture.userDataUse, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords);
             variant->userDataReads = UserDataReads(stageCapture.userDataUse, *stageCapture.compiled, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords);
             tagBufferWords(*variant, stageCapture.bufferBaseWords);
+            tagDataLeaves(*variant, stageCapture.dataLeaves, stageCapture.otherReads);
+            variant->inputExports = stageCapture.inputExports;
             const auto sameContent = [](const DispatchVariant& a, const DispatchVariant& b) {
                 const auto flatten = [](const DispatchVariant& source) {
                     std::vector<std::pair<std::uint64_t, std::uint32_t>> flat;

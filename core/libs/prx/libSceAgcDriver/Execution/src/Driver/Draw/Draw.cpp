@@ -106,6 +106,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 cacheLock.lock();
             }
             if (drawIdentity != 0) drawRelocationPending = {drawKey, drawIdentity, drawAliases, relocation};
+            if (drawIdentity != 0 && drawMissDiagnosisEnabled()) {
+                if (relocation == nullptr) noteDrawKeyMiss(drawRelocations.contains(drawIdentity) ? DrawKeyMiss::Idle : DrawKeyMiss::Unlearned);
+                else if (drawAliases.structure == 0) noteDrawKeyMiss(DrawKeyMiss::Unreadable);
+            }
             if (drawAliases.structure != 0) relocateDrawEntry(queue, drawAliases, entry, decode, userPatches);
             if (relocation != nullptr) {
                 auto& trial = drawRelocationTrials[drawIdentity];
@@ -262,7 +266,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& program = programs[i];
         pushCursorBytes = Graphics::StagePushOffset(pushCursorBytes, program.binary.stage, localDevice->GraphicsPipelineLibraries());
         pushOffsets[i] = pushCursorBytes;
-        const bool reused = !drawHit && !verifyHit && drawRelocationEnabled() && matched[i] != nullptr;
+        bool reused = !drawHit && !verifyHit && drawRelocationEnabled() && matched[i] != nullptr && matched[i]->pushOffset == pushCursorBytes;
+        const ShaderRecompiler::RecompileResult* front = nullptr;
+        if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) {
+            for (auto previous = i; previous-- > 0;) {
+                if (programResults[previous] == nullptr) continue;
+                front = programResults[previous];
+                break;
+            }
+        }
+        if (reused && front != nullptr && matched[i]->inputExports != front->parameterExports) reused = false;
+        if (!reused && !drawHit && !verifyHit) matched[i] = nullptr;
         if (reused) fresh[i] = matched[i];
         if (drawHit || reused) {
 
@@ -270,12 +284,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             resultIndex[i] = results.size();
-            if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) {
-                for (auto previous = i; previous-- > 0;) {
-                    if (programResults[previous] == nullptr) continue;
-                    pixel = Graphics::DefaultUnexportedInputs(decode->pixel, programResults[previous]->parameterExports);
-                    break;
-                }
+            if (front != nullptr) {
+                pixel = Graphics::DefaultUnexportedInputs(decode->pixel, front->parameterExports);
+                stageCaptures[i].inputExports = front->parameterExports;
             }
             results.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
             if (!rejected.empty()) return DrawVerdict::Rejected;

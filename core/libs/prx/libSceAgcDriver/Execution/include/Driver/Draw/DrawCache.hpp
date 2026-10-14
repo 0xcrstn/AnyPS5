@@ -66,10 +66,11 @@ struct DrawEntry {
     std::list<std::uint64_t>::iterator order;
 };
 
-enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
+enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, NoVariant, Count };
 
 struct DrawEntryCounters {
     std::uint64_t lookups = 0, absent = 0, hits = 0, stageValidations = 0, stageEqual = 0, variantsCompared = 0, inserts = 0, variantsInserted = 0, variantsEvicted = 0, present = 0, unstable = 0, touches = 0, verifyHits = 0, verifyMismatches = 0;
+    std::uint64_t partialStages = 0, dataPatchedStages = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrawMiss::Count)> misses{};
     std::array<std::uint64_t, MaxDispatchVariants> variantHitsByRank{};
     double validateUs = 0;
@@ -102,6 +103,9 @@ struct StageCapture {
     ShaderRecompiler::SrtUserDataUse userDataUse;
     std::shared_ptr<const ShaderRecompiler::SourceHandle> prepared;
     std::vector<ShaderRecompiler::BufferBaseWord> bufferBaseWords;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> dataLeaves;
+    std::vector<std::uint64_t> otherReads;
+    std::vector<std::uint32_t> inputExports;
 };
 
 struct RelocatableUserWord {
@@ -122,10 +126,17 @@ struct DrawUserPatch {
     std::uint32_t index, value;
 };
 
+struct DrawStructureParts {
+    std::uint64_t shape = 0;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> words;
+};
+
 struct DrawAliasKeys {
     static constexpr std::size_t Stages = 3;
     std::uint64_t structure = 0;
     std::array<std::uint64_t, Stages> content{};
+    std::array<std::vector<std::uint32_t>, Stages> raw;
+    DrawStructureParts parts;
     static std::size_t Stage(std::uint32_t reg) { return reg >= 0x10cu ? 2 : reg >= 0x08cu ? 1 : 0; }
     std::uint64_t Key(std::uint64_t stageKey, std::uint32_t userDataBase) const { return (stageKey ^ (content[Stage(userDataBase)] + 0x9e3779b97f4a7c15ull)) * 0x100000001b3ull + userDataBase; }
 };
@@ -150,18 +161,20 @@ public:
         order.splice(order.begin(), order, found->second.second);
         return &found->second.first;
     }
-    void Put(std::uint64_t key, TValue value) {
+    bool Put(std::uint64_t key, TValue value, std::uint64_t* evicted = nullptr) {
         if (const auto found = entries.find(key); found != entries.end()) {
             found->second.first = std::move(value);
             order.splice(order.begin(), order, found->second.second);
-            return;
+            return false;
         }
         while (!entries.empty() && entries.size() >= capacity) {
+            if (evicted != nullptr) *evicted = order.back();
             entries.erase(order.back());
             order.pop_back();
         }
         order.push_front(key);
         entries.emplace(key, std::make_pair(std::move(value), order.begin()));
+        return true;
     }
     std::size_t Size() const { return entries.size(); }
 
@@ -181,6 +194,29 @@ struct DrawRelocationTrial {
     static constexpr std::uint32_t Window = 1024, MinimumHitShare = 16, IdleDraws = 16384;
     std::uint32_t lookups = 0, hits = 0, idle = 0;
     bool productive = false;
+};
+
+enum class DrawKeyMiss : std::size_t { Unlearned, Idle, Unreadable, NewStructure, RegisterState, ValueWord, ReadWord, OtherWord, StructureDropped, Relocated, Count };
+
+enum class DrawStageMiss : std::size_t { NoStageKey, DonorEvicted, NoDonor, ShapeChanged, DonorDropped, Refused, BufferBase, BufferWord, ImageWord, FlatWord, ShaderData, Constant, Unbound, Count };
+
+struct DrawStageSample {
+    std::vector<std::uint32_t> raw;
+    std::shared_ptr<const DispatchVariant> variant;
+};
+
+struct DrawMissDiagnosis {
+    static constexpr std::size_t Samples = 4096;
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawKeyMiss::Count)> keys{};
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawStageMiss::Count)> stages{};
+    std::uint64_t wordAddressLike = 0, contentAddressLike = 0, oneWord = 0, fewWords = 0, manyWords = 0;
+    std::uint64_t donorLookups = 0, donorFound = 0, donorPuts = 0, donorNew = 0, donorEvictions = 0, donorBytes = 0;
+    RecentTable<bool> evictedDonors{Samples * 16};
+    std::unordered_map<std::uint64_t, DrawStructureParts> learned;
+    RecentTable<DrawStageSample> samples{Samples};
+    static std::uint64_t SampleKey(std::uint64_t structure, std::size_t stage) { return (structure ^ (0x9e3779b97f4a7c15ull * (stage + 1))) * 0x100000001b3ull; }
+    static bool AddressLike(std::uint32_t before, std::uint32_t after);
+    static DrawStageMiss Classify(const DispatchVariant& variant, std::uint32_t before, std::uint32_t after);
 };
 
 struct DrawRelocationCounters {

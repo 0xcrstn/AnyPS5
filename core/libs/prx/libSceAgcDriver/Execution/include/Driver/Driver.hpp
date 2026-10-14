@@ -128,7 +128,13 @@ private:
     static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, const DrawRelocation* relocation = nullptr, DrawAliasKeys* aliases = nullptr);
     static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
     static bool drawRelocationEnabled();
-    static std::uint64_t relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable);
+    static std::uint64_t relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable, std::vector<std::uint32_t>* raw = nullptr);
+    static bool drawMissDiagnosisEnabled();
+    static void tagDataLeaves(DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads);
+    void noteDrawKeyMiss(DrawKeyMiss reason);
+    void diagnoseStructureMiss(const DrawAliasKeys& aliases);
+    void diagnoseStageMiss(const DrawAliasKeys& aliases, std::size_t stage, std::uint32_t userDataBase, std::uint64_t donorKey, bool refused);
+    void reportDrawMisses();
     static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords);
     static void applyShaderDataPatches(DispatchVariant& variant);
     static std::shared_ptr<DispatchVariant> cloneVariant(const DispatchVariant& variant);
@@ -334,6 +340,7 @@ private:
     DrawRelocationPending drawRelocationPending;
     std::unordered_map<std::uint64_t, DrawRelocationTrial> drawRelocationTrials;
     DrawRelocationCounters drawRelocationCounters;
+    DrawMissDiagnosis drawMissDiagnosis;
     std::vector<std::uint64_t> drawStageDonorKeys;
     std::mutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
