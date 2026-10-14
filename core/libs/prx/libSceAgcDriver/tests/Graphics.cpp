@@ -5847,8 +5847,7 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--library-push-offset") {
             LibraryPushOffsetTests();
-            std::printf("library push offset tests passed
-");
+            std::printf("library push offset tests passed\n");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--sparse-buffer-holes") {
