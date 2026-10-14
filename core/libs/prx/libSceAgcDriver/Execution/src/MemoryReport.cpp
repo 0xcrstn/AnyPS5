@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/MemoryReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProcessMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DriverHeapTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -59,11 +60,13 @@ std::string Describe(const std::function<std::string()>& device) {
     const auto heapBytes = space.hostPrivate - space.stacks;
     const auto storageCopies = Graphics::StorageImageHostCopyBytes();
     const auto bufferCopies = Graphics::GuestBufferHostCopyBytes();
-    const auto known = accounted + storageCopies + bufferCopies;
+    std::uint64_t driverBytes = 0;
+    for (const auto& use : DriverHeapTrace::Read()) driverBytes += use.heapBytes + use.virtualBytes;
+    const auto known = accounted + storageCopies + bufferCopies + driverBytes;
     std::string text = "[memory] process commit " + gib(process.commit) + " (peak " + gib(process.peakCommit) + "), working set " + gib(process.workingSet);
     text += " | guest arena private " + gib(process.commit > space.hostPrivate ? process.commit - space.hostPrivate : 0);
     text += "; guest heap live " + mib(guestHeap.largeLiveBytes) + " + small spans " + mib(guestHeap.smallSpanBytes) + ", freed blocks kept " + mib(guestHeap.largeCachedBytes);
-    text += " | host private " + gib(space.hostPrivate) + ": " + std::to_string(space.threads) + " thread stacks " + mib(space.stacks) + ", heaps and other allocations " + gib(heapBytes) + " (the shader counters below account for ~" + gib(accounted) + ", storage image host copies of guest bytes " + gib(storageCopies) + ", guest buffer snapshots " + gib(bufferCopies) + ", the rest ~" + gib(heapBytes > known ? heapBytes - known : 0) + ": the Vulkan driver's host memory and the other caches)";
+    text += " | host private " + gib(space.hostPrivate) + ": " + std::to_string(space.threads) + " thread stacks " + mib(space.stacks) + ", heaps and other allocations " + gib(heapBytes) + " (the shader counters below account for ~" + gib(accounted) + ", storage image host copies of guest bytes " + gib(storageCopies) + ", guest buffer snapshots " + gib(bufferCopies) + (DriverHeapTrace::Enabled() ? ", driver modules (APS5_TRACE_DRIVER_HEAP) " + gib(driverBytes) : std::string{}) + ", the rest ~" + gib(heapBytes > known ? heapBytes - known : 0) + ": the Vulkan driver's host memory and the other caches)";
     if (!space.largest.empty()) {
         text += " (largest";
         for (const auto& [base, bytes] : space.largest) {
