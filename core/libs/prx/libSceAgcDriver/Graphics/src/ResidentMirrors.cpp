@@ -28,6 +28,7 @@ struct ResidentMirror {
     bool anyWritten = false;
     const Recorder* usedBy = nullptr;
     std::uint64_t usedBatch = 0;
+    bool retired = false;
 };
 
 namespace {
@@ -126,19 +127,26 @@ bool ResidentMirrorsEnabled() {
     return enabled;
 }
 
+bool BufferMirrorsEnabled() {
+    static const bool enabled = std::getenv("APS5_RESIDENT_BUFFER_MIRRORS") != nullptr && BudgetBytes() != 0;
+    return enabled;
+}
+
 std::shared_ptr<ResidentMirror> MirrorOfImport(const Context& context, const HostImport& import) {
-    if (!ResidentMirrorsEnabled() || import.bytes == 0 || import.unwatched || import.dmaBuf || !context.bufferDeviceAddress) return {};
+    if (!(ResidentMirrorsEnabled() || BufferMirrorsEnabled()) || import.bytes == 0 || import.unwatched || import.dmaBuf || !context.bufferDeviceAddress) return {};
     if (!GuestMemory::Watched(import.base, static_cast<std::size_t>(import.bytes))) return {};
     auto& registry = Mirrors();
     std::lock_guard lock(registry.mutex);
     if (const auto found = registry.byBase.find(import.base); found != registry.byBase.end()) {
         if (found->second->device == context.device && found->second->source == import.buffer && found->second->bytes == import.bytes) return found->second;
         registry.bytes -= found->second->bytes;
+        found->second->retired = true;
         registry.byBase.erase(found);
     }
     if (registry.bytes + import.bytes > BudgetBytes()) {
         for (auto it = registry.byBase.begin(); it != registry.byBase.end() && registry.bytes + import.bytes > BudgetBytes();) {
             if (it->second.use_count() == 1) {
+                it->second->retired = true;
                 registry.bytes -= it->second->bytes;
                 it = registry.byBase.erase(it);
             } else {
@@ -177,6 +185,10 @@ VkDeviceAddress MirrorDeviceAddress(const ResidentMirror& mirror) {
     return mirror.address;
 }
 
+VkBuffer MirrorBuffer(const ResidentMirror& mirror) {
+    return mirror.buffer->Handle();
+}
+
 void NoteMirroredWrite(std::uint64_t begin, std::uint64_t end) {
     auto& registry = Mirrors();
     if (!registry.any.load(std::memory_order_acquire) || end <= begin) return;
@@ -213,7 +225,7 @@ void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirr
                 mirror->usedBatch = batch;
                 registry.used.push_back(mirror);
             }
-            if (mirror->anyUnsynced) unsynced.push_back(mirror.get());
+            if (mirror->anyUnsynced && !mirror->retired) unsynced.push_back(mirror.get());
         }
     }
     Stats().uses.fetch_add(1, std::memory_order_relaxed);
@@ -262,6 +274,7 @@ void SubmitMirrors(Recorder& recorder) {
     std::vector<std::uint8_t> changed;
     VkCommandBuffer prologue = VK_NULL_HANDLE;
     for (const auto& mirror : used) {
+        if (mirror->retired) continue;
         const auto started = std::chrono::steady_clock::now();
         const auto generation = GuestMemory::CollectWrites(mirror->base, static_cast<std::size_t>(mirror->bytes));
         changed.assign(mirror->generations.size(), GuestMemory::BlockWritten);
@@ -303,6 +316,7 @@ void ForgetMirrors(VkDevice device, std::uint64_t begin, std::uint64_t end) {
     for (auto it = registry.byBase.begin(); it != registry.byBase.end();) {
         const auto& mirror = *it->second;
         if (mirror.device == device && mirror.base < end && begin < mirror.base + mirror.bytes) {
+            it->second->retired = true;
             registry.bytes -= mirror.bytes;
             it = registry.byBase.erase(it);
         } else {
