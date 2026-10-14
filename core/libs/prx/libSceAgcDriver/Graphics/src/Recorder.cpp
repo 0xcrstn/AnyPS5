@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
@@ -2557,6 +2558,20 @@ void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
     if (owner == nullptr || bytes == 0) return;
     ensureOpen();
     if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
+}
+
+bool Recorder::KeepOnce(std::shared_ptr<void> object, std::size_t bytes) {
+    if (object == nullptr) return false;
+    ensureOpen();
+    open->keptBytes += bytes;
+    if (!open->keptOwners.insert(object.get()).second) return false;
+    open->kept.push_back(std::move(object));
+    return true;
+}
+
+DrawSnapshotArena& Recorder::SnapshotArena() {
+    if (snapshotArena == nullptr) snapshotArena = std::make_unique<DrawSnapshotArena>(context);
+    return *snapshotArena;
 }
 
 void Recorder::BoundKeptBytes() {
