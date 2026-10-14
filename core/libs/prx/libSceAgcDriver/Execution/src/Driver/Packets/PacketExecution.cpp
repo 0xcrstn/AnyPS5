@@ -126,7 +126,7 @@ void Driver::execute(const Submission& submission) {
         const SlowReport slowPacket([&] {
             char text[128];
             std::snprintf(text, sizeof(text), "queue %u packet opcode 0x%02x (%zu dwords) at dword %zu of submission %llu", submission.queue, static_cast<unsigned>(opcode), static_cast<std::size_t>(count), cursor, static_cast<unsigned long long>(submission.serial));
-            return std::string(text);
+            return std::string(text) + describeWait(packet);
         });
         auto nextCursor = cursor + count;
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
