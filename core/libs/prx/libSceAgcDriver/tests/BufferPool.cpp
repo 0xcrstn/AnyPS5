@@ -487,9 +487,37 @@ void PartialSlabDoesNotRetry() {
 
 }
 
+void SizeClassExtent() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VkBuffer first = VK_NULL_HANDLE;
+    {
+        Buffer snapshot(context, 100 * 1024, usage, HostVisible, BufferExtent::SizeClass);
+        first = snapshot.Handle();
+        Expect(snapshot.Bytes().size() == 100 * 1024, "a size-class buffer does not span the requested bytes");
+        Expect(mock.sizes.at(first) == 128 * 1024, "a size-class buffer was created with " + std::to_string(mock.sizes.at(first)) + " bytes, not its 128 KiB class");
+    }
+    const auto created = mock.next;
+    const auto destroyed = mock.destroyedBuffers;
+    {
+        Buffer snapshot(context, 120 * 1024, usage, HostVisible, BufferExtent::SizeClass);
+        Expect(snapshot.Handle() == first && mock.next == created && mock.destroyedBuffers == destroyed, "a retained size-class buffer was made again for another size in its class");
+        Expect(snapshot.Bytes().size() == 120 * 1024, "a reused size-class buffer spans the earlier size");
+    }
+    {
+        Buffer exact(context, 110 * 1024, usage);
+        Expect(mock.sizes.at(exact.Handle()) == 110 * 1024, "an exact buffer taken from a size-class slot kept the class-sized VkBuffer");
+        Expect(exact.Bytes().size() == 110 * 1024, "an exact buffer does not span the requested bytes");
+    }
+    Buffer again(context, 64 * 1024 + 1, usage, HostVisible, BufferExtent::SizeClass);
+    Expect(mock.sizes.at(again.Handle()) == 128 * 1024, "a size-class buffer taken from an exact slot kept the exact VkBuffer");
+}
+
 int main() {
     try {
         SizeClassesAndDirections();
+        SizeClassExtent();
         LargerClass();
         KeptUntilFence();
         Budget();

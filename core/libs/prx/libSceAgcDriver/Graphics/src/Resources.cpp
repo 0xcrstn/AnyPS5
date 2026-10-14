@@ -37,7 +37,7 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
 
 }
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, BufferExtent extent) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), handleBytes(extent == BufferExtent::SizeClass ? capacity : size), usage(BufferPool::Usage(usage, properties)), properties(properties) {
     Require(size != 0, "zero-sized GPU buffer");
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
@@ -51,12 +51,13 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         capacity = allocation->bytes;
         offset = allocation->offset;
         slab = allocation->slab;
-        if (allocation->bufferBytes != size) {
+        if (extent == BufferExtent::SizeClass) handleBytes = capacity;
+        if (allocation->bufferBytes != handleBytes) {
             context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
             buffer = VK_NULL_HANDLE;
             deviceAddress = 0;
             try {
-                buffer = BindExactBuffer(context, size, this->usage, memory, offset, allocationBytes);
+                buffer = BindExactBuffer(context, handleBytes, this->usage, memory, offset, allocationBytes);
                 initializeAddress(usage);
             } catch (...) {
                 release();
@@ -68,7 +69,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
     }
     try {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        info.size = size;
+        info.size = handleBytes;
         info.usage = this->usage;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         Check(context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer), "vkCreateBuffer");
@@ -120,7 +121,7 @@ Buffer::~Buffer() {
 
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size});
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, handleBytes});
         return;
     }
     if (slab) {
