@@ -200,20 +200,24 @@ void CheckDeferredSharedImports() {
     };
     Require(ImportWatched(base, bytes, [] { return true; }), "fresh shared import failed");
     Require(protection(0) == PAGE_READWRITE && protection(bytes - 1) == PAGE_READWRITE, "fresh import armed shared pages");
+    const char* faultSetting = std::getenv("APS5_SHARED_WRITE_FAULTS");
+    const bool faults = faultSetting != nullptr && *faultSetting != '\0' && std::string_view(faultSetting) != "0";
     const auto gpu = MarkWritten(base + 4096, 4);
-    Require(gpu != 0 && protection(0) == PAGE_READONLY && protection(Block) == PAGE_READWRITE, "GPU write did not activate only its block");
+    Require(gpu != 0 && protection(4096) == PAGE_READONLY && protection(Block) == PAGE_READWRITE, "GPU write did not activate only its block");
+    Require(protection(0) == (faults ? PAGE_READONLY : PAGE_READWRITE), faults ? "GPU write did not arm its whole block" : "a shared subpage the GPU did not write was armed for write faults");
     CollectWritesUncached(base, Block);
     Require(!WrittenSince(base + 4096, 4, gpu) && !StoredOver(base + 4096, 4, gpu), "first collect overwrote a GPU generation");
     static_cast<volatile std::uint8_t*>(memory)[4096] = 0x44;
     CollectWritesUncached(base, Block);
     Require(WrittenSince(base + 4096, 4, gpu) && StoredOver(base + 4096, 4, gpu), "CPU store after GPU write was missed");
-    const char* faultSetting = std::getenv("APS5_SHARED_WRITE_FAULTS");
-    const bool faults = faultSetting != nullptr && *faultSetting != '\0' && std::string_view(faultSetting) != "0";
     Require(protection(4096) == (faults ? PAGE_READONLY : PAGE_READWRITE), faults ? "a collected shared subpage was not armed again" : "a CPU-written shared subpage was armed for write faults again");
-    Require(protection(0) == PAGE_READONLY, "a shared subpage the CPU did not write stopped faulting");
+    Require(protection(0) == (faults ? PAGE_READONLY : PAGE_READWRITE), faults ? "a collected shared subpage stopped faulting" : "a shared subpage the GPU did not write was armed for write faults");
     const auto written = CollectWritesUncached(base, Block);
     static_cast<volatile std::uint8_t*>(memory)[4096 + 8] = 0x45;
     Require(!UnchangedSinceCollected(base + 4096, 16, written), "a store to a CPU-written shared subpage was missed");
+    const auto digested = CollectWritesUncached(base, Block);
+    static_cast<volatile std::uint8_t*>(memory)[8] = 0x46;
+    Require(!UnchangedSinceCollected(base, 16, digested), "a store to a shared subpage the GPU did not write was missed");
 
     const auto second = base + Block;
     const auto before = CollectWritesUncached(second, 4096);
