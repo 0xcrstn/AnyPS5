@@ -41,6 +41,10 @@ struct CompiledShader {
     std::uint64_t programAddress = 0;
 };
 
+inline std::uint32_t LibraryPushOffset(const CompiledShader& shader) {
+    return shader.program->pushConstants.empty() ? 0u : shader.pushConstantOffset;
+}
+
 inline VkShaderStageFlagBits VulkanStage(ShaderRecompiler::ShaderStage stage) {
     switch (stage) {
         case ShaderRecompiler::ShaderStage::Vertex:
