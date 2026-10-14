@@ -1001,7 +1001,17 @@ bool ResultMemo() {
     return resultMemo;
 }
 
-constexpr std::size_t ResultMemoEntries = 256;
+std::size_t ResultMemoEntries() {
+    static const std::size_t entries = [] {
+        const char* text = std::getenv("APS5_RESULT_MEMO_ENTRIES");
+        if (text == nullptr || *text == '\0') return std::size_t{256};
+        char* end = nullptr;
+        const auto value = std::strtoull(text, &end, 10);
+        if (end == text || *end != '\0' || value == 0) throw std::runtime_error("APS5_RESULT_MEMO_ENTRIES is not a positive whole number: " + std::string(text));
+        return static_cast<std::size_t>(value);
+    }();
+    return entries;
+}
 
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
@@ -1125,7 +1135,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         if (source.memoIndex.find(index) == source.memoIndex.end()) {
             source.memo.push_front({variant->artifact.variantId, hash, shared});
             source.memoIndex.emplace(index, source.memo.begin());
-            while (source.memo.size() > ResultMemoEntries) {
+            while (source.memo.size() > ResultMemoEntries()) {
                 const auto& last = source.memo.back();
                 source.memoIndex.erase((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
                 source.memo.pop_back();
