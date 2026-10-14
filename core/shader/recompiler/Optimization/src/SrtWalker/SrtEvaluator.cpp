@@ -2,6 +2,7 @@
 #include "Optimization/SrtWalker/SrtAddressArithmetic.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,56 @@
 #include <vector>
 
 namespace ShaderRecompiler::Detail {
+
+namespace {
+
+constexpr std::size_t PooledTables = 8;
+constexpr std::size_t FirstTableSlots = 64;
+
+std::vector<EvaluatedValues::Storage>& tablePool() {
+    struct TablePoolStorage {};
+    return HostThreadLocal<std::vector<EvaluatedValues::Storage>, TablePoolStorage>();
+}
+
+}
+
+EvaluatedValues::EvaluatedValues() {
+    auto& pool = tablePool();
+    if (pool.empty()) {
+        return;
+    }
+    auto storage = std::move(pool.back());
+    pool.pop_back();
+    _slots = std::move(storage.slots);
+    _generation = storage.generation + 1u;
+    if (_generation == 0u) {
+        std::fill(_slots.begin(), _slots.end(), Slot{});
+        _generation = 1u;
+    }
+}
+
+EvaluatedValues::~EvaluatedValues() {
+    if (_slots.empty()) {
+        return;
+    }
+    auto& pool = tablePool();
+    if (pool.size() < PooledTables) {
+        pool.push_back({std::move(_slots), _generation});
+    }
+}
+
+void EvaluatedValues::Grow() {
+    std::vector<Slot> previous(_slots.empty() ? FirstTableSlots : _slots.size() * 2u);
+    previous.swap(_slots);
+    const auto generation = _generation;
+    _generation = 1u;
+    _count = 0;
+    for (const auto& slot : previous) {
+        if (slot.generation == generation) {
+            Insert(slot.key, slot.value);
+        }
+    }
+}
 
 bool Evaluator::Evaluate(IrValue* value, std::uint32_t& result) {
     std::uint64_t wide = 0;
