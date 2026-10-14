@@ -138,10 +138,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         entry = nullptr;
         decode = nullptr;
     }
-    if (planned) planDrawDecode(queue, submission, localDevice->Serial(), decode, profile);
+    if (planned) planDrawDecode(queue, submission, localDevice->Serial(), decode, userPatches, profile);
     phaseTiming.Phase(DrawRowKeyLookupValidate);
 
-    resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
+    if (!planned) resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
     const auto& graphics = decode->state;
     auto pixel = decode->pixel;
     std::vector<DrawProgram> programs = decode->programs;
@@ -227,7 +227,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (variant != nullptr) applyShaderDataPatches(*variant);
     }
     const auto relocatedDecode = decode;
-    if (!userPatches.empty()) {
+    if (!userPatches.empty() && registerKey) {
         std::lock_guard cacheLock(drawCacheMutex);
         if (drawHit) ++drawRelocationCounters.hits;
         if (profile && drawRelocationCounters.lookups >= 100000) reportDrawRelocation();
@@ -240,7 +240,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             putStageDonor(drawStageDonorKeys[i], matched[i], programs[i].userData, nullptr, nullptr, false);
         }
     }
-    if (!userPatches.empty() && !drawHit) {
+    if (!userPatches.empty() && !drawHit && registerKey) {
         auto current = std::make_shared<DrawDecode>(*decode);
         for (const auto& patch : userPatches) current->programs[patch.program].userData[patch.index] = patch.value;
         decode = std::move(current);

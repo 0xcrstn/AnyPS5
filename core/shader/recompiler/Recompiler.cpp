@@ -299,6 +299,8 @@ struct EmissionFailure {
     std::exception_ptr failure;
 };
 
+struct MaterializedTemplate;
+
 struct SourceEntry {
     std::mutex mutex;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
@@ -324,6 +326,7 @@ struct SourceEntry {
     bool planSpilled = false;
     bool planUsed = false;
     bool planSpillRequested = false;
+    std::vector<std::shared_ptr<const MaterializedTemplate>> templates;
 };
 
 namespace {
@@ -875,9 +878,7 @@ std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t varian
     return entry->module;
 }
 
-std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet) {
-    struct BindingPlanKeyStorage {};
-    auto& key = HostThreadLocal<std::vector<std::uint64_t>, BindingPlanKeyStorage>();
+void bindingPlanKeyWords(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, std::vector<std::uint64_t>& key) {
     key.clear();
     key.push_back(variant.artifact.variantId);
     for (std::size_t index = 0; index < variant.info.info.buffers.size(); ++index) {
@@ -902,6 +903,12 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
+}
+
+std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet) {
+    struct BindingPlanKeyStorage {};
+    auto& key = HostThreadLocal<std::vector<std::uint64_t>, BindingPlanKeyStorage>();
+    bindingPlanKeyWords(variant, snapshot, exports, key);
     static PrimedSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
     std::shared_ptr<PreparedBindingPlan> plan;
@@ -959,7 +966,14 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     return entry->module;
 }
 
-RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false) {
+struct MaterializedParts {
+    std::shared_ptr<PreparedBindingPlan> plan;
+    std::shared_ptr<PreparedModuleEntry> module;
+    const DescriptorBindingPlan* bindings = nullptr;
+    std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources / RuntimeAbi::VertexSelectorsPerDword> runtimeSelectors{};
+};
+
+RecompileResult materializeSkeleton(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults, MaterializedParts& parts) {
     RecompileResult result;
     const auto& artifact = variant.artifact;
     static_cast<CompiledShaderArtifact&>(result) = {
@@ -985,6 +999,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .variantId = artifact.variantId
     };
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
+    parts.plan = plan;
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
     struct LocalModuleKeyStorage {};
@@ -999,7 +1014,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     }
     result.vertexAttributes.reserve(result.vertexInputs.size());
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
-    std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources / RuntimeAbi::VertexSelectorsPerDword> runtimeSelectors{};
+    auto& runtimeSelectors = parts.runtimeSelectors;
     for (const auto& input : result.vertexInputs) {
         if (!request.context.vertex || input.location >= request.context.vertex->resourcesNum || input.location >= request.context.vertex->resources.size()) throw std::runtime_error("Shader cache: invalid vertex attribute metadata");
         const auto& vertex = *request.context.vertex;
@@ -1073,9 +1088,24 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.specializationId = module->specializationId;
         result.spirv = module->spirv;
         bindingPlan = &entry->bindings;
+        parts.module = entry;
     } else {
         result.spirv = artifact.spirv.Resolved();
     }
+    parts.bindings = bindingPlan;
+    return result;
+}
+
+void fillMaterializedValues(RecompileResult& result, const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, const MaterializedParts& parts) {
+    const auto& artifact = variant.artifact;
+    for (std::size_t index = 0; index < result.vertexInputs.size() && index < result.vertexAttributes.size(); ++index) {
+        const auto& input = result.vertexInputs[index];
+        const auto& vertex = *request.context.vertex;
+        result.vertexAttributes[index].resource = vertex.resources[input.location];
+        result.vertexAttributes[index].fetchIndex = vertex.fetchEmbedded ? vertex.resourcesDst[input.location].fetchIndex : input.fetchIndex;
+    }
+    const DescriptorBindingPlan* bindingPlan = parts.bindings;
+    const auto& runtimeSelectors = parts.runtimeSelectors;
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
@@ -1098,6 +1128,12 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     result.bufferBaseSlots = std::move(bindings.bufferBaseSlots);
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
     result.bdaWrites = variant.info.info.bdaWrites || variant.info.info.usesDma;
+}
+
+RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false) {
+    MaterializedParts parts;
+    auto result = materializeSkeleton(variant, request, snapshot, registrationDefaults, parts);
+    fillMaterializedValues(result, variant, request, snapshot, parts);
     return result;
 }
 
@@ -1710,10 +1746,132 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::CaptureValues(c
     return capture;
 }
 
-std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeValues(const ResourceCapture& capture) const {
+struct MaterializedTemplate {
+    std::vector<std::uint64_t> key;
+    std::shared_ptr<const RecompileResult> skeleton;
+    MaterializedParts parts;
+};
+
+namespace {
+
+void specializationKeyWords(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, std::vector<std::uint64_t>& key) {
+    bindingPlanKeyWords(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, key);
+    key.push_back(request.layout.pushConstantOffsetBytes);
+    key.push_back(request.target.registrationModules);
+    if (request.context.pixel) {
+        const auto& pixel = *request.context.pixel;
+        key.push_back(1);
+        for (const auto packing : pixel.targetExportPacking) key.push_back(static_cast<std::uint64_t>(packing));
+        key.push_back(pixel.dualSourceBlend);
+        key.push_back(static_cast<std::uint64_t>(pixel.rasterPrimitive));
+        key.push_back(pixel.layerExported);
+    } else {
+        key.push_back(0);
+    }
+    if (request.context.vertex) {
+        const auto& vertex = *request.context.vertex;
+        key.push_back(1 + vertex.resourcesNum);
+        key.push_back(vertex.fetchEmbedded);
+        for (const auto& input : variant.artifact.vertexInputs) key.push_back(input.location < vertex.resources.size() ? vertex.resources[input.location].fields[3] : ~std::uint64_t {0});
+    } else {
+        key.push_back(0);
+    }
+    for (const auto threads : partialThreads(request)) key.push_back(threads);
+}
+
+constexpr std::size_t MaxMaterializedTemplates = 32;
+
+struct MaterializeValuesCounters {
+    std::atomic<std::uint64_t> templateHits{0}, templateMisses{0};
+};
+
+MaterializeValuesCounters& materializeValuesCounters() {
+    static MaterializeValuesCounters counters;
+    return counters;
+}
+
+}
+
+std::uint64_t SpecializationKey(const SourceHandle& handle, const RecompileRequest& request, const ResourceSnapshot& snapshot) {
+    if (handle.artifact == nullptr) throw std::runtime_error("ShaderRecompiler: prepared artifact is missing");
+    struct SpecializationKeyStorage {};
+    auto& key = HostThreadLocal<std::vector<std::uint64_t>, SpecializationKeyStorage>();
+    specializationKeyWords(*handle.artifact, request, snapshot, key);
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto word : key) {
+        hash ^= word;
+        hash *= 0x100000001b3ull;
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+SnapshotWordCounts CountSpecializationWords(const ResourceSnapshot& snapshot) {
+    SnapshotWordCounts counts;
+    for (const auto& descriptor : snapshot.buffers) {
+        if (descriptor.dwordCount == 0) continue;
+        counts.keyWords += 2;
+        counts.valueWords += 2;
+    }
+    for (const auto& descriptor : snapshot.images) {
+        if (descriptor.dwordCount == 0) continue;
+        counts.keyWords += 7;
+        counts.valueWords += 1;
+    }
+    for (const auto& descriptor : snapshot.samplers) counts.keyWords += descriptor.dwordCount;
+    counts.valueWords += snapshot.flattenedSrt.size() + snapshot.userData.size();
+    return counts;
+}
+
+MaterializeValuesCounts GetMaterializeValuesCounts() {
+    const auto& counters = materializeValuesCounters();
+    return {counters.templateHits.load(std::memory_order_relaxed), counters.templateMisses.load(std::memory_order_relaxed)};
+}
+
+std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeValues(const ResourceCapture& capture, bool* templateHit) const {
     if (capture.source != handle->source || capture.plan != usePlan(*handle->source)) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
-    auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
+    if (templateHit != nullptr) *templateHit = false;
+    static const bool templates = std::getenv("APS5_NO_MATERIALIZE_TEMPLATES") == nullptr;
+    const auto& variant = *handle->artifact;
+    auto& source = *handle->source;
+    if (!templates) {
+        auto result = std::make_shared<RecompileResult>(materializeResult(variant, request, capture.snapshot));
+        result->cacheHit = true;
+        return result;
+    }
+    struct TemplateKeyStorage {};
+    auto& key = HostThreadLocal<std::vector<std::uint64_t>, TemplateKeyStorage>();
+    specializationKeyWords(variant, request, capture.snapshot, key);
+    std::shared_ptr<const MaterializedTemplate> found;
+    {
+        std::lock_guard lock(source.mutex);
+        for (std::size_t index = 0; index < source.templates.size(); ++index) {
+            if (!std::ranges::equal(source.templates[index]->key, key)) continue;
+            found = source.templates[index];
+            if (index != 0) std::rotate(source.templates.begin(), source.templates.begin() + static_cast<std::ptrdiff_t>(index), source.templates.begin() + static_cast<std::ptrdiff_t>(index) + 1);
+            break;
+        }
+    }
+    if (found != nullptr) {
+        auto result = std::make_shared<RecompileResult>(*found->skeleton);
+        fillMaterializedValues(*result, variant, request, capture.snapshot, found->parts);
+        result->cacheHit = true;
+        materializeValuesCounters().templateHits.fetch_add(1, std::memory_order_relaxed);
+        if (templateHit != nullptr) *templateHit = true;
+        return result;
+    }
+    auto stored = std::make_shared<MaterializedTemplate>();
+    stored->key = key;
+    auto skeleton = materializeSkeleton(variant, request, capture.snapshot, false, stored->parts);
+    stored->skeleton = std::make_shared<const RecompileResult>(skeleton);
+    auto result = std::make_shared<RecompileResult>(std::move(skeleton));
+    fillMaterializedValues(*result, variant, request, capture.snapshot, stored->parts);
     result->cacheHit = true;
+    {
+        std::lock_guard lock(source.mutex);
+        source.templates.insert(source.templates.begin(), std::move(stored));
+        if (source.templates.size() > MaxMaterializedTemplates) source.templates.pop_back();
+    }
+    materializeValuesCounters().templateMisses.fetch_add(1, std::memory_order_relaxed);
     return result;
 }
 

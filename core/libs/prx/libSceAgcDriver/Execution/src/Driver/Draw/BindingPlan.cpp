@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <chrono>
@@ -62,29 +63,56 @@ bool Driver::verifyBindingPlan() {
     return verify;
 }
 
-void Driver::planDrawDecode(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial, std::shared_ptr<const DrawDecode>& decode, bool profile) {
-    const auto key = drawRegisterKey(queue, *submission.shaders, deviceSerial);
+void Driver::planDrawDecode(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches, bool profile) {
+    static const bool userWordsKeyed = std::getenv("APS5_BINDING_PLAN_KEY_USER_WORDS") != nullptr;
+    const auto key = userWordsKeyed ? drawRegisterKey(queue, *submission.shaders, deviceSerial) : drawDecodeKey(queue, *submission.shaders, deviceSerial);
+    const bool verify = verifyBindingPlan() || verifyDrawRecipe();
+    const auto freshDecode = [&] {
+        std::vector<Graphics::RegisterRead> reads;
+        struct ReadScope {
+            explicit ReadScope(std::vector<Graphics::RegisterRead>* log) { Graphics::RegisterReadLog() = log; }
+            ~ReadScope() { Graphics::RegisterReadLog() = nullptr; }
+        } scope(verify ? &reads : nullptr);
+        auto fresh = decodeDraw(queue, submission);
+        for (const auto read : reads) {
+            require(Graphics::DrawKeyCovers(read), "binding plan decode read a register its key does not cover");
+        }
+        return fresh;
+    };
     {
         std::lock_guard lock(bindingPlanMutex);
         ++bindingPlanCounters.draws;
         if (auto* found = plannedDecodes.Find(key); found != nullptr && DecodeProgramsCurrent(**found, *submission.shaders)) decode = *found;
     }
     if (decode != nullptr) {
+        patches.clear();
+        const auto& programs = decode->programs;
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            const auto& program = programs[i];
+            for (std::uint32_t index = program.hiddenUserWords; index < program.userData.size(); ++index) {
+                const auto now = readUserData(queue.shader, program.userDataBase + index - program.hiddenUserWords);
+                if (now != program.userData[index]) patches.push_back({i, index, now});
+            }
+        }
         bool mismatch = false;
-        const bool verify = verifyBindingPlan();
-        if (verify) mismatch = !sameDecode(*decode, *decodeDraw(queue, submission));
+        if (verify) {
+            auto patched = std::make_shared<DrawDecode>(*decode);
+            for (const auto& patch : patches) patched->programs[patch.program].userData[patch.index] = patch.value;
+            mismatch = !sameDecode(*patched, *freshDecode());
+        }
         std::lock_guard lock(bindingPlanMutex);
         ++bindingPlanCounters.decodeHits;
+        if (!patches.empty()) ++bindingPlanCounters.decodesPatched;
         if (verify) ++bindingPlanCounters.verifiedDecodes;
         if (mismatch) {
             ++bindingPlanCounters.decodeMismatches;
             static std::atomic<std::uint64_t> reports{0};
-            if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[binding-plan] verify: the decode kept for register key 0x%llx differs from a fresh decode\n", static_cast<unsigned long long>(key));
+            if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[binding-plan] verify: the decode kept for key 0x%llx differs from a fresh decode after patching %zu user words\n", static_cast<unsigned long long>(key), patches.size());
         }
         if (profile) reportBindingPlan();
         return;
     }
-    std::shared_ptr<const DrawDecode> fresh = decodeDraw(queue, submission);
+    std::shared_ptr<const DrawDecode> fresh = freshDecode();
     decode = fresh;
     std::lock_guard lock(bindingPlanMutex);
     ++bindingPlanCounters.decodeMisses;
@@ -97,9 +125,12 @@ BindingPlanCounters Driver::PlanCounters() {
     return bindingPlanCounters;
 }
 
-void Driver::notePlannedStage(bool verified, bool mismatch) {
+void Driver::notePlannedStage(bool verified, bool mismatch, bool templateHit, ShaderRecompiler::SnapshotWordCounts words) {
     std::lock_guard lock(bindingPlanMutex);
     ++bindingPlanCounters.stages;
+    if (templateHit) ++bindingPlanCounters.templateHits;
+    bindingPlanCounters.keyWords += words.keyWords;
+    bindingPlanCounters.valueWords += words.valueWords;
     if (verified) ++bindingPlanCounters.verifiedStages;
     if (mismatch) ++bindingPlanCounters.stageMismatches;
 }
@@ -108,7 +139,7 @@ void Driver::reportBindingPlan() {
     auto& counters = bindingPlanCounters;
     const auto now = std::chrono::steady_clock::now();
     if (now - counters.lastReport < std::chrono::seconds(10)) return;
-    AgcDriver::ProfilePrint_nid_no_patch("[binding-plan] (10 s) %llu draws: decodes kept %llu, made %llu; %llu stages captured without the draw cache; verify: %llu decodes compared, %llu differed; %llu stages compared, %llu differed\n", static_cast<unsigned long long>(counters.draws), static_cast<unsigned long long>(counters.decodeHits), static_cast<unsigned long long>(counters.decodeMisses), static_cast<unsigned long long>(counters.stages), static_cast<unsigned long long>(counters.verifiedDecodes), static_cast<unsigned long long>(counters.decodeMismatches), static_cast<unsigned long long>(counters.verifiedStages), static_cast<unsigned long long>(counters.stageMismatches));
+    AgcDriver::ProfilePrint_nid_no_patch("[binding-plan] (10 s) %llu draws: decodes kept %llu (%llu with user words patched), made %llu; %llu stages captured without the draw cache, %llu refilled from a specialization-key template (descriptor words in the key %llu, value words passed as data %llu); verify: %llu decodes compared, %llu differed; %llu stages compared, %llu differed\n", static_cast<unsigned long long>(counters.draws), static_cast<unsigned long long>(counters.decodeHits), static_cast<unsigned long long>(counters.decodesPatched), static_cast<unsigned long long>(counters.decodeMisses), static_cast<unsigned long long>(counters.stages), static_cast<unsigned long long>(counters.templateHits), static_cast<unsigned long long>(counters.keyWords), static_cast<unsigned long long>(counters.valueWords), static_cast<unsigned long long>(counters.verifiedDecodes), static_cast<unsigned long long>(counters.decodeMismatches), static_cast<unsigned long long>(counters.verifiedStages), static_cast<unsigned long long>(counters.stageMismatches));
     counters = {};
     counters.lastReport = now;
 }
