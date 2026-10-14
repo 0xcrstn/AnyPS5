@@ -224,6 +224,7 @@ CompiledVariant sampleVariant() {
     image.flatVolumeCompatible = false;
     image.flatLineCompatible = false;
     image.foldTexelOffsetsOnly = true;
+    image.optionalDescriptor = true;
     image.byElements = 4;
     image.byComponents = 1;
     image.indirectRoot = 0;
