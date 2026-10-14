@@ -470,6 +470,15 @@ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #endif
 }
 
+void GuestArenaNoteDeviceWrite_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+#ifdef _WIN32
+    WindowsMappings::Get().NoteDeviceWrite(address, bytes);
+#else
+    (void)address;
+    (void)bytes;
+#endif
+}
+
 #ifndef _WIN32
 namespace {
 

@@ -1343,6 +1343,9 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (bytes == 0) return 0;
+#ifdef _WIN32
+    GuestArena::GuestArenaNoteDeviceWrite_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+#endif
     ++tracker.generation;
     if (!tracker.watched || !tracker.covers(address, bytes)) {
         tracker.noteUnstampedStore(address, address + bytes);

@@ -187,7 +187,7 @@ public:
         invalidate(*view.page, written);
         protectSubpages(base, written, view.protection, "resume shared memory write");
         view.armed &= static_cast<std::uint8_t>(~written);
-        if (!faultSharedWrites()) view.page->cpuWritten |= written;
+        if (!faultSharedWrites()) view.page->deviceWritten &= static_cast<std::uint8_t>(~written);
         return true;
     }
 
@@ -239,6 +239,18 @@ public:
             view.armed &= static_cast<std::uint8_t>(~opened);
         }
         return true;
+    }
+
+    void NoteDeviceWrite(std::uintptr_t address, std::size_t bytes) {
+        if (faultSharedWrites()) return;
+        std::lock_guard lock(mutex);
+        const auto end = address + bytes;
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
+            auto& page = *it->second.page;
+            const auto written = subpagesOf(it->first, address, end);
+            page.deviceWritten |= written;
+            page.digested &= static_cast<std::uint8_t>(~written);
+        }
     }
 
     void EndHostWrite(std::uintptr_t address, std::size_t bytes) {
@@ -412,9 +424,9 @@ public:
                             untracked |= arming;
                             continue;
                         }
-                        const auto written = static_cast<std::uint8_t>(arming & view.page->cpuWritten);
-                        digesting |= written;
-                        const auto faulting = static_cast<std::uint8_t>(arming & ~written);
+                        const auto digestible = faultSharedWrites() ? std::uint8_t{0} : static_cast<std::uint8_t>(arming & ~view.page->deviceWritten);
+                        digesting |= digestible;
+                        const auto faulting = static_cast<std::uint8_t>(arming & ~digestible);
                         if (faulting == 0) continue;
                         const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
                         protectSubpages(alias, faulting, protection, "arm shared memory write tracking");
@@ -495,7 +507,7 @@ private:
         std::uint32_t pins = 0;
         std::array<std::uint64_t, subpages> digest{};
         std::uint8_t digested = 0;
-        std::uint8_t cpuWritten = 0;
+        std::uint8_t deviceWritten = 0;
     };
     struct Section {
         HANDLE handle;
