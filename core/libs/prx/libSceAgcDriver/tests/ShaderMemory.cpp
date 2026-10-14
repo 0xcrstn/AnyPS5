@@ -1076,15 +1076,14 @@ void verifyDescriptorPhis() {
         code.insert(code.begin() + 8, words);
         return code;
     };
-    auto programCounterEntry = makeRequest(entryWrites({0xbe8e1f00u}));
-    require(GetResourcePlan(programCounterEntry)->info.images.size() == 2u, "descriptor Phi: a loop entry whose T# registers hold the program counter was not folded onto the loop's two SRT T#s");
-    const std::array<std::pair<std::vector<std::uint32_t>, const char*>, 2> invalidEntries{{
-        {entryWrites({0xbe8e037eu}), "descriptor Phi: a T# holding EXEC was accepted"},
-        {entryWrites({0x7d840080u, 0xbe8e036au}), "descriptor Phi: a T# holding a compare mask was accepted"},
+    const std::array<std::pair<std::vector<std::uint32_t>, const char*>, 3> controlEntries{{
+        {entryWrites({0xbe8e1f00u}), "descriptor Phi: a loop entry whose T# registers hold the program counter was not folded onto the loop's two SRT T#s"},
+        {entryWrites({0xbe8e037eu}), "descriptor Phi: a loop entry whose T# registers hold EXEC was not folded onto the loop's two SRT T#s"},
+        {entryWrites({0x7d840080u, 0xbe8e036au}), "descriptor Phi: a loop entry whose T# registers hold a compare mask was not folded onto the loop's two SRT T#s"},
     }};
-    for (const auto& [code, message] : invalidEntries) {
+    for (const auto& [code, message] : controlEntries) {
         auto request = makeRequest(code);
-        expectFailure([&] { static_cast<void>(GetResourcePlan(request)); }, "GetImageResource dword 0 is not a valid runtime value", message);
+        require(GetResourcePlan(request)->info.images.size() == 2u, message);
     }
     auto unwritten = loopCode;
     unwritten[4] = 0xf4080200u;
