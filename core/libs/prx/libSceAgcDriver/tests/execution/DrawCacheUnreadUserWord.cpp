@@ -112,9 +112,9 @@ void UnreadWordsDoNotSplitTheCache(bool libraries) {
     for (std::size_t i = 4; i < same.size(); ++i) counters = draw({same[i].data()});
     Require(counters.lookups == 8 && counters.hits == 4 && counters.inserts == 2, mode + ": draws whose data moved and whose unread user word changed did not reuse the cached draw (" + std::to_string(counters.hits) + " hits in " + std::to_string(counters.lookups) + " lookups)");
     const auto other = draw({Other.data()});
-    Require(other.lookups == 9 && other.hits == 4, mode + ": a draw whose moved data holds another value reused the cached draw");
+    Require(other.lookups == 9 && other.hits == 5 && other.dataPatchedStages != 0, mode + ": a draw whose moved data holds another value it loads as data did not reuse the cached draw with the value patched (" + std::to_string(other.hits) + " hits)");
     const auto again = draw({same[0].data()});
-    Require(again.lookups == 10 && again.hits == 5, mode + ": a draw at an address seen before did not reuse the cached draw (" + std::to_string(again.hits) + " hits)");
+    Require(again.lookups == 10 && again.hits == 6, mode + ": a draw at an address seen before did not reuse the cached draw (" + std::to_string(again.hits) + " hits)");
 }
 
 }

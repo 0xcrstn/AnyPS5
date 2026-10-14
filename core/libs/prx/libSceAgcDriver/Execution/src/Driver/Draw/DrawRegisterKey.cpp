@@ -114,18 +114,23 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     std::uint64_t shape = 0;
     auto key = RegisterStateKey(queue, allUserWords, true, aliased ? &shape : nullptr);
     if (verify && key != RegisterStateKey(queue, allUserWords, false)) throw std::runtime_error("incremental register fingerprint disagrees with full state");
+    const bool diagnose = aliased && drawMissDiagnosisEnabled();
+    std::array<std::vector<std::uint32_t>, DrawAliasKeys::Stages> raw;
+    DrawStructureParts parts;
     if (aliased) {
         mixOther(shape);
+        parts.shape = shape;
         forEachKeyedUserWord(queue, allUserWords, [&](std::uint32_t offset, std::uint32_t value) {
             mixOther(offset);
             if (std::find(relocation->unread.begin(), relocation->unread.end(), offset) != relocation->unread.end()) return;
             const auto word = std::find_if(relocation->words.begin(), relocation->words.end(), [&](const RelocatableUserWord& candidate) { return candidate.reg == offset; });
             if (word == relocation->words.end()) {
                 mixOther(value);
+                if (diagnose) parts.words.emplace_back(offset, value);
                 return;
             }
             auto& stage = content[DrawAliasKeys::Stage(offset)];
-            stage = (stage ^ offset ^ relocatedContentKey(*word, value, readable)) * 0x100000001b3ull;
+            stage = (stage ^ offset ^ relocatedContentKey(*word, value, readable, diagnose ? &raw[DrawAliasKeys::Stage(offset)] : nullptr)) * 0x100000001b3ull;
         });
         mixOther(deviceSerial);
     }
@@ -158,6 +163,8 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     if (aliased && readable) {
         aliases->structure = other == 0 ? 1 : other;
         aliases->content = content;
+        aliases->raw = std::move(raw);
+        aliases->parts = std::move(parts);
     }
     return key;
 }

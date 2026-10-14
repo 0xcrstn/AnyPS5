@@ -48,6 +48,7 @@ struct DispatchVariant {
     std::vector<std::byte> patchedPushConstants;
     bool dataPatched = false;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
+    std::vector<std::uint32_t> inputExports;
 
     std::shared_ptr<ShaderMemory> memory;
     std::vector<ShaderRecompiler::MemoryRegion> captured;

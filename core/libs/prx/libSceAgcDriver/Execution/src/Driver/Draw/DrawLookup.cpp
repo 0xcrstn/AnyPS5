@@ -82,7 +82,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             std::optional<DrawMiss> miss;
             std::vector<std::size_t> ranks(programs.size(), 0);
-            std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0;
+            std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, partial = 0, dataPatched = 0;
             if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
 
             std::uint32_t cursor = 0;
@@ -90,10 +90,12 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
 
                 std::optional<SampledReadScope> sampling;
-                for (std::size_t i = 0; !miss && i < programs.size(); ++i) {
+                const bool fixedSlots = localDevice->GraphicsPipelineLibraries();
+                for (std::size_t i = 0; i < programs.size(); ++i) {
                     if (roles[i] == Role::GeometryBack) continue;
+                    cursor = Graphics::StagePushOffset(cursor, programs[i].binary.stage, fixedSlots);
+                    if (miss && (*miss == DrawMiss::Stages || !drawRelocationEnabled() || !fixedSlots || programs[i].binary.stage != ShaderRecompiler::ShaderStage::Fragment)) break;
                     ++stageValidations;
-                    cursor = Graphics::StagePushOffset(cursor, programs[i].binary.stage, localDevice->GraphicsPipelineLibraries());
                     const auto& variants = entry->stages[i];
                     auto outcome = EntryOutcome::Differing;
                     bool anyLayout = false;
@@ -105,13 +107,14 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         appendEntryRegions(*variant, regions);
                         ++compared;
                         std::vector<std::pair<std::uint32_t, std::uint32_t>> live;
-                        const bool data = drawRelocationEnabled() && !variant->bufferWordBuffers.empty();
+                        const bool data = drawRelocationEnabled() && !variant->dataPositions.empty();
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, data ? &live : nullptr);
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, data ? &live : nullptr);
                         if (result == EntryOutcome::EqualData) {
                             auto patched = patchBufferWords(*variant, live);
                             result = patched != nullptr ? EntryOutcome::Equal : EntryOutcome::Differing;
                             if (patched != nullptr) {
+                                ++dataPatched;
                                 variant = std::move(patched);
                                 regions.clear();
                                 appendEntryRegions(*variant, regions);
@@ -126,8 +129,13 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         cursor += static_cast<std::uint32_t>(variant->compiled->pushConstants.size());
                         break;
                     }
-                    if (matched[i] != nullptr) continue;
-                    if (!anyLayout) miss = DrawMiss::Layout;
+                    if (matched[i] != nullptr) {
+                        if (miss) ++partial;
+                        continue;
+                    }
+                    if (miss) continue;
+                    if (variants.empty()) miss = DrawMiss::NoVariant;
+                    else if (!anyLayout) miss = DrawMiss::Layout;
                     else if (outcome != EntryOutcome::Differing) miss = DrawMiss::Gate;
                     else miss = roles[i] == Role::Fragment ? DrawMiss::FragmentDiffering : i == 0 ? DrawMiss::FrontDiffering : DrawMiss::OtherDiffering;
                 }
@@ -138,6 +146,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             counters.stageValidations += stageValidations;
             counters.stageEqual += stageEqual;
             counters.variantsCompared += compared;
+            counters.partialStages += drawHit ? 0 : partial;
+            counters.dataPatchedStages += dataPatched;
             if (drawHit) {
                 ++counters.hits;
                 if (registerKey) ++counters.registerKeyHits;
