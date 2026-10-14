@@ -514,10 +514,12 @@ void Registration(bool indirect) {
     }
     const auto retained = ShaderRecompiler::GetRetainedShaderMemory();
     Require(retained.sources != 0 && retained.plans != 0 && retained.planBytes != 0, "the memory report counts no resource plan of a prepared shader");
-    Require(retained.variants != 0 && retained.variantSpirvBytes + retained.spilledSpirvBytes != 0, "the memory report counts no compiled variant of a prepared shader");
+    Require(retained.variants != 0 && retained.variantSpirvBytes + retained.spilledSpirvBytes != 0 && retained.variantMetadataBytes >= retained.variants * sizeof(ShaderRecompiler::CompiledShaderArtifact), "the memory report counts no compiled variant of a prepared shader");
     auto backlog = AgcDriver::DriverDetail::RegistrationPreparationBacklog();
     for (const auto settled = std::chrono::steady_clock::now() + std::chrono::seconds(10); (backlog.queued != 0 || backlog.running != 0 || backlog.plans != 0) && std::chrono::steady_clock::now() < settled; backlog = AgcDriver::DriverDetail::RegistrationPreparationBacklog()) std::this_thread::yield();
     Require(backlog.registered >= 33 && backlog.queued == 0 && backlog.plans == 0 && backlog.planInstructions == 0, "the memory report counts registrations or settled preparation plans wrongly");
+    const auto settled = ShaderRecompiler::GetRetainedShaderMemory();
+    Require(settled.irPrograms == 0 && settled.irBytes == 0 && settled.irPeakBytes != 0, "the memory report keeps counting IR after its preparations finished, or never counted it");
     const auto report = AgcDriver::MemoryReport::Describe({});
     Require(report.starts_with("[memory] process commit ") && report.find(" | shaders registered ") != std::string::npos, "the memory report line is malformed");
     std::uint32_t destination = 0;
