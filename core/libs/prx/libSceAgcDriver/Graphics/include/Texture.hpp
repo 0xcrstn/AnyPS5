@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -197,6 +198,7 @@ public:
     static bool AnyPending();
     static void FlushDumpSelected(const char* reason);
     static bool StoreAtFlipRequested(const char* value);
+    static bool PresentThenStore(bool storeAtFlip, const std::function<bool()>& present);
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
     static void BumpPendingSerial();
@@ -343,6 +345,7 @@ public:
     bool Refresh();
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
+    static std::uint64_t UntrackedCompares();
     std::uint64_t GuestBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
@@ -503,7 +506,7 @@ private:
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
-    mutable std::array<std::uint64_t, 4> comparedGuestBytes{};
+    mutable std::array<std::uint64_t, 5> comparedGuestBytes{};
     std::vector<std::byte> generationBaseline;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
