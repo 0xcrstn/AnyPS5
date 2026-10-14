@@ -1032,6 +1032,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        copy.dirtySerial = GuestMemory::EpochDirtySetEnabled() ? GuestMemory::DirtySerial() : 0;
         copy.generation = GuestMemory::CollectWrites(address, bytes);
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
         if (copy.buffer != nullptr) {
@@ -1057,7 +1058,7 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
 
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived) {
     if (recorder == nullptr || copy.reused || copy.generation == 0 || copy.buffer == nullptr) return;
-    recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
+    recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived, copy.dirtySerial);
 }
 
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment) {

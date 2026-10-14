@@ -81,6 +81,7 @@ private:
         std::size_t chunk = 0;
         std::uint64_t chunkSerial = 0;
         VkDeviceSize offset = 0;
+        std::uint64_t dirtySerial = 0;
     };
     struct Placement {
         std::size_t chunk;

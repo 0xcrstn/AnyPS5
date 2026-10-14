@@ -47,6 +47,7 @@ std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, con
 // Whether `image` is still the storage cache's image of its surface (what CachedStorageSurface
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);
+std::uint64_t StorageCacheSerial();
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
 
 // Defined in Texture.cpp beside the pending-results registry, for the fast Revalidate below: whether
@@ -260,13 +261,15 @@ public:
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
     // and, on a refusal, what failed.
-    enum class ProofPath : std::size_t { Fast, OwnRefreshed, Full, Count };
+    enum class ProofPath : std::size_t { Fast, OwnRefreshed, Full, EpochSkip, Count };
     enum class ProofFailure : std::size_t { None, Imports, Evicted, Pending, Changed, Keys, Other, Count };
     struct ProofReport {
         ProofPath path = ProofPath::Fast;
         ProofFailure failure = ProofFailure::None;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    static std::uint64_t EpochSkips();
+    static std::uint64_t EpochSkipDisagreements();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
@@ -479,6 +482,19 @@ private:
     OwnRefreshFallback refreshOwnObjects(std::span<const CompiledShader> shaders, std::span<PendingOverlap> overlapping);
     // Today's per-element walk (APS5_NO_EPOCH_REVALIDATE=1).
     bool fastRevalidateEach();
+    struct EpochProof {
+        bool valid = false;
+        std::uint64_t epoch = 0;
+        std::uint64_t dirtySerial = 0;
+        std::uint64_t keyStores = 0;
+        std::uint64_t registry = 0;
+        std::uint64_t depth = 0;
+        std::uint64_t storageCache = 0;
+    };
+    EpochProof epochProof;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> proofRanges;
+    bool epochProofHolds();
+    void recordEpochProof(std::uint64_t dirtySerial);
     Context context;
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;

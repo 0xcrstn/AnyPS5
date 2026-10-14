@@ -3572,7 +3572,7 @@ constexpr std::array<const char*, RecipeMissCount> RecipeMissNames{"no recipe", 
 // The draw rows name the miss reasons of DrawWithRecipe (a target or a pipeline gone is the
 // objects-gone slot).
 constexpr std::array<const char*, RecipeMissCount> DrawRecipeMissNames{"no recipe", "device", "template gone", "targets gone", "not recordable"};
-constexpr std::array<const char*, static_cast<std::size_t>(Graphics::ShaderResources::ProofPath::Count)> ProofPathNames{"fast", "T1 refreshed", "full"};
+constexpr std::array<const char*, static_cast<std::size_t>(Graphics::ShaderResources::ProofPath::Count)> ProofPathNames{"fast", "T1 refreshed", "full", "epoch skip"};
 constexpr std::array<const char*, static_cast<std::size_t>(Graphics::ShaderResources::ProofFailure::Count)> ProofFailureNames{"none", "imports", "evicted", "pending", "changed", "keys", "other"};
 
 struct RecipeCounters {

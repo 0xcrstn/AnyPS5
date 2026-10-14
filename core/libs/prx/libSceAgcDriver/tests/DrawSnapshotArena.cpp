@@ -1,6 +1,10 @@
 #include "DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -9,12 +13,14 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -355,6 +361,142 @@ void DisabledTests(Fixture& fixture) {
     fixture.GetRecorder().Sync();
 }
 
+void EpochDirtySetTests(Fixture& fixture) {
+    struct Restore {
+        bool enabled = GuestMemory::EpochDirtySetEnabled();
+        bool verify = GuestMemory::EpochDirtySetVerify();
+        ~Restore() {
+            GuestMemory::SetEpochDirtySet(enabled);
+            GuestMemory::SetEpochDirtySetVerify(verify);
+        }
+    } restore;
+    for (const bool arena : {false, true}) {
+        DrawSnapshotArena::SetEnabled(arena);
+        DrawSnapshotArena::SetExtendBytes(0);
+        GuestMemory::SetEpochDirtySet(true);
+        GuestMemory::SetEpochDirtySetVerify(true);
+        const auto disagreementsBefore = GuestMemory::DirtySetStatistics().verifyDisagreements;
+        const char* mode = arena ? " (arena)" : " (per-draw buffers)";
+        std::memset(fixture.Bytes(16384), 0x61, 8192);
+        GuestMemory::BumpCollectEpoch();
+        Statistics first{};
+        const auto a = fixture.Take(16384, 4096, &first);
+        Require(first.copied == 1 && Holds(a, std::byte{0x61}), std::string("the first snapshot under the dirty set does not hold the guest bytes") + mode);
+        Statistics second{};
+        const auto b = fixture.Take(16384, 4096, &second);
+        Require(second.reused == 1 && second.copied == 0 && Holds(b, std::byte{0x61}), std::string("an unchanged range was copied again in the same epoch") + mode);
+        GuestMemory::BumpCollectEpoch();
+        Statistics third{};
+        const auto c = fixture.Take(16384, 4096, &third);
+        Require(third.reused == 1 && third.copied == 0 && Holds(c, std::byte{0x61}), std::string("an unchanged range was copied again in a new epoch") + mode);
+        std::memset(fixture.Bytes(16384 + 512), 0x62, 64);
+        GuestMemory::BumpCollectEpoch();
+        Statistics fourth{};
+        const auto d = fixture.Take(16384, 4096, &fourth);
+        Require(fourth.copied == 1 && SameBytes(d, fixture.Bytes(16384)), std::string("a CPU store before an ordering point did not make the snapshot again") + mode);
+        Require(Holds(a, std::byte{0x61}), std::string("a new snapshot overwrote the bytes an earlier draw binds") + mode);
+        std::memset(fixture.Bytes(16384 + 1024), 0x63, 16);
+        GuestMemory::MarkWritten(fixture.Address() + 16384 + 1024, 16);
+        Statistics fifth{};
+        const auto e = fixture.Take(16384, 4096, &fifth);
+        Require(fifth.copied == 1 && SameBytes(e, fixture.Bytes(16384)), std::string("a driver store in the same epoch did not make the snapshot again") + mode);
+        Statistics sixth{};
+        const auto f = fixture.Take(16384, 4096, &sixth);
+        Require(sixth.reused == 1 && sixth.copied == 0 && SameBytes(f, fixture.Bytes(16384)), std::string("an unchanged range after a driver store was copied again") + mode);
+        {
+            GuestAllocations::Mutation mutation;
+        }
+        Statistics seventh{};
+        const auto g = fixture.Take(16384, 4096, &seventh);
+        Require(seventh.copied == 1 && SameBytes(g, fixture.Bytes(16384)), std::string("a snapshot outlived a registry mutation") + mode);
+        for (std::size_t draw = 0; draw < 512; ++draw) {
+            if (draw % 64 == 0) {
+                fixture.Release();
+                fixture.GetRecorder().Submit();
+                std::memset(fixture.Bytes((draw * 4096) % 32768), static_cast<int>(draw), 32);
+                GuestMemory::BumpCollectEpoch();
+            }
+            const auto offset = (draw * 256) % 32768;
+            const auto taken = fixture.Take(offset, 256);
+            Require(SameBytes(taken, fixture.Bytes(offset)), std::string("a snapshot of the ring differs from the guest bytes") + mode);
+        }
+        fixture.Release();
+        fixture.GetRecorder().Sync();
+        Require(GuestMemory::DirtySetStatistics().verifyDisagreements == disagreementsBefore, std::string("the dirty set disagreed with a stamp check") + mode);
+    }
+    DrawSnapshotArena::SetEnabled(false);
+}
+
+void EpochDirtyOwnedRangeTests(const Context& context) {
+    const Settings settings;
+    struct Restore {
+        bool enabled = GuestMemory::EpochDirtySetEnabled();
+        bool verify = GuestMemory::EpochDirtySetVerify();
+        ~Restore() {
+            GuestMemory::SetEpochDirtySet(enabled);
+            GuestMemory::SetEpochDirtySetVerify(verify);
+        }
+    } restore;
+    constexpr std::size_t blockBytes = 65536;
+    constexpr std::size_t smallBytes = 4096;
+    constexpr std::size_t vertexBytes = 2 * blockBytes;
+    DrawSnapshotArena::SetEnabled(true);
+    DrawSnapshotArena::SetChunkBytes(std::size_t{4} << 20u);
+    DrawSnapshotArena::SetBudgetBytes(std::size_t{8} << 20u);
+    DrawSnapshotArena::SetExtendBytes(std::size_t{1} << 20u);
+    GuestMemory::SetEpochDirtySet(true);
+    for (const bool verify : {false, true}) {
+        Fixture fixture(context, std::size_t{2} << 20u);
+        Require(fixture.Ready(), "the owned-range fixture lost its host import");
+        GuestMemory::SetEpochDirtySetVerify(verify);
+        const char* mode = verify ? " (verified)" : " (unverified)";
+        const auto disagreementsBefore = GuestMemory::DirtySetStatistics().verifyDisagreements;
+        std::memset(fixture.Bytes(0), 0x71, std::size_t{2} << 20u);
+        GuestMemory::BumpCollectEpoch();
+        Require(GuestMemory::CollectWrites(fixture.Address(), std::size_t{2} << 20u) != 0, "the owned arena range was not collected before its snapshot");
+        Statistics first{};
+        const auto prefix = fixture.Take(0, smallBytes, &first);
+        Require(first.arenaCopies == 1 && Holds(prefix, std::byte{0x71}), std::string("the widened arena snapshot was not copied") + mode);
+        Statistics second{};
+        const auto tail = fixture.Take(blockBytes, smallBytes, &second);
+        Require(second.arenaHits == 1 && tail.handle == prefix.handle && Holds(tail, std::byte{0x71}), std::string("the default arena extension did not own the later range") + mode);
+        std::memset(fixture.Bytes(blockBytes), 0x72, smallBytes);
+        GuestMemory::MarkWritten(fixture.Address() + blockBytes, smallBytes);
+        Statistics third{};
+        const auto cleanPrefix = fixture.Take(0, smallBytes, &third);
+        Require(third.arenaHits == 1 && Holds(cleanPrefix, std::byte{0x71}), std::string("a write outside the requested prefix prevented its reuse") + mode);
+        Statistics fourth{};
+        const auto changedTail = fixture.Take(blockBytes, smallBytes, &fourth);
+        Require(fourth.arenaCopies == 1 && Holds(changedTail, std::byte{0x72}), std::string("a prefix check hid a write elsewhere in the widened arena snapshot") + mode);
+        Require(Holds(tail, std::byte{0x71}), std::string("a widened arena refresh overwrote an earlier draw's bytes") + mode);
+
+        auto& recorder = fixture.GetRecorder();
+        const auto address = fixture.Address() + 4 * blockBytes;
+        GuestMemory::BumpCollectEpoch();
+        const auto generation = GuestMemory::CollectWrites(address, vertexBytes);
+        Require(generation != 0, "the vertex snapshot range was not collected");
+        auto vertex = std::make_shared<Buffer>(fixture.GetContext(), vertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        std::memcpy(vertex->Bytes().data(), reinterpret_cast<const void*>(address), vertexBytes);
+        recorder.KeepDrawSnapshot(address, vertexBytes, generation, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), vertex, Recorder::SnapshotUse::Vertex, 0, GuestMemory::DirtySerial());
+        std::memset(fixture.Bytes(5 * blockBytes), 0x73, smallBytes);
+        GuestMemory::MarkWritten(address + blockBytes, smallBytes);
+        Require(recorder.ReusableDrawSnapshot(address, smallBytes, Recorder::SnapshotUse::Vertex) == vertex, std::string("a write outside the smaller vertex request prevented its reuse") + mode);
+        Require(recorder.ReusableDrawSnapshot(address, vertexBytes, Recorder::SnapshotUse::Vertex) == nullptr, std::string("a smaller vertex request hid a write in the larger owned snapshot") + mode);
+        Require(vertex->Bytes()[blockBytes] == std::byte{0x71}, std::string("a vertex cache rejection overwrote an earlier draw's bytes") + mode);
+
+        const std::array<std::uint64_t, 3> stamp{GuestMemory::DirtySerial(), GuestMemory::CollectEpoch(), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
+        recorder.NoteUnwrittenDrawSnapshot(address, vertexBytes, stamp, generation, vertex);
+        GuestMemory::SetEpochDirtySet(false);
+        Require(recorder.UnwrittenDrawSnapshot(address, vertexBytes, stamp) == nullptr, "equal serial and tracker numbers reused a snapshot across disabling the dirty set");
+        recorder.NoteUnwrittenDrawSnapshot(address, vertexBytes, stamp, generation, vertex);
+        GuestMemory::SetEpochDirtySet(true);
+        Require(recorder.UnwrittenDrawSnapshot(address, vertexBytes, stamp) == nullptr, "equal tracker and serial numbers reused a snapshot across enabling the dirty set");
+        fixture.Release();
+        recorder.Sync();
+        Require(GuestMemory::DirtySetStatistics().verifyDisagreements == disagreementsBefore, std::string("the owned-range dirty proof disagreed with its stamp check") + mode);
+    }
+}
+
 struct Pattern {
     const char* name;
     std::size_t draws;
@@ -407,7 +549,9 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
         PendingWriteTests(fixture);
         GpuReadTests(fixture);
         DisabledTests(fixture);
+        EpochDirtySetTests(fixture);
     }
+    EpochDirtyOwnedRangeTests(context);
     {
         DrawSnapshotArena::SetChunkBytes(65536);
         DrawSnapshotArena::SetBudgetBytes(2 * 65536);
@@ -416,6 +560,95 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
         RecycleTests(fixture);
     }
     std::cout << "draw snapshot arena tests passed\n";
+    return true;
+}
+
+bool RunEpochDirtySetBenchmark(const Context& context) {
+    const Settings settings;
+    struct Restore {
+        bool enabled = GuestMemory::EpochDirtySetEnabled();
+        ~Restore() { GuestMemory::SetEpochDirtySet(enabled); }
+    } restore;
+    constexpr std::size_t blockBytes = std::size_t{32} << 20u;
+    Fixture fixture(context, blockBytes);
+    if (!fixture.Ready()) {
+        std::cout << "host imports or write watching unavailable: epoch dirty set not measured\n";
+        return false;
+    }
+    for (std::size_t offset = 0; offset < blockBytes; offset += 4096) std::memset(fixture.Bytes(offset), static_cast<int>(offset / 4096), 4096);
+    const std::vector<Pattern> patterns{
+        {"ring of 256 B constants", 4096, 64, false, [](std::size_t draw) { return std::pair<std::uint64_t, std::size_t>{(draw * 256) % (std::size_t{8} << 20u), 256}; }},
+        {"ring of 4 KiB constants", 4096, 64, false, [](std::size_t draw) { return std::pair<std::uint64_t, std::size_t>{(draw * 4096) % (std::size_t{24} << 20u), 4096}; }},
+        {"128 KiB windows sliding 4 KiB", 4096, 64, false, [](std::size_t draw) { return std::pair<std::uint64_t, std::size_t>{(draw % 2048) * 4096, std::size_t{128} << 10u}; }},
+        {"same 16 ranges every draw", 4096, 64, false, [](std::size_t draw) { return std::pair<std::uint64_t, std::size_t>{(draw % 16) * 65536, 4096}; }},
+        {"same 16 ranges, one stored each epoch", 4096, 64, true, [](std::size_t draw) { return std::pair<std::uint64_t, std::size_t>{(draw % 16) * 65536, 4096}; }},
+    };
+    for (const bool arena : {false, true}) {
+        for (const auto& pattern : patterns) {
+            Statistics offStatistics{};
+            Statistics onStatistics{};
+            DrawSnapshotArena::Counters counters{};
+            GuestMemory::SetEpochDirtySet(false);
+            const auto offUs = MeasurePattern(fixture, pattern, arena, offStatistics, counters);
+            GuestMemory::SetEpochDirtySet(true);
+            const auto before = GuestMemory::DirtySetStatistics();
+            const auto onUs = MeasurePattern(fixture, pattern, arena, onStatistics, counters);
+            const auto after = GuestMemory::DirtySetStatistics();
+            const auto parts = [&](const Statistics& part) {
+                const auto draws = static_cast<double>(pattern.draws);
+                return std::string("checks ") + std::to_string(part.checkUs / draws).substr(0, 5) + " collects " + std::to_string(part.collectUs / draws).substr(0, 5) + " lookups " + std::to_string(part.lookupUs / draws).substr(0, 5) + " copies " + std::to_string(part.copyUs / draws).substr(0, 5);
+            };
+            std::printf("[dirty-set-bench] %-40s %s: off %7.2f us (%s) | on %7.2f us (%s; dirty checks %llu, serial hits %llu, log clean %llu, widened walks %llu)\n", pattern.name, arena ? "arena" : "per-draw buffers", offUs, parts(offStatistics).c_str(), onUs, parts(onStatistics).c_str(), static_cast<unsigned long long>(after.checks - before.checks), static_cast<unsigned long long>(after.serialHits - before.serialHits), static_cast<unsigned long long>(after.logClean - before.logClean), static_cast<unsigned long long>(after.widenedWalks - before.widenedWalks));
+        }
+    }
+    {
+        Context context = fixture.GetContext();
+        TextureDetiler detiler(context);
+        context.detiler = &detiler;
+        PlaceholderImages placeholders(context);
+        context.placeholderImages = &placeholders;
+        TextureCache textureCache(context);
+        context.textureCache = &textureCache;
+        const std::lock_guard gpu(GuestMemory::GpuMutex());
+        constexpr std::size_t surfaces = 16;
+        constexpr std::uint32_t side = 128;
+        constexpr std::size_t surfaceBytes = std::size_t{side} * side * 4;
+        const auto base = fixture.Address() + (std::size_t{16} << 20u);
+        ShaderRecompiler::DescriptorBinding binding{};
+        binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+        binding.descriptorSet = 0;
+        binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding + PlaceholderDimensionsPerClass + 2u;
+        binding.count = surfaces;
+        binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+        binding.imageWritten.assign(surfaces, false);
+        binding.imageSamplers.assign(surfaces, 0u);
+        for (std::size_t i = 0; i < surfaces; ++i) {
+            const auto address = base + i * surfaceBytes;
+            const std::array<std::uint32_t, 8> words{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (20u << 20u) | (((side - 1u) & 3u) << 30u), ((side - 1u) >> 2u) | ((side - 1u) << 14u), 0xfacu | (0x1bu << 20u) | (9u << 28u), 0u, 0u, 0u, 0u};
+            binding.guestDescriptor.insert(binding.guestDescriptor.end(), words.begin(), words.end());
+        }
+        ShaderRecompiler::RecompileResult program;
+        program.bindings.push_back(std::move(binding));
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        for (const bool enabled : {false, true}) {
+            GuestMemory::SetEpochDirtySet(enabled);
+            GuestMemory::BumpCollectEpoch();
+            auto resources = std::make_shared<ShaderResources>(context, shader);
+            Require(resources->Reusable() && resources->Revalidate(shader), "the sampled template does not revalidate");
+            constexpr int calls = 4096;
+            const auto skipsBefore = ShaderResources::EpochSkips();
+            const auto start = std::chrono::steady_clock::now();
+            for (int call = 0; call < calls; ++call) {
+                if (call % 64 == 0) GuestMemory::BumpCollectEpoch();
+                Require(resources->Revalidate(shader), "a revalidation of the unchanged sampled template failed");
+            }
+            const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / calls;
+            std::printf("[dirty-set-bench] Revalidate of a template with %zu sampled textures, epoch every 64 calls: dirty set %s %7.2f us per call (%llu skipped)\n", surfaces, enabled ? "on " : "off", us, static_cast<unsigned long long>(ShaderResources::EpochSkips() - skipsBefore));
+            resources.reset();
+            ClearCachedTextures(context.device);
+        }
+    }
     return true;
 }
 

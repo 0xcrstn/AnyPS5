@@ -700,6 +700,75 @@ std::uint64_t CollectCommitted(const PartlyCommitted& range, Runs& runs) {
     return CollectCommittedWrites(range.Address(), PartlyCommitted::Bytes, runs);
 }
 
+void CheckEpochDirtySet() {
+    struct Restore {
+        bool enabled = EpochDirtySetEnabled();
+        std::size_t widen = EpochDirtySetWidenBytes();
+        ~Restore() {
+            SetEpochDirtySet(enabled);
+            SetEpochDirtySetWidenBytes(widen);
+        }
+    } restore;
+    SetEpochDirtySet(true);
+    SetEpochDirtySetWidenBytes(Block);
+    void* memory = AllocateWatched(4 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 4 * Block);
+    BumpCollectEpoch();
+    Require(CollectWrites(base, 4 * Block) != 0, "the dirty set block is not collected");
+    const auto clean = DirtySerial();
+    Require(UnchangedSinceDirtySerial(base, 4 * Block, clean), "an untouched range reads as dirty");
+    bytes[Block + 40000] = 0x22;
+    BumpCollectEpoch();
+    const auto generation = CollectWrites(base + Block, 64);
+    Require(generation != 0 && DirtySerial() > clean, "a collect widened to the block did not find the store in another page of the block");
+    Require(!UnchangedSince(base + Block + 40000, 64, generation - 1), "the widened collect did not stamp the stored block");
+    std::uint64_t through = 0;
+    Require(!UnchangedSinceDirtySerial(base + Block, Block, clean, &through), "a collected CPU store is not in the dirty log");
+    Require(UnchangedSinceDirtySerial(base + 2 * Block, Block, clean, &through) && through == DirtySerial(), "a store in one block dirtied another");
+    Require(UnchangedSinceDirtySerial(base + Block, Block, through), "a range reads as dirty after the serial it was checked through");
+    const auto beforeDriver = DirtySerial();
+    Require(MarkWritten(base + 2 * Block + 16, 4) != 0, "a driver store into the dirty set block is not stamped");
+    Require(!UnchangedSinceDirtySerial(base + 2 * Block, 64, beforeDriver), "a driver store is not in the dirty log");
+    Require(UnchangedSinceDirtySerial(base + 3 * Block, Block, beforeDriver), "a driver store dirtied another block");
+    const auto beforeWrite = DirtySerial();
+    const std::array<std::byte, 64> zeros{};
+    Write(base + 3 * Block, zeros);
+    Require(!UnchangedSinceDirtySerial(base + 3 * Block, 64, beforeWrite), "a driver write is not in the dirty log");
+    const auto beforeUnwatch = DirtySerial();
+    Unwatch(base, Block);
+    Require(!UnchangedSinceDirtySerial(base, Block, beforeUnwatch), "an unwatch is not in the dirty log");
+    const auto beforeOverflow = DirtySerial();
+    for (int repeat = 0; repeat < 5000; ++repeat) MarkWritten(base + 2 * Block, 4);
+    Require(!UnchangedSinceDirtySerial(base + 3 * Block, Block, beforeOverflow), "an overflowed dirty log answered unchanged");
+    Require(UnchangedSinceDirtySerial(base + 3 * Block, Block, DirtySerial()), "the current serial reads as dirty");
+    const auto beforeStore = DirtySerial();
+    bytes[3 * Block + 100] = 0x33;
+    Require(UnchangedSinceDirtySerial(base + 3 * Block, Block, beforeStore), "an uncollected store showed before its epoch");
+    BumpCollectEpoch();
+    Require(CollectWrites(base + 3 * Block, Block) != 0 && !UnchangedSinceDirtySerial(base + 3 * Block, Block, beforeStore), "the next epoch's collect did not log the store");
+    SetEpochDirtySet(false);
+    bytes[2 * Block + 40000] = 0x44;
+    BumpCollectEpoch();
+    const auto beforeExact = DirtySerial();
+    const auto exact = CollectWrites(base + 2 * Block, 64);
+    Require(exact != 0, "the exact collect failed");
+    Require(UnchangedSince(base + 2 * Block + 40000, 64, exact), "a collect with the dirty set off walked beyond its range");
+    BumpCollectEpoch();
+    Require(CollectWrites(base + 2 * Block + 40000, 64) != 0 && !UnchangedSince(base + 2 * Block + 40000, 64, exact), "the exact collect of the stored page did not stamp the store");
+    Require(MarkWritten(base + 2 * Block + 16, 4) != 0, "a driver store with the dirty set off was not stamped");
+    Write(base + 3 * Block, zeros);
+    Unwatch(base + 3 * Block, Block);
+    Require(DirtySerial() == beforeExact, "writes with the dirty set off updated the dirty log");
+    Require(!UnchangedSinceDirtySerial(base + 2 * Block, Block, beforeExact), "a disabled dirty log accepted a proof");
+    SetEpochDirtySet(true);
+    Require(DirtySerial() > beforeExact && !UnchangedSinceDirtySerial(base + 2 * Block, Block, beforeExact), "re-enabling the dirty log preserved a proof from before skipped writes");
+    const auto enabled = DirtySerial();
+    SetEpochDirtySet(true);
+    Require(DirtySerial() == enabled && UnchangedSinceDirtySerial(base + 2 * Block, Block, enabled), "enabling an already enabled dirty log invalidated its current proof");
+}
+
 void CheckCommittedRanges() {
     PartlyCommitted range;
     const auto base = range.Address();
@@ -784,6 +853,7 @@ int main() {
         CheckOwnStore();
         CheckUnwatch();
         CheckNewestStamp();
+        CheckEpochDirtySet();
 #ifdef _WIN32
         CheckDeferredSharedImports();
         CheckPrivateMappingReuse();

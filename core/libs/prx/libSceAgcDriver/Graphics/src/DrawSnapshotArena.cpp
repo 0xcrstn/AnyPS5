@@ -176,13 +176,29 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::lookup(Recorder& recor
     for (std::size_t depth = 0; depth < LookupDepth && found != entries.begin(); ++depth) {
         --found;
         const auto begin = found->first;
-        const auto& entry = found->second;
+        auto& entry = found->second;
         if (entry.end < address + bytes || (address - begin) % alignment != 0) continue;
         if (entry.chunkSerial != chunks[entry.chunk]->serial || entry.registryGeneration != registryGeneration) {
             found = entries.erase(found);
             continue;
         }
-        if (GuestMemory::CollectWrites(begin, static_cast<std::size_t>(entry.end - begin)) == 0 || !GuestMemory::UnchangedSince(address, bytes, entry.generation)) {
+        if (GuestMemory::CollectWrites(begin, static_cast<std::size_t>(entry.end - begin)) == 0) {
+            ++counters.stale;
+            continue;
+        }
+        bool unchanged = false;
+        if (entry.dirtySerial != 0 && GuestMemory::EpochDirtySetEnabled()) {
+            std::uint64_t through = 0;
+            const auto ownedBytes = static_cast<std::size_t>(entry.end - begin);
+            unchanged = GuestMemory::UnchangedSinceDirtySerial(begin, ownedBytes, entry.dirtySerial, &through);
+            if (unchanged && GuestMemory::EpochDirtySetVerify()) {
+                const bool slow = GuestMemory::UnchangedSince(begin, ownedBytes, entry.generation);
+                GuestMemory::NoteDirtySetVerify(slow);
+                unchanged = slow;
+            }
+            if (unchanged) entry.dirtySerial = through;
+        }
+        if (!unchanged && !GuestMemory::UnchangedSince(address, bytes, entry.generation)) {
             ++counters.stale;
             continue;
         }
@@ -208,6 +224,7 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::Take(Recorder& recorde
     auto first = address;
     auto last = address + bytes;
     std::uint64_t segmentGeneration = 0;
+    const auto dirtySerial = GuestMemory::EpochDirtySetEnabled() ? GuestMemory::DirtySerial() : 0;
     const auto widenedFirst = address - (address % SegmentGranule) / alignment * alignment;
     const auto widenedLast = AlignUp(address + bytes, SegmentGranule) + ExtendBytes();
     const auto widenedBytes = static_cast<std::size_t>(widenedLast - widenedFirst);
@@ -232,7 +249,7 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::Take(Recorder& recorde
     counters.copiedBytes += segmentBytes;
     if (segmentGeneration != 0) {
         if (entries.size() >= MaxEntries) entries.clear();
-        entries[first] = Entry{last, segmentGeneration, registryGeneration, placement->chunk, chunk.serial, placement->offset};
+        entries[first] = Entry{last, segmentGeneration, registryGeneration, placement->chunk, chunk.serial, placement->offset, dirtySerial};
     } else {
         ++counters.unindexed;
     }

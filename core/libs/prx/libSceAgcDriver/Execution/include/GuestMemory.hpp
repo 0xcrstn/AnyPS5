@@ -191,6 +191,30 @@ void NoteLockedGpuWait(double ms);
 // a caller reads the difference across a span of its own work.
 std::uint64_t ThreadCollectedBytes();
 std::uint64_t ThreadCollectedNanoseconds();
+bool EpochDirtySetEnabled();
+void SetEpochDirtySet(bool enabled);
+bool EpochDirtySetVerify();
+void SetEpochDirtySetVerify(bool verify);
+std::size_t EpochDirtySetWidenBytes();
+void SetEpochDirtySetWidenBytes(std::size_t bytes);
+std::uint64_t DirtySerial();
+using DirtyRange = std::pair<std::uint64_t, std::uint64_t>;
+bool UnchangedSinceDirtySerial(std::span<const DirtyRange> ranges, std::uint64_t serial, std::uint64_t* checkedThrough = nullptr);
+bool UnchangedSinceDirtySerial(std::uint64_t address, std::size_t bytes, std::uint64_t serial, std::uint64_t* checkedThrough = nullptr);
+void NoteDirtySetVerify(bool agreed);
+struct DirtySetCounts {
+    std::uint64_t serial = 0;
+    std::uint64_t checks = 0;
+    std::uint64_t serialHits = 0;
+    std::uint64_t logClean = 0;
+    std::uint64_t logOverlaps = 0;
+    std::uint64_t logOverflows = 0;
+    std::uint64_t widenedWalks = 0;
+    std::uint64_t widenFallbacks = 0;
+    std::uint64_t verifyChecks = 0;
+    std::uint64_t verifyDisagreements = 0;
+};
+DirtySetCounts DirtySetStatistics();
 // A code address (a return address) as an offset into its module, in the form of the [guestmem]
 // callers (symbolized with nm against the driver's image). Takes the loader lock: for reports only.
 unsigned long long CodeOffset(const void* address);

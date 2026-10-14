@@ -2685,8 +2685,8 @@ void drawSnapshotRetireTests(const Device& device) {
         const std::array<std::uint64_t, 3> stamp{1, 2, 3};
         auto fourth = snapshot();
         unwritten = fourth;
-        cache.NoteUnwrittenDrawSnapshot(address, 16, stamp, std::move(fourth));
-        cache.NoteUnwrittenDrawSnapshot(address, 16, stamp, snapshot());
+        cache.NoteUnwrittenDrawSnapshot(address, 16, stamp, generation, std::move(fourth));
+        cache.NoteUnwrittenDrawSnapshot(address, 16, stamp, generation, snapshot());
         Require(!unwritten.expired() && cache.UnwrittenDrawSnapshot(address, 16, stamp) != unwritten.lock(), "a replaced unwritten snapshot was not retired with the open batch");
         cache.Submit();
         cache.Sync();
@@ -7438,6 +7438,9 @@ int main(int argc, char** argv) {
             singleCubeTests(device, recorder);
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-epoch-dirty-set") {
+            return RunEpochDirtySetBenchmark(device.GetContext()) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unchanged-cpu-stamps-only") {
             unchangedCpuStampTests(device, recorder);

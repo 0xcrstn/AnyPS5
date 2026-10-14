@@ -1380,6 +1380,10 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
+std::uint64_t Recorder::KeyStoreSerial() {
+    return keyStoreCount.load(std::memory_order_relaxed);
+}
+
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
     ensureOpen();
     auto& pass = open->renderPass;
@@ -2608,11 +2612,23 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
 
 std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp) {
     const auto found = unwrittenSnapshots.find(address);
-    if (found == unwrittenSnapshots.end() || found->second.bytes != bytes || found->second.stamp != stamp) return {};
-    return found->second.buffer;
+    if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return {};
+    auto& entry = found->second;
+    if (entry.dirtySet != GuestMemory::EpochDirtySetEnabled()) return {};
+    if (entry.stamp == stamp) return entry.buffer;
+    if (!GuestMemory::EpochDirtySetEnabled() || entry.stamp[1] != stamp[1] || entry.stamp[2] != stamp[2]) return {};
+    std::uint64_t through = 0;
+    if (!GuestMemory::UnchangedSinceDirtySerial(address, bytes, entry.stamp[0], &through)) return {};
+    if (GuestMemory::EpochDirtySetVerify()) {
+        const bool slow = entry.generation != 0 && GuestMemory::UnchangedSince(address, bytes, entry.generation);
+        GuestMemory::NoteDirtySetVerify(slow);
+        if (!slow) return {};
+    }
+    entry.stamp[0] = through;
+    return entry.buffer;
 }
 
-void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer) {
+void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::uint64_t generation, std::shared_ptr<Buffer> buffer) {
     constexpr std::size_t Limit = 4096;
     if (unwrittenSnapshots.size() >= Limit) {
         retireSnapshot(std::make_shared<std::unordered_map<std::uint64_t, UnwrittenSnapshot>>(std::move(unwrittenSnapshots)));
@@ -2620,19 +2636,32 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
     }
     auto& entry = unwrittenSnapshots[address];
     retireSnapshot(std::move(entry.buffer));
-    entry = {bytes, stamp, std::move(buffer)};
+    entry = {bytes, stamp, std::move(buffer), generation, GuestMemory::EpochDirtySetEnabled()};
 }
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+    bool unchanged = false;
+    if (sameRegistry && found->second.dirtySerial != 0 && GuestMemory::EpochDirtySetEnabled()) {
+        std::uint64_t through = 0;
+        const auto ownedBytes = std::get<2>(found->first);
+        unchanged = GuestMemory::UnchangedSinceDirtySerial(address, ownedBytes, found->second.dirtySerial, &through);
+        if (unchanged && GuestMemory::EpochDirtySetVerify()) {
+            const bool slow = GuestMemory::UnchangedSince(address, ownedBytes, found->second.generation);
+            GuestMemory::NoteDirtySetVerify(slow);
+            unchanged = slow;
+        }
+        if (unchanged) found->second.dirtySerial = through;
+    }
+    if (!sameRegistry || (!unchanged && !GuestMemory::UnchangedSince(address, bytes, found->second.generation))) {
         if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes)) {
             eraseDrawSnapshot(found);
             return {};
         }
         found->second.generation = generation;
+        found->second.dirtySerial = 0;
     }
     auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
     recency.splice(recency.end(), recency, found->second.recent);
@@ -2831,7 +2860,7 @@ std::shared_ptr<Buffer> Recorder::SnapshotTwin(const std::shared_ptr<Buffer>& sn
     return found->second.twin;
 }
 
-void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
+void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived, std::uint64_t dirtySerial) {
     const bool storage = use == SnapshotUse::Storage;
     const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
     const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntries;
@@ -2846,7 +2875,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     const DrawSnapshotKey key{address, use, bytes};
     pool.recency.push_back(key);
     try {
-        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
+        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived, dirtySerial});
     } catch (...) {
         pool.recency.pop_back();
         throw;
