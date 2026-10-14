@@ -871,8 +871,6 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         Require(result.renderExtent.width != 0 && result.renderExtent.height != 0, "empty framebuffer extent for a draw without color writes");
     }
     if (const auto ignored = read(cx, 0x207) & LayerExports & ~result.layerExports & ~(1u << 21u); ignored != 0) {
-        // Reported once per kind of draw that drops them (up to 32 kinds), with the targets that
-        // decide whether it renders layers.
         const auto layers = static_cast<std::uint32_t>(std::min<std::uint64_t>(result.renderLayers, 0xffu));
         const std::uint64_t kind = read(cx, 0x207) | static_cast<std::uint64_t>(std::min<std::size_t>(result.colors.size(), 0xffu)) << 32u | static_cast<std::uint64_t>(layers) << 40u | (result.depth ? 1ull << 48u : 0ull);
         thread_local std::uint64_t lastKind = 0;
@@ -883,7 +881,9 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
             std::lock_guard lock(reportedMutex);
             if (reported.size() < 32u && std::ranges::find(reported, kind) == reported.end()) {
                 reported.push_back(kind);
-                std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x, ignored bits 0x%08x): %zu color targets of %u layers, %s, DB_DEPTH_VIEW=0x%08x, render extent %ux%u\n", read(cx, 0x207), ignored, result.colors.size(), layers, result.depth ? "a depth target" : "no depth target", read(cx, 0x002), result.renderExtent.width, result.renderExtent.height);
+                char depth[64] = "no depth target";
+                if (result.depth) std::snprintf(depth, sizeof(depth), "a depth target (DB_DEPTH_VIEW=0x%08x)", read(cx, 0x002));
+                std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x, ignored bits 0x%08x): %zu color targets of %u layers, %s, render extent %ux%u\n", read(cx, 0x207), ignored, result.colors.size(), layers, depth, result.renderExtent.width, result.renderExtent.height);
             }
         }
     }
