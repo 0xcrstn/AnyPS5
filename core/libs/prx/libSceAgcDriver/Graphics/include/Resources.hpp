@@ -18,6 +18,7 @@ public:
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
     std::span<std::byte> Bytes();
     bool Mapped() const { return mapping != nullptr; }
+    std::size_t Size() const { return size; }
     void Invalidate();
 
 private:
