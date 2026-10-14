@@ -971,8 +971,8 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
             std::lock_guard lock(prepared.mutex);
             prepared.entries.insert(prepared.entries.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
             if (failure == nullptr && !skipped && !plan->abiKey.empty()) prepared.registeredAbis.push_back(std::move(plan->abiKey));
-            if (skipped) prepared.deferred = true;
-            prepared.failure = failure;
+            if (skipped || (failure != nullptr && plan->budgeted)) prepared.deferred = true;
+            prepared.failure = plan->budgeted ? nullptr : failure;
             prepared.pending = false;
         }
         prepared.settled.notify_all();
