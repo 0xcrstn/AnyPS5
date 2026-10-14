@@ -1385,6 +1385,14 @@ void DepthStencilTests() {
     Require(rejection.empty(), "precheck rejected a stencil draw with a surface: " + rejection);
     Require(state.depth && state.depth->address == 0x10000 && state.depth->stencilAddress == 0x20000 && state.depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT && state.depth->clearStencil == 7 && state.depth->htileAddress == 0x10000030000ull && !state.depth->htileStencil, "depth surface decode changed");
     {
+        queue.context[0x002] = 3u | (3u << 13u);
+        const auto slice = AgcDriver::Graphics::DecodeState(queue);
+        queue.context[0x002] = 0;
+        const auto depthSlice = AgcDriver::Graphics::DepthSliceBytes({4, 2}, 4u);
+        const auto stencilSlice = AgcDriver::Graphics::DepthSliceBytes({4, 2}, 1u);
+        Require(slice.depth && slice.depth->address == 0x10000 + 3u * depthSlice && slice.depth->stencilAddress == 0x20000 + 3u * stencilSlice && slice.depth->extent.width == 4 && slice.depth->extent.height == 2, "DB_DEPTH_VIEW SLICE_START 3 did not select the fourth depth and stencil slices");
+    }
+    {
         queue.context[0x011] &= ~(1u << 29u);
         const auto stencilTiled = AgcDriver::Graphics::DecodeState(queue);
         Require(stencilTiled.depth && stencilTiled.depth->htileStencil, "HTILE holds the stencil state without TILE_STENCIL_DISABLE");
