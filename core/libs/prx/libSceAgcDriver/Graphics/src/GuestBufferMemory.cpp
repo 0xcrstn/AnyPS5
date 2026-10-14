@@ -669,7 +669,11 @@ ImportRun crossedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, 
 ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
     const auto window = importWindow.load(std::memory_order_relaxed);
     if (window == 0) return {};
-    return crossedRun(lease, begin, end);
+    auto run = crossedRun(lease, begin, end);
+    if (run.ranges.empty()) return run;
+    if (std::all_of(run.ranges.begin(), run.ranges.end(), [window](const auto& range) { return range->bytes > window; })) return run;
+    if (begin == run.base && end == run.base + run.bytes) return run;
+    return {};
 }
 
 bool joinedCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
