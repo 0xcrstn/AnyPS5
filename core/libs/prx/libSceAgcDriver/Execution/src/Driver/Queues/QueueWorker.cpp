@@ -60,6 +60,10 @@ const std::atomic<std::uint64_t>*& Driver::workerQueued() {
 }
 
 void Driver::reapCompletionLabels() {
+    if (const auto peek = device.Load(); peek == nullptr || !peek->ReapMayRetire()) {
+        ++reapsSkipped[TryIdle];
+        return;
+    }
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
     if (!gpuLock.owns_lock()) {
         ++triesFailed[TryIdle];

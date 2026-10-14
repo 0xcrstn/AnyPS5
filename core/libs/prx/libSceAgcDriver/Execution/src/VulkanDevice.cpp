@@ -1841,6 +1841,10 @@ void VulkanDevice::ReapRecorded() {
     if (state->recorder) state->recorder->Reap();
 }
 
+bool VulkanDevice::ReapMayRetire() const {
+    return state->recorder == nullptr || state->recorder->ReapMayRetire();
+}
+
 std::optional<Graphics::Recorder::LabelHit> VulkanDevice::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, Graphics::Recorder::LabelRefusal* refusal) const {
     if (!state->recorder) return std::nullopt;
     return state->recorder->PendingLabel(address, bytes, afterStamp, refusal);

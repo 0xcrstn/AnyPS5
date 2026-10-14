@@ -1762,6 +1762,7 @@ struct GpuLockStats {
     HolderMatrixValues waitedBehindNs{};
     std::uint64_t tries = 0;
     std::uint64_t triesFailed = 0;
+    std::uint64_t triesSeenHeld = 0;
     std::uint64_t lockedGpuWaits = 0;
     double lockedGpuWaitMs = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -1846,9 +1847,14 @@ void GpuMutexType::acquired() {
     if (++depth == 1) gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
 }
 
+bool GpuMutexType::HeldByOtherThread() const {
+    const auto* holder = owner.load(std::memory_order_relaxed);
+    return holder != nullptr && holder != ThreadToken();
+}
+
 bool GpuMutexType::try_lock() {
     if (!GpuLockProfiled()) {
-        if (!mutex.try_lock()) return false;
+        if (HeldByOtherThread() || !mutex.try_lock()) return false;
         acquired();
         return true;
     }
@@ -1857,6 +1863,11 @@ bool GpuMutexType::try_lock() {
     auto& stats = LockStats();
     const auto tagged = std::exchange(stats.nextSite, GpuLockSite::Other);
     ++stats.tries;
+    if (HeldByOtherThread()) {
+        ++stats.triesFailed;
+        ++stats.triesSeenHeld;
+        return false;
+    }
     if (!mutex.try_lock()) {
         ++stats.triesFailed;
         return false;
@@ -1986,8 +1997,8 @@ void GpuMutexType::lock() {
             }
             holds += "; waited behind (holder/site ms):" + WaitedBehindReport(stats.waitedBehindNs);
         }
-        char counts[160];
-        std::snprintf(counts, sizeof(counts), "; lock() %llu / try %llu / try failed %llu; locked GPU waits %llu / %.0f ms", static_cast<unsigned long long>(stats.acquisitions), static_cast<unsigned long long>(stats.tries), static_cast<unsigned long long>(stats.triesFailed), static_cast<unsigned long long>(stats.lockedGpuWaits), stats.lockedGpuWaitMs);
+        char counts[224];
+        std::snprintf(counts, sizeof(counts), "; lock() %llu / try %llu / try failed %llu (%llu seen held without touching the mutex); locked GPU waits %llu / %.0f ms", static_cast<unsigned long long>(stats.acquisitions), static_cast<unsigned long long>(stats.tries), static_cast<unsigned long long>(stats.triesFailed), static_cast<unsigned long long>(stats.triesSeenHeld), static_cast<unsigned long long>(stats.lockedGpuWaits), stats.lockedGpuWaitMs);
         holds += counts;
         if (stats.tag == 0xffffffffu) AgcDriver::ProfilePrint_nid_no_patch("[lock] %s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.holderColumn == PresenterColumn ? "presenter" : "untagged thread", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
         else AgcDriver::ProfilePrint_nid_no_patch("[lock] queue 0x%x waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.tag, stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
@@ -2003,6 +2014,7 @@ void GpuMutexType::lock() {
         for (auto& row : stats.waitedBehindNs) row.fill(0);
         stats.tries = 0;
         stats.triesFailed = 0;
+        stats.triesSeenHeld = 0;
         stats.lockedGpuWaits = 0;
         stats.lockedGpuWaitMs = 0;
         return;
