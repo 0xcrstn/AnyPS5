@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "IntermediateRepresentation/IrOpcode.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -512,6 +513,12 @@ void reportRecordParts(const DrawProfile& profile) {
         if (bindings.wholeCopies[reason] == 0) continue;
         any = true;
         r += std::snprintf(reasons + r, sizeof(reasons) - static_cast<std::size_t>(r), " %s %llu %.1f;", ShaderResources::WholeCopyName(static_cast<ShaderResources::WholeCopy>(reason)), static_cast<unsigned long long>(bindings.wholeCopies[reason]), static_cast<double>(bindings.wholeBytes[reason]) / 1048576.0);
+    }
+    const auto blocking = ShaderResources::TakeBlockingOpcodes();
+    for (const auto& [opcode, count] : blocking) {
+        if (count == 0 || r <= 0 || static_cast<std::size_t>(r) >= sizeof(reasons)) continue;
+        const auto name = ShaderRecompiler::IrOpcodeName(static_cast<ShaderRecompiler::IrOpcode>(opcode));
+        r += std::snprintf(reasons + r, sizeof(reasons) - static_cast<std::size_t>(r), "%s %.*s %llu", opcode == blocking.front().first ? " unbounded indices stop at:" : ",", static_cast<int>(name.size()), name.data(), static_cast<unsigned long long>(count));
     }
     if (any) std::fprintf(stderr, "%s\n", reasons);
 }
@@ -1763,7 +1770,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     parts.lap(RecordStores);
     std::optional<ShaderResources::DrawIndexRanges> drawRanges;
-    if (args == nullptr && !state.stages.mesh && !state.stages.tessellation && state.stages.path == ShaderPath::Vertex && draw.instanceCount != 0 && static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount - 1u <= std::numeric_limits<std::uint32_t>::max() && draw.firstVertex <= inputs.maxIndex) drawRanges = ShaderResources::DrawIndexRanges{draw.firstVertex, inputs.maxIndex, draw.firstInstance, draw.firstInstance + draw.instanceCount - 1u};
+    if (args == nullptr && !state.stages.mesh && !state.stages.tessellation && state.stages.path == ShaderPath::Vertex && draw.instanceCount != 0 && static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount - 1u <= std::numeric_limits<std::uint32_t>::max() && draw.firstVertex <= inputs.maxIndex) drawRanges = ShaderResources::DrawIndexRanges{draw.firstVertex, inputs.maxIndex, draw.firstInstance, draw.firstInstance + draw.instanceCount - 1u, shaders.empty() || shaders.front().program == nullptr ? -1 : shaders.front().program->vertexOffsetSgpr, draw.vertexFold, shaders.empty() || shaders.front().program == nullptr ? -1 : shaders.front().program->instanceOffsetSgpr, draw.instanceFold};
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.profile ? &outcome.bindings : nullptr, drawRanges ? &*drawRanges : nullptr);
     parts.lap(RecordBindings);
     const bool capture = CaptureInputsEnabled();

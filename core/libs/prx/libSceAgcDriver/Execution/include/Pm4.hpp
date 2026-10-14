@@ -24,6 +24,8 @@ struct DrawParameters {
     bool indexed = true;
     std::uint32_t firstVertex = 0;
     std::uint32_t firstInstance = 0;
+    std::uint32_t vertexFold = 0;
+    std::uint32_t instanceFold = 0;
     // An indirect draw (DRAW_INDIRECT 0x24, DRAW_INDEX_INDIRECT 0x25 and their multi forms 0x2c and
     // 0x38): the CP reads {vertexCount, instanceCount, startVertex, startInstance} (indexed:
     // {indexCount, instanceCount, firstIndex, vertexOffset, startInstance}) per record at

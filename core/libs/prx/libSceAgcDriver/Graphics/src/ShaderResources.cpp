@@ -3554,9 +3554,35 @@ bool PartialSnapshotsDisabled() {
 }
 
 const char* ShaderResources::WholeCopyName(WholeCopy reason) {
-    static constexpr std::array<const char*, static_cast<std::size_t>(WholeCopy::Count)> names{"not analysed", "index from the vertex id", "index from the instance id", "index loaded from memory", "index from user data", "unbounded index", "no draw range", "unbounded offset", "unbounded soffset", "unbounded scalar offset", "offset past 32 bits", "other read", "image alias", "swizzled", "add tid", "past 4 GiB", "over half", "disabled"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(WholeCopy::Count)> names{"not analysed", "index from the vertex id", "index from the instance id", "index loaded from memory", "index from user data", "unbounded index", "no draw range", "index unbounded at the draw", "unbounded offset", "unbounded soffset", "unbounded scalar offset", "offset past 32 bits", "other read", "image alias", "swizzled", "add tid", "past 4 GiB", "over half", "disabled"};
     const auto index = static_cast<std::size_t>(reason);
     return index < names.size() ? names[index] : "?";
+}
+
+namespace {
+
+std::array<std::atomic<std::uint64_t>, 1024>& BlockingOpcodeCounts() {
+    static std::array<std::atomic<std::uint64_t>, 1024> counts{};
+    return counts;
+}
+
+void NoteBlockingOpcode(std::uint16_t opcode) {
+    if (opcode < BlockingOpcodeCounts().size()) BlockingOpcodeCounts()[opcode].fetch_add(1, std::memory_order_relaxed);
+}
+
+}
+
+std::array<std::pair<std::uint16_t, std::uint64_t>, 6> ShaderResources::TakeBlockingOpcodes() {
+    std::array<std::pair<std::uint16_t, std::uint64_t>, 6> top{};
+    auto& counts = BlockingOpcodeCounts();
+    for (std::size_t opcode = 0; opcode < counts.size(); ++opcode) {
+        const auto count = counts[opcode].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        const auto smallest = std::min_element(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+        if (count > smallest->second) *smallest = {static_cast<std::uint16_t>(opcode), count};
+    }
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    return top;
 }
 
 std::optional<ShaderResources::ReadAnalysis> ShaderResources::ElementReadAnalysis(const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element) {
@@ -3594,7 +3620,13 @@ std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std:
         std::uint64_t firstIndex = range.firstIndex;
         std::uint64_t lastIndex = range.lastIndex;
         using Source = ShaderRecompiler::BufferIndexSource;
-        if (range.indexSource != Source::None && stride != 0) {
+        if (range.indexSource == Source::Expression && stride != 0) {
+            if (drawRanges == nullptr) return whole(WholeCopy::NoDrawRange);
+            const auto evaluated = ShaderRecompiler::EvaluateBufferIndex(range.indexExpression, *drawRanges);
+            if (!evaluated) return whole(WholeCopy::IndexAtDraw);
+            firstIndex = evaluated->first;
+            lastIndex = evaluated->second;
+        } else if (range.indexSource != Source::None && range.indexSource != Source::Expression && stride != 0) {
             if (drawRanges == nullptr) return whole(WholeCopy::NoDrawRange);
             const bool vertex = range.indexSource == Source::VertexIndex;
             firstIndex += static_cast<std::uint64_t>(range.indexScale) * (vertex ? drawRanges->firstVertex : drawRanges->firstInstance);
@@ -3602,6 +3634,7 @@ std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std:
             if (lastIndex > ShaderRecompiler::BufferReadRanges::AnyIndex) return whole(WholeCopy::BeyondFourGiB);
         } else if (range.indexSource == Source::None && range.lastIndex == ShaderRecompiler::BufferReadRanges::AnyIndex && stride != 0) {
             using Origin = ShaderRecompiler::BufferIndexOrigin;
+            if (range.blockingOpcode != 0) NoteBlockingOpcode(range.blockingOpcode);
             switch (range.indexOrigin) {
             case Origin::VertexIndex: return whole(WholeCopy::IndexVertex);
             case Origin::InstanceIndex: return whole(WholeCopy::IndexInstance);

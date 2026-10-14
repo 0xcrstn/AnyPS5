@@ -258,6 +258,14 @@ void encodeReadRanges(Writer& writer, const BufferReadRanges& ranges) {
         out.Value(range.indexSource);
         out.Value(range.indexOrigin);
         out.Value(range.indexScale);
+        out.List(range.indexExpression, [](Writer& node, const BufferIndexNode& entry) {
+            node.Value(entry.op);
+            node.Value(entry.left);
+            node.Value(entry.right);
+            node.Value(entry.low);
+            node.Value(entry.high);
+        });
+        out.Value(range.blockingOpcode);
     });
 }
 
@@ -265,7 +273,7 @@ void decodeReadRanges(Reader& reader, BufferReadRanges& ranges) {
     reader.Value(ranges.bounded);
     reader.Value(ranges.unbound);
     if (static_cast<std::uint32_t>(ranges.unbound) >= static_cast<std::uint32_t>(BufferReadUnbound::Count)) ranges.unbound = BufferReadUnbound::Opcode;
-    reader.List(ranges.ranges, 36, [](Reader& in, BufferReadRange& range) {
+    reader.List(ranges.ranges, 46, [](Reader& in, BufferReadRange& range) {
         in.Value(range.firstIndex);
         in.Value(range.lastIndex);
         in.Value(range.begin);
@@ -273,6 +281,16 @@ void decodeReadRanges(Reader& reader, BufferReadRanges& ranges) {
         in.Value(range.indexSource);
         in.Value(range.indexOrigin);
         in.Value(range.indexScale);
+        in.List(range.indexExpression, 14, [](Reader& node, BufferIndexNode& entry) {
+            node.Value(entry.op);
+            node.Value(entry.left);
+            node.Value(entry.right);
+            node.Value(entry.low);
+            node.Value(entry.high);
+            if (static_cast<std::uint32_t>(entry.op) >= static_cast<std::uint32_t>(BufferIndexOp::Count)) entry.op = BufferIndexOp::Count;
+        });
+        in.Value(range.blockingOpcode);
+        if (std::any_of(range.indexExpression.begin(), range.indexExpression.end(), [](const BufferIndexNode& entry) { return entry.op == BufferIndexOp::Count; })) range.indexExpression.clear();
         if (static_cast<std::uint32_t>(range.indexSource) >= static_cast<std::uint32_t>(BufferIndexSource::Count) || static_cast<std::uint32_t>(range.indexOrigin) >= static_cast<std::uint32_t>(BufferIndexOrigin::Count)) {
             range.indexSource = BufferIndexSource::None;
             range.indexOrigin = BufferIndexOrigin::Other;

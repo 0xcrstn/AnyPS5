@@ -67,6 +67,16 @@ alignas(256) constexpr std::array<std::uint32_t, 11> ConstantCode{
     0x7e0002ffu, 0x3e800000u, 0x7e0202ffu, 0x00000000u, 0x7e0402ffu, 0x00000000u, 0x7e0602ffu, 0x3f800000u, 0xf800180fu, 0x03020100u, 0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 11> OtherConstantCode{
+    0x7e0002ffu, 0x3f400000u, 0x7e0202ffu, 0x00000000u, 0x7e0402ffu, 0x00000000u, 0x7e0602ffu, 0x3f800000u, 0xf800180fu, 0x03020100u, 0xbf810000u,
+};
+
+constexpr float OtherRed = 0.75f;
+
+alignas(256) constexpr std::array<std::uint32_t, 8> ClampedVertexCode{
+    0x260c0affu, 0x000003ffu, 0xe0382000u, 0x80000006u, 0xbf8c3f70u, 0xf80008cfu, 0x03020100u, 0xbf810000u,
+};
+
 constexpr float ConstantRed = 0.25f;
 constexpr std::uint32_t VertexRecords = 1024;
 constexpr std::uint32_t FirstVertex = 100;
@@ -172,14 +182,14 @@ ShaderRecompiler::RecompileResult CompilePixel(AgcDriver::VulkanDevice& device, 
     return ShaderRecompiler::Recompile(fragment);
 }
 
-void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> descriptor, const PixelProgram& program, bool checkRanges, const std::array<std::uint32_t, 4>& vertexBuffer, std::uint32_t firstVertex) {
+void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> descriptor, const PixelProgram& program, bool checkRanges, const std::array<std::uint32_t, 4>& vertexBuffer, std::uint32_t firstVertex, std::span<const std::uint32_t> vertexCode = VertexCode) {
     const auto target = device.Target();
     constexpr std::uint32_t waveSize = 64;
     std::vector<std::uint32_t> vertexUserData(4, 0u);
     std::copy(vertexBuffer.begin(), vertexBuffer.end(), vertexUserData.begin());
-    const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(VertexCode.data()), std::as_bytes(std::span(VertexCode))}}};
+    const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(vertexCode.data()), std::as_bytes(vertexCode)}}};
     ShaderRecompiler::RecompileRequest vertex{
-        {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(VertexCode.data()), VertexCode, 0, {}},
+        {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(vertexCode.data()), vertexCode, 0, {}},
         {waveSize, 0, vertexUserData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, vertexMemory},
         target,
         {0, 0, 0, 64}
@@ -190,7 +200,9 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
         const auto binding = std::find_if(vertexResult.bindings.begin(), vertexResult.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& candidate) { return candidate.role == ShaderRecompiler::DescriptorRole::GuestBuffers; });
         Require(binding != vertexResult.bindings.end() && binding->bufferReadRanges.size() == 1, "the vertex shader has no guest buffer binding with read ranges");
         const auto& ranges = binding->bufferReadRanges.front();
-        Require(ranges.bounded && ranges.ranges.size() == 1 && ranges.ranges.front().indexSource == ShaderRecompiler::BufferIndexSource::VertexIndex && ranges.ranges.front().indexScale == 1u && ranges.ranges.front().firstIndex == 0u && ranges.ranges.front().lastIndex == 0u && ranges.ranges.front().begin == 0u && ranges.ranges.front().end == 16u, "a buffer_load_dwordx4 at the vertex id was not analysed as reading 16 bytes of the vertex id's record");
+        const bool clamped = vertexCode.data() == ClampedVertexCode.data();
+        const auto expectedSource = clamped ? ShaderRecompiler::BufferIndexSource::Expression : ShaderRecompiler::BufferIndexSource::VertexIndex;
+        Require(ranges.bounded && ranges.ranges.size() == 1 && ranges.ranges.front().indexSource == expectedSource && ranges.ranges.front().begin == 0u && ranges.ranges.front().end == 16u, clamped ? "a buffer_load_dwordx4 at min(vertex id, 1023) was not analysed as an index expression of the vertex id" : "a buffer_load_dwordx4 at the vertex id was not analysed as reading 16 bytes of the vertex id's record");
     }
     const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
     AgcDriver::Graphics::State state{};
@@ -283,6 +295,11 @@ void ReadRangeTests(AgcDriver::VulkanDevice& device, Block& target, Block& input
     Draw(device, color, unused, constant, true, vertexDescriptor, FirstVertex);
     std::memset(input.data, 0, InputBytes);
     ExpectSurface(device, target, layout, ConstantRed, "a draw whose vertex shader loads its position at the vertex id from vertices 100 to 102 of a 1024-vertex buffer");
+    const PixelProgram clampedConstant{OtherConstantCode, 0u, "a constant pixel shader after a clamped fetch"};
+    std::memcpy(input.data + FirstVertex * 16u, Triangle.data(), sizeof(Triangle));
+    Draw(device, color, unused, clampedConstant, true, vertexDescriptor, FirstVertex, ClampedVertexCode);
+    std::memset(input.data, 0, InputBytes);
+    ExpectSurface(device, target, layout, OtherRed, "a draw whose vertex shader loads its position at min(vertex id, 1023) from vertices 100 to 102 of a 1024-vertex buffer");
 }
 
 }

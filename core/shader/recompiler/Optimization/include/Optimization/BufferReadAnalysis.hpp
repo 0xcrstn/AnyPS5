@@ -30,11 +30,13 @@ public:
     std::optional<Interval> Of(const IrValue* value);
     std::optional<Affine> AffineOf(const IrValue* value, std::uint32_t depth = 0);
     BufferIndexOrigin OriginOf(const IrValue* value);
+    std::optional<std::uint8_t> BuildIndex(const IrValue* value, std::vector<BufferIndexNode>& nodes, std::uint16_t& blocking, std::uint32_t depth = 0);
     void Note(BufferReadRanges& ranges, const IrValue& inst, const MemoryInfo& memory);
 
 private:
     static constexpr std::uint32_t MaxAffineDepth = 16;
     static constexpr std::size_t MaxOriginValues = 64;
+    static constexpr std::size_t MaxIndexNodes = 32;
     static constexpr std::size_t MaxDepth = 64;
     std::optional<Interval> compute(const IrValue& value);
     std::unordered_map<const IrValue*, std::optional<Interval>> intervals;

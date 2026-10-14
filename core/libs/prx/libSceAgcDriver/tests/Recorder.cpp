@@ -2423,6 +2423,12 @@ void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
     ShaderRecompiler::BufferReadRanges byVertex;
     byVertex.ranges = {{2u, 5u, 0u, 16u, ShaderRecompiler::BufferIndexSource::VertexIndex, ShaderRecompiler::BufferIndexOrigin::Bounded, 3u}};
     const ShaderResources::DrawIndexRanges draw{10u, 12u, 0u, 0u};
+    ShaderRecompiler::BufferReadRanges byExpression;
+    byExpression.ranges = {{0u, 0u, 0u, 16u, ShaderRecompiler::BufferIndexSource::Expression, ShaderRecompiler::BufferIndexOrigin::VertexIndex, 0u, {{ShaderRecompiler::BufferIndexOp::VertexIndex, 0u, 0u, 0u, 0u}, {ShaderRecompiler::BufferIndexOp::Divide, 0u, 0u, 2u, 0u}}}};
+    const auto halfRanges = ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byExpression, 65536u, &reason, &draw);
+    Require(halfRanges.has_value() && *halfRanges == ShaderResources::ByteRanges{{80u, 112u}}, "records vertex / 2 of vertices 10 to 12 were not placed at bytes 80 to 112");
+    byExpression.ranges.front().indexExpression.front().op = ShaderRecompiler::BufferIndexOp::UserData;
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byExpression, 65536u, &reason, &draw).has_value() && reason == ShaderResources::WholeCopy::IndexAtDraw, "an index expression of an unknown user word was given read ranges");
     const auto vertexRanges = ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byVertex, 65536u, &reason, &draw);
     Require(vertexRanges.has_value() && *vertexRanges == ShaderResources::ByteRanges{{512u, 672u}}, "records 3 * vertex + 2 to 3 * vertex + 5 of vertices 10 to 12 were not placed at bytes 512 to 672");
     Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byVertex, 65536u, &reason).has_value() && reason == ShaderResources::WholeCopy::NoDrawRange, "a vertex-indexed load without the draw's vertex range was given read ranges");
