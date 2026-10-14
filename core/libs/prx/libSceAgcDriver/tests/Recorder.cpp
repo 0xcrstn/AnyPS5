@@ -1716,6 +1716,152 @@ void readWrittenStagingTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+void stagingReuseTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: staging reuse not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 1u << 20u;
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "write watching unavailable: staging reuse not tested\n";
+        return;
+    }
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared staging section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    struct Release {
+        void* block;
+        ~Release() {
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+#else
+    void* block = AllocateWatched(bytes, 65536);
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+#endif
+    std::memset(block, 0x11, bytes);
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    if (HostImportFor(context, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "the staging test block is not imported and watched: staging reuse not tested\n";
+        return;
+    }
+    AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+    constexpr std::uint64_t elementBytes = 32u << 10u;
+    const auto element = address + 65536 + 4096;
+    const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+    const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    struct Use {
+        std::uint64_t copied;
+        std::uint64_t skipped;
+        VkBuffer shadow;
+        std::vector<std::uint8_t> seen;
+    };
+    const auto run = [&](std::uint64_t written, std::uint64_t readBytes, std::uint32_t storeOffset, std::uint32_t storeBytes, std::uint32_t value, bool finish) {
+        const auto before = StagingCounters();
+        Use use{};
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddWritable(written, elementBytes);
+        if (readBytes != 0) memory.AddReadable(written, readBytes);
+        memory.Upload(false);
+        Require(memory.InPlaceReads().empty(), "a written element in the staging window was bound in place");
+        const auto after = StagingCounters();
+        use.copied = (after.staged - after.skipped) - (before.staged - before.skipped);
+        use.skipped = after.skipped - before.skipped;
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(written, elementBytes, adjustment);
+        use.shadow = view.buffer;
+        const auto base = view.offset + adjustment;
+        auto readback = std::make_shared<Buffer>(context, elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferCopy region{base, 0, elementBytes};
+        copy(commands, view.buffer, readback->Handle(), 1, &region);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (storeBytes != 0) fill(commands, view.buffer, base + storeOffset, storeBytes, value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(readback);
+        if (finish) {
+            memory.RecordCopyBacks(recorder);
+            recorder.NotePendingWrites(memory.Writes());
+            memory.MarkDirectWrites();
+        }
+        recorder.Sync();
+        const auto contents = readback->Bytes();
+        use.seen.resize(contents.size());
+        std::memcpy(use.seen.data(), contents.data(), contents.size());
+        if (finish) memory.WriteBack();
+        return use;
+    };
+    const auto all = [](const std::vector<std::uint8_t>& seen, std::uint8_t value) {
+        return std::all_of(seen.begin(), seen.end(), [&](std::uint8_t byte) { return byte == value; });
+    };
+    const auto guestAll = [&](std::uint64_t from, std::uint64_t to, std::uint8_t value) {
+        return std::all_of(guest + (from - address), guest + (to - address), [&](std::uint8_t byte) { return byte == value; });
+    };
+    const auto first = run(element, 0, 0, static_cast<std::uint32_t>(elementBytes), 0xa1a1a1a1u, true);
+    Require(first.copied == 1 && first.skipped == 0, "the first use of a staged element did not copy it in");
+    Require(all(first.seen, 0x11), "the staged copy-in missed the guest bytes");
+    Require(guestAll(element, element + elementBytes, 0xa1) && guestAll(address, element, 0x11) && guestAll(element + elementBytes, address + bytes, 0x11), "the staged copy-back did not store exactly the written element");
+    const auto second = run(element, 0, 256, 256, 0xb2b2b2b2u, true);
+    Require(second.copied == 0 && second.skipped == 1, "an unchanged staged element was copied in again");
+    Require(second.shadow == first.shadow, "an unchanged staged element did not reuse its shadow");
+    Require(all(second.seen, 0xa1), "a reused shadow does not hold the guest bytes");
+    Require(guestAll(element, element + 256, 0xa1) && guestAll(element + 256, element + 512, 0xb2) && guestAll(element + 512, element + elementBytes, 0xa1), "a reused shadow's copy-back did not store the GPU's results");
+    guest[element - address + 1000] = 0xc3;
+    const auto third = run(element, 0, 0, 0, 0, true);
+    Require(third.copied == 1 && third.skipped == 0, "a CPU write into a staged element did not copy it in again");
+    Require(third.seen[1000] == 0xc3 && third.seen[300] == 0xb2 && third.seen[0] == 0xa1, "the shadow missed the CPU write");
+    Require(AgcDriver::GuestMemory::MarkWritten(element + elementBytes + 4096, 256) != 0, "a GPU write next to the element was not stamped");
+    guest[element - address - 1] = 0x44;
+    const auto fourth = run(element, 0, 0, 0, 0, true);
+    Require(fourth.copied == 0 && fourth.skipped == 1, "stores next to a staged element in its write block copied it in again");
+    Require(fourth.seen[1000] == 0xc3 && fourth.seen[300] == 0xb2, "a reused shadow lost the previous use's bytes");
+    Require(AgcDriver::GuestMemory::MarkWritten(element + 2048, 4) != 0, "a GPU write into the element was not stamped");
+    const auto fifth = run(element, 0, 0, 0, 0, true);
+    Require(fifth.copied == 1 && fifth.skipped == 0 && fifth.seen[1000] == 0xc3, "a driver store into a staged element did not copy it in again");
+    const auto lost = run(element, 0, 0, 64, 0xd4d4d4d4u, false);
+    Require(lost.skipped == 1, "an unchanged staged element was copied in again");
+    const auto recovered = run(element, 0, 0, 0, 0, true);
+    Require(recovered.copied == 1 && recovered.skipped == 0 && recovered.seen[0] == 0xa1 && recovered.seen[1000] == 0xc3, "a use that recorded no copy-back left its shadow trusted");
+    Require(guestAll(element, element + 64, 0xa1), "a use without copy-back stored its results");
+    const auto partial = address + 4 * 65536;
+    const auto partialFirst = run(partial, 2 * elementBytes, 0, 0, 0, true);
+    const auto partialSecond = run(partial, 2 * elementBytes, 0, 0, 0, true);
+    Require(partialFirst.copied == 1 && partialSecond.copied == 1 && partialSecond.skipped == 0, "a staged region the shader writes only in part skipped its copy-in");
+    std::cout << "Staging reuse tests passed\n";
+}
+
 void misalignedRegionTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
@@ -6753,6 +6899,10 @@ int main(int argc, char** argv) {
             parkedImportUnmapTests(device);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--staging-reuse-only") {
+            stagingReuseTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--unit-shadow-only") {
             if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
                 std::cout << "skipped, unit shadows or host imports are unavailable\n";
@@ -6817,6 +6967,7 @@ int main(int argc, char** argv) {
         refreshProofTests(device, recorder);
         resourceReadTests(device, recorder);
         readWrittenStagingTests(device, recorder);
+        stagingReuseTests(device, recorder);
         depthSurfaceProofTests(device, recorder);
         multisampleGuestAccessTests(device, recorder);
         misalignedSnapshotTests(device, recorder);
