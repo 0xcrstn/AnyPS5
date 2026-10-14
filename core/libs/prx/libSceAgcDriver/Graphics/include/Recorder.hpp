@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -455,6 +456,18 @@ public:
     enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
+    static constexpr std::uint64_t DrawProgramFlag = std::uint64_t{1} << 63u;
+    static constexpr std::uint64_t VertexOnlyFlag = std::uint64_t{1} << 62u;
+    static constexpr std::uint64_t DrawProgramKey(std::uint64_t address, bool pixel) { return (address & ~(DrawProgramFlag | VertexOnlyFlag)) | DrawProgramFlag | (pixel ? 0u : VertexOnlyFlag); }
+    std::uint32_t BeginDrawProgramTiming(std::uint64_t key);
+    static void NoteProgramWords(std::uint64_t key, std::size_t words);
+    struct GpuProgramTotals {
+        std::uint64_t key = 0;
+        std::uint64_t count = 0;
+        double ms = 0;
+        std::size_t words = 0;
+    };
+    static std::string FormatGpuPrograms(std::vector<GpuProgramTotals> programs, bool draws, std::size_t limit);
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
     // A leading barrier a command left out because the previous trailing barrier covered its
     // accesses (see Commands), on the [barriers] line as 'merged'. Debug aid: APS5_FULL_BARRIERS=1
