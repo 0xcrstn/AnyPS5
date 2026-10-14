@@ -141,9 +141,19 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         key ^= value;
         key *= 0x100000001b3ull;
     };
+    DispatchKeyParts keyParts{address, 0, {}, userData};
+    const auto component = [&](DispatchKeyComponent which, std::uint64_t value) {
+        auto& part = keyParts.components[static_cast<std::size_t>(which)];
+        part ^= value;
+        part *= 0x100000001b3ull;
+    };
     mix(address);
     mix(packet[4] & 0x8000u);
-    for (const auto threads : compute.partialThreads) mix(threads);
+    component(DispatchKeyComponent::WaveSize, packet[4] & 0x8000u);
+    for (const auto threads : compute.partialThreads) {
+        mix(threads);
+        component(DispatchKeyComponent::PartialThreads, threads);
+    }
     for (const auto word : userData) mix(word);
 
     static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
@@ -152,11 +162,13 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const auto found = queue.shader.find(offset);
 
             mix(found == queue.shader.end() ? (1ull << 32u) : found->second);
+            component(DispatchKeyComponent::Registers, found == queue.shader.end() ? (1ull << 32u) : found->second);
         }
     } else {
         for (const auto& [offset, value] : queue.shader) {
             mix(offset);
             mix(value);
+            component(DispatchKeyComponent::Registers, (static_cast<std::uint64_t>(offset) << 32u) | value);
         }
     }
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
@@ -210,6 +222,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    component(DispatchKeyComponent::Shader, reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    keyParts.identity = 0xcbf29ce484222325ull;
+    for (const auto value : {address, static_cast<std::uint64_t>(userData.size())}) {
+        keyParts.identity ^= value;
+        keyParts.identity *= 0x100000001b3ull;
+    }
+    for (const auto value : keyParts.components) {
+        keyParts.identity ^= value;
+        keyParts.identity *= 0x100000001b3ull;
+    }
     if (fromAhead && key != ahead.key) {
         fromAhead = false;
         ++groupStats.keyMismatches;
@@ -233,7 +255,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
         phaseTiming.Phase(PhaseLookup);
     } else {
-        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+        lookupDispatch(address, submission, key, keyParts, registeredShader, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
     }
     timing.Mark("lookup_cache");
     if (cached) {
@@ -283,7 +305,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
-        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        insertDispatch(address, key, keyParts, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
     }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
@@ -308,7 +330,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (cached) ++groupStats.resolvedHits;
         return;
     }
-    if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
+    if (verifyDataHits() && cached && !liveWords.empty()) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
         dispatch(queue, packet, submission, indirectArguments);
