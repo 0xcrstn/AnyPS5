@@ -1053,6 +1053,11 @@ VkFormat AttachmentProxyFormat(const Context& context, VkFormat format) {
 std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
+    static const bool unwatchHooked = [] {
+        GuestMemory::SetUnwatchHook(&StorageTexture::SaveBeforeUnwatch);
+        return true;
+    }();
+    static_cast<void>(unwatchHooked);
     auto texture = std::shared_ptr<StorageTexture>(new StorageTexture(context, detiler, descriptor, mipLevel));
     uploadReason = "first";
     texture->upload();
@@ -1781,7 +1786,13 @@ bool StorageTexture::Refresh() {
             cpuBlocks.assign(generations.size(), 0);
             tracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stampedBlocks, cpuBlocks);
             compared = !tracked && compareUntracked(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), stampedBlocks, true);
-            if (compared) cpuBlocks = stampedBlocks;
+            if (compared) {
+                for (const auto& [from, unitGeneration] : keptAtUnwatch) {
+                    const auto unit = static_cast<std::uint32_t>((from - descriptor.baseAddress) / trackedLayerBytes);
+                    if (keptAtUnwatchHolds(from, unit)) stampedBlocks[static_cast<std::size_t>(from / 65536 - descriptor.baseAddress / 65536)] = GuestMemory::BlockWritten;
+                }
+                cpuBlocks = stampedBlocks;
+            }
         };
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = ProvedKeys();
@@ -3160,6 +3171,63 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     return true;
 }
 
+void StorageTexture::SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes) {
+    std::vector<std::shared_ptr<StorageTexture>> overlapping;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        const auto take = [&](StorageTexture* texture) {
+            if (!texture->overlaps(address, bytes)) return;
+            if (auto alive = texture->weak_from_this().lock()) overlapping.push_back(std::move(alive));
+        };
+        for (auto* texture : pending.textures) take(texture);
+        for (auto* texture : pending.flushing) take(texture);
+    }
+    if (overlapping.empty()) return;
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    for (const auto& texture : overlapping) texture->saveBeforeUnwatch();
+}
+
+void StorageTexture::forgetKeptAtUnwatch(std::uint32_t unit) {
+    const auto begin = layerBegin(unit);
+    keptAtUnwatch.erase(keptAtUnwatch.lower_bound(begin), keptAtUnwatch.lower_bound(begin + layerBytes(unit)));
+}
+
+bool StorageTexture::keptAtUnwatchHolds(std::uint64_t from, std::uint32_t unit) const {
+    const auto found = keptAtUnwatch.find(from);
+    return found != keptAtUnwatch.end() && layerOriginal[unit] && found->second == layerGeneration[unit];
+}
+
+void StorageTexture::saveBeforeUnwatch() {
+    std::vector<bool> units(trackedLayers, false);
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) units[unit] = layerPending[unit] && !layerOriginal[unit] && layerGeneration[unit] != 0;
+    const auto runs = unitRuns(units);
+    if (runs.empty()) return;
+    original.resize(static_cast<std::size_t>(guestBytes));
+    comparedGuestBytes = {};
+    for (const auto& [begin, end] : runs) GuestMemory::ReadCommittedUnsynced(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
+    for (const auto& [begin, end] : runs) GuestMemory::CollectWritesUncached(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
+    constexpr std::uint64_t block = 65536;
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        if (!units[unit]) continue;
+        const auto begin = layerBegin(unit);
+        const auto end = begin + layerBytes(unit);
+        const auto spanBegin = begin & ~(block - 1);
+        const auto spanBlocks = static_cast<std::size_t>((end - spanBegin + block - 1) / block);
+        const std::vector<std::uint64_t> generations(spanBlocks, layerGeneration[unit]);
+        std::vector<std::uint8_t> changedBlocks(spanBlocks);
+        if (!GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), generations, changedBlocks)) continue;
+        forgetKeptAtUnwatch(unit);
+        for (auto at = spanBegin; at < end; at += block) {
+            const auto from = std::max(at, begin);
+            const auto to = std::min(at + block, end);
+            const bool edge = from != at || to != at + block;
+            if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten && (!edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[unit])) && !unchangedSinceBaseline(from, to)) keptAtUnwatch.emplace(from, layerGeneration[unit]);
+        }
+        layerOriginal[unit] = true;
+    }
+}
+
 bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason) {
     if (scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes)) return false;
     std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -4280,7 +4348,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             const auto to = std::min(at + block, end);
             if (from >= to) continue;
             const bool edge = from != at || to != at + block;
-            if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten && (compared[layer] || !edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[layer])) && !unchangedSinceBaseline(from, to)) {
+            if (keptAtUnwatchHolds(from, layer) || (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten && (compared[layer] || !edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[layer])) && !unchangedSinceBaseline(from, to))) {
                 skippedAny = true;
                 skippedLayer[layer] = true;
                 ++skipped;
@@ -4289,6 +4357,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             if (!keep.empty() && keep.back().second == from) keep.back().second = to;
             else keep.emplace_back(from, to);
         }
+    }
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        if (layers[layer]) forgetKeptAtUnwatch(layer);
     }
     // Debug aid: APS5_TRACE_FLUSH also names the blocks a write-back leaves to the CPU.
     static const bool traceKept = std::getenv("APS5_TRACE_FLUSH") != nullptr;

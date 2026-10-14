@@ -63,6 +63,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 bool WriteWatched();
 void Unwatch(std::uint64_t address, std::size_t bytes);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true);
+void SetUnwatchHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
