@@ -5,6 +5,8 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -149,6 +151,7 @@ public:
         protectSubpages(base, written, view.protection, "resume shared memory write");
         view.armed &= static_cast<std::uint8_t>(~written);
         if (!faultSharedWrites()) view.page->deviceWritten &= static_cast<std::uint8_t>(~written);
+        ++statistics.faults;
         return true;
     }
 
@@ -180,6 +183,7 @@ public:
             auto& page = *it->second.page;
             const auto written = subpagesOf(it->first, address, end);
             page.deviceWritten |= written;
+            ++statistics.deviceWrites;
             page.digested &= static_cast<std::uint8_t>(~written);
         }
     }
@@ -251,6 +255,8 @@ public:
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
         std::lock_guard lock(mutex);
+        ++statistics.collections;
+        reportStatistics();
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -403,6 +409,16 @@ private:
     static_assert(subpageBytes == 4096, "Collect reports one page per subpage");
     static constexpr std::size_t subpages = pageBytes / subpageBytes;
     static constexpr std::uint8_t allSubpages = (1u << subpages) - 1;
+    struct Statistics {
+        std::uint64_t collections = 0;
+        std::uint64_t hashed = 0;
+        std::uint64_t changed = 0;
+        std::uint64_t faults = 0;
+        std::uint64_t deviceWrites = 0;
+        std::chrono::steady_clock::duration hashing{};
+        std::map<std::uintptr_t, std::uint64_t> regions;
+        std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    };
     struct SharedPage {
         std::array<std::uint64_t, subpages> generation = [] {
             std::array<std::uint64_t, subpages> initial{};
@@ -506,13 +522,43 @@ private:
     }
 
     void verifyDigests(SharedPage& page, std::uintptr_t base, std::uint8_t mask) {
+        const bool traced = traceWriteTracking();
+        const auto start = traced ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto checked = static_cast<std::uint8_t>(mask & page.digested);
         std::uint8_t changed = 0;
         for (std::size_t sub = 0; sub < subpages; ++sub) {
             const auto bit = static_cast<std::uint8_t>(1u << sub);
-            if ((mask & page.digested & bit) == 0) continue;
+            if ((checked & bit) == 0) continue;
             if (subpageDigest(base + sub * subpageBytes) != page.digest[sub]) changed |= bit;
         }
         if (changed != 0) invalidate(page, changed);
+        if (!traced) return;
+        statistics.hashed += static_cast<std::uint64_t>(std::popcount(static_cast<unsigned>(checked)));
+        statistics.changed += static_cast<std::uint64_t>(std::popcount(static_cast<unsigned>(changed)));
+        statistics.hashing += std::chrono::steady_clock::now() - start;
+        if (changed != 0) statistics.regions[base >> 20] += static_cast<std::uint64_t>(std::popcount(static_cast<unsigned>(changed)));
+    }
+
+    static bool traceWriteTracking() {
+        static const bool traced = [] {
+            const char* value = std::getenv("APS5_TRACE_WRITE_TRACKING");
+            return value != nullptr && *value != '\0' && !(value[0] == '0' && value[1] == '\0');
+        }();
+        return traced;
+    }
+
+    void reportStatistics() {
+        if (!traceWriteTracking()) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - statistics.since < std::chrono::seconds(5)) return;
+        const auto seconds = std::chrono::duration<double>(now - statistics.since).count();
+        std::fprintf(stderr, "[write-tracking] %.0f s: %llu collections, %llu digested subpages checked (%.1f MiB) in %.1f ms, %llu changed, %llu guest write faults, %llu device writes noted\n", seconds, static_cast<unsigned long long>(statistics.collections), static_cast<unsigned long long>(statistics.hashed), static_cast<double>(statistics.hashed) * subpageBytes / 1048576.0, std::chrono::duration<double, std::milli>(statistics.hashing).count(), static_cast<unsigned long long>(statistics.changed), static_cast<unsigned long long>(statistics.faults), static_cast<unsigned long long>(statistics.deviceWrites));
+        std::vector<std::pair<std::uint64_t, std::uintptr_t>> busiest;
+        for (const auto& [region, changes] : statistics.regions) busiest.emplace_back(changes, region);
+        std::sort(busiest.rbegin(), busiest.rend());
+        for (std::size_t i = 0; i < busiest.size() && i < 8; ++i) std::fprintf(stderr, "[write-tracking]   0x%llx: %llu changed subpages\n", static_cast<unsigned long long>(busiest[i].second << 20), static_cast<unsigned long long>(busiest[i].first));
+        statistics = Statistics{};
+        statistics.since = now;
     }
 
     static std::uint8_t subpagesOf(std::uintptr_t base, std::uintptr_t address, std::uintptr_t end) {
@@ -661,6 +707,7 @@ private:
 
     Ranges cleanRanges;
     Ranges freshRanges;
+    Statistics statistics;
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::map<std::uintptr_t, std::size_t> splitAliases;
