@@ -25,11 +25,13 @@ public:
         IrOpcode opcode = IrOpcode::Void;
         std::uint8_t count = 0;
         bool loaded = false;
+        bool clean = false;
         std::uint32_t index = 0;
         std::int64_t immediate = 0;
         std::array<Operand, 5> arguments{};
     };
     struct Source {
+        std::uint32_t index = 0;
         std::uint32_t dwordCount = 0;
         std::array<Operand, 8> dwords{};
     };
@@ -37,21 +39,37 @@ public:
         std::uint32_t flatOffset = 0;
         Operand value;
     };
+    struct Block {
+        bool conditional = false;
+        Operand condition;
+        std::vector<std::uint32_t> successors;
+        std::vector<std::uint32_t> sources;
+        std::vector<std::uint32_t> images;
+    };
+    enum class Outcome : std::uint8_t { Served, Inaccessible, Failed };
 
     static std::shared_ptr<const SrtTape> Compile(const IrResourcePlan& plan, std::span<const std::uint32_t> sources);
     static std::shared_ptr<const SrtTape> For(const IrResourcePlan& plan);
-    bool Run(const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::uint32_t& nullRootReads) const;
+    bool Compiled() const { return refusal == SrtCompiledWalkRefusal::None; }
+    SrtCompiledWalkRefusal Refusal() const { return refusal; }
+    Outcome Run(const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::uint32_t& nullRootReads) const;
     std::size_t Instructions() const { return instructions.size(); }
     std::size_t Reads() const { return reads; }
+    std::size_t Blocks() const { return blocks.size(); }
 
 private:
+    class Runner;
     std::vector<Instruction> instructions;
     std::vector<Source> sources;
     std::vector<FlatRoot> flatRoots;
+    std::vector<Block> blocks;
     std::size_t flatSize = 0;
-    std::size_t activeSize = 0;
+    std::size_t sourceCount = 0;
+    std::size_t imageCount = 0;
     std::uint32_t userDataBase = 0;
     std::size_t reads = 0;
+    bool requiresCleanMemory = false;
+    SrtCompiledWalkRefusal refusal = SrtCompiledWalkRefusal::None;
 };
 
 bool CompiledWalkEnabled();

@@ -106,8 +106,14 @@ struct DrawValidateSplit {
 
 DrawValidateSplit& ThreadDrawValidateSplit();
 
+enum class SnapshotPart : std::uint8_t { None, Buffer, Image, Sampler, FlatData, FlatOther, UserData, UniformFill, Poison, NullRoots, Result, Count };
+inline constexpr std::size_t SnapshotParts = static_cast<std::size_t>(SnapshotPart::Count);
+inline constexpr const char* SnapshotPartNames[SnapshotParts] = {"none", "buffer descriptor", "image descriptor", "sampler", "flat SRT data word (pure leaf)", "flat SRT other word", "user data", "uniform fill", "poisoned read", "null-root reads", "result only"};
+SnapshotPart FirstSnapshotDifference(const ShaderRecompiler::ResourceCapture& full, const ShaderRecompiler::ResourceSnapshot& planned);
+
 struct BindingPlanCounters {
     std::uint64_t draws = 0, decodeHits = 0, decodeMisses = 0, stages = 0, verifiedStages = 0, stageMismatches = 0, verifiedDecodes = 0, decodeMismatches = 0;
+    std::array<std::uint64_t, SnapshotParts> mismatchParts{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

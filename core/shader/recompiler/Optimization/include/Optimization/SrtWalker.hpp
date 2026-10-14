@@ -4,6 +4,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "UserDataUse.hpp"
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <utility>
@@ -37,10 +38,17 @@ struct SrtRuntime {
     bool compiledWalk = false;
 };
 
+enum class SrtCompiledWalkRefusal : std::uint8_t { None, IncompletePlan, Opcode, Phi, VoidHandle, WideSource, Cycle, FlatOffset, UserData, IndirectImage, Count };
+inline constexpr std::size_t SrtCompiledWalkRefusals = static_cast<std::size_t>(SrtCompiledWalkRefusal::Count);
+inline constexpr const char* SrtCompiledWalkRefusalNames[SrtCompiledWalkRefusals] = {"none", "incomplete plan", "unsupported opcode", "variant phi", "void handle", "wide source", "cycle", "flat offset", "user data register", "indirect image"};
+
 struct SrtCompiledWalkCounts {
     std::uint64_t runs = 0;
     std::uint64_t fallbacks = 0;
+    std::uint64_t fallbacksInaccessible = 0;
     std::uint64_t uncompiled = 0;
+    std::uint64_t indirectImages = 0;
+    std::array<std::uint64_t, SrtCompiledWalkRefusals> refusals{};
 };
 [[nodiscard]] SrtCompiledWalkCounts CompiledWalkCounts();
 

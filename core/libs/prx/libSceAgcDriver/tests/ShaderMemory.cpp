@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/RequestMemoryView.hpp"
@@ -10,6 +11,7 @@
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
+#include "Optimization/SrtWalker/SrtTape.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
@@ -1049,7 +1051,245 @@ void verifyCaptureMemo() {
     std::cout << "Capture memo " << (memo ? "on" : "off") << ": " << unchangedUs << " us per capture over unchanged guest words, " << movedUs << " us per capture over a moved pointer to equal guest words, " << changedUs << " us per capture over changed guest words\n";
 }
 
+void verifyCompiledWalkValues() {
+    using namespace ShaderRecompiler;
+    IrResourcePlan plan;
+    plan.srtPlanComplete = true;
+    std::vector<std::unique_ptr<IrValue>> values;
+    const auto make = [&](IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments = {}) -> IrValue& {
+        values.push_back(std::make_unique<IrValue>(opcode, type, static_cast<std::uint32_t>(values.size())));
+        for (auto* argument : arguments) values.back()->AddArgument(argument);
+        return *values.back();
+    };
+    const auto constant = [&](std::uint32_t word) -> IrValue& {
+        auto& result = make(IrOpcode::Void, IrType::U32);
+        result.SetImmediateU32(word);
+        return result;
+    };
+    const auto user = [&](std::uint32_t index) -> IrValue& {
+        auto& reg = make(IrOpcode::Void, IrType::ScalarReg);
+        reg.SetRegister({RegisterBank::Scalar, index});
+        return make(IrOpcode::GetUserData, IrType::U32, {&reg});
+    };
+    const auto handle = [&](IrValue& low, IrValue& high) -> IrValue& { return make(IrOpcode::CompositeConstructU64, IrType::U64, {&low, &high}); };
+    const auto read = [&](IrValue& address, std::uint32_t offset) -> IrValue& {
+        auto& result = make(IrOpcode::LoadAddressU32, IrType::U32, {&address, &constant(offset)});
+        MemoryFlags flags{};
+        flags.index = 0;
+        flags.pc = 0x40u + static_cast<std::uint32_t>(values.size());
+        result.SetFlags(flags);
+        return result;
+    };
+    struct Memory {
+        std::map<std::uint64_t, std::uint32_t> words{{0x10000u, 11u}, {0x10004u, 0u}};
+        std::map<std::uint64_t, std::uint32_t> clean{{0x10000u, 22u}, {0x10004u, 0u}};
+        std::uint64_t inaccessible = 0;
+    } memory;
+    const auto mainRead = +[](void* context, std::uint64_t address, std::uint32_t* word) {
+        const auto& words = static_cast<Memory*>(context)->words;
+        const auto found = words.find(address);
+        if (found == words.end()) return false;
+        *word = found->second;
+        return true;
+    };
+    const auto cleanRead = +[](void* context, std::uint64_t address, std::uint32_t* word) {
+        const auto& words = static_cast<Memory*>(context)->clean;
+        const auto found = words.find(address);
+        if (found == words.end()) return false;
+        *word = found->second;
+        return true;
+    };
+    std::array<std::uint32_t, 4> userData{0x10000u, 0u, 1u, 42u};
+    SrtRuntime runtime{userData};
+    runtime.userContext = &memory;
+    runtime.readMemory = mainRead;
+    runtime.readSpecializationMemory = cleanRead;
+    runtime.accessible = +[](void* context, std::uint64_t address, std::uint64_t) { return address != static_cast<Memory*>(context)->inaccessible; };
+    struct Result {
+        std::vector<DescriptorValue> descriptors;
+        std::vector<std::uint32_t> flat;
+        std::vector<std::uint8_t> active;
+        std::vector<SrtReadPoison> poison;
+        std::uint32_t nullRoots = 0;
+        bool operator==(const Result& other) const = default;
+    };
+    const auto evaluate = [&](bool compiled) {
+        Result result;
+        runtime.compiledWalk = compiled;
+        SrtWalker{}.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, result.descriptors, result.flat, plan.cleanFlatSlots, result.active, &result.poison, &result.nullRoots);
+        return result;
+    };
+    const bool compiledWalk = std::getenv("APS5_NO_COMPILED_WALK") == nullptr;
+    const auto check = [&](bool served, const char* message) {
+        plan.compiledWalk = std::make_shared<CompiledWalkCell>();
+        const auto reference = evaluate(false);
+        const auto before = CompiledWalkCounts();
+        const auto actual = evaluate(true);
+        const auto after = CompiledWalkCounts();
+        require(actual == reference, message);
+        require(after.runs - before.runs == (served && compiledWalk ? 1u : 0u), "compiled walk: the selected plan was not served as configured");
+        return actual;
+    };
+    plan.memoryInfo.push_back({.kind = ResourceKind::ScalarAddress});
+    auto& root = read(handle(user(0), user(1)), 0u);
+    auto& resource = make(IrOpcode::GetSrtResource, IrType::SrtResource);
+    auto& flat = make(IrOpcode::ReadConst, IrType::U32, {&resource, &constant(0u)});
+    plan.srtReads = {{&root, 0u}};
+    plan.cleanFlatSlots = {1u};
+    plan.descriptorSources.resize(3);
+    plan.descriptorSources[0].dwordCount = 1u;
+    plan.descriptorSources[0].dwords[0] = &constant(101u);
+    plan.descriptorSources[2].dwordCount = 1u;
+    plan.descriptorSources[2].dwords[0] = &flat;
+    plan.materializationSources = {2u, 0u};
+    plan.info.images.resize(1);
+    plan.controlFlow = {{&user(2), {1u, 2u}, {}, {}}, {nullptr, {}, {2u}, {0u}}, {nullptr, {}, {0u}, {}}};
+    require(check(true, "compiled walk: reordered active sources or clean slots differ").descriptors[0].dwords[0] == 22u, "compiled walk: a clean slot used runtime memory");
+    userData[2] = 0u;
+    require(check(true, "compiled walk: an inactive reordered source was evaluated").descriptors[0].dwords[0] == 0u, "compiled walk: an inactive source kept its words");
+    runtime.readSpecializationMemory = nullptr;
+    expectFailure([&] { static_cast<void>(evaluate(false)); }, "clean flat slots need specialization memory", "compiled walk: the reference accepted a clean slot without a reader");
+    expectFailure([&] { static_cast<void>(evaluate(true)); }, "clean flat slots need specialization memory", "compiled walk: a clean slot read through a missing reader");
+    runtime.readSpecializationMemory = cleanRead;
+    plan.controlFlow.clear();
+    plan.cleanFlatSlots.clear();
+    plan.materializationSources = {2u};
+    plan.srtReads.clear();
+    auto& maskReg = make(IrOpcode::Void, IrType::VectorReg);
+    maskReg.SetRegister({RegisterBank::Vector, 0u});
+    auto& mask = make(IrOpcode::GetRegister, IrType::U32, {&maskReg});
+    auto& selected = make(IrOpcode::SelectU32, IrType::U32, {&mask, &user(3), &mask});
+    plan.descriptorSources[2].dwords[0] = &make(IrOpcode::ReadFirstLane, IrType::U32, {&selected, &mask});
+    require(check(true, "compiled walk: lane-selected values differ").descriptors[0].dwords[0] == 42u, "compiled walk: the active lane was not selected");
+    auto& nested = read(handle(root, constant(0u)), 0u);
+    plan.descriptorSources[2].dwords[0] = &nested;
+    plan.srtReads = {{&root, 0u}, {&nested, 1u}};
+    memory.words[0x10000u] = 0x20000u;
+    memory.inaccessible = 0x20000u;
+    const auto beforeFallback = CompiledWalkCounts();
+    const auto poisoned = check(false, "compiled walk: inaccessible nested reads changed poison");
+    require(poisoned.poison.size() == 1u && poisoned.poison[0].slot == 1u && poisoned.poison[0].address == 0x20000u && poisoned.poison[0].pc == nested.Flags<MemoryFlags>().pc, "compiled walk: inaccessible nested reads lost their identity");
+    require(CompiledWalkCounts().fallbacksInaccessible - beforeFallback.fallbacksInaccessible == (compiledWalk ? 1u : 0u), "compiled walk: inaccessible nested reads did not fall back");
+    plan.descriptorSources[2].dwords[0] = &root;
+    plan.srtReads = {{&root, 0u}};
+    userData[0] = 0u;
+    require(check(true, "compiled walk: null roots differ").nullRoots == 1u, "compiled walk: null roots were not reported");
+    userData[0] = 0x10000u;
+    plan.requiresSpecializationMemory = true;
+    check(false, "compiled walk: indirect-image fallback differs");
+}
+
+struct CaptureReadHooks {
+    static inline std::uint64_t begin = 0;
+    static inline std::uint64_t end = 0;
+    static inline std::uint64_t generation = 1;
+    static inline std::uint32_t* replaced = nullptr;
+    static inline std::uint32_t replacement = 0;
+    static inline std::uint32_t flushes = 0;
+    static inline std::uint32_t guards = 0;
+    static inline bool pending = false;
+    static inline bool reject = false;
+    static inline bool publish = false;
+
+    static bool Overlaps(std::uint64_t address, std::size_t bytes) { return address < end && begin < address + bytes; }
+    static AgcDriver::ShaderMemory::PendingWrite Query(std::uint64_t address, std::size_t bytes, std::span<std::byte>) {
+        return pending && Overlaps(address, bytes) ? AgcDriver::ShaderMemory::PendingWrite::Sync : AgcDriver::ShaderMemory::PendingWrite::None;
+    }
+    static AgcDriver::ShaderMemory::PendingWrite QueryPending(std::uint64_t address, std::size_t bytes, std::span<std::byte>) {
+        return Overlaps(address, bytes) ? AgcDriver::ShaderMemory::PendingWrite::Sync : AgcDriver::ShaderMemory::PendingWrite::None;
+    }
+    static std::uint64_t Generation() { return generation; }
+    static void Guard(std::uint64_t address, std::size_t bytes) {
+        if (!Overlaps(address, bytes)) return;
+        ++guards;
+        if (reject) throw std::runtime_error("capture read guard");
+        if (publish) {
+            publish = false;
+            pending = true;
+            ++generation;
+        }
+    }
+    static void Flush(std::uint64_t address, std::size_t bytes) {
+        if (!Overlaps(address, bytes)) return;
+        ++flushes;
+        if (replaced != nullptr) *replaced = replacement;
+    }
+    ~CaptureReadHooks() {
+        AgcDriver::GuestMemory::SetReadGuard(nullptr);
+        AgcDriver::GuestMemory::SetFlushHook(nullptr);
+        AgcDriver::ShaderMemory::SetPendingGenerationProvider(nullptr);
+    }
+};
+
+void verifyCaptureReadHooks(const ShaderRecompiler::PreparedShaderInvocation& invocation, std::array<std::uint32_t, 32>& table, std::uint32_t replacement) {
+    using Hooks = CaptureReadHooks;
+    const Hooks reset;
+    Hooks::begin = reinterpret_cast<std::uintptr_t>(table.data());
+    Hooks::end = Hooks::begin + sizeof(table);
+    Hooks::pending = false;
+    Hooks::reject = false;
+    Hooks::publish = false;
+    Hooks::replaced = nullptr;
+    AgcDriver::GuestMemory::SetReadGuard(&Hooks::Guard);
+    AgcDriver::GuestMemory::SetFlushHook(&Hooks::Flush);
+    AgcDriver::ShaderMemory::SetPendingGenerationProvider(&Hooks::Generation);
+    {
+        AgcDriver::ShaderMemory memory({}, &Hooks::Query);
+        static_cast<void>(memory.CaptureValues(invocation));
+    }
+    Hooks::reject = true;
+    expectFailure([&] {
+        AgcDriver::ShaderMemory memory({}, &Hooks::Query);
+        static_cast<void>(memory.CaptureValues(invocation));
+    }, "capture read guard", "capture values: direct reads bypassed the read guard");
+    expectFailure([&] {
+        AgcDriver::ShaderMemory memory({}, &Hooks::Query);
+        static_cast<void>(memory.Capture(invocation));
+    }, "capture read guard", "capture values: traced reads bypassed the read guard");
+    Hooks::reject = false;
+    const auto original = table[0];
+    Hooks::replaced = table.data();
+    Hooks::replacement = replacement;
+    Hooks::pending = true;
+    ++Hooks::generation;
+    const auto capture = [&](AgcDriver::ShaderMemory::PendingWriteQuery query, bool valuesOnly) {
+        Hooks::flushes = 0;
+        Hooks::guards = 0;
+        table[0] = original;
+        AgcDriver::ShaderMemory memory({}, query);
+        const auto result = valuesOnly ? memory.CaptureValues(invocation) : memory.Capture(invocation);
+        require(Hooks::flushes != 0 && Hooks::guards != 0, "capture values: a pending or unclassified page skipped the hooks");
+        require(result->snapshot.images.at(0).dwords[0] == replacement, "capture values: a pending write was not completed before the read");
+        return result;
+    };
+    const auto direct = capture(&Hooks::Query, true);
+    const auto reference = capture(&Hooks::Query, false);
+    require(direct->snapshot.images == reference->snapshot.images && direct->snapshot.flattenedSrt == reference->snapshot.flattenedSrt, "capture values: pending-write reads differ from traced reads");
+    Hooks::pending = false;
+    ++Hooks::generation;
+    Hooks::replaced = nullptr;
+    {
+        AgcDriver::ShaderMemory memory({}, &Hooks::Query);
+        static_cast<void>(memory.CaptureValues(invocation));
+    }
+    Hooks::replaced = table.data();
+    static_cast<void>(capture(&Hooks::QueryPending, true));
+    static_cast<void>(capture(nullptr, true));
+    Hooks::pending = false;
+    ++Hooks::generation;
+    Hooks::replaced = nullptr;
+    {
+        AgcDriver::ShaderMemory memory({}, &Hooks::Query);
+        static_cast<void>(memory.CaptureValues(invocation));
+    }
+    Hooks::replaced = table.data();
+    Hooks::publish = true;
+    static_cast<void>(capture(&Hooks::Query, true));
+    table[0] = original;
+}
+
 void verifyCaptureValues() {
+    verifyCompiledWalkValues();
     using namespace ShaderRecompiler;
     constexpr std::uint32_t Format8888UNorm = 56;
     constexpr std::uint32_t Type2D = 9;
@@ -1102,6 +1342,13 @@ void verifyCaptureValues() {
     const auto sameSnapshot = [](const ResourceSnapshot& a, const ResourceSnapshot& b) {
         return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers && a.flattenedSrt == b.flattenedSrt && a.userData == b.userData && a.uniformFill == b.uniformFill && a.srtPoison == b.srtPoison && a.nullRootReads == b.nullRootReads;
     };
+    const auto sameRegions = [](std::span<const MemoryRegion> a, std::span<const MemoryRegion> b) {
+        if (a.size() != b.size()) return false;
+        for (std::size_t index = 0; index < a.size(); ++index) {
+            if (a[index].guestAddress != b[index].guestAddress || !std::ranges::equal(a[index].bytes, b[index].bytes)) return false;
+        }
+        return true;
+    };
     const auto check = [&](const char* what) {
         const auto prepared = PreparedShaderInvocation::TryCreate(request, handle);
         require(prepared.has_value(), "capture values: the prepared shader does not match its request");
@@ -1113,12 +1360,12 @@ void verifyCaptureValues() {
         require(sameSnapshot(lean->snapshot, reference->snapshot), "capture values: the values-only snapshot differs from the full capture");
         const auto leanRegions = values.Regions();
         const auto fullRegions = full.Regions();
-        require(leanRegions.size() == fullRegions.size(), "capture values: the values-only capture read other guest words");
-        for (std::size_t index = 0; index < leanRegions.size(); ++index) require(leanRegions[index].guestAddress == fullRegions[index].guestAddress && leanRegions[index].bytes.size() == fullRegions[index].bytes.size(), "capture values: the values-only capture read other guest words");
+        require(sameRegions(leanRegions, fullRegions), "capture values: the values-only capture read other guest words or bytes");
         verifyResult(*prepared->MaterializeValues(*lean), *prepared->Materialize(*reference));
         require(lean->userDataUse.reads.empty() && lean->readTrace.otherReads.empty() && lean->bufferBaseWords.empty() && lean->baseSlots.empty(), "capture values: the values-only capture traced its reads");
         return lean;
     };
+    const auto branchBefore = CompiledWalkCounts();
     const auto initial = check("initial tables");
     require(initial->snapshot.images.at(0).dwords[0] == first[0], "capture values: the first T# was not captured");
     fill(tables.first, second, 1u, 4u);
@@ -1133,8 +1380,12 @@ void verifyCaptureValues() {
     require(moved->snapshot.images.at(0).dwords[0] == second[0], "capture values: a moved SRT pointer was not followed");
     userData[2] = 9u;
     require(check("changed unread user word")->snapshot.userData.at(2) == 9u, "capture values: a changed user word was not captured");
+    const auto branchAfter = CompiledWalkCounts();
+    const bool compiledWalk = std::getenv("APS5_NO_COMPILED_WALK") == nullptr;
+    require(branchAfter.runs - branchBefore.runs == (compiledWalk ? 5u : 0u), "capture values: the compiled walk did not serve the branch plan as configured");
 
     constexpr int Iterations = 20000;
+    const auto noPendingWrites = +[](std::uint64_t, std::size_t, std::span<std::byte>) { return AgcDriver::ShaderMemory::PendingWrite::None; };
     const auto prepared = PreparedShaderInvocation::TryCreate(request, handle);
     require(prepared.has_value(), "capture values: the prepared shader stopped matching its request");
     const auto time = [&](auto&& body) {
@@ -1146,11 +1397,11 @@ void verifyCaptureValues() {
         return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / Iterations;
     };
     const auto fullUs = time([&] {
-        AgcDriver::ShaderMemory memory({});
+        AgcDriver::ShaderMemory memory({}, noPendingWrites);
         static_cast<void>(prepared->Materialize(*memory.Capture(*prepared)));
     });
     const auto valuesUs = time([&] {
-        AgcDriver::ShaderMemory memory({});
+        AgcDriver::ShaderMemory memory({}, noPendingWrites);
         static_cast<void>(prepared->MaterializeValues(*memory.CaptureValues(*prepared)));
     });
     std::cout << "Capture and materialize over changed guest words: " << fullUs << " us traced and memoized, " << valuesUs << " us values only" << std::endl;
@@ -1172,8 +1423,7 @@ void verifyCaptureValues() {
         require(sameSnapshot(lean->snapshot, reference->snapshot), "capture values: the compiled walk differs from the traced walk");
         const auto leanRegions = values.Regions();
         const auto fullRegions = full.Regions();
-        require(leanRegions.size() == fullRegions.size(), "capture values: the compiled walk read other guest words");
-        for (std::size_t index = 0; index < leanRegions.size(); ++index) require(leanRegions[index].guestAddress == fullRegions[index].guestAddress && leanRegions[index].bytes.size() == fullRegions[index].bytes.size(), "capture values: the compiled walk read other guest words");
+        require(sameRegions(leanRegions, fullRegions), "capture values: the compiled walk read other guest words or bytes");
         verifyResult(*plainPrepared->MaterializeValues(*lean), *plainPrepared->Materialize(*reference));
         return lean;
     };
@@ -1187,19 +1437,28 @@ void verifyCaptureValues() {
     fill(tables.second, first, 1u, 12u);
     require(checkPlain()->snapshot.images.at(0).dwords[0] == first[0], "capture values: the compiled walk did not follow a moved SRT pointer");
     const auto compiledAfter = CompiledWalkCounts();
-    const bool compiledWalk = std::getenv("APS5_NO_COMPILED_WALK") == nullptr;
     require(compiledAfter.runs - compiledBefore.runs == (compiledWalk ? 3u : 0u) && compiledAfter.fallbacks == compiledBefore.fallbacks, "capture values: the compiled walk did not serve the straight-line plan as configured");
     const auto plainPrepared = PreparedShaderInvocation::TryCreate(plain, plainHandle);
     require(plainPrepared.has_value(), "capture values: the straight-line shader stopped matching its request");
     const auto plainFullUs = time([&] {
-        AgcDriver::ShaderMemory memory({});
+        AgcDriver::ShaderMemory memory({}, noPendingWrites);
         static_cast<void>(plainPrepared->Materialize(*memory.Capture(*plainPrepared)));
     });
     const auto plainValuesUs = time([&] {
-        AgcDriver::ShaderMemory memory({});
+        AgcDriver::ShaderMemory memory({}, noPendingWrites);
         static_cast<void>(plainPrepared->MaterializeValues(*memory.CaptureValues(*plainPrepared)));
     });
     std::cout << "Straight-line shader over changed guest words: " << plainFullUs << " us traced and memoized, " << plainValuesUs << " us values only (compiled walk " << (compiledWalk ? "on" : "off") << ")" << std::endl;
+    verifyCaptureReadHooks(*plainPrepared, tables.second, second[0]);
+    struct alignas(4096) CrossPageTable { std::array<std::uint32_t, 2048> words{}; };
+    static CrossPageTable crossPage;
+    const auto* source = tables.second.data();
+    auto* crossing = crossPage.words.data() + 1020;
+    std::copy_n(source, tables.second.size(), crossing);
+    const auto crossingAddress = reinterpret_cast<std::uintptr_t>(crossing);
+    plainUser[0] = static_cast<std::uint32_t>(crossingAddress);
+    plainUser[1] = static_cast<std::uint32_t>(crossingAddress >> 32u);
+    static_cast<void>(checkPlain());
 }
 
 // A compute program sampling a T# loaded from a table buffer at a runtime key (a bindless image

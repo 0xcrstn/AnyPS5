@@ -53,17 +53,20 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         stageCapture.compiled = invocation.MaterializeValues(*values);
         phaseTiming.Phase(DrawRowRecompile);
         bool mismatch = false;
+        auto part = SnapshotPart::None;
         if (verifyBindingPlan()) {
             const auto full = shaderMemory.Capture(invocation);
             const auto reference = invocation.Materialize(*full);
-            mismatch = !SameSnapshot(full->snapshot, values->snapshot) || !SameStageResult(*reference, *stageCapture.compiled);
+            part = FirstSnapshotDifference(*full, values->snapshot);
+            if (part == SnapshotPart::None && !SameStageResult(*reference, *stageCapture.compiled)) part = SnapshotPart::Result;
+            mismatch = part != SnapshotPart::None;
             if (mismatch) {
                 static std::atomic<std::uint64_t> reports{0};
-                if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[binding-plan] verify: stage %zu (program 0x%llx) differs from the full capture and materialize (snapshot %s)%c", i, static_cast<unsigned long long>(program.binary.codeAddress), SameSnapshot(full->snapshot, values->snapshot) ? "equal" : "differs", 10);
+                if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[binding-plan] verify: stage %zu (program 0x%llx) differs from the full capture and materialize, first in: %s%c", i, static_cast<unsigned long long>(program.binary.codeAddress), SnapshotPartNames[static_cast<std::size_t>(part)], 10);
             }
             phaseTiming.Phase(DrawRowVectors);
         }
-        notePlannedStage(verifyBindingPlan(), mismatch);
+        notePlannedStage(verifyBindingPlan(), mismatch, part);
         return *stageCapture.compiled;
     }
     const auto capture = [&] {
