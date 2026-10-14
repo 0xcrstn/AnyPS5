@@ -23,6 +23,7 @@
 #include <functional>
 #include <list>
 #include <atomic>
+#include <map>
 #include <pthread.h>
 #include <sstream>
 #include <stdexcept>
@@ -484,6 +485,13 @@ std::vector<std::uint32_t> ReadUserDataCallee(std::uint64_t address, std::uint32
     throw std::runtime_error("its callee at " + hexText(address) + " does not return within " + std::to_string(limitWords * 4u) + " bytes");
 }
 
+void NoteUserDataCallees(std::uint64_t caller, std::span<const ShaderRecompiler::UserDataCall> calls, std::span<const std::vector<std::uint32_t>> callees);
+
+bool CalleePreparationDisabled() {
+    static const bool disabled = std::getenv("APS5_NO_CALLEE_PREPARE") != nullptr;
+    return disabled;
+}
+
 std::vector<std::uint32_t> LinkUserDataCallees(const ShaderRecompiler::RecompileRequest& request) {
     if (request.shader.stage != ShaderRecompiler::ShaderStage::Compute) return {};
     const auto code = request.shader.code;
@@ -503,6 +511,7 @@ std::vector<std::uint32_t> LinkUserDataCallees(const ShaderRecompiler::Recompile
                 std::to_string(call.userDataRegister + 1u) + "] at program counter " + hexText(call.programCounter) + ", but " + error.what());
         }
     }
+    NoteUserDataCallees(request.shader.codeAddress, calls, callees);
     return ShaderRecompiler::LinkUserDataCalls(program, calls, callees);
 }
 
@@ -616,6 +625,7 @@ struct RegisteredPreparation {
     std::optional<ShaderRecompiler::RecompileRequest> request;
     std::vector<std::uint64_t> abiKey;
     std::shared_ptr<VulkanDevice> prebuildDevice;
+    bool awaitsCallees = false;
 };
 
 std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, bool* deferred = nullptr) {
@@ -708,7 +718,9 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
         if (const auto counter = ShaderRecompiler::UnresolvableSwappcTarget(plan->decoded, &plan->swappc)) {
             char reason[96];
             std::snprintf(reason, sizeof(reason), "its s_swappc_b64 at program counter 0x%x calls a computed target", *counter);
-            return defer(reason);
+            if (stage != Stage::Compute || CalleePreparationDisabled() || ShaderRecompiler::FindUserDataCalls(plan->decoded, plan->swappc).empty()) return defer(reason);
+            static_cast<void>(defer(reason));
+            plan->awaitsCallees = true;
         }
     }
     plan->memory = {{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
@@ -759,7 +771,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
 
 std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, bool* deferred = nullptr) {
     const auto plan = PlanRegistered(snapshot, device, state, registration, deferred);
-    return plan != nullptr ? PrepareRegistered(*plan) : std::vector<PreparedShaders::Entry>{};
+    return plan != nullptr && !plan->awaitsCallees ? PrepareRegistered(*plan) : std::vector<PreparedShaders::Entry>{};
 }
 
 class RegistrationPreparePool {
@@ -913,6 +925,91 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
         }
         prepared.settled.notify_all();
     }, preparedKey);
+}
+
+struct CalleeWaiter {
+    std::weak_ptr<const ShaderSnapshot> snapshot;
+    std::shared_ptr<const RegisteredPreparation> plan;
+    std::vector<ShaderRecompiler::UserDataCall> calls;
+    std::vector<std::vector<std::uint32_t>> linked;
+};
+
+struct UserDataCallees {
+    std::mutex mutex;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::vector<std::vector<std::uint32_t>>> known;
+    std::vector<CalleeWaiter> waiters;
+};
+
+UserDataCallees& KnownUserDataCallees() {
+    static auto* callees = new UserDataCallees();
+    return *callees;
+}
+
+constexpr std::size_t MaxCalleesPerRegisters = 4;
+
+void PrepareWithKnownCallees(UserDataCallees& state, CalleeWaiter& waiter, std::uint64_t caller) {
+    const auto snapshot = waiter.snapshot.lock();
+    if (snapshot == nullptr || snapshot->codeAddress == caller) return;
+    std::vector<std::vector<std::uint32_t>> callees;
+    for (const auto& call : waiter.calls) {
+        const auto found = state.known.find({call.userDataRegister, call.linkRegister});
+        if (found == state.known.end()) return;
+        callees.push_back(found->second.back());
+    }
+    auto linked = ShaderRecompiler::LinkUserDataCalls(waiter.plan->decoded, waiter.calls, callees);
+    if (std::ranges::find(waiter.linked, linked) != waiter.linked.end()) return;
+    auto& prepared = *snapshot->prepared;
+    {
+        std::lock_guard lock(prepared.mutex);
+        if (prepared.pending) return;
+        prepared.pending = true;
+    }
+    waiter.linked.push_back(linked);
+    if (std::getenv("APS5_TRACE_PREPARATION_WAIT") != nullptr) std::fprintf(stderr, "[shader-prepare] queued compute shader 0x%llx with the user-data callees a dispatch of 0x%llx linked\n", static_cast<unsigned long long>(snapshot->codeAddress), static_cast<unsigned long long>(caller));
+    auto code = std::make_shared<const std::vector<std::uint32_t>>(std::move(linked));
+    SubmitRegistrationPreparation([snapshot, plan = waiter.plan, code] {
+        PerformanceContext timingContext(FrameTiming::Preparation());
+        std::vector<PreparedShaders::Entry> entries;
+        try {
+            auto linkedPlan = *plan;
+            linkedPlan.request->shader.code = *code;
+            linkedPlan.prebuildDevice = nullptr;
+            entries = PrepareRegistered(linkedPlan);
+        } catch (const std::exception& error) {
+            APS5_LOG_ERR("Shader 0x%llx could not be prepared with a callee another dispatch linked: %s", static_cast<unsigned long long>(snapshot->codeAddress), error.what());
+        }
+        auto& prepared = *snapshot->prepared;
+        {
+            std::lock_guard lock(prepared.mutex);
+            prepared.entries.insert(prepared.entries.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
+            prepared.pending = false;
+        }
+        prepared.settled.notify_all();
+    }, &prepared);
+}
+
+void AwaitUserDataCallees(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<const RegisteredPreparation> plan) {
+    auto calls = ShaderRecompiler::FindUserDataCalls(plan->decoded, plan->swappc);
+    auto& state = KnownUserDataCallees();
+    std::lock_guard lock(state.mutex);
+    state.waiters.push_back({snapshot, std::move(plan), std::move(calls), {}});
+    PrepareWithKnownCallees(state, state.waiters.back(), 0);
+}
+
+void NoteUserDataCallees(std::uint64_t caller, std::span<const ShaderRecompiler::UserDataCall> calls, std::span<const std::vector<std::uint32_t>> callees) {
+    if (CalleePreparationDisabled()) return;
+    auto& state = KnownUserDataCallees();
+    std::lock_guard lock(state.mutex);
+    bool added = false;
+    for (std::size_t index = 0; index < calls.size() && index < callees.size(); ++index) {
+        auto& known = state.known[{calls[index].userDataRegister, calls[index].linkRegister}];
+        if (std::ranges::find(known, callees[index]) != known.end() || known.size() == MaxCalleesPerRegisters) continue;
+        known.push_back(callees[index]);
+        added = true;
+    }
+    if (!added) return;
+    std::erase_if(state.waiters, [](const CalleeWaiter& waiter) { return waiter.snapshot.expired(); });
+    for (auto& waiter : state.waiters) PrepareWithKnownCallees(state, waiter, caller);
 }
 
 }
@@ -1312,8 +1409,8 @@ void Driver::RegisterShader(const Shader* shader) {
     if (AsyncRegistrationPrepare()) {
         preparation = PlanRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
         if (preparation != nullptr) preparation->prebuildDevice = localDevice;
-        if (preparation != nullptr && (snapshot.type == 0 || snapshot.type == 1)) BuildRegisteredAbiKey(registered, *localDevice, preparation->abiKey);
-        snapshot.prepared->pending = preparation != nullptr;
+        if (preparation != nullptr && !preparation->awaitsCallees && (snapshot.type == 0 || snapshot.type == 1)) BuildRegisteredAbiKey(registered, *localDevice, preparation->abiKey);
+        snapshot.prepared->pending = preparation != nullptr && !preparation->awaitsCallees;
     } else {
         snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
         if ((snapshot.type == 0 || snapshot.type == 1) && !snapshot.prepared->entries.empty()) {
@@ -1345,7 +1442,8 @@ void Driver::RegisterShader(const Shader* shader) {
         PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(PrepareNullPixelProgram(*localDevice)));
     }
     transaction.Commit();
-    if (preparation != nullptr) PrepareRegisteredInBackground(published, std::move(preparation));
+    if (preparation != nullptr && preparation->awaitsCallees) AwaitUserDataCallees(published, std::move(preparation));
+    else if (preparation != nullptr) PrepareRegisteredInBackground(published, std::move(preparation));
 }
 
 }
