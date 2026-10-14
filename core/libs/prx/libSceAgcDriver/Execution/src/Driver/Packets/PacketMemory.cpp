@@ -131,21 +131,23 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
                 const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
-                if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
+                const bool hostStore = reason == 3 && !Graphics::RegisteredReadableCovers(store->address, bytes.size()) && !localDevice->StoresPendingOver(store->address, bytes.size());
+                if (reason == 0 || reason == 1 || reason == 5 || hostStore) noteLabelStore(store->address, bytes, stamp, submission.queue);
                 if (reason == 0 || reason == 5) {
                     if (reason == 0) ++storesOnGpu;
                     else ++storesBehindCompletions;
                     wroteOnGpu = true;
                     drained = false;
                     outcome = reason == 0 ? "stored on the GPU" : "stored behind completions";
-                } else if (reason == 1) {
+                } else if (reason == 1 || hostStore) {
                     GuestMemory::Write(store->address, bytes, 1);
-                    ++storesOnCpu;
+                    if (reason == 1) ++storesOnCpu;
+                    else ++storesToHostMemory;
                     wroteOnGpu = true;
                     drained = false;
-                    outcome = "stored on the CPU (idle)";
+                    outcome = reason == 1 ? "stored on the CPU (idle)" : "stored on the CPU (not imported)";
                 } else {
-                    outcome = reason == 2 ? "drained (completions)" : reason == 3 ? "drained (not imported)" : "drained (undecodable)";
+                    outcome = reason == 2 ? "drained (completions)" : reason == 3 ? "drained (not imported, stores pending)" : "drained (undecodable)";
                 }
                 Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
             }

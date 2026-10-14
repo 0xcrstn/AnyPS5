@@ -512,6 +512,46 @@ void testCopyIntoHostMemory() {
     GuestHeap::GuestHeapFree_nid_postfix(produced);
 }
 
+std::array<std::uint32_t, 7> memoryFill(const void* destination, std::uint32_t value, std::uint32_t bytes) {
+    const auto to = reinterpret_cast<std::uintptr_t>(destination);
+    return {0xc0055000, 0x40000000, value, 0, static_cast<std::uint32_t>(to), static_cast<std::uint32_t>(static_cast<std::uint64_t>(to) >> 32u), bytes};
+}
+
+void testSmallStoresIntoHostMemory() {
+    constexpr std::size_t busyWords = 1024u * 1024u;
+    constexpr auto busyBytes = static_cast<std::uint32_t>(busyWords * 4);
+    constexpr std::size_t words = 1024;
+    constexpr auto bytes = static_cast<std::uint32_t>(words * 4);
+    constexpr std::uint32_t pattern = 0x5eedf00du;
+    auto* produced = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, busyBytes));
+    auto* source = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, busyBytes));
+    auto* busy = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, busyBytes));
+    auto* readBack = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, bytes));
+    std::vector<std::uint32_t> copied(words), filled(words);
+    for (std::size_t i = 0; i < busyWords; ++i) {
+        produced[i] = 0xc0000000u | static_cast<std::uint32_t>(i);
+        source[i] = 0x3f000000u | static_cast<std::uint32_t>(i);
+    }
+    std::fill(readBack, readBack + words, 0u);
+    const auto hostStoresBefore = AgcDriver::DriverDetail::storesToHostMemory.load();
+    const auto drainedBefore = AgcDriver::DriverDetail::storesDrained.load();
+    alignas(64) static volatile std::uint32_t done = 0;
+    done = 0;
+    submit(0, commands(memoryCopy(source, produced, busyBytes), memoryCopy(copied.data(), source, bytes), memoryCopy(busy, produced, busyBytes), memoryFill(filled.data(), pattern, bytes), memoryCopy(readBack, filled.data(), bytes), writeData(&done, 1)));
+    waitFor(&done, 1, "the label after small stores into host memory never landed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(std::equal(copied.begin(), copied.end(), produced), "a small copy into host memory did not see the GPU copy into its source");
+    check(std::all_of(filled.begin(), filled.end(), [](std::uint32_t word) { return word == pattern; }), "a small fill into host memory did not land");
+    check(std::all_of(readBack, readBack + words, [](std::uint32_t word) { return word == pattern; }), "a later copy did not read a small fill into host memory");
+    check(AgcDriver::DriverDetail::storesDrained.load() == drainedBefore, "a small store into host memory drained the device");
+    check(AgcDriver::DriverDetail::storesToHostMemory.load() > hostStoresBefore, "a small store into host memory behind recorded work was not stored on the CPU");
+    check(std::equal(busy, busy + busyWords, produced), "a GPU copy recorded around small stores into host memory lost bytes");
+    GuestHeap::GuestHeapFree_nid_postfix(readBack);
+    GuestHeap::GuestHeapFree_nid_postfix(busy);
+    GuestHeap::GuestHeapFree_nid_postfix(source);
+    GuestHeap::GuestHeapFree_nid_postfix(produced);
+}
+
 void testShaderHeaderAlignment() {
     alignas(256) static const std::array<std::uint32_t, 64> code{0xbf810000};
     struct Header {
@@ -800,6 +840,7 @@ int main(int argc, char** argv) {
         testShaderHeaderAlignment();
         testHeaderWithoutProgramAddress();
         testCopyIntoHostMemory();
+        testSmallStoresIntoHostMemory();
         testRegisteredFloatMode();
         testReadOnlyResummarize();
         testWorkerFailure();
