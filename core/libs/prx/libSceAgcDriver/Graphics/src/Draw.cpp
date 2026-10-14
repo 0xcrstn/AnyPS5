@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -621,6 +622,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     }
     std::fprintf(stderr, "%s\n", line);
     reportRecordParts(profile);
+    DrawSnapshotArena::ReportActive();
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
@@ -1676,15 +1678,14 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     };
     if (bindings != nullptr) {
         for (const auto& snapshot : bindings->snapshots) {
-            const auto bytes = snapshot.buffer->Bytes();
-            addSample(snapshot.address, bytes.size(), snapshot.buffer->Handle(), 0, bytes.data());
+            addSample(snapshot.address, snapshot.bytes.size(), snapshot.handle, snapshot.offset, snapshot.bytes.data());
         }
     }
     for (const auto& [begin, end] : resources.InPlaceReads()) {
         Require(end >= begin, "invalid capture input range");
         const auto bytes = static_cast<std::size_t>(end - begin);
         if (bytes == 0 || bytes > 512) continue;
-        if (bindings != nullptr && std::any_of(bindings->snapshots.begin(), bindings->snapshots.end(), [&](const auto& snapshot) { return snapshot.address < end && begin < snapshot.address + snapshot.buffer->Bytes().size(); })) continue;
+        if (bindings != nullptr && std::any_of(bindings->snapshots.begin(), bindings->snapshots.end(), [&](const auto& snapshot) { return snapshot.address < end && begin < snapshot.address + snapshot.bytes.size(); })) continue;
         if (resources.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes)) {
             CaptureTrace::Log("input-skip draw=%llu batch=%llu address=%llx bytes=%zu reason=gpu-writer", draw, batch, static_cast<unsigned long long>(begin), bytes);
             continue;

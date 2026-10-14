@@ -137,6 +137,9 @@ public:
         struct Snapshot {
             std::uint64_t address;
             std::shared_ptr<Buffer> buffer;
+            VkBuffer handle = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            std::span<const std::byte> bytes;
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation fragmentAllocation;
@@ -157,6 +160,8 @@ public:
         std::uint64_t skipped = 0;
         std::uint64_t copiedBytes = 0;
         std::uint64_t descriptorWrites = 0;
+        std::uint64_t arenaHits = 0;
+        std::uint64_t arenaCopies = 0;
         double checkUs = 0;
         double collectUs = 0;
         double lookupUs = 0;

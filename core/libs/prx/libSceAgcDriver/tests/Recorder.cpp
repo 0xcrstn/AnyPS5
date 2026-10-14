@@ -27,6 +27,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "ResidentPresent.hpp"
+#include "DrawSnapshotArena.hpp"
 #include "SampleLod_spv.h"
 #include "BufferUpdate_spv.h"
 #include "SampleArray_spv.h"
@@ -6594,6 +6595,10 @@ int main(int argc, char** argv) {
         }
 #endif
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
+        if (argc == 2 && (std::string_view(argv[1]) == "--draw-snapshot-arena-only" || std::string_view(argv[1]) == "--benchmark-draw-snapshot-arena")) {
+            const bool ran = std::string_view(argv[1]) == "--draw-snapshot-arena-only" ? RunDrawSnapshotArenaTests(device.GetContext()) : RunDrawSnapshotArenaBenchmark(device.GetContext());
+            return ran ? 0 : 77;
+        }
         Recorder recorder(device.GetContext());
         recorder.Activate();
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {

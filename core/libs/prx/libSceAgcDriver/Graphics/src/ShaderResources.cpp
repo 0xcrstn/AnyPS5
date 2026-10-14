@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -3608,7 +3609,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
             }
             selected.push_back(index);
-            result->snapshots.push_back({0, std::move(buffer)});
+            const auto wordHandle = buffer->Handle();
+            const auto wordBytes = buffer->Bytes();
+            result->snapshots.push_back({0, std::move(buffer), wordHandle, 0, wordBytes});
             if (statistics != nullptr && held != movedWordBuffers.end()) {
                 ++statistics->reused;
             } else if (statistics != nullptr) {
@@ -3638,6 +3641,23 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         lap(&DrawBindingsStatistics::checkUs);
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        if (DrawSnapshotArena::Enabled()) {
+            if (const auto view = recorder.SnapshotArena().Take(recorder, begin, bytes, registryGeneration)) {
+                lap(view->copied ? &DrawBindingsStatistics::copyUs : &DrawBindingsStatistics::lookupUs);
+                if (statistics != nullptr && view->copied) {
+                    ++statistics->copied;
+                    ++statistics->arenaCopies;
+                    statistics->copiedBytes += bytes;
+                } else if (statistics != nullptr) {
+                    ++statistics->reused;
+                    ++statistics->arenaHits;
+                }
+                selected.push_back(index);
+                result->snapshots.push_back({begin, nullptr, view->buffer, view->offset, view->bytes});
+                totalSnapshotBytes += bytes;
+                continue;
+            }
+        }
         if (!stamped) {
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
@@ -3677,7 +3697,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         lap(&DrawBindingsStatistics::keepUs);
         selected.push_back(index);
-        result->snapshots.push_back({begin, std::move(buffer)});
+        const auto snapshotHandle = buffer->Handle();
+        const auto snapshotBytes = buffer->Bytes();
+        result->snapshots.push_back({begin, std::move(buffer), snapshotHandle, 0, snapshotBytes});
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
@@ -3712,12 +3734,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
             if (snapshotIndex == selected.size()) continue;
             const auto& snapshot = result->snapshots[snapshotIndex];
-            buffers[offset + element] = {snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()};
+            buffers[offset + element] = {snapshot.handle, snapshot.offset, snapshot.bytes.size()};
         }
     }
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    for (const auto& snapshot : result->snapshots) {
+        if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    }
     if (statistics != nullptr) statistics->descriptorWrites += writes.size();
     lap(&DrawBindingsStatistics::updateUs);
     return result;
