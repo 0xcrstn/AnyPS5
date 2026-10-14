@@ -139,6 +139,9 @@ public:
             std::uint64_t address;
             std::shared_ptr<Buffer> buffer;
             std::shared_ptr<Buffer> twin = {};
+            VkBuffer handle = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            std::span<const std::byte> bytes;
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation fragmentAllocation;
@@ -169,6 +172,8 @@ public:
         std::uint64_t uncopiedBytes = 0;
         std::array<std::uint64_t, static_cast<std::size_t>(WholeCopy::Count)> wholeCopies{};
         std::array<std::uint64_t, static_cast<std::size_t>(WholeCopy::Count)> wholeBytes{};
+        std::uint64_t arenaHits = 0;
+        std::uint64_t arenaCopies = 0;
         double checkUs = 0;
         double collectUs = 0;
         double lookupUs = 0;

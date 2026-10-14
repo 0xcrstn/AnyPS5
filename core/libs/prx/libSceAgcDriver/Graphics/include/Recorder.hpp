@@ -26,6 +26,7 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
+class DrawSnapshotArena;
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -91,6 +92,8 @@ public:
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
+    bool KeepOnce(std::shared_ptr<void> object, std::size_t bytes);
+    DrawSnapshotArena& SnapshotArena();
     std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
     void FlushDeferredReleases();
     static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
@@ -864,6 +867,7 @@ private:
         std::shared_ptr<Buffer> buffer;
     };
     std::unordered_map<std::uint64_t, UnwrittenSnapshot> unwrittenSnapshots;
+    std::unique_ptr<DrawSnapshotArena> snapshotArena;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     void retireSnapshot(std::shared_ptr<void> object);
