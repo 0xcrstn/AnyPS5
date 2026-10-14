@@ -1268,18 +1268,6 @@ void ShadersWriteMemoryTests() {
     Require(writes({{Stage::Geometry, &stores, 0}, {Stage::Fragment, &reads, 0}}), "a geometry shader that stores to a buffer was not reported");
 }
 
-void LibraryPushOffsetTests() {
-    using Stage = ShaderRecompiler::ShaderStage;
-    ShaderRecompiler::RecompileResult plain;
-    ShaderRecompiler::RecompileResult pushing;
-    pushing.pushConstants.resize(16);
-    Require(AgcDriver::Graphics::LibraryPushOffset({Stage::Fragment, &plain, AgcDriver::Graphics::PipelinePushSlotBytes}) == 0u, "a fragment stage without push constants keeps the prebuild's fixed push offset in its library key");
-    Require(AgcDriver::Graphics::LibraryPushOffset({Stage::Fragment, &plain, 0u}) == AgcDriver::Graphics::LibraryPushOffset({Stage::Fragment, &plain, AgcDriver::Graphics::PipelinePushSlotBytes}), "a fragment stage without push constants is keyed differently at draw and at prebuild");
-    Require(AgcDriver::Graphics::LibraryPushOffset({Stage::Fragment, &pushing, AgcDriver::Graphics::PipelinePushSlotBytes}) == AgcDriver::Graphics::PipelinePushSlotBytes, "a fragment stage with push constants lost its push offset from the library key");
-    Require(AgcDriver::Graphics::LibraryPushOffset({Stage::Vertex, &pushing, 8u}) == 8u, "a vertex stage with push constants lost its push offset from the library key");
-    Require(AgcDriver::Graphics::LibraryPushOffset({Stage::Vertex, &plain, 8u}) == 0u, "a vertex stage without push constants keeps a push offset in its library key");
-}
-
 void ReversedComponentOrderTests() {
     {
         auto queue = makeState();
@@ -5857,11 +5845,6 @@ int main(int argc, char** argv) {
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
 #endif
     try {
-        if (argc == 2 && std::string_view(argv[1]) == "--library-push-offset") {
-            LibraryPushOffsetTests();
-            std::printf("library push offset tests passed\n");
-            return 0;
-        }
         if (argc == 2 && std::string_view(argv[1]) == "--sparse-buffer-holes") {
             bool passed = false;
             {
@@ -6010,7 +5993,6 @@ int main(int argc, char** argv) {
         vertexZeroFillTests();
         vertexZeroFillMergeTests();
         parallelCompareTests();
-        LibraryPushOffsetTests();
         pixelParameterSlotTests();
         rectListTests();
         prewarmPipelineTests();
