@@ -1716,4 +1716,100 @@ std::vector<UserDataCallee> LoadUserDataCallees() {
     return callees;
 }
 
+namespace {
+
+constexpr std::size_t ShaderUseRecordBytes = 16u;
+constexpr std::uint64_t ShaderUseSeed = 0x45535553u;
+
+std::uint32_t shaderUseCheck(std::span<const std::byte> record) {
+    return static_cast<std::uint32_t>(HashBytes(record.first(12u), ShaderUseSeed));
+}
+
+struct ShaderUseAppender {
+    std::mutex mutex;
+    std::ofstream file;
+    bool opened = false;
+};
+
+ShaderUseAppender& shaderUseAppender() {
+    static auto* appender = new ShaderUseAppender();
+    return *appender;
+}
+
+}
+
+std::filesystem::path ShaderUseFile() {
+    const auto root = ShaderCacheDirectory();
+    return root.empty() ? std::filesystem::path{} : root / "shader-use.bin";
+}
+
+std::vector<std::byte> EncodeShaderUse(const ShaderUse& use) {
+    std::vector<std::byte> record(ShaderUseRecordBytes);
+    std::memcpy(record.data(), &use.key, sizeof(use.key));
+    std::memcpy(record.data() + 8u, &use.firstUseMs, sizeof(use.firstUseMs));
+    const auto check = shaderUseCheck(record);
+    std::memcpy(record.data() + 12u, &check, sizeof(check));
+    return record;
+}
+
+ShaderUses DecodeShaderUses(std::span<const std::byte> file, std::size_t* records) {
+    ShaderUses uses;
+    std::size_t valid = 0;
+    for (std::size_t offset = 0; offset + ShaderUseRecordBytes <= file.size(); offset += ShaderUseRecordBytes) {
+        const auto record = file.subspan(offset, ShaderUseRecordBytes);
+        std::uint32_t check = 0;
+        std::memcpy(&check, record.data() + 12u, sizeof(check));
+        if (check != shaderUseCheck(record)) continue;
+        ShaderUse use;
+        std::memcpy(&use.key, record.data(), sizeof(use.key));
+        std::memcpy(&use.firstUseMs, record.data() + 8u, sizeof(use.firstUseMs));
+        ++valid;
+        const auto [found, inserted] = uses.try_emplace(use.key, use.firstUseMs);
+        if (!inserted) found->second = std::min(found->second, use.firstUseMs);
+    }
+    if (records != nullptr) *records = valid;
+    return uses;
+}
+
+const ShaderUses& EarlierShaderUses() {
+    static const auto* uses = [] {
+        auto* loaded = new ShaderUses();
+        const auto path = ShaderUseFile();
+        std::vector<std::byte> bytes;
+        if (path.empty() || !ReadWholeFile(path, bytes)) return loaded;
+        std::size_t records = 0;
+        *loaded = DecodeShaderUses(bytes, &records);
+        if (records == loaded->size() && bytes.size() == records * ShaderUseRecordBytes) return loaded;
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> ordered(loaded->begin(), loaded->end());
+        std::ranges::sort(ordered, [](const auto& left, const auto& right) { return left.second != right.second ? left.second < right.second : left.first < right.first; });
+        std::vector<std::byte> compacted;
+        compacted.reserve(ordered.size() * ShaderUseRecordBytes);
+        for (const auto& [key, firstUseMs] : ordered) {
+            const auto record = EncodeShaderUse({key, firstUseMs});
+            compacted.insert(compacted.end(), record.begin(), record.end());
+        }
+        static_cast<void>(WriteFileAtomically(path, compacted));
+        return loaded;
+    }();
+    return *uses;
+}
+
+void StoreShaderUse(const ShaderUse& use) {
+    const auto path = ShaderUseFile();
+    if (path.empty()) return;
+    static_cast<void>(EarlierShaderUses());
+    auto& appender = shaderUseAppender();
+    std::lock_guard lock(appender.mutex);
+    if (!appender.opened) {
+        appender.opened = true;
+        std::error_code error;
+        std::filesystem::create_directories(path.parent_path(), error);
+        appender.file.open(path, std::ios::binary | std::ios::app);
+    }
+    if (!appender.file) return;
+    const auto record = EncodeShaderUse(use);
+    appender.file.write(reinterpret_cast<const char*>(record.data()), static_cast<std::streamsize>(record.size()));
+    appender.file.flush();
+}
+
 }

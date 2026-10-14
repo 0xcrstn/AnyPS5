@@ -11,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ShaderRecompiler::ShaderDiskCache {
@@ -91,6 +92,18 @@ struct UserDataCallee {
 [[nodiscard]] std::filesystem::path UserDataCalleeDirectory();
 void StoreUserDataCallee(const UserDataCallee& callee);
 [[nodiscard]] std::vector<UserDataCallee> LoadUserDataCallees();
+
+struct ShaderUse {
+    std::uint64_t key = 0;
+    std::uint32_t firstUseMs = 0;
+};
+using ShaderUses = std::unordered_map<std::uint64_t, std::uint32_t>;
+
+[[nodiscard]] std::filesystem::path ShaderUseFile();
+[[nodiscard]] std::vector<std::byte> EncodeShaderUse(const ShaderUse& use);
+[[nodiscard]] ShaderUses DecodeShaderUses(std::span<const std::byte> file, std::size_t* records = nullptr);
+[[nodiscard]] const ShaderUses& EarlierShaderUses();
+void StoreShaderUse(const ShaderUse& use);
 
 }
 

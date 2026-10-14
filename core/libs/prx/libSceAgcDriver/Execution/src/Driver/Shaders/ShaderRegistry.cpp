@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/SlowReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/PreparationQueue.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostThread.hpp"
@@ -12,6 +13,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "CompiledVariant.hpp"
 #include "ShaderDiskCache.hpp"
+#include "ShaderCacheDirectory.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
@@ -31,6 +33,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
+#include <chrono>
+#include <limits>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 namespace AgcDriver::DriverDetail {
@@ -149,7 +154,57 @@ bool RawGraphicsDrawn() {
 
 namespace {
 
+bool UseOrderedPreparation() {
+    static const bool ordered = std::getenv("APS5_NO_USE_ORDER") == nullptr;
+    return ordered;
+}
+
+std::chrono::steady_clock::time_point UseClockStart() {
+    static const auto start = std::chrono::steady_clock::now();
+    return start;
+}
+
+struct RecordedUses {
+    std::mutex mutex;
+    std::unordered_set<std::uint64_t> keys;
+};
+
+RecordedUses& RecordedShaderUses() {
+    static auto* recorded = new RecordedUses();
+    return *recorded;
+}
+
+void NoteRegisteredUse(PreparedShaders& prepared) {
+    if (prepared.useKey == 0 || prepared.used.exchange(true)) return;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - UseClockStart()).count();
+    const auto firstUseMs = static_cast<std::uint32_t>(std::clamp<std::int64_t>(elapsed, 0, std::numeric_limits<std::uint32_t>::max()));
+    const auto& earlier = ShaderRecompiler::ShaderDiskCache::EarlierShaderUses();
+    const auto known = earlier.find(prepared.useKey);
+    if (known != earlier.end() && known->second <= firstUseMs) return;
+    auto& recorded = RecordedShaderUses();
+    {
+        std::lock_guard lock(recorded.mutex);
+        if (!recorded.keys.insert(prepared.useKey).second) return;
+    }
+    ShaderRecompiler::ShaderDiskCache::StoreShaderUse({prepared.useKey, firstUseMs});
+}
+
+void AssignUseRank(ShaderSnapshot& snapshot) {
+    if (!UseOrderedPreparation()) return;
+    static_cast<void>(UseClockStart());
+    auto key = ShaderRecompiler::HashBytes(std::as_bytes(std::span(snapshot.code)), 0x55534500u + snapshot.type);
+    if (key == 0) key = 1;
+    auto& prepared = *snapshot.prepared;
+    prepared.useKey = key;
+    const auto& earlier = ShaderRecompiler::ShaderDiskCache::EarlierShaderUses();
+    static std::atomic<bool> reported{false};
+    if (!earlier.empty() && !reported.exchange(true)) APS5_LOG_OUT("%zu shaders were used in earlier runs; registered ones among them are prepared before the others, earliest first use first (APS5_NO_USE_ORDER=1 keeps registration order)", earlier.size());
+    const auto found = earlier.find(key);
+    if (found != earlier.end()) prepared.useRank = found->second;
+}
+
 void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock) {
+    NoteRegisteredUse(prepared);
     if (prepared.pending) PrioritizeRegistrationPreparation(prepared);
     prepared.settled.wait(lock, [&] { return !prepared.pending; });
     if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
@@ -929,8 +984,7 @@ public:
         {
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
-                if (!behind && prepared != nullptr && prepared->demanded.load()) tasks.push_front({std::move(task), prepared});
-                else tasks.push_back({std::move(task), prepared});
+                tasks.Push(std::move(task), prepared, prepared != nullptr ? prepared->useRank : Queue::Unranked, prepared != nullptr && prepared->demanded.load(), behind);
                 lock.unlock();
                 ready.notify_one();
                 return;
@@ -945,19 +999,18 @@ public:
 
     void Prioritize(const PreparedShaders& prepared) {
         std::lock_guard lock(mutex);
-        const auto found = std::ranges::find_if(tasks, [&](const auto& task) { return task.prepared == &prepared; });
-        if (found == tasks.end()) return;
-        if (std::getenv("APS5_TRACE_PREPARATION_WAIT") != nullptr) std::fprintf(stderr, "[shader-prepare] demanded queued task at position %zu of %zu\n", static_cast<std::size_t>(std::distance(tasks.begin(), found)), tasks.size());
-        std::rotate(tasks.begin(), found, std::next(found));
+        const auto position = tasks.Prioritize(&prepared);
+        if (position.has_value() && std::getenv("APS5_TRACE_PREPARATION_WAIT") != nullptr) std::fprintf(stderr, "[shader-prepare] demanded queued task at position %zu of %zu\n", *position, tasks.Size());
     }
 
     void Count(RegistrationBacklog& backlog, bool prebuild) {
         std::lock_guard lock(mutex);
         if (prebuild) {
-            backlog.prebuildsQueued = tasks.size();
+            backlog.prebuildsQueued = tasks.Size();
             return;
         }
-        backlog.queued = tasks.size();
+        backlog.queued = tasks.Size();
+        backlog.queuedByUse = tasks.RankedSize();
         backlog.running = running;
         backlog.threads = threads;
     }
@@ -965,7 +1018,7 @@ public:
     void Close() {
         std::unique_lock lock(mutex);
         closed = true;
-        idle.wait(lock, [&] { return tasks.empty() && running == 0; });
+        idle.wait(lock, [&] { return tasks.Empty() && running == 0; });
     }
 
 private:
@@ -979,34 +1032,30 @@ private:
         auto& pool = *static_cast<RegistrationPreparePool*>(argument);
         if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("shader prepare", TraceThread::DefaultCapacity / 8);
         for (;;) {
-            Task task;
+            std::function<void()> task;
             {
                 std::unique_lock lock(pool.mutex);
-                pool.ready.wait(lock, [&] { return !pool.tasks.empty(); });
-                task = std::move(pool.tasks.front());
-                pool.tasks.pop_front();
+                pool.ready.wait(lock, [&] { return !pool.tasks.Empty(); });
+                task = pool.tasks.Pop();
                 ++pool.running;
             }
-            task.function();
+            task();
             task = {};
             {
                 std::lock_guard lock(pool.mutex);
                 --pool.running;
-                if (pool.tasks.empty() && pool.running == 0) pool.idle.notify_all();
+                if (pool.tasks.Empty() && pool.running == 0) pool.idle.notify_all();
             }
         }
         return nullptr;
     }
 
-    struct Task {
-        std::function<void()> function;
-        const PreparedShaders* prepared = nullptr;
-    };
+    using Queue = PreparationQueue<std::function<void()>>;
 
     std::mutex mutex;
     std::condition_variable ready;
     std::condition_variable idle;
-    std::deque<Task> tasks;
+    Queue tasks;
     unsigned threads = 0;
     unsigned running = 0;
     bool closed = false;
@@ -1650,6 +1699,7 @@ void Driver::RegisterShader(const Shader* shader) {
     registered.context = snapshot.registeredState->context;
     registered.userConfig = snapshot.registeredState->userConfig;
     std::shared_ptr<RegisteredPreparation> preparation;
+    AssignUseRank(snapshot);
     if (AsyncRegistrationPrepare()) {
         preparation = PlanRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
         if (preparation != nullptr && !RegistrationPrepareAdmitted()) {
