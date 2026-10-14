@@ -1,6 +1,7 @@
 #include "prx/libc/include/general/LogMacros.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/SlowReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -32,6 +33,11 @@
 namespace AgcDriver::DriverDetail {
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
+    const SlowReport slow([&] {
+        char text[192];
+        std::snprintf(text, sizeof(text), "shader 0x%llx stage %u preparation (%s, %zu code dwords)", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.shader.stage), preparation != nullptr ? "ahead of use" : "at use", request.shader.code.size());
+        return std::string(text);
+    });
     std::exception_ptr failure;
     std::string dump;
     try {
