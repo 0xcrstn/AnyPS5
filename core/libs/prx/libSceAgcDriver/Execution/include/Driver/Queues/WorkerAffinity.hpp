@@ -9,6 +9,10 @@ std::uint64_t WorkerAffinityMask();
 
 void PinWorkerThread(const char* role);
 
+std::uint64_t PreparationAffinityMask();
+
+void PinPreparationThread(const char* role);
+
 }
 
 #endif

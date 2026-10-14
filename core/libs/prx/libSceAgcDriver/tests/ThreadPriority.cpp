@@ -33,6 +33,20 @@ void ParseTests() {
     }
 }
 
+void PreparationParseTests() {
+    for (const char* text : {static_cast<const char*>(nullptr), "", "below"}) Require(ParsePreparationPriorityMode(text) == PreparationPriorityMode::BelowNormal, std::string("APS5_PREPARE_PRIORITY=") + (text == nullptr ? "(unset)" : text) + " must lower the preparation threads");
+    Require(ParsePreparationPriorityMode("normal") == PreparationPriorityMode::Normal, "APS5_PREPARE_PRIORITY=normal must leave the preparation threads alone");
+    for (const char* text : {"high", "BELOW", "idle", "0", " normal"}) {
+        bool threw = false;
+        try {
+            static_cast<void>(ParsePreparationPriorityMode(text));
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        Require(threw, std::string("APS5_PREPARE_PRIORITY=") + text + " must be rejected");
+    }
+}
+
 void ExpectRefused(const RealtimePlan& plan, const std::string& what) {
     Require(!plan.refusal.empty() && !plan.limit.has_value(), what + " must refuse real-time priority without touching RLIMIT_RTTIME");
 }
@@ -77,6 +91,7 @@ int main(int argc, char** argv) {
         }
         ParseTests();
         PlanTests();
+        PreparationParseTests();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/HostThread.hpp"
+#include <cstring>
 #include <memory>
+#include <string>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -38,6 +40,12 @@ bool StartDetachedHostThread(HostThreadEntry entry, void* argument, std::size_t 
     CloseHandle(reinterpret_cast<HANDLE>(handle));
     return true;
 }
+
+void NameHostThread(const char* name) {
+    std::wstring wide;
+    for (const char* cursor = name; *cursor != '\0'; ++cursor) wide.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*cursor)));
+    SetThreadDescription(GetCurrentThread(), wide.c_str());
+}
 #else
 bool StartDetachedHostThread(HostThreadEntry entry, void* argument, std::size_t stackReserveBytes) {
     pthread_attr_t attributes;
@@ -47,6 +55,19 @@ bool StartDetachedHostThread(HostThreadEntry entry, void* argument, std::size_t 
     pthread_attr_destroy(&attributes);
     if (started) pthread_detach(thread);
     return started;
+}
+
+void NameHostThread(const char* name) {
+#ifdef __linux__
+    char truncated[16];
+    std::strncpy(truncated, name, sizeof(truncated) - 1);
+    truncated[sizeof(truncated) - 1] = '\0';
+    pthread_setname_np(pthread_self(), truncated);
+#elif defined(__APPLE__)
+    pthread_setname_np(name);
+#else
+    (void)name;
+#endif
 }
 #endif
 
