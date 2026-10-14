@@ -2710,6 +2710,7 @@ struct MockVulkan {
     std::map<VkBuffer, VkDeviceMemory> bufferMemory;
     std::map<VkBuffer, VkDeviceSize> bufferOffset;
     std::map<VkDeviceMemory, std::vector<std::byte>> memories;
+    std::map<VkDeviceMemory, std::span<std::byte>> importedMemories;
     std::map<VkDeviceMemory, VkDeviceSize> allocationSizes;
     VkDeviceSize allocatedBytes = 0;
     std::optional<VkDeviceSize> memoryLimit;
@@ -2770,6 +2771,11 @@ VKAPI_ATTR void VKAPI_CALL mockGetBufferMemoryRequirements(VkDevice, VkBuffer bu
     *requirements = {mock.bufferSizes.at(buffer), 1, 1};
 }
 
+std::span<std::byte> mockMemoryBytes(VkDeviceMemory memory) {
+    if (const auto found = mock.importedMemories.find(memory); found != mock.importedMemories.end()) return found->second;
+    return mock.memories.at(memory);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
     ++mock.allocationAttempts;
     if (mock.memoryLimit.has_value() && mock.allocatedBytes + info->allocationSize > *mock.memoryLimit) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -2777,30 +2783,35 @@ VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAlloca
     mock.memories[*memory] = std::vector<std::byte>(info->allocationSize);
     mock.allocationSizes[*memory] = info->allocationSize;
     mock.allocatedBytes += info->allocationSize;
-    if (info->pNext != nullptr) {
-        const auto* flags = static_cast<const VkMemoryAllocateFlagsInfo*>(info->pNext);
-        mock.allocationFlags[*memory] = flags->flags;
-        Require(flags->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO && flags->flags == VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, "invalid BDA allocation flags");
+    for (auto* extension = static_cast<const VkBaseInStructure*>(info->pNext); extension != nullptr; extension = extension->pNext) {
+        if (extension->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO) {
+            const auto* flags = reinterpret_cast<const VkMemoryAllocateFlagsInfo*>(extension);
+            mock.allocationFlags[*memory] = flags->flags;
+            Require(flags->flags == VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, "invalid BDA allocation flags");
+        } else if (extension->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT) {
+            const auto* imported = reinterpret_cast<const VkImportMemoryHostPointerInfoEXT*>(extension);
+            Require(imported->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT && imported->pHostPointer != nullptr, "invalid host memory import");
+            mock.importedMemories[*memory] = {static_cast<std::byte*>(imported->pHostPointer), static_cast<std::size_t>(info->allocationSize)};
+        } else Require(false, "unsupported mock memory allocation extension");
     }
     ++mock.live;
     return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockBindBufferMemory(VkDevice, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset) {
-    Require(offset + mock.bufferSizes.at(buffer) <= mock.memories.at(memory).size(), "mock buffer memory is bound past its allocation");
+    Require(offset + mock.bufferSizes.at(buffer) <= mockMemoryBytes(memory).size(), "mock buffer memory is bound past its allocation");
     mock.bufferMemory[buffer] = memory;
     mock.bufferOffset[buffer] = offset;
     return VK_SUCCESS;
 }
 
 std::span<std::byte> mockBufferMemory(VkBuffer buffer) {
-    auto& memory = mock.memories.at(mock.bufferMemory.at(buffer));
-    return std::span<std::byte>(memory).subspan(static_cast<std::size_t>(mock.bufferOffset.at(buffer)), static_cast<std::size_t>(mock.bufferSizes.at(buffer)));
+    return mockMemoryBytes(mock.bufferMemory.at(buffer)).subspan(static_cast<std::size_t>(mock.bufferOffset.at(buffer)), static_cast<std::size_t>(mock.bufferSizes.at(buffer)));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockMapMemory(VkDevice, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize, VkMemoryMapFlags, void** data) {
     Require(offset == 0, "mock memory must be mapped from offset zero");
-    *data = mock.memories.at(memory).data();
+    *data = mockMemoryBytes(memory).data();
     return VK_SUCCESS;
 }
 
@@ -2811,6 +2822,7 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyBuffer(VkDevice, VkBuffer, const VkAllocat
 }
 
 VKAPI_ATTR void VKAPI_CALL mockFreeMemory(VkDevice, VkDeviceMemory memory, const VkAllocationCallbacks*) {
+    mock.importedMemories.erase(memory);
     if (const auto found = mock.allocationSizes.find(memory); found != mock.allocationSizes.end()) {
         mock.allocatedBytes -= found->second;
         mock.allocationSizes.erase(found);
