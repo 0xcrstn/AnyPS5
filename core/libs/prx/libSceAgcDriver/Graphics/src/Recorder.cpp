@@ -1109,7 +1109,9 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
     if (result != VK_SUCCESS) {
         std::fprintf(stderr, "[gpu] timeline semaphore creation failed (Vulkan result %d); drains wait under the GPU mutex\n", static_cast<int>(result));
         timeline = VK_NULL_HANDLE;
+        return;
     }
+    getCounterValue = context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR");
 }
 
 Recorder::~Recorder() {
@@ -3571,6 +3573,13 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     return true;
 }
 
+bool Recorder::ReapMayRetire() const {
+    if (timeline == VK_NULL_HANDLE || getCounterValue == nullptr) return true;
+    std::uint64_t value = 0;
+    if (getCounterValue(context.device, timeline, &value) != VK_SUCCESS) return true;
+    return value >= frontSerialFloor.load(std::memory_order_acquire);
+}
+
 bool Recorder::Reap() {
     PerformanceTimer frameTiming("Recorder.Reap");
     dropStaleHoldKept();
@@ -3584,6 +3593,7 @@ bool Recorder::Reap() {
         finish(std::move(batch), false, 4);
         ++retired;
     }
+    frontSerialFloor.store(inFlight.empty() ? submissions + 1 : inFlight.front()->serial, std::memory_order_release);
     if (profile) {
         ++holdCounters.reaps;
         if (retired != 0) ++holdCounters.reapsWithWork;

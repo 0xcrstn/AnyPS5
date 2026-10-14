@@ -238,6 +238,13 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         const bool labelDue = labelFlushDue();
         const bool reap = sleeping && (behindCompletion || ((reapAll || queue0Dormant.load(std::memory_order_relaxed)) && completionsPending()));
         if (!changed && !labelDue && !reap) return false;
+        if (!changed && !labelDue) {
+            const auto peek = device.Load();
+            if (peek == nullptr || !peek->ReapMayRetire()) {
+                ++reapsSkipped[TryPoll];
+                return false;
+            }
+        }
 
         if (!changed && !pollTryEach()) {
             const auto now = std::chrono::steady_clock::now();

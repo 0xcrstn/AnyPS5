@@ -182,6 +182,7 @@ public:
     // ever submitted); WaitSerial(serial) then covers all recorded work.
     std::uint64_t SubmitAndEpoch();
     bool HasTimeline() const { return timeline != VK_NULL_HANDLE; }
+    bool ReapMayRetire() const;
     // Waits until every batch up to `serial` completed on the GPU. Called WITHOUT GuestMemory::GpuMutex:
     // it touches only the immutable timeline semaphore (the caller keeps the device alive). Requires
     // HasTimeline(); the debug switch APS5_NO_TIMELINE makes the device create the recorder without one.
@@ -770,6 +771,8 @@ private:
 
     Context context;
     VkSemaphore timeline = VK_NULL_HANDLE;
+    PFN_vkGetSemaphoreCounterValueKHR getCounterValue = nullptr;
+    std::atomic<std::uint64_t> frontSerialFloor{1};
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
     std::uint64_t id = 0;

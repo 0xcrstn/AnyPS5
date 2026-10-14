@@ -20,6 +20,7 @@ std::atomic<bool> queue0Dormant{false};
 std::atomic<std::uint64_t> packetLockRecordUs{0}, packetLockSubmitUs{0};
 
 std::atomic<std::uint64_t> triesFailed[TrySites] = {};
+std::atomic<std::uint64_t> reapsSkipped[TrySites] = {};
 
 std::atomic<std::uint64_t> storesOnGpu{0}, storesBehindCompletions{0}, storesOnCpu{0}, storesDrained{0}, copiesToHostMemory{0};
 
