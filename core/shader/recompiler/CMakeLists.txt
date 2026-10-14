@@ -223,7 +223,9 @@ function(add_shader_recompiler target runtimeTarget)
             CaptureResources
             DebugProbeActive
             DepthBitsTextureWidth
+            EvaluateBufferIndex
             HashBytes
+            IrOpcodeName
             PixelInput
             PixelInputBit
             RayTracingStrict
