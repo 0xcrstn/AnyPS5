@@ -342,22 +342,6 @@ constexpr std::array<const char*, SyncCount> SyncReasonNames{"none", "non-reside
 constexpr std::size_t IndirectPathCount = static_cast<std::size_t>(IndirectDrawPath::Count);
 constexpr std::array<const char*, IndirectPathCount> IndirectDrawPathNames{"gpu-side", "patched SGPR not folded", "fetch offset unknown", "non-vertex path", "GE_INDX_OFFSET", "draw index", "vertex range too large", "feature gap", "pending image results", "pending label or copied write", "not imported", "disabled"};
 
-enum RecordPart : std::size_t { RecordStores, RecordBindings, RecordAccess, RecordPassStart, RecordBegin, RecordCommands, RecordLeave, RecordPartCount };
-constexpr std::array<const char*, RecordPartCount> RecordPartNames{"stores", "bindings", "access", "pass start", "begin", "commands", "leave"};
-
-struct RecordLap {
-    bool profile;
-    std::array<double, RecordPartCount>& us;
-    std::chrono::steady_clock::time_point last;
-    RecordLap(bool profile, std::array<double, RecordPartCount>& us) : profile(profile), us(us), last(profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
-    void lap(RecordPart part) {
-        if (!profile) return;
-        const auto now = std::chrono::steady_clock::now();
-        us[part] += std::chrono::duration<double, std::micro>(now - last).count();
-        last = now;
-    }
-};
-
 // What became of one draw, for the totals.
 struct DrawOutcome {
     // In the recorder; `waited` when the recorder was synced right after (copied writes or a lease).
@@ -367,10 +351,6 @@ struct DrawOutcome {
     // A recorded draw began a render pass of its own, or continued the previous draw's.
     bool passBegun = false;
     bool passContinued = false;
-    bool passBarrier = false;
-    bool recordTimed = false;
-    std::array<double, RecordPartCount> recordUs{};
-    ShaderResources::DrawBindingsStatistics bindings;
     SyncReason reason = SyncNone;
     // Shader validation memo (see CachedFragmentOutputs).
     bool validateMemoized = false;
@@ -443,11 +423,6 @@ struct DrawProfile {
     // Render passes recorded draws began, and draws that continued the previous draw's pass.
     std::uint64_t passesBegun = 0;
     std::uint64_t passesContinued = 0;
-    std::uint64_t passBarriers = 0;
-    std::uint64_t recordDraws = 0;
-    std::uint64_t bindingDraws = 0;
-    std::array<double, RecordPartCount> recordUs{};
-    ShaderResources::DrawBindingsStatistics bindings;
     std::array<std::uint64_t, SyncCount> reasons{};
     // The CPU inside Graphics::Draw, split by outcome: a synchronous draw costs ten times a recorded
     // one, so one average would only show the synchronous population.
@@ -488,25 +463,6 @@ DrawProfile& Profile() {
     return profile;
 }
 
-void reportRecordParts(const DrawProfile& profile) {
-    if (profile.recordDraws == 0) return;
-    const auto draws = static_cast<double>(profile.recordDraws);
-    const auto& bindings = profile.bindings;
-    double totalUs = 0;
-    for (const auto us : profile.recordUs) totalUs += us;
-    char line[1024];
-    int n = std::snprintf(line, sizeof(line), "[draw-record] %llu recorded draws (10 s), us per draw: total %.1f,", static_cast<unsigned long long>(profile.recordDraws), totalUs / draws);
-    for (std::size_t i = 0; i < RecordPartCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
-        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.1f", RecordPartNames[i], profile.recordUs[i] / draws);
-        if (i == RecordBindings && n > 0 && static_cast<std::size_t>(n) < sizeof(line)) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (checks %.1f, write collects %.1f, snapshot lookups %.1f, buffers %.1f, copies %.1f, snapshot keeps %.1f, set allocations %.1f, set updates %.1f)", bindings.checkUs / draws, bindings.collectUs / draws, bindings.lookupUs / draws, bindings.bufferUs / draws, bindings.copyUs / draws, bindings.keepUs / draws, bindings.allocateUs / draws, bindings.updateUs / draws);
-    }
-    if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) {
-        const auto snapshotDraws = profile.bindingDraws != 0 ? static_cast<double>(profile.bindingDraws) : 1.0;
-        std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw), %llu skipped, %llu descriptor writes; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
-    }
-    std::fprintf(stderr, "%s\n", line);
-}
-
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
 void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
     auto& profile = Profile();
@@ -537,27 +493,6 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     if (outcome.completion) ++profile.completion;
     if (outcome.passBegun) ++profile.passesBegun;
     if (outcome.passContinued) ++profile.passesContinued;
-    if (outcome.passBarrier) ++profile.passBarriers;
-    if (outcome.recordTimed) {
-        ++profile.recordDraws;
-        for (std::size_t i = 0; i < RecordPartCount; ++i) profile.recordUs[i] += outcome.recordUs[i];
-        const auto& bindings = outcome.bindings;
-        if (bindings.snapshots != 0 || bindings.skipped != 0) ++profile.bindingDraws;
-        profile.bindings.snapshots += bindings.snapshots;
-        profile.bindings.reused += bindings.reused;
-        profile.bindings.copied += bindings.copied;
-        profile.bindings.skipped += bindings.skipped;
-        profile.bindings.copiedBytes += bindings.copiedBytes;
-        profile.bindings.descriptorWrites += bindings.descriptorWrites;
-        profile.bindings.checkUs += bindings.checkUs;
-        profile.bindings.collectUs += bindings.collectUs;
-        profile.bindings.lookupUs += bindings.lookupUs;
-        profile.bindings.bufferUs += bindings.bufferUs;
-        profile.bindings.copyUs += bindings.copyUs;
-        profile.bindings.keepUs += bindings.keepUs;
-        profile.bindings.allocateUs += bindings.allocateUs;
-        profile.bindings.updateUs += bindings.updateUs;
-    }
     ++profile.reasons[outcome.reason];
     (outcome.recorded ? (outcome.waited ? profile.waitedUs : profile.recordedUs) : profile.synchronousUs) += drawUs;
     profile.targetLookups += outcome.targetLookups;
@@ -620,7 +555,6 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
-    reportRecordParts(profile);
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
@@ -628,10 +562,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.bindingsUs = profile.uploadUs = profile.descriptorsUs = profile.otherUs = profile.addressOtherUs = 0;
     profile.addressBuilds = 0;
     profile.draws = profile.recorded = profile.waited = profile.completion = 0;
-    profile.passesBegun = profile.passesContinued = profile.passBarriers = 0;
-    profile.recordDraws = profile.bindingDraws = 0;
-    profile.recordUs.fill(0);
-    profile.bindings = {};
+    profile.passesBegun = profile.passesContinued = 0;
     profile.reasons.fill(0);
     profile.recordedUs = profile.waitedUs = profile.synchronousUs = 0;
     profile.targetLookups = profile.slowLookups = 0;
@@ -1727,8 +1658,6 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
     using CommandClass = Recorder::CommandClass;
     const auto countBarrier = [&](std::uint32_t count) { Recorder::CountBarriers(CommandClass::Draw, count); };
-    outcome.recordTimed = timer.profile;
-    RecordLap parts(timer.profile, outcome.recordUs);
     // The pass is named by its attachment views (stable while the kept targets live, so unique
     // within the open batch) and the extent. The previous draw's pass is continued only when this
     // draw neither reads its attachments (a barrier would be owed, which no pass allows) nor
@@ -1747,9 +1676,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
-    parts.lap(RecordStores);
-    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.profile ? &outcome.bindings : nullptr);
-    parts.lap(RecordBindings);
+    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
@@ -1767,13 +1694,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    parts.lap(RecordAccess);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
-    parts.lap(RecordPassStart);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
-    outcome.passBarrier = !continued && start.barrier;
     const auto commands = start.commands;
     if (!continued) recorder->PrepareSampleSlot();
     if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
@@ -1823,7 +1747,6 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
     }
-    parts.lap(RecordBegin);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
@@ -1845,7 +1768,6 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
-    parts.lap(RecordCommands);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
@@ -1860,7 +1782,6 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
-    parts.lap(RecordLeave);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);
