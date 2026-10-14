@@ -2,6 +2,7 @@
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -60,6 +61,94 @@ std::vector<std::uint8_t> ComputePureFlatSlots(const IrResourcePlan& plan) {
         for (std::size_t i = 0; i < raw->ArgumentCount(); ++i) mark(raw->Argument(i));
     }
     return pure;
+}
+
+std::vector<std::uint8_t> ComputeBaseOnlyFlatSlots(const IrResourcePlan& plan) {
+    std::vector<std::uint8_t> base(plan.srtReads.size(), 0u);
+    if (base.empty()) return base;
+    const bool disqualified = !plan.srtPlanComplete || plan.requiresSpecializationMemory
+        || std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.indirectImage.has_value(); })
+        || (plan.uniformFill.fill.kind != UniformFillKind::None && plan.uniformFill.fill.words > plan.uniformFill.values.size());
+    if (disqualified) return base;
+    std::unordered_map<const IrValue*, std::uint32_t> readSlots;
+    for (std::uint32_t slot = 0; slot < plan.srtReads.size(); ++slot) {
+        if (plan.srtReads[slot].value != nullptr) readSlots.emplace(plan.srtReads[slot].value->Resolve(), slot);
+    }
+    const auto slotOf = [&](IrValue* raw) -> std::optional<std::uint32_t> {
+        if (raw == nullptr) return std::nullopt;
+        const IrValue* value = raw->Resolve();
+        if (value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() >= 2 && value->Argument(1) != nullptr) {
+            const IrValue* slot = value->Argument(1)->Resolve();
+            if (slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < base.size()) return slot->ImmediateU32();
+            return std::nullopt;
+        }
+        if (const auto found = readSlots.find(value); found != readSlots.end()) return found->second;
+        return std::nullopt;
+    };
+    std::vector<std::uint8_t> used(base.size(), 0u);
+    std::unordered_set<const IrValue*> visited;
+    std::vector<IrValue*> pending;
+    const auto mark = [&](IrValue* root) {
+        if (root == nullptr) return;
+        pending.push_back(root);
+        while (!pending.empty()) {
+            IrValue* value = pending.back()->Resolve();
+            pending.pop_back();
+            if (!visited.insert(value).second) continue;
+            if (const auto slot = slotOf(value)) {
+                used[*slot] = 1u;
+                if (plan.srtReads[*slot].value != nullptr && plan.srtReads[*slot].value->Resolve() != value) pending.push_back(plan.srtReads[*slot].value);
+                if (value->Opcode() == IrOpcode::ReadConst) continue;
+            }
+            if (IsRawRead(plan, *value)) continue;
+            for (std::size_t i = 0; i < value->ArgumentCount(); ++i) {
+                if (value->Argument(i) != nullptr) pending.push_back(value->Argument(i));
+            }
+        }
+    };
+    for (const auto& source : plan.descriptorSources) {
+        for (std::uint32_t i = 0; i < source.dwordCount && i < source.dwords.size(); ++i) mark(source.dwords[i]);
+    }
+    for (const auto& block : plan.controlFlow) mark(block.condition);
+    if (plan.uniformFill.fill.kind != UniformFillKind::None) {
+        for (std::uint32_t i = 0; i < plan.uniformFill.fill.words; ++i) mark(plan.uniformFill.values[i]);
+    }
+    std::vector<IrValue*> raws;
+    std::unordered_set<const IrValue*> seen;
+    std::vector<IrValue*> walk;
+    for (const auto& read : plan.srtReads) {
+        if (read.value != nullptr) walk.push_back(read.value);
+    }
+    while (!walk.empty()) {
+        IrValue* value = walk.back()->Resolve();
+        walk.pop_back();
+        if (!seen.insert(value).second) continue;
+        if (IsRawRead(plan, *value)) raws.push_back(value);
+        for (std::size_t i = 0; i < value->ArgumentCount(); ++i) {
+            if (value->Argument(i) != nullptr) walk.push_back(value->Argument(i));
+        }
+        if (value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() >= 2 && value->Argument(1) != nullptr) {
+            const IrValue* slot = value->Argument(1)->Resolve();
+            if (slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < plan.srtReads.size() && plan.srtReads[slot->ImmediateU32()].value != nullptr) walk.push_back(plan.srtReads[slot->ImmediateU32()].value);
+        }
+    }
+    for (IrValue* raw : raws) {
+        IrValue* handle = raw->ArgumentCount() != 0u ? raw->Argument(0) : nullptr;
+        if (handle == nullptr) continue;
+        handle = handle->Resolve();
+        if (handle->ArgumentCount() == 0u) {
+            mark(handle);
+            continue;
+        }
+        if (const auto slot = slotOf(handle->Argument(0))) base[*slot] = 1u;
+        else mark(handle->Argument(0));
+        for (std::size_t i = 1; i < handle->ArgumentCount(); ++i) mark(handle->Argument(i));
+        for (std::size_t i = 1; i < raw->ArgumentCount(); ++i) mark(raw->Argument(i));
+    }
+    for (std::size_t slot = 0; slot < base.size(); ++slot) {
+        if (used[slot] != 0u) base[slot] = 0u;
+    }
+    return base;
 }
 
 std::vector<std::uint32_t> ComputeGuardedFlatSlots(const IrResourcePlan& plan) {

@@ -69,7 +69,7 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
     return hash;
 }
 
-void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords) {
+void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::pair<std::uint32_t, std::uint64_t>> baseSlots) {
     std::uint64_t relocatable = eligible && drawRelocationEnabled() ? use.asBase & ~use.asValue : 0;
     if (hiddenWords != 0) relocatable &= hiddenWords >= 64 ? 0 : ~((std::uint64_t {1} << hiddenWords) - 1);
     std::vector<std::pair<std::uint64_t, std::int32_t>> reads;
@@ -91,32 +91,125 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
             if (reads[i].second >= 0 && ((reads[i].first & 3u) != 0 || !covered(reads[i].first))) drop(reads[i].second);
         }
     }
-    const auto origin = [&](std::uint64_t address) -> std::int8_t {
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> nested;
+    std::vector<std::pair<std::uint64_t, std::int16_t>> dependents;
+    if (drawRelocationEnabled() && eligible && !baseSlots.empty() && use.readBases.size() == use.reads.size()) {
+        for (const auto& [slot, pointer] : baseSlots) {
+            if ((pointer & 3u) != 0 || !covered(pointer) || nested.size() >= 1024) continue;
+            bool usable = true, any = false;
+            std::vector<std::uint64_t> addresses;
+            for (std::size_t i = 0; usable && i < use.reads.size(); ++i) {
+                if (use.reads[i].first == pointer && use.readBases[i] != 0) usable = false;
+                if (use.readBases[i] != pointer) continue;
+                any = true;
+                const auto address = use.reads[i].first;
+                if ((address & 3u) != 0 || !covered(address) || address == pointer) usable = false;
+                for (std::size_t j = 0; usable && j < use.reads.size(); ++j) {
+                    if (use.reads[j].first == address && (use.readBases[j] != pointer || use.reads[j].second >= 0)) usable = false;
+                }
+                addresses.push_back(address);
+            }
+            if (!usable || !any) continue;
+            if (std::any_of(dependents.begin(), dependents.end(), [&](const std::pair<std::uint64_t, std::int16_t>& dependent) { return dependent.first == pointer || std::find(addresses.begin(), addresses.end(), dependent.first) != addresses.end(); })) continue;
+            if (std::any_of(nested.begin(), nested.end(), [&](const std::pair<std::uint64_t, std::uint32_t>& base) { return std::find(addresses.begin(), addresses.end(), base.first) != addresses.end(); })) continue;
+            const auto index = static_cast<std::int16_t>(nested.size());
+            nested.emplace_back(pointer, slot);
+            for (const auto address : addresses) dependents.emplace_back(address, index);
+        }
+        std::sort(dependents.begin(), dependents.end());
+        dependents.erase(std::unique(dependents.begin(), dependents.end()), dependents.end());
+    }
+    const auto key = [&](std::uint64_t address) -> std::int32_t {
+        if (!dependents.empty()) {
+            const auto found = std::lower_bound(dependents.begin(), dependents.end(), std::make_pair(address, std::numeric_limits<std::int16_t>::min()));
+            if (found != dependents.end() && found->first == address) return 64 + found->second;
+        }
+        if (relocatable == 0) return -1;
         const auto found = std::lower_bound(reads.begin(), reads.end(), std::make_pair(address, std::numeric_limits<std::int32_t>::min()));
         if (found == reads.end() || found->first != address || found->second < 0) return -1;
-        return (relocatable >> found->second & 1u) != 0 ? static_cast<std::int8_t>(found->second) : std::int8_t {-1};
+        return (relocatable >> found->second & 1u) != 0 ? found->second : -1;
     };
     variant.relocatableWords = relocatable;
+    const bool split = relocatable != 0 || !nested.empty();
     for (const auto& region : regions) {
         const auto count = region.bytes.size() / sizeof(std::uint32_t);
         const auto offset = variant.words.size();
         variant.words.resize(offset + count);
         std::memcpy(variant.words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
-        if (relocatable == 0) {
+        for (std::size_t base = 0; base < nested.size(); ++base) {
+            const auto pointer = nested[base].first;
+            if (pointer >= region.guestAddress && pointer - region.guestAddress + sizeof(std::uint32_t) <= region.bytes.size()) variant.nestedBases.emplace_back(static_cast<std::uint32_t>(offset + (pointer - region.guestAddress) / sizeof(std::uint32_t)), nested[base].second);
+        }
+        if (!split) {
             variant.runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
             continue;
         }
         std::size_t start = 0;
-        auto current = count != 0 ? origin(region.guestAddress) : std::int8_t {-1};
+        auto current = count != 0 ? key(region.guestAddress) : -1;
         for (std::size_t word = 1; word <= count; ++word) {
-            const auto next = word < count ? origin(region.guestAddress + word * sizeof(std::uint32_t)) : std::int8_t {-2};
+            const auto next = word < count ? key(region.guestAddress + word * sizeof(std::uint32_t)) : -2;
             if (next == current) continue;
             variant.runs.emplace_back(region.guestAddress + start * sizeof(std::uint32_t), region.guestAddress + word * sizeof(std::uint32_t));
-            variant.runBases.push_back(current);
+            variant.runBases.push_back(current >= 0 && current < 64 ? static_cast<std::int8_t>(current) : std::int8_t {-1});
+            variant.runNested.push_back(current >= 64 ? static_cast<std::int16_t>(current - 64) : std::int16_t {-1});
             start = word;
             current = next;
         }
     }
+    if (variant.nestedBases.size() != nested.size()) {
+        variant.nestedBases.clear();
+        variant.runNested.clear();
+    }
+}
+
+std::shared_ptr<DispatchVariant> Driver::followNestedBases(const DispatchVariant& variant, bool& refused) {
+    refused = false;
+    if (variant.nestedBases.empty() || variant.runNested.size() != variant.runs.size()) return nullptr;
+    std::shared_ptr<DispatchVariant> copy;
+    std::shared_ptr<ShaderRecompiler::RecompileResult> rebased;
+    for (std::size_t base = 0; base < variant.nestedBases.size(); ++base) {
+        const auto [position, slot] = variant.nestedBases[base];
+        std::uint64_t address = 0;
+        std::uint32_t first = 0;
+        bool located = false;
+        for (const auto& [begin, end] : variant.runs) {
+            const auto count = static_cast<std::uint32_t>((end - begin) / sizeof(std::uint32_t));
+            if (position >= first && position < first + count) {
+                address = begin + static_cast<std::uint64_t>(position - first) * sizeof(std::uint32_t);
+                located = true;
+                break;
+            }
+            first += count;
+        }
+        if (!located || position >= variant.words.size()) continue;
+        std::uint32_t live = 0;
+        if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(&live, 1))) != GuestMemory::Compare::Equal) continue;
+        const auto stored = variant.words[position];
+        if (live == stored) continue;
+        if (copy == nullptr) {
+            copy = cloneVariant(variant);
+            rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+        }
+        const auto delta = static_cast<std::int64_t>(live & ~3u) - static_cast<std::int64_t>(stored & ~3u);
+        for (std::size_t run = 0; run < copy->runs.size(); ++run) {
+            if (copy->runNested[run] != static_cast<std::int16_t>(base)) continue;
+            copy->runs[run].first = static_cast<std::uint64_t>(static_cast<std::int64_t>(copy->runs[run].first) + delta);
+            copy->runs[run].second = static_cast<std::uint64_t>(static_cast<std::int64_t>(copy->runs[run].second) + delta);
+        }
+        copy->words[position] = live;
+        for (auto& binding : rebased->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::FlattenedSrt || slot >= binding.guestDescriptor.size()) continue;
+            if (binding.guestDescriptor[slot] != stored) {
+                refused = true;
+                return nullptr;
+            }
+            binding.guestDescriptor[slot] = live;
+        }
+    }
+    if (copy == nullptr) return nullptr;
+    copy->compiled = std::move(rebased);
+    copy->dataPatched = true;
+    return copy;
 }
 
 void Driver::learnPendingRelocation() {
@@ -175,7 +268,7 @@ void Driver::learnPendingRelocation() {
                 continue;
             }
             if (std::find(view->banned.begin(), view->banned.end(), reg) != view->banned.end()) continue;
-            if (held && variant.dataPositions.empty()) continue;
+            if (held && variant.dataPositions.empty() && variant.nestedBases.empty()) continue;
             RelocatableUserWord word{reg, {}};
             const auto base = AlignedWord(program.userData[index]);
             std::uint32_t position = 0;
@@ -185,6 +278,9 @@ void Driver::learnPendingRelocation() {
                     word.reads.emplace_back(static_cast<std::int64_t>(variant.runs[run].first - base), count);
                     for (const auto data : variant.dataPositions) {
                         if (data >= position && data < position + count) word.dataOffsets.push_back(static_cast<std::int64_t>(variant.runs[run].first - base) + static_cast<std::int64_t>(data - position) * 4);
+                    }
+                    for (const auto& nested : variant.nestedBases) {
+                        if (nested.first >= position && nested.first < position + count) word.dataOffsets.push_back(static_cast<std::int64_t>(variant.runs[run].first - base) + static_cast<std::int64_t>(nested.first - position) * 4);
                     }
                 }
                 position += count;
@@ -346,7 +442,7 @@ std::uint64_t DrawStageContent(const DispatchVariant& variant) {
     std::size_t data = 0;
     for (std::size_t position = 0; position < variant.words.size(); ++position) {
         while (data < variant.dataPositions.size() && variant.dataPositions[data] < position) ++data;
-        const bool masked = data < variant.dataPositions.size() && variant.dataPositions[data] == position;
+        const bool masked = (data < variant.dataPositions.size() && variant.dataPositions[data] == position) || std::any_of(variant.nestedBases.begin(), variant.nestedBases.end(), [&](const std::pair<std::uint32_t, std::uint32_t>& nested) { return nested.first == position; });
         hash = (hash ^ (masked ? 0u : variant.words[position])) * 0x100000001b3ull;
     }
     hash = (hash ^ reinterpret_cast<std::uintptr_t>(variant.prepared.get())) * 0x100000001b3ull;
@@ -416,6 +512,8 @@ std::shared_ptr<DispatchVariant> Driver::cloneVariant(const DispatchVariant& var
     copy->shaderDataPatches = variant.shaderDataPatches;
     copy->vertexInfo = variant.vertexInfo;
     copy->inputExports = variant.inputExports;
+    copy->runNested = variant.runNested;
+    copy->nestedBases = variant.nestedBases;
     return copy;
 }
 

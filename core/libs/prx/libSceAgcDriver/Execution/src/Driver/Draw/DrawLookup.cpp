@@ -88,7 +88,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             std::optional<DrawMiss> miss;
             std::vector<std::size_t> ranks(programs.size(), 0);
-            std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, partial = 0, dataPatched = 0, validatedRuns = 0, validatedWords = 0;
+            std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, partial = 0, dataPatched = 0, validatedRuns = 0, validatedWords = 0, nestedMoved = 0, nestedRefused = 0;
             double stageValidateUs = 0, patchUs = 0;
             auto& split = ThreadDrawValidateSplit();
             split = DrawValidateSplit{profile};
@@ -112,6 +112,15 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     for (std::size_t rank = 0; rank < variants.size(); ++rank) {
                         auto variant = variants[rank];
                         if (variant->pushOffset != cursor) continue;
+                        if (!variant->nestedBases.empty() && drawRelocationEnabled()) {
+                            bool refused = false;
+                            if (auto followed = followNestedBases(*variant, refused)) {
+                                variant = std::move(followed);
+                                ++nestedMoved;
+                            } else if (refused) {
+                                ++nestedRefused;
+                            }
+                        }
                         auto& regions = matchedRegions[i];
                         regions.clear();
                         appendEntryRegions(*variant, regions);
@@ -167,6 +176,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             counters.variantsCompared += compared;
             counters.partialStages += drawHit ? 0 : partial;
             counters.dataPatchedStages += dataPatched;
+            counters.nestedMoved += nestedMoved;
+            counters.nestedRefused += nestedRefused;
             counters.stageValidateUs += stageValidateUs;
             counters.patchUs += patchUs;
             counters.validatedRuns += validatedRuns;
