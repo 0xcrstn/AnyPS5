@@ -29,6 +29,8 @@
 #include "ResidentPresent.hpp"
 #include "SampleLod_spv.h"
 #include "BufferUpdate_spv.h"
+#include "AddressCopy_spv.h"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
 #include "SampleArray_spv.h"
 #include "Cover_vert_spv.h"
 #include "Cover_frag_spv.h"
@@ -6233,6 +6235,202 @@ void atomicViewTests(const Device& device, Recorder& recorder) {
     }
 }
 
+bool residentMirrorTests(const Device& device, Recorder& recorder) {
+    if (!AgcDriver::Graphics::ResidentMirrorsEnabled()) {
+        std::cout << "resident mirrors are off (APS5_RESIDENT_MIRRORS): not tested\n";
+        return false;
+    }
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress || !AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "host imports, device addresses or write watching unavailable: resident mirrors not tested\n";
+        return false;
+    }
+    constexpr std::size_t bytes = 1u << 20u;
+    constexpr std::size_t words = bytes / 4;
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared mirror section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    struct Release {
+        void* block;
+        ~Release() {
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+#else
+    void* block = AllocateWatched(bytes, 65536);
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+#endif
+    auto* guest = static_cast<std::uint32_t*>(block);
+    for (std::size_t index = 0; index < words; ++index) guest[index] = static_cast<std::uint32_t>(index * 2654435761u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            recorder.Sync();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, recorder, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "the mirror test block is not imported and watched: resident mirrors not tested\n";
+        return false;
+    }
+    GuestBufferMemory leased(context);
+    leased.AcquireRegistered();
+    leased.AddReadable(address, bytes);
+    leased.Upload(true);
+    std::vector<std::shared_ptr<AgcDriver::Graphics::ResidentMirror>> mirrors;
+    const auto ranges = leased.MirroredRanges(leased.AddressRanges(), mirrors);
+    const auto mapped = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= address && address + bytes <= range.end; });
+    Require(mapped != ranges.end() && mirrors.size() == 1, "the imported block got no resident mirror");
+    const auto mirrorAddress = mapped->deviceAddress + (address - mapped->begin);
+    Require(mirrorAddress != import->address + (address - import->base), "the mirrored range still points at the import");
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    struct Objects {
+        const Context& context;
+        VkPipelineLayout& layout;
+        VkShaderModule& module;
+        VkPipeline& pipeline;
+        ~Objects() {
+            if (pipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+            if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            if (layout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+        }
+    } objects{context, layout, module, pipeline};
+    struct Push {
+        std::uint64_t source;
+        std::uint64_t target;
+        std::uint32_t count;
+        std::uint32_t pad;
+    };
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push)};
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &push;
+    Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "mirror test pipeline layout");
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = sizeof(ADDRESS_COPY_SPV);
+    moduleInfo.pCode = ADDRESS_COPY_SPV;
+    Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "mirror test shader module");
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+    pipelineInfo.layout = layout;
+    Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline), "mirror test pipeline");
+    const auto read = [&] {
+        auto output = std::make_shared<AgcDriver::Graphics::Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        std::memset(output->Bytes().data(), 0xcd, bytes);
+        AgcDriver::Graphics::UseMirrors(recorder, mirrors);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        const Push values{mirrorAddress, output->DeviceAddress(), static_cast<std::uint32_t>(words), 0};
+        context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(values), &values);
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, static_cast<std::uint32_t>(words / 64), 1, 1);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(output);
+        return output;
+    };
+    const auto same = [&](const std::shared_ptr<AgcDriver::Graphics::Buffer>& output, const std::vector<std::uint32_t>& expected) {
+        return std::memcmp(output->Bytes().data(), expected.data(), bytes) == 0;
+    };
+    const auto snapshot = [&] { return std::vector<std::uint32_t>(guest, guest + words); };
+    const auto before = AgcDriver::Graphics::MirrorTotals();
+    auto expected = snapshot();
+    auto first = read();
+    recorder.Submit();
+    recorder.Sync();
+    Require(same(first, expected), "a first read through a resident mirror missed the guest bytes");
+    auto again = read();
+    recorder.Submit();
+    recorder.Sync();
+    Require(same(again, expected), "a second read through an unchanged mirror differs");
+    for (std::size_t index = 1000; index < 1100; ++index) guest[index] = 0x11110000u + static_cast<std::uint32_t>(index);
+    guest[words - 1] = 0x22222222u;
+    expected = snapshot();
+    auto written = read();
+    recorder.Submit();
+    recorder.Sync();
+    Require(same(written, expected), "a guest write between batches did not reach the mirror");
+    const std::uint64_t gpuOffset = 3 * 65536 + 256;
+    const std::uint64_t gpuBytes = 4096;
+    auto preWrite = read();
+    {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, address - import->base + gpuOffset, gpuBytes, 0x5a5a5a5au);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        recorder.NotePendingWrite(address + gpuOffset, gpuBytes);
+        static_cast<void>(AgcDriver::GuestMemory::MarkWritten(address + gpuOffset, gpuBytes));
+    }
+    auto postWrite = read();
+    recorder.Submit();
+    recorder.Sync();
+    auto filled = expected;
+    for (std::size_t index = gpuOffset / 4; index < (gpuOffset + gpuBytes) / 4; ++index) filled[index] = 0x5a5a5a5au;
+    Require(same(preWrite, expected), "a read recorded before a GPU write in its batch saw the write");
+    Require(same(postWrite, filled), "a read recorded after a GPU write in its batch missed the write");
+    Require(snapshot() == filled, "the GPU write did not reach guest memory");
+    auto settled = read();
+    recorder.Submit();
+    recorder.Sync();
+    Require(same(settled, filled), "a mirror lost a GPU write of an earlier batch");
+    guest[gpuOffset / 4] = 0x33333333u;
+    expected = snapshot();
+    auto overwritten = read();
+    recorder.Submit();
+    recorder.Sync();
+    Require(same(overwritten, expected), "a guest write over GPU-written bytes did not reach the mirror");
+    const std::uint64_t lateOffset = 9 * 65536;
+    auto beforeLate = read();
+    {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, address - import->base + lateOffset, 65536, 0x6b6b6b6bu);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        recorder.NotePendingWrite(address + lateOffset, 65536);
+    }
+    recorder.Submit();
+    recorder.Sync();
+    Require(same(beforeLate, expected), "a read recorded before a later GPU write saw the write");
+    expected = snapshot();
+    Require(expected[lateOffset / 4] == 0x6b6b6b6bu, "the late GPU write did not reach guest memory");
+    auto afterLate = read();
+    recorder.Submit();
+    recorder.Sync();
+    Require(same(afterLate, expected), "a GPU write after the last read of its batch left the mirror stale");
+    const auto after = AgcDriver::Graphics::MirrorTotals();
+    Require(after.made - before.made <= 1 && after.uses - before.uses == 9 && after.refreshes - before.refreshes >= 8 && after.midBatchSyncs - before.midBatchSyncs == 1, "resident mirror counters do not match the reads");
+    leased.WriteBack();
+    std::cout << "resident mirror tests passed (" << (after.refreshedBytes - before.refreshedBytes) / 1024 << " KiB refreshed, " << (after.midBatchBytes - before.midBatchBytes) / 1024 << " KiB synced mid-batch)\n";
+    return true;
+}
+
 bool drawInputTwinTests(const Device& device, Recorder& recorder) {
     if (!device.Graphics()) return false;
     constexpr std::size_t unit = 65536;
@@ -7191,6 +7389,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--parked-import-unmap-only") {
             gpu.unlock();
             parkedImportUnmapTests(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--resident-mirrors-only") {
+            if (!residentMirrorTests(device, recorder)) return 77;
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-input-twins-only") {
