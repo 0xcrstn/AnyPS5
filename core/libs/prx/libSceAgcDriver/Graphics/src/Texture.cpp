@@ -3319,6 +3319,13 @@ bool StorageTexture::StoreAtFlipRequested(const char* value) {
     throw std::runtime_error(std::string("APS5_STORE_AT_FLIP=") + value + ": expected 1");
 }
 
+bool StorageTexture::PresentThenStore(bool storeAtFlip, const std::function<bool()>& present) {
+    if (!storeAtFlip) FlushDumpSelected("flip");
+    const bool presented = present();
+    if (storeAtFlip) FlushAllPending("flip");
+    return presented;
+}
+
 std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t address, std::uint64_t bytes) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);

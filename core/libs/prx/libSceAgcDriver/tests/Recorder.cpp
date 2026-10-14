@@ -5701,6 +5701,101 @@ void sliceDirtyTests(const Device& device, Recorder& recorder) {
     std::cout << "slice dirty marking: ok\n";
 }
 
+void presentThenStoreTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    constexpr std::uint32_t side = 128;
+    constexpr std::size_t bytes = 65536;
+    constexpr std::uint8_t untouched = 0x11;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: present then store not tested\n";
+        return;
+    }
+    std::memset(block, untouched, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        std::size_t bytes;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+            ReleaseWatched(block, bytes);
+        }
+    } unregister{base, block, address, bytes};
+    AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.hostImportAlignment = 0;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == bytes, "the present-then-store image does not fill its 64 KiB block");
+    const auto stored = [&](std::array<std::uint8_t, 4> color) {
+        std::vector<std::byte> read(bytes);
+        AgcDriver::GuestMemory::Read(address, read);
+        for (std::size_t at = 0; at < read.size(); ++at) {
+            if (std::to_integer<std::uint8_t>(read[at]) != color[at % 4]) return false;
+        }
+        return true;
+    };
+    auto image = StorageTexture::Create(context, detiler, resource, 0);
+    const auto write = [&](const VkClearColorValue& color) {
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+    };
+    const auto settle = [&] {
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+    write({{1.0f, 0.0f, 0.0f, 1.0f}});
+    bool presentedPending = false;
+    Require(StorageTexture::PresentThenStore(true, [&] {
+        presentedPending = StorageTexture::FindPending(address, bytes) == image;
+        return true;
+    }), "a flip that presented reported no present");
+    Require(presentedPending, "the flip stored the pending display image before presenting it");
+    Require(StorageTexture::FindPending(address, bytes) == nullptr, "APS5_STORE_AT_FLIP=1 left an image pending after the flip");
+    settle();
+    Require(stored({255, 0, 0, 255}), "the flip did not store the presented image's results");
+    write({{0.0f, 1.0f, 0.0f, 1.0f}});
+    Require(!StorageTexture::PresentThenStore(true, [] { return false; }), "a dropped flip reported a present");
+    Require(StorageTexture::FindPending(address, bytes) == nullptr, "a dropped flip did not store the pending results");
+    settle();
+    Require(stored({0, 255, 0, 255}), "a dropped flip did not store the newer results");
+    write({{0.0f, 0.0f, 1.0f, 1.0f}});
+    Require(StorageTexture::PresentThenStore(false, [] { return true; }), "a flip without APS5_STORE_AT_FLIP reported no present");
+    Require(StorageTexture::FindPending(address, bytes) == image, "a flip without APS5_STORE_AT_FLIP stored the pending results");
+    image->WriteBack();
+    settle();
+    Require(stored({0, 0, 255, 255}), "the results kept pending over a flip were not stored later");
+    std::cout << "present then store at flip: ok\n";
+}
+
 void atomicViewTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     TextureDetiler detiler(context);
@@ -6575,6 +6670,10 @@ int main(int argc, char** argv) {
             sliceDirtyTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--present-then-store-only") {
+            presentThenStoreTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--resident-present-only") {
             RunResidentPresentTests(device.GetContext());
             return 0;
@@ -6655,6 +6754,7 @@ int main(int argc, char** argv) {
         drawInputInPlaceTests(device, recorder);
         RunResidentPresentTests(device.GetContext());
         sliceDirtyTests(device, recorder);
+        presentThenStoreTests(device, recorder);
         storeRunTests(device, recorder);
         queuedWriteGroupTests();
         remappedImportTests(device);

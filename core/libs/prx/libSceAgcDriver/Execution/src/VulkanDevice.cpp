@@ -2578,8 +2578,10 @@ FrameDumps& Dumps() {
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
-    if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
-    else Graphics::StorageTexture::FlushDumpSelected("flip");
+    return Graphics::StorageTexture::PresentThenStore(storeAtFlip, [&] { return presentDisplayBuffer(buffer); });
+}
+
+bool VulkanDevice::presentDisplayBuffer(const DisplayBuffer& buffer) {
     auto& dumps = Dumps();
     if (buffer.tilingMode == 1) {
         const auto pixels = ReadDisplayBuffer(buffer);
