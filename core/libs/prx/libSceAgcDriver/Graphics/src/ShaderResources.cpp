@@ -3610,7 +3610,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                 recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
             }
-            if (GuestMemory::TrackerGeneration() == stamp[0]) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer);
+            if (generation != 0 && GuestMemory::TrackerGeneration() == stamp[0]) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer);
             else stamped = false;
         }
         selected.push_back(index);
