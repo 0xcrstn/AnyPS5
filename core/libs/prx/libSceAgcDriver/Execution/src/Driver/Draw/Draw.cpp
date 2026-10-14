@@ -289,6 +289,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
         if ((drawHit || reused) && !matched[i]->patchedPushConstants.empty()) stages.back().pushConstants = matched[i]->patchedPushConstants;
+        stages.back().programAddress = program.binary.codeAddress;
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
