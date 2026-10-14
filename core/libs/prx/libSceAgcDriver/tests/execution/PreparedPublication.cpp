@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "BdaAbi.hpp"
+#include <spirv/unified1/spirv.hpp>
 #include <array>
 #include <algorithm>
 #include <atomic>
@@ -14,6 +16,7 @@
 #include <latch>
 #include <optional>
 #include <semaphore>
+#include <string_view>
 #include <thread>
 
 namespace {
@@ -338,6 +341,79 @@ void PreparationPriority(bool beforeSubmit) {
     Require(demandedDone.get() == 0u && backgroundDone.get() == 1u && order.load() == 2u, "demanded preparation waited behind background work or ran twice");
 }
 
+void PartialGroupPlacement(bool prioritized) {
+    const auto workers = std::max(2u, std::thread::hardware_concurrency() / 2u);
+    std::barrier started(static_cast<std::ptrdiff_t>(workers + 1u));
+    std::counting_semaphore<> release(0);
+    std::latch finished(static_cast<std::ptrdiff_t>(workers));
+    for (unsigned index = 0; index < workers; ++index) {
+        SubmitRegistrationPreparation([&] {
+            started.arrive_and_wait();
+            release.acquire();
+            finished.count_down();
+        });
+    }
+    started.arrive_and_wait();
+    PreparedShaders prepared;
+    PrioritizeRegistrationPreparation(prepared);
+    std::atomic<unsigned> order{0};
+    std::promise<unsigned> background;
+    std::promise<unsigned> partialGroups;
+    auto backgroundDone = background.get_future();
+    auto partialGroupsDone = partialGroups.get_future();
+    SubmitRegistrationPreparation([&] { background.set_value(order.fetch_add(1u)); });
+    SubmitRegistrationPreparation([&] { partialGroups.set_value(order.fetch_add(1u)); }, &prepared, true);
+    if (prioritized) PrioritizeRegistrationPreparation(prepared);
+    release.release();
+    const bool settled = partialGroupsDone.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    const bool backgroundSettled = backgroundDone.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    release.release(static_cast<std::ptrdiff_t>(workers - 1u));
+    finished.wait();
+    Require(settled && backgroundSettled, "preparation queue did not complete its work");
+    if (prioritized) {
+        Require(partialGroupsDone.get() == 0u && backgroundDone.get() == 1u, "a partial-group preparation a dispatch waits for stayed behind background work");
+    } else {
+        Require(backgroundDone.get() == 0u && partialGroupsDone.get() == 1u, "a partial-group preparation nothing waits for ran before work queued earlier");
+    }
+}
+
+SpirvTarget HostlessComputeTarget() {
+    static constexpr std::array<std::uint32_t, 2> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses};
+    static constexpr std::array<std::string_view, 2> extensions{"SPV_KHR_float_controls", "SPV_KHR_physical_storage_buffer"};
+    return {0x00401000u, 0x00010300u, 32, BdaAbi::Version, capabilities, extensions, false, {1024, 1024, 64}, 1024, 32768, {}, {}};
+}
+
+void PartialGroupWait() {
+    ShaderSnapshot snapshot{};
+    snapshot.codeAddress = 0x30000;
+    snapshot.code = {0xbf810000u};
+    RecompileRequest full{{ShaderStage::Compute, 0x30000, snapshot.code, 0, {}}, {32, 0, {}, ShaderComputeStageInfo{{64, 1, 1}, 0, {false, false, false}, false, 1, {}}, {}, {}, {}}, HostlessComputeTarget(), {0, 0, 0, 128}};
+    auto partial = full;
+    partial.context.compute->partialThreads = {1, 1, 1};
+    const auto fullHandle = PrepareShader(full);
+    const auto partialHandle = PrepareShader(partial);
+    snapshot.prepared->entries.push_back({0, fullHandle});
+    snapshot.prepared->partialGroupsPending = true;
+    static_cast<void>(InvocationFor(snapshot, 0, full));
+    Require(snapshot.prepared->entries.size() == 1u && snapshot.prepared->partialGroupsPending, "a full-group dispatch did not use the published artifact while the partial-group one was queued");
+    auto dispatch = full;
+    dispatch.context.compute->partialThreads = {100, 1, 1};
+    auto publisher = std::async(std::launch::async, [&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        {
+            std::lock_guard lock(snapshot.prepared->mutex);
+            snapshot.prepared->entries.push_back({0, partialHandle});
+            snapshot.prepared->partialGroupsPending = false;
+        }
+        snapshot.prepared->settled.notify_all();
+    });
+    static_cast<void>(InvocationFor(snapshot, 0, dispatch));
+    publisher.get();
+    Require(snapshot.prepared->entries.size() == 2u, "a partial-group dispatch prepared its artifact at use instead of waiting for the queued preparation");
+    static_cast<void>(SourceHandleFor(snapshot, 0, dispatch));
+    Require(snapshot.prepared->entries.size() == 2u, "a partial-group source lookup missed the published artifact");
+}
+
 }
 
 int main() {
@@ -348,6 +424,9 @@ int main() {
         TransactionLock();
         PreparationPriority(false);
         PreparationPriority(true);
+        PartialGroupPlacement(false);
+        PartialGroupPlacement(true);
+        PartialGroupWait();
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Registration(*device);
