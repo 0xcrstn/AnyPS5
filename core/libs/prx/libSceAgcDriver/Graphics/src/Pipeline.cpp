@@ -499,9 +499,12 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             prebuilt = true;
             return;
         }
+        const auto partsBefore = ThreadBuiltLibraryParts();
         const SlowReport slowPipeline([&] {
-            char text[96];
-            std::snprintf(text, sizeof(text), "graphics pipeline creation (%u stages, %s)", pipelineInfo.stageCount, libraries ? "linked from libraries" : "complete");
+            const auto& parts = ThreadBuiltLibraryParts();
+            char text[224];
+            if (!libraries) std::snprintf(text, sizeof(text), "graphics pipeline creation (%u stages, complete)", pipelineInfo.stageCount);
+            else std::snprintf(text, sizeof(text), "graphics pipeline creation (%u stages, linked from libraries; built here: %llu vertex input, %llu pre-rasterization, %llu fragment shader, %llu fragment output)", pipelineInfo.stageCount, static_cast<unsigned long long>(parts[0] - partsBefore[0]), static_cast<unsigned long long>(parts[1] - partsBefore[1]), static_cast<unsigned long long>(parts[2] - partsBefore[2]), static_cast<unsigned long long>(parts[3] - partsBefore[3]));
             return std::string(text);
         });
         if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
