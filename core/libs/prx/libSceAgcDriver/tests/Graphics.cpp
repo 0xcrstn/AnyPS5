@@ -5845,6 +5845,12 @@ int main(int argc, char** argv) {
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
 #endif
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--library-push-offset") {
+            LibraryPushOffsetTests();
+            std::printf("library push offset tests passed
+");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--sparse-buffer-holes") {
             bool passed = false;
             {
