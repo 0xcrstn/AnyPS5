@@ -71,6 +71,8 @@ enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiff
 struct DrawEntryCounters {
     std::uint64_t lookups = 0, absent = 0, hits = 0, stageValidations = 0, stageEqual = 0, variantsCompared = 0, inserts = 0, variantsInserted = 0, variantsEvicted = 0, present = 0, unstable = 0, touches = 0, verifyHits = 0, verifyMismatches = 0;
     std::uint64_t partialStages = 0, dataPatchedStages = 0;
+    double learnUs = 0, relocateUs = 0, stageValidateUs = 0, patchUs = 0, insertUs = 0, syncUs = 0, overlapUs = 0, labelUs = 0, compareUs = 0;
+    std::uint64_t validatedRuns = 0, validatedWords = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrawMiss::Count)> misses{};
     std::array<std::uint64_t, MaxDispatchVariants> variantHitsByRank{};
     double validateUs = 0;
@@ -92,6 +94,13 @@ private:
     std::vector<std::uint8_t> next;
     std::size_t bucketMask = 0;
 };
+
+struct DrawValidateSplit {
+    bool timed = false;
+    double syncUs = 0, overlapUs = 0, labelUs = 0, compareUs = 0;
+};
+
+DrawValidateSplit& ThreadDrawValidateSplit();
 
 enum class DrawVerdict { Drawn, Nothing, Rejected };
 
@@ -141,10 +150,22 @@ struct DrawAliasKeys {
     std::uint64_t Key(std::uint64_t stageKey, std::uint32_t userDataBase) const { return (stageKey ^ (content[Stage(userDataBase)] + 0x9e3779b97f4a7c15ull)) * 0x100000001b3ull + userDataBase; }
 };
 
-struct DrawStageDonor {
+struct DrawStageOption {
     std::shared_ptr<DispatchVariant> variant;
     std::vector<std::uint32_t> userData;
+    std::uint64_t content = 0;
 };
+
+struct DrawStageDonor {
+    static constexpr std::size_t Options = 4, Recent = 8;
+    std::vector<DrawStageOption> options;
+    std::array<std::uint64_t, Recent> recent{};
+    std::size_t next = 0;
+    bool cycling = false;
+    std::uint64_t Bytes() const;
+};
+
+std::uint64_t DrawStageContent(const DispatchVariant& variant);
 
 struct DrawDecodeDonor {
     std::shared_ptr<const DrawDecode> decode;
@@ -177,6 +198,10 @@ public:
         return true;
     }
     std::size_t Size() const { return entries.size(); }
+    template <typename TVisit>
+    void ForEach(TVisit&& visit) const {
+        for (const auto& [key, held] : entries) visit(held.first);
+    }
 
 private:
     std::size_t capacity;
@@ -210,7 +235,9 @@ struct DrawMissDiagnosis {
     std::array<std::uint64_t, static_cast<std::size_t>(DrawKeyMiss::Count)> keys{};
     std::array<std::uint64_t, static_cast<std::size_t>(DrawStageMiss::Count)> stages{};
     std::uint64_t wordAddressLike = 0, contentAddressLike = 0, oneWord = 0, fewWords = 0, manyWords = 0;
-    std::uint64_t donorLookups = 0, donorFound = 0, donorPuts = 0, donorNew = 0, donorEvictions = 0, donorBytes = 0;
+    std::uint64_t donorLookups = 0, donorFound = 0, donorPuts = 0, donorNew = 0, donorEvictions = 0, donorBytes = 0, donorSame = 0, donorRecurring = 0, donorFresh = 0, donorOptionsTried = 0, donorAlternateHits = 0;
+    std::uint64_t validationMisses = 0, validationNone = 0, validationUnreadable = 0, validationRelocatedRun = 0, validationAbsoluteRun = 0, validationDataWord = 0, validationAddressLike = 0, validationOneWord = 0, validationFewWords = 0, validationManyWords = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawStageMiss::Count)> validationRoles{};
     RecentTable<bool> evictedDonors{Samples * 16};
     std::unordered_map<std::uint64_t, DrawStructureParts> learned;
     RecentTable<DrawStageSample> samples{Samples};

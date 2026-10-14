@@ -206,7 +206,8 @@ void Driver::learnPendingRelocation() {
         }
         donor.stageKeys[i] = key == 0 ? 1 : key;
         std::uint64_t evicted = 0;
-        const bool added = drawStageDonors.Put(pending.aliases.Key(donor.stageKeys[i], program.userDataBase), {variant, program.userData}, &evicted);
+        bool added = false;
+        putStageDonor(pending.aliases.Key(donor.stageKeys[i], program.userDataBase), variant, program.userData, &evicted, &added, true);
         if (drawMissDiagnosisEnabled()) {
             auto& diagnosis = drawMissDiagnosis;
             ++diagnosis.donorPuts;
@@ -258,55 +259,119 @@ void Driver::relocateDrawEntry(const QueueState& queue, const DrawAliasKeys& ali
             if (found != nullptr) ++drawMissDiagnosis.donorFound;
         }
         if (found != nullptr) drawStageDonorKeys[i] = donorKey;
-        const auto* donor = found != nullptr && found->variant != nullptr && found->variant->compiled != nullptr && found->userData.size() == program.userData.size() ? found : nullptr;
+        std::vector<std::uint32_t> now(program.userData.size(), 0);
+        for (std::uint32_t index = program.hiddenUserWords; index < program.userData.size(); ++index) {
+            now[index] = readUserData(queue.shader, program.userDataBase + index - program.hiddenUserWords);
+            if (now[index] != program.userData[index]) current.push_back({i, index, now[index]});
+        }
         struct Move {
             std::uint32_t index, from, to;
         };
-        std::vector<Move> moves;
-        bool allowed = donor != nullptr;
-        for (std::uint32_t index = program.hiddenUserWords; index < program.userData.size(); ++index) {
-            const auto now = readUserData(queue.shader, program.userDataBase + index - program.hiddenUserWords);
-            if (now != program.userData[index]) current.push_back({i, index, now});
-            if (donor == nullptr || now == donor->userData[index]) continue;
-            if (index < 64 && (donor->variant->userDataReads >> index & 1u) == 0) {
-                ++counters.unreadMoves;
+        bool usable = false;
+        const std::span<const DrawStageOption> options = found != nullptr ? std::span<const DrawStageOption>(found->options) : std::span<const DrawStageOption>();
+        for (const auto& option : options) {
+            if (option.variant == nullptr || option.variant->compiled == nullptr || option.userData.size() != program.userData.size()) continue;
+            usable = true;
+            if (drawMissDiagnosisEnabled()) ++drawMissDiagnosis.donorOptionsTried;
+            std::vector<Move> moves;
+            bool allowed = true;
+            for (std::uint32_t index = program.hiddenUserWords; index < program.userData.size(); ++index) {
+                if (now[index] == option.userData[index]) continue;
+                if (index < 64 && (option.variant->userDataReads >> index & 1u) == 0) {
+                    ++counters.unreadMoves;
+                    continue;
+                }
+                const auto from = option.userData[index];
+                if (index >= 64 || (option.variant->relocatableWords >> index & 1u) == 0 || from == 0 || now[index] == 0 || ((from ^ now[index]) & 3u) != 0) allowed = false;
+                moves.push_back({index, from, now[index]});
+            }
+            if (!allowed) continue;
+            if (moves.empty()) {
+                relocated->stages[i].push_back(option.variant);
                 continue;
             }
-            const auto from = donor->userData[index];
-            if (index >= 64 || (donor->variant->relocatableWords >> index & 1u) == 0 || from == 0 || now == 0 || ((from ^ now) & 3u) != 0) allowed = false;
-            moves.push_back({index, from, now});
+            const auto& variant = option.variant;
+            auto copy = cloneVariant(*variant);
+            for (const auto& move : moves) {
+                const auto delta = AlignedWord(move.to) - AlignedWord(move.from);
+                for (std::size_t run = 0; run < copy->runs.size() && run < copy->runBases.size(); ++run) {
+                    if (copy->runBases[run] != static_cast<std::int8_t>(move.index)) continue;
+                    copy->runs[run].first += delta;
+                    copy->runs[run].second += delta;
+                }
+                const auto& forwarded = variant->compiled->shaderDataUserWords;
+                for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
+                    if (forwarded[slot] == move.index) copy->shaderDataPatches.emplace_back(slot, move.to);
+                }
+            }
+            relocated->stages[i].push_back(std::move(copy));
         }
-        if (!allowed) {
-            if (donor != nullptr) ++counters.refused;
+        if (relocated->stages[i].empty()) {
+            if (usable) ++counters.refused;
             else ++counters.missingStage;
-            if (drawMissDiagnosisEnabled()) diagnoseStageMiss(aliases, i, program.userDataBase, donorKey, found != nullptr);
+            if (drawMissDiagnosisEnabled()) diagnoseStageMiss(aliases, i, program.userDataBase, donorKey, usable);
             complete = false;
-            continue;
         }
-        if (moves.empty()) {
-            relocated->stages[i].push_back(donor->variant);
-            continue;
-        }
-        const auto& variant = donor->variant;
-        auto copy = cloneVariant(*variant);
-        for (const auto& move : moves) {
-            const auto delta = AlignedWord(move.to) - AlignedWord(move.from);
-            for (std::size_t run = 0; run < copy->runs.size() && run < copy->runBases.size(); ++run) {
-                if (copy->runBases[run] != static_cast<std::int8_t>(move.index)) continue;
-                copy->runs[run].first += delta;
-                copy->runs[run].second += delta;
-            }
-            const auto& forwarded = variant->compiled->shaderDataUserWords;
-            for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
-                if (forwarded[slot] == move.index) copy->shaderDataPatches.emplace_back(slot, move.to);
-            }
-        }
-        relocated->stages[i].push_back(std::move(copy));
     }
     if (complete) ++counters.donors;
     patches = std::move(current);
     entry = std::move(relocated);
     decode = shared;
+}
+
+std::uint64_t DrawStageContent(const DispatchVariant& variant) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    std::size_t data = 0;
+    for (std::size_t position = 0; position < variant.words.size(); ++position) {
+        while (data < variant.dataPositions.size() && variant.dataPositions[data] < position) ++data;
+        const bool masked = data < variant.dataPositions.size() && variant.dataPositions[data] == position;
+        hash = (hash ^ (masked ? 0u : variant.words[position])) * 0x100000001b3ull;
+    }
+    hash = (hash ^ reinterpret_cast<std::uintptr_t>(variant.prepared.get())) * 0x100000001b3ull;
+    return hash == 0 ? 1 : hash;
+}
+
+std::uint64_t DrawStageDonor::Bytes() const {
+    std::uint64_t bytes = sizeof(DrawStageDonor);
+    for (const auto& option : options) {
+        bytes += sizeof(DrawStageOption) + option.userData.size() * sizeof(std::uint32_t);
+        if (option.variant != nullptr) bytes += sizeof(DispatchVariant) + option.variant->words.size() * sizeof(std::uint32_t) + option.variant->runs.size() * sizeof(option.variant->runs[0]) + option.variant->dataPositions.size() * sizeof(std::uint32_t) * 2;
+    }
+    return bytes;
+}
+
+void Driver::putStageDonor(std::uint64_t key, const std::shared_ptr<DispatchVariant>& variant, const std::vector<std::uint32_t>& userData, std::uint64_t* evicted, bool* added, bool count) {
+    const auto content = DrawStageContent(*variant);
+    auto* held = drawStageDonors.Find(key);
+    if (held == nullptr) {
+        DrawStageDonor donor;
+        donor.options.push_back({variant, userData, content});
+        donor.recent[0] = content;
+        donor.next = 1;
+        const bool inserted = drawStageDonors.Put(key, std::move(donor), evicted);
+        if (added != nullptr) *added = inserted;
+        return;
+    }
+    if (added != nullptr) *added = false;
+    auto& options = held->options;
+    const auto same = std::find_if(options.begin(), options.end(), [&](const DrawStageOption& option) { return option.content == content; });
+    const bool known = same != options.end();
+    const bool recurring = std::find(held->recent.begin(), held->recent.end(), content) != held->recent.end();
+    if (count && drawMissDiagnosisEnabled()) {
+        auto& diagnosis = drawMissDiagnosis;
+        if (known) ++diagnosis.donorSame;
+        else if (recurring) ++diagnosis.donorRecurring;
+        else ++diagnosis.donorFresh;
+    }
+    if (known) options.erase(same);
+    else if (recurring) held->cycling = true;
+    if (!known && !held->cycling) options.clear();
+    options.insert(options.begin(), {variant, userData, content});
+    if (options.size() > DrawStageDonor::Options) options.resize(DrawStageDonor::Options);
+    if (!recurring) {
+        held->recent[held->next] = content;
+        held->next = (held->next + 1) % DrawStageDonor::Recent;
+    }
 }
 
 std::shared_ptr<DispatchVariant> Driver::cloneVariant(const DispatchVariant& variant) {

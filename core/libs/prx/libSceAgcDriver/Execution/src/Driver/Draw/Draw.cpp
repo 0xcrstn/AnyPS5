@@ -77,7 +77,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (drawRelocationEnabled()) {
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
             std::lock_guard cacheLock(drawCacheMutex);
+            const auto learnStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             learnPendingRelocation();
+            if (profile) drawEntryCounters.learnUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - learnStart).count();
             drawStageDonorKeys.clear();
             const auto known = drawRelocations.find(drawIdentity);
             if (known != drawRelocations.end()) {
@@ -110,7 +112,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (relocation == nullptr) noteDrawKeyMiss(drawRelocations.contains(drawIdentity) ? DrawKeyMiss::Idle : DrawKeyMiss::Unlearned);
                 else if (drawAliases.structure == 0) noteDrawKeyMiss(DrawKeyMiss::Unreadable);
             }
-            if (drawAliases.structure != 0) relocateDrawEntry(queue, drawAliases, entry, decode, userPatches);
+            if (drawAliases.structure != 0) {
+                const auto relocateStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                relocateDrawEntry(queue, drawAliases, entry, decode, userPatches);
+                if (profile) drawEntryCounters.relocateUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - relocateStart).count();
+            }
             if (relocation != nullptr) {
                 auto& trial = drawRelocationTrials[drawIdentity];
                 ++trial.lookups;
@@ -229,7 +235,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::size_t i = 0; i < matched.size() && i < drawStageDonorKeys.size() && i < programs.size(); ++i) {
             if (matched[i] == nullptr || !matched[i]->dataPatched || drawStageDonorKeys[i] == 0) continue;
             matched[i]->dataPatched = false;
-            drawStageDonors.Put(drawStageDonorKeys[i], {matched[i], programs[i].userData});
+            putStageDonor(drawStageDonorKeys[i], matched[i], programs[i].userData, nullptr, nullptr, false);
         }
     }
     if (!userPatches.empty() && !drawHit) {
