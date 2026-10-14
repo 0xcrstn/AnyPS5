@@ -815,7 +815,16 @@ void verifyCaptureMemoDataWords() {
     require(changedServed == memo && std::find(changed->snapshot.flattenedSrt.begin(), changed->snapshot.flattenedSrt.end(), 0x40400000u) != changed->snapshot.flattenedSrt.end(), "capture memo data words: a changed pure SRT data word was not patched into the memoized capture");
     guest.table = reinterpret_cast<std::uintptr_t>(&guest.other);
     const auto [moved, movedServed] = capture();
-    require(!movedServed && std::find(moved->snapshot.flattenedSrt.begin(), moved->snapshot.flattenedSrt.end(), 0x40000000u) != moved->snapshot.flattenedSrt.end(), "capture memo data words: a changed pointer in guest memory was served from the memo");
+    require(movedServed == memo && std::find(moved->snapshot.flattenedSrt.begin(), moved->snapshot.flattenedSrt.end(), 0x40000000u) != moved->snapshot.flattenedSrt.end(), "capture memo data words: a moved base word read from guest memory was not followed");
+    guest.other = 0x40400000u;
+    guest.table = reinterpret_cast<std::uintptr_t>(&guest.payload);
+    guest.payload = 0x40800000u;
+    const auto [back, backServed] = capture();
+    require(backServed == memo && std::find(back->snapshot.flattenedSrt.begin(), back->snapshot.flattenedSrt.end(), 0x40800000u) != back->snapshot.flattenedSrt.end(), "capture memo data words: a moved base word over changed data was not followed");
+    guest.table = 0;
+    const auto [nulled, nulledServed] = capture();
+    require(!nulledServed, "capture memo data words: a base word moved to null was followed");
+    guest.table = reinterpret_cast<std::uintptr_t>(&guest.other);
     constexpr int Iterations = 20000;
     const auto prepared = PreparedShaderInvocation::TryCreate(request, handle);
     const auto started = std::chrono::steady_clock::now();
@@ -828,7 +837,17 @@ void verifyCaptureMemoDataWords() {
     const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / Iterations;
     const auto served = AgcDriver::ShaderMemory::MemoizedCaptures() - before;
     require(memo ? served >= Iterations - 1 : served == 0, "capture memo data words: captures over changed pure SRT data words were not served as configured");
-    std::cout << "Capture memo " << (memo ? "on" : "off") << ": " << us << " us per capture over a changed pure SRT data word\n";
+    const auto movingBefore = AgcDriver::ShaderMemory::MemoizedCaptures();
+    const auto movingStarted = std::chrono::steady_clock::now();
+    for (int i = 0; i < Iterations; ++i) {
+        guest.table = reinterpret_cast<std::uintptr_t>(i % 2 == 0 ? &guest.payload : &guest.other);
+        AgcDriver::ShaderMemory memory({});
+        static_cast<void>(memory.Capture(*prepared));
+    }
+    const auto movingUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - movingStarted).count() / Iterations;
+    const auto followed = AgcDriver::ShaderMemory::MemoizedCaptures() - movingBefore;
+    require(memo ? followed >= Iterations - 1 : followed == 0, "capture memo data words: captures over a moved base word in guest memory were not served as configured");
+    std::cout << "Capture memo " << (memo ? "on" : "off") << ": " << us << " us per capture over a changed pure SRT data word, " << movingUs << " us per capture over a moved base word in guest memory\n";
 }
 
 void verifyCaptureMemo() {

@@ -79,6 +79,17 @@ public:
         std::uint64_t bytes;
         std::uint32_t value;
     };
+    struct ReplayPlan {
+        std::span<const std::pair<std::uint64_t, std::uint32_t>> dataLeaves;
+        std::span<const std::pair<std::uint64_t, std::uint32_t>> baseWords;
+        std::span<const std::uint64_t> accessBases;
+    };
+    struct ReplayResult {
+        std::vector<std::pair<std::size_t, std::uint32_t>> changed;
+        std::vector<std::pair<std::uint64_t, std::int64_t>> moved;
+        std::vector<std::uint64_t> addresses;
+        std::uint64_t mismatch = 0;
+    };
 
 private:
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
@@ -96,7 +107,7 @@ private:
     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
     static bool accessible(void* context, std::uint64_t address, std::uint64_t bytes);
     Page& page(std::uint64_t base);
-    bool replay(std::span<const RecordedAccess> accesses, std::span<const std::pair<std::uint64_t, std::uint32_t>> dataLeaves = {}, std::vector<std::pair<std::size_t, std::uint32_t>>* changed = nullptr, std::uint64_t* mismatch = nullptr);
+    bool replay(std::span<const RecordedAccess> accesses, const ReplayPlan* plan = nullptr, ReplayResult* result = nullptr);
     bool probe(std::uint64_t address, std::uint64_t bytes);
 
     // Regions given at construction (the registered shader's code and header), referenced as given:
