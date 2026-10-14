@@ -479,7 +479,19 @@ public:
         std::uint64_t count = 0;
         double ms = 0;
         std::size_t words = 0;
+        std::uint64_t placements = 0;
+        double inPlaceBytes = 0;
+        double hostCopyBytes = 0;
+        double deviceBytes = 0;
+        std::uint64_t addressBased = 0;
     };
+    struct BoundPlacement {
+        std::uint64_t inPlace = 0;
+        std::uint64_t hostCopies = 0;
+        std::uint64_t device = 0;
+        bool addressBased = false;
+    };
+    static void NoteProgramPlacement(std::uint64_t key, const BoundPlacement& placement);
     static std::string FormatGpuPrograms(std::vector<GpuProgramTotals> programs, bool draws, std::size_t limit);
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
     // A leading barrier a command left out because the previous trailing barrier covered its

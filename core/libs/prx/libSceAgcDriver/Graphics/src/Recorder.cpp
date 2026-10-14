@@ -1754,6 +1754,8 @@ std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
 double timingProgramMs = 0, timingDrawProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::map<std::uint64_t, std::size_t> timingProgramWords;
+struct PlacementTotals { std::uint64_t notes = 0; double inPlace = 0; double hostCopies = 0; double device = 0; std::uint64_t addressBased = 0; };
+std::map<std::uint64_t, PlacementTotals> timingPlacement;
 std::uint64_t timingBatches = 0;
 
 bool DrawOrGpuProfiled() {
@@ -1948,13 +1950,24 @@ void Recorder::NoteProgramWords(std::uint64_t key, std::size_t words) {
     timingProgramWords[key] = words;
 }
 
+void Recorder::NoteProgramPlacement(std::uint64_t key, const BoundPlacement& placement) {
+    if (!GpuTimingEnabled() || key == 0) return;
+    std::lock_guard lock(timingMutex);
+    auto& totals = timingPlacement[key];
+    ++totals.notes;
+    totals.inPlace += static_cast<double>(placement.inPlace);
+    totals.hostCopies += static_cast<double>(placement.hostCopies);
+    totals.device += static_cast<double>(placement.device);
+    if (placement.addressBased) ++totals.addressBased;
+}
+
 std::string Recorder::FormatGpuPrograms(std::vector<GpuProgramTotals> programs, bool draws, std::size_t limit) {
     std::sort(programs.begin(), programs.end(), [](const GpuProgramTotals& a, const GpuProgramTotals& b) { return a.ms > b.ms; });
     std::string text;
     for (std::size_t i = 0; i < programs.size() && i < limit; ++i) {
         const auto& program = programs[i];
         const auto perRun = program.count != 0 ? program.ms * 1000.0 / static_cast<double>(program.count) : 0.0;
-        char entry[160];
+        char entry[256];
         if (draws) {
             std::snprintf(entry, sizeof(entry), " %s 0x%llx x%llu %.0fms %.0fus", (program.key & VertexOnlyFlag) != 0 ? "vs" : "ps", static_cast<unsigned long long>(program.key & ~(DrawProgramFlag | VertexOnlyFlag)), static_cast<unsigned long long>(program.count), program.ms, perRun);
         } else if (program.words != 0) {
@@ -1963,6 +1976,11 @@ std::string Recorder::FormatGpuPrograms(std::vector<GpuProgramTotals> programs, 
             std::snprintf(entry, sizeof(entry), " 0x%llx x%llu %.0fms %.0fus", static_cast<unsigned long long>(program.key), static_cast<unsigned long long>(program.count), program.ms, perRun);
         }
         text += entry;
+        if (program.placements != 0) {
+            const auto notes = static_cast<double>(program.placements) * 1048576.0;
+            std::snprintf(entry, sizeof(entry), " [in place %.2f host copy %.2f device %.2f MiB%s]", program.inPlaceBytes / notes, program.hostCopyBytes / notes, program.deviceBytes / notes, program.addressBased != 0 ? " address-based" : "");
+            text += entry;
+        }
     }
     return text;
 }
@@ -2452,7 +2470,15 @@ void Recorder::readGpuTiming(Batch& batch) {
             classes += text;
         } else {
             const auto words = timingProgramWords.find(key);
-            ((key & DrawProgramFlag) != 0 ? drawPrograms : dispatchPrograms).push_back({key, totals.count, totals.ms, words != timingProgramWords.end() ? words->second : 0});
+            GpuProgramTotals program{key, totals.count, totals.ms, words != timingProgramWords.end() ? words->second : 0};
+            if (const auto placement = timingPlacement.find(key); placement != timingPlacement.end()) {
+                program.placements = placement->second.notes;
+                program.inPlaceBytes = placement->second.inPlace;
+                program.hostCopyBytes = placement->second.hostCopies;
+                program.deviceBytes = placement->second.device;
+                program.addressBased = placement->second.addressBased;
+            }
+            ((key & DrawProgramFlag) != 0 ? drawPrograms : dispatchPrograms).push_back(program);
         }
     }
     // The first field stays the program sum: the measure scripts match on it.
@@ -2460,6 +2486,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     AgcDriver::ProfilePrint_nid_no_patch("%s; by draw program (%.0f ms in %zu programs):%s", FormatGpuPrograms(std::move(dispatchPrograms), false, 12).c_str(), timingDrawProgramMs, drawPrograms.size(), FormatGpuPrograms(std::move(drawPrograms), true, 16).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();
+    timingPlacement.clear();
     timingProgramMs = timingDrawProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
     lock.unlock();
