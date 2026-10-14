@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -343,6 +344,25 @@ constexpr std::size_t IndirectPathCount = static_cast<std::size_t>(IndirectDrawP
 constexpr std::array<const char*, IndirectPathCount> IndirectDrawPathNames{"gpu-side", "patched SGPR not folded", "fetch offset unknown", "non-vertex path", "GE_INDX_OFFSET", "draw index", "vertex range too large", "feature gap", "pending image results", "pending label or copied write", "not imported", "disabled"};
 
 // What became of one draw, for the totals.
+struct TargetLookupSplit {
+    double imageUs = 0;
+    double registerClearUs = 0;
+    double cmaskClearUs = 0;
+    double walkUs = 0;
+    LookupOutcomes outcomes;
+
+    void Add(const TargetLookupSplit& other) {
+        imageUs += other.imageUs;
+        registerClearUs += other.registerClearUs;
+        cmaskClearUs += other.cmaskClearUs;
+        walkUs += other.walkUs;
+        for (std::size_t i = 0; i < LookupOutcomes::Count; ++i) {
+            outcomes.counts[i] += other.outcomes.counts[i];
+            outcomes.ms[i] += other.outcomes.ms[i];
+        }
+    }
+};
+
 struct DrawOutcome {
     // In the recorder; `waited` when the recorder was synced right after (copied writes or a lease).
     bool recorded = false;
@@ -372,6 +392,7 @@ struct DrawOutcome {
     std::uint64_t partialLookups = 0;
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
+    TargetLookupSplit lookupSplit;
     // How the draw's resources came about (DrawKind), for the per-kind averages.
     std::size_t kind = 0;
     // The flush hook's fence waits made inside this draw (index and vertex reads, the target
@@ -396,6 +417,7 @@ struct DrawProfile {
     std::uint64_t partialLookups = 0;
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
+    TargetLookupSplit lookupSplit;
     std::array<double, PhaseCount> totalsUs{};
     // The longest single draw's time per phase, and the longest draw: the [lock] line's 'draw'
     // hold max (tens of ms against an average well under a millisecond) needs a phase name.
@@ -502,6 +524,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.partialLookups += outcome.partialLookups;
     profile.pagesWalked += outcome.pagesWalked;
     profile.lookupUs += outcome.lookupUs;
+    profile.lookupSplit.Add(outcome.lookupSplit);
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
         profile.kindUs[outcome.kind] += drawUs;
@@ -512,7 +535,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.lastReport = now;
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
-    char line[2048];
+    char line[4096];
     int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     for (std::size_t i = SyncNone + 1; i < SyncCount && room(); ++i) {
@@ -524,6 +547,12 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
         if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
+        if (i == PhaseReadTarget && room()) {
+            const auto& split = profile.lookupSplit;
+            const auto& found = split.outcomes;
+            const auto count = [&](LookupOutcomes::Kind kind) { return static_cast<unsigned long long>(found.counts[kind]); };
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (lookup split, ms: image %.1f [cache hit %llu %.1f, made %llu %.1f; refresh proved %llu %.1f, unchanged %llu %.1f, compared %llu %.1f; uploads %llu %.1f; dcc scans %llu %.1f; pending flushes %llu %.1f], register clears %.1f, cmask clears %.1f, write-watch walks %.1f)", split.imageUs / 1000.0, count(LookupOutcomes::StorageHit), found.ms[LookupOutcomes::StorageHit], count(LookupOutcomes::StorageMade), found.ms[LookupOutcomes::StorageMade], count(LookupOutcomes::RefreshProved), found.ms[LookupOutcomes::RefreshProved], count(LookupOutcomes::RefreshUnchanged), found.ms[LookupOutcomes::RefreshUnchanged], count(LookupOutcomes::RefreshCompared), found.ms[LookupOutcomes::RefreshCompared], count(LookupOutcomes::UploadDirect) + count(LookupOutcomes::UploadCpu) + count(LookupOutcomes::UploadClear), found.ms[LookupOutcomes::UploadDirect] + found.ms[LookupOutcomes::UploadCpu] + found.ms[LookupOutcomes::UploadClear], count(LookupOutcomes::DccScan), found.ms[LookupOutcomes::DccScan], count(LookupOutcomes::PendingFlush), found.ms[LookupOutcomes::PendingFlush], split.registerClearUs / 1000.0, split.cmaskClearUs / 1000.0, split.walkUs / 1000.0);
+        }
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
@@ -569,6 +598,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.slowLookupUs = 0;
     profile.fullScissorLookups = profile.partialLookups = profile.pagesWalked = 0;
     profile.lookupUs = 0;
+    profile.lookupSplit = {};
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
@@ -1217,18 +1247,37 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
+    const auto walkNsBefore = profile ? GuestMemory::ThreadCollectedNanoseconds() : 0;
+    const auto outcomesBefore = profile ? ThreadLookupOutcomes() : LookupOutcomes{};
+    auto stepStart = lookupStart;
+    const auto step = [&](double& us) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        us += std::chrono::duration<double, std::micro>(now - stepStart).count();
+        stepStart = now;
+    };
     std::shared_ptr<StorageTexture> resident;
     try {
         resident = lookup();
+        step(outcome.lookupSplit.imageUs);
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
+        step(outcome.lookupSplit.registerClearUs);
     } catch (const std::exception& error) {
         static std::mutex reportMutex;
         static std::set<std::uint64_t> reported;
         std::lock_guard lock(reportMutex);
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
+    if (profile) stepStart = std::chrono::steady_clock::now();
     if (resident != nullptr) materializeCmaskClear(context, color, resident);
     if (profile) {
+        step(outcome.lookupSplit.cmaskClearUs);
+        outcome.lookupSplit.walkUs += static_cast<double>(GuestMemory::ThreadCollectedNanoseconds() - walkNsBefore) / 1000.0;
+        const auto& outcomesAfter = ThreadLookupOutcomes();
+        for (std::size_t i = 0; i < LookupOutcomes::Count; ++i) {
+            outcome.lookupSplit.outcomes.counts[i] += outcomesAfter.counts[i] - outcomesBefore.counts[i];
+            outcome.lookupSplit.outcomes.ms[i] += outcomesAfter.ms[i] - outcomesBefore.ms[i];
+        }
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         ++outcome.targetLookups;
         if (lookupUs >= 1000.0) {
