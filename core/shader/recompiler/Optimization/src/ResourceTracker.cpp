@@ -904,11 +904,42 @@ private:
         return strict;
     }
 
-    static IrValue* GiveUp(DescriptorWeb& web, const char* reason) {
+    static IrValue* GiveUp(DescriptorWeb& web, std::string reason) {
         if (web.failure.empty()) {
-            web.failure = reason;
+            web.failure = std::move(reason);
         }
         return nullptr;
+    }
+
+    std::string RebuildBlocker(IrValue* value, std::uint32_t depth) const {
+        value = value->Resolve();
+        if (value->HasImmediate()) {
+            return {};
+        }
+        if (value->IsPhi()) {
+            IrValue* invariant = ResolveInvariantPhi(m_program.Resources(), value);
+            if (invariant == nullptr || invariant->IsPhi()) {
+                return "a Phi that does not resolve to one value: " + describeValueChain(value, 3u);
+            }
+            return RebuildBlocker(invariant, depth);
+        }
+        if (depth == 0u) {
+            return "a chain deeper than " + std::to_string(phiSearchDepth) + " operations";
+        }
+        const auto op = value->Opcode();
+        const bool register_ = op == IrOpcode::GetUserData;
+        const bool argumentless = (op == IrOpcode::GetShaderBase || op == IrOpcode::GetSrtResource) && value->ArgumentCount() == 0u;
+        const bool srtRead = op == IrOpcode::ReadConst && value->ArgumentCount() == 2u && value->Argument(0)->Resolve()->Opcode() == IrOpcode::GetSrtResource && value->Argument(1)->Resolve()->HasImmediate();
+        if (!register_ && !argumentless && !srtRead && !Detail::IsRuntimeUniformOp(op)) {
+            return describeValueChain(value, 3u);
+        }
+        for (std::size_t index = 0; !register_ && index < value->ArgumentCount(); index++) {
+            auto blocker = RebuildBlocker(value->Argument(index), depth - 1u);
+            if (!blocker.empty()) {
+                return blocker;
+            }
+        }
+        return {};
     }
 
     IrValue* WebSelector(std::vector<IrValue*> tuple, DescriptorWeb& web, IrValue& position) {
@@ -942,7 +973,7 @@ private:
             }
             for (IrValue* value : tuple) {
                 if (Rematerialize(value, position, false, phiSearchDepth) == nullptr) {
-                    return GiveUp(web, "a descriptor dword is not rebuilt from user data, the SRT and uniform operations before the read");
+                    return GiveUp(web, "a descriptor dword is not rebuilt from user data, the SRT and uniform operations before the read (" + RebuildBlocker(value, phiSearchDepth) + ")");
                 }
             }
             const auto same = std::ranges::find_if(web.arms, [&](const std::vector<IrValue*>& arm) {
