@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchRelocation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CacheSizing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
@@ -66,6 +67,7 @@ public:
     static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request);
     DrawEntryCounters DrawCacheCounters();
+    DispatchCacheTotals DispatchCacheCounters();
 
 private:
     friend class SampledReadScope;
@@ -109,9 +111,23 @@ private:
     void eraseDispatchEntry(std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>>::iterator it);
     void classifyDiffering(std::uint64_t program, std::uint64_t key, const DispatchVariant& old, const DispatchVariant& fresh, const ShaderRecompiler::ResourceCapture* capture, EntryCounters& counters);
     void reportDispatchCache(EntryCounters& counters);
-    void lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering);
-    void insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming);
+    void lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, const DispatchKeyParts& parts, const std::shared_ptr<const ShaderSnapshot>& registeredShader, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering);
+    void insertDispatch(std::uint64_t address, std::uint64_t key, const DispatchKeyParts& parts, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming);
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
+    void storeDispatchVariant(std::uint64_t key, std::shared_ptr<DispatchVariant> fresh, const std::shared_ptr<DispatchEntry>& missedEntry, std::shared_ptr<DispatchVariant>& attachVariant);
+    static bool dispatchRelocationEnabled();
+    static std::uint64_t userDataCallWords(std::span<const std::uint32_t> code, std::size_t userWords);
+    static bool dispatchMissDiagnosisEnabled();
+    static std::uint64_t dispatchStructureKey(const DispatchKeyParts& parts, const DispatchShape& shape);
+    void learnDispatchDonor(const DispatchKeyParts& parts, const std::shared_ptr<DispatchVariant>& variant);
+    void noteDispatchMiss(DispatchMiss reason);
+    void diagnoseDispatchIdentity(const DispatchKeyParts& parts);
+    void diagnoseDispatchWords(const DispatchKeyParts& parts, const DispatchShape& shape, std::uint64_t structure);
+    void diagnoseDispatchContent(const DispatchVariant& relocated);
+    static std::shared_ptr<DispatchVariant> relocatedDispatchVariant(const DispatchDonor& donor, std::span<const std::uint32_t> userData, std::uint64_t& moves);
+    static void patchDispatchShaderData(DispatchVariant& variant);
+    bool relocateDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, const DispatchKeyParts& parts, const std::shared_ptr<const ShaderSnapshot>& registeredShader, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<DispatchEntry>& missedEntry, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit);
+    void reportDispatchRelocation();
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool drawEntries();
     static bool verifyDrawEntries();
@@ -325,6 +341,14 @@ private:
     Graphics::CacheSizing dispatchSizing{dispatchCacheLimits()};
 
     EntryCounters entryCounters;
+
+    static constexpr std::size_t MaxDispatchDonors = 16384;
+    RecentTable<DispatchShape> dispatchShapes{MaxDispatchDonors};
+    RecentTable<DispatchDonor> dispatchDonors{MaxDispatchDonors};
+    RecentTable<bool> evictedDispatchDonors{MaxDispatchDonors * 4};
+    std::unordered_map<std::uint64_t, DispatchKeyLast> lastDispatchKeys;
+    DispatchRelocationCounters dispatchRelocationCounters;
+    DispatchCacheTotals dispatchCacheTotals;
 
     std::atomic<std::uint64_t> dataPendingMisses{0};
 

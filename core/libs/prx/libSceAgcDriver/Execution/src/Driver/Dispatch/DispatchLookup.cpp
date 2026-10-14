@@ -4,12 +4,13 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
+void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, const DispatchKeyParts& parts, const std::shared_ptr<const ShaderSnapshot>& registeredShader, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
     if (!noDispatchCache) {
 
         static const bool validateUnlocked = std::getenv("APS5_NO_UNLOCKED_VALIDATE") == nullptr;
         std::unique_lock cacheLock(dispatchCacheMutex);
         ++entryCounters.lookups;
+        ++dispatchCacheTotals.lookups;
         const auto found = dispatchCache.find(key);
         std::shared_ptr<DispatchEntry> entry = found != dispatchCache.end() ? found->second : nullptr;
         if (entry == nullptr) {
@@ -124,20 +125,24 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 compiledResult = variant->compiled;
                 if (dataHit) {
 
-                    liveWords = variant->words;
-                    for (const auto& [position, value] : liveData) liveWords[position] = value;
-                    regions.clear();
-                    appendEntryRegions(*variant, regions, &liveWords);
-                    auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant->compiled);
-                    auto& descriptor = patched->bindings[variant->flatBinding].guestDescriptor;
-                    for (std::size_t k = 0; k < variant->dataPositions.size(); ++k) {
-                        if (variant->dataSlots[k] < descriptor.size()) descriptor[variant->dataSlots[k]] = liveWords[variant->dataPositions[k]];
+                    const auto patched = patchBufferWords(*variant, liveData);
+                    if (patched != nullptr) {
+                        liveWords = patched->words;
+                        regions.clear();
+                        appendEntryRegions(*variant, regions, &liveWords);
+                        compiledResult = patched->compiled;
+                        ++counters.dataHits;
+                        counters.dataWordsRefreshed += liveData.size();
+                        ++counters.dataHitsByRank[rank];
+                    } else {
+                        current = false;
+                        dataHit = false;
+                        compiledResult = nullptr;
+                        --counters.variantHitsByRank[rank];
                     }
-                    compiledResult = std::move(patched);
-                    ++counters.dataHits;
-                    counters.dataWordsRefreshed += liveData.size();
-                    ++counters.dataHitsByRank[rank];
                 }
+            }
+            if (current) {
                 if (stampValidate()) {
                     captured = variant->captured;
                 } else {
@@ -150,6 +155,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 keepVariant = variant;
                 cached = true;
                 ++dispatchCacheHits;
+                ++dispatchCacheTotals.exactHits;
                 if (untouched) {
                     if (restamped != 0) variant->generation.store(restamped, std::memory_order_release);
 
@@ -183,6 +189,14 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 reportDispatchCache(counters);
             }
             phaseTiming.Phase(PhaseRelock);
+        }
+        if (!cached && dispatchRelocationEnabled() && !stampValidate()) {
+            if (cacheLock.owns_lock()) cacheLock.unlock();
+            if (relocateDispatch(address, submission, key, parts, registeredShader, profile, memory, missedEntry, compiledResult, keepVariant, captured, liveWords, dataHit)) {
+                cached = true;
+                validated = true;
+            }
+            phaseTiming.Phase(PhaseValidate);
         }
     }
 }
