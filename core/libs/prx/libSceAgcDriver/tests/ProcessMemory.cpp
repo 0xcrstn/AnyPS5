@@ -69,6 +69,41 @@ void checkHostCommit() {
     VirtualFree(block, 0, MEM_RELEASE);
 }
 
+void checkGpuMapped() {
+    const auto before = WalkAddressSpace(0, 0, ThreadStackAllocations());
+    auto* combined = static_cast<std::byte*>(VirtualAlloc(nullptr, 32 * MiB, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE));
+    require(combined != nullptr, "commit a write-combined block");
+    const auto after = WalkAddressSpace(0, 0, ThreadStackAllocations());
+    require(after.gpuMapped >= before.gpuMapped + 32 * MiB && after.gpuMappedCount == before.gpuMappedCount + 1, "a write-combined allocation is not counted as GPU memory the driver mapped");
+    require(std::ranges::binary_search(after.gpuMappedBases, reinterpret_cast<std::uintptr_t>(combined)), "the write-combined allocation's base is not listed");
+    require(after.hostPrivate >= before.hostPrivate + 32 * MiB, "a write-combined allocation left host private memory");
+    VirtualFree(combined, 0, MEM_RELEASE);
+}
+
+void checkDelta() {
+    auto* large = static_cast<std::byte*>(VirtualAlloc(nullptr, 48 * MiB, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    auto* medium = static_cast<std::byte*>(VirtualAlloc(nullptr, 300 * 1024, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    auto* growing = static_cast<std::byte*>(VirtualAlloc(nullptr, 8 * MiB, MEM_RESERVE, PAGE_READWRITE));
+    require(large != nullptr && medium != nullptr && growing != nullptr && VirtualAlloc(growing, MiB, MEM_COMMIT, PAGE_READWRITE) != nullptr, "allocate the delta fixtures");
+    const auto before = WalkAddressSpace(0, 0, ThreadStackAllocations());
+    auto* small = static_cast<std::byte*>(VirtualAlloc(nullptr, 20 * 1024, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    require(small != nullptr && VirtualAlloc(growing + MiB, 2 * MiB, MEM_COMMIT, PAGE_READWRITE) != nullptr, "change the delta fixtures");
+    VirtualFree(medium, 0, MEM_RELEASE);
+    auto* held = VirtualAlloc(medium, 64 * 1024, MEM_RESERVE, PAGE_NOACCESS);
+    const auto after = WalkAddressSpace(0, 0, ThreadStackAllocations());
+    const auto delta = DiffAllocations(before.allocations, after.allocations, 4);
+    require(delta.newCount[0] >= 1 && delta.newBytes[0] >= 20 * 1024, "a new small allocation was not counted in its size class");
+    require(delta.vanishedCount >= 1 && delta.vanishedBytes >= 300 * 1024, "a released allocation was not counted as gone");
+    require(delta.grownBytes >= 2 * MiB, "a reservation committing more was not counted as grown");
+    require(!delta.largest.empty() && std::ranges::any_of(delta.largest, [&](const AllocationChange& change) { return change.base == reinterpret_cast<std::uintptr_t>(growing) && change.before == MiB && change.after == 3 * MiB; }), "the grown reservation is not among the largest changes");
+    require(std::ranges::none_of(delta.largest, [&](const AllocationChange& change) { return change.base == reinterpret_cast<std::uintptr_t>(large); }), "an unchanged allocation is listed as a change");
+    require(AllocationSizeClass(1000) == 0 && AllocationSizeClass(64 * 1024) == 1 && AllocationSizeClass(MiB) == 2 && AllocationSizeClass(16 * MiB) == 3, "size classes are misassigned");
+    VirtualFree(large, 0, MEM_RELEASE);
+    VirtualFree(small, 0, MEM_RELEASE);
+    VirtualFree(growing, 0, MEM_RELEASE);
+    if (held != nullptr) VirtualFree(held, 0, MEM_RELEASE);
+}
+
 unsigned __stdcall parkedThread(void* argument) {
     WaitForSingleObject(static_cast<HANDLE>(argument), INFINITE);
     return 0;
@@ -99,6 +134,8 @@ int main() {
         checkArenaSkipped();
         checkHostCommit();
         checkThreadStacks();
+        checkDelta();
+        checkGpuMapped();
 #endif
         require(ReadProcessCounters().commit != 0, "the process commit is read");
     } catch (const std::exception& error) {

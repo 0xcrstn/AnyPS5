@@ -18,6 +18,7 @@ struct ModuleUse {
 bool Enabled();
 std::size_t HookModules(std::string_view pathPart);
 std::vector<ModuleUse> Read();
+std::string Owner(std::uintptr_t address);
 
 }
 

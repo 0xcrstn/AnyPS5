@@ -46,10 +46,35 @@ std::string Describe(const std::function<std::string()>& device) {
     const auto process = ProcessMemory::ReadProcessCounters();
     static std::mutex stacksMutex;
     static std::vector<std::uintptr_t> stacks;
+    static std::vector<std::pair<std::uintptr_t, std::uint64_t>> previousAllocations;
     static std::uint64_t reports = 0;
     std::lock_guard stacksLock(stacksMutex);
     if (reports++ % 10 == 0) stacks = ProcessMemory::ThreadStackAllocations();
-    const auto space = ProcessMemory::WalkAddressSpace(arenaBase, arenaBytes, stacks);
+    auto space = ProcessMemory::WalkAddressSpace(arenaBase, arenaBytes, stacks);
+    const auto gpuMappedBases = std::move(space.gpuMappedBases);
+    std::string changes;
+    if (!previousAllocations.empty()) {
+        const auto delta = ProcessMemory::DiffAllocations(previousAllocations, space.allocations, 6);
+        std::uint64_t newCount = 0;
+        std::uint64_t newBytes = 0;
+        for (std::size_t sizeClass = 0; sizeClass < delta.newCount.size(); ++sizeClass) {
+            newCount += delta.newCount[sizeClass];
+            newBytes += delta.newBytes[sizeClass];
+        }
+        changes = " | since the last report: " + std::to_string(newCount) + " new host allocations (" + mib(newBytes) + ": under 64 KiB " + std::to_string(delta.newCount[0]) + " / " + mib(delta.newBytes[0]) + ", under 1 MiB " + std::to_string(delta.newCount[1]) + " / " + mib(delta.newBytes[1]) + ", under 16 MiB " + std::to_string(delta.newCount[2]) + " / " + mib(delta.newBytes[2]) + ", larger " + std::to_string(delta.newCount[3]) + " / " + mib(delta.newBytes[3]) + "), grown by " + mib(delta.grownBytes) + ", shrunk by " + mib(delta.shrunkBytes) + ", " + std::to_string(delta.vanishedCount) + " gone (" + mib(delta.vanishedBytes) + ")";
+        if (!delta.largest.empty()) {
+            changes += "; largest";
+            for (const auto& change : delta.largest) {
+                char part[96];
+                std::snprintf(part, sizeof(part), " 0x%llx %s %s", static_cast<unsigned long long>(change.base), change.before == 0 ? "new" : (mib(change.before) + " to").c_str(), mib(change.after).c_str());
+                changes += part;
+                const auto owner = DriverHeapTrace::Owner(change.base);
+                if (std::ranges::binary_search(gpuMappedBases, change.base)) changes += " (write-combined: GPU memory)";
+                else if (!owner.empty()) changes += " (" + owner + ")";
+            }
+        }
+    }
+    previousAllocations = std::move(space.allocations);
     GuestHeap::GuestHeapStatistics guestHeap{};
     GuestHeap::GuestHeapGetStatistics_nid_no_patch(&guestHeap);
     const auto shaders = ShaderRecompiler::GetRetainedShaderMemory();
@@ -62,11 +87,11 @@ std::string Describe(const std::function<std::string()>& device) {
     const auto bufferCopies = Graphics::GuestBufferHostCopyBytes();
     std::uint64_t driverBytes = 0;
     for (const auto& use : DriverHeapTrace::Read()) driverBytes += use.heapBytes + use.virtualBytes;
-    const auto known = accounted + storageCopies + bufferCopies + driverBytes;
+    const auto known = accounted + storageCopies + bufferCopies + driverBytes + space.gpuMapped;
     std::string text = "[memory] process commit " + gib(process.commit) + " (peak " + gib(process.peakCommit) + "), working set " + gib(process.workingSet);
     text += " | guest arena private " + gib(process.commit > space.hostPrivate ? process.commit - space.hostPrivate : 0);
     text += "; guest heap live " + mib(guestHeap.largeLiveBytes) + " + small spans " + mib(guestHeap.smallSpanBytes) + ", freed blocks kept " + mib(guestHeap.largeCachedBytes);
-    text += " | host private " + gib(space.hostPrivate) + ": " + std::to_string(space.threads) + " thread stacks " + mib(space.stacks) + ", heaps and other allocations " + gib(heapBytes) + " (the shader counters below account for ~" + gib(accounted) + ", storage image host copies of guest bytes " + gib(storageCopies) + ", guest buffer snapshots " + gib(bufferCopies) + (DriverHeapTrace::Enabled() ? ", driver modules (APS5_TRACE_DRIVER_HEAP) " + gib(driverBytes) : std::string{}) + ", the rest ~" + gib(heapBytes > known ? heapBytes - known : 0) + ": the Vulkan driver's host memory and the other caches)";
+    text += " | host private " + gib(space.hostPrivate) + ": " + std::to_string(space.threads) + " thread stacks " + mib(space.stacks) + ", heaps and other allocations " + gib(heapBytes) + " (the shader counters below account for ~" + gib(accounted) + ", storage image host copies of guest bytes " + gib(storageCopies) + ", guest buffer snapshots " + gib(bufferCopies) + (DriverHeapTrace::Enabled() ? ", driver modules (APS5_TRACE_DRIVER_HEAP) " + gib(driverBytes) : std::string{}) + ", GPU memory the driver mapped write-combined " + gib(space.gpuMapped) + " in " + std::to_string(space.gpuMappedCount) + " allocations, the rest ~" + gib(heapBytes > known ? heapBytes - known : 0) + ": the Vulkan driver's host memory and the other caches)";
     if (!space.largest.empty()) {
         text += " (largest";
         for (const auto& [base, bytes] : space.largest) {
@@ -84,6 +109,7 @@ std::string Describe(const std::function<std::string()>& device) {
         static_cast<unsigned long long>(backlog.registered), static_cast<unsigned long long>(backlog.queued), static_cast<unsigned long long>(backlog.queuedByUse), static_cast<unsigned long long>(backlog.running), static_cast<unsigned long long>(backlog.threads), static_cast<unsigned long long>(backlog.prebuildsQueued), static_cast<unsigned long long>(backlog.plans), static_cast<unsigned long long>(backlog.planInstructions), mib(backlog.planInstructionBytes).c_str(),
         static_cast<unsigned long long>(shaders.sources), static_cast<unsigned long long>(shaders.plans), static_cast<unsigned long long>(shaders.planValues), mib(shaders.planBytes).c_str(), static_cast<unsigned long long>(shaders.spilledPlans), mib(shaders.spilledPlanBytes).c_str(), static_cast<unsigned long long>(shaders.planReloads), static_cast<unsigned long long>(shaders.programs), static_cast<unsigned long long>(shaders.irPrograms), mib(shaders.irBytes).c_str(), mib(shaders.irPeakBytes).c_str(), static_cast<unsigned long long>(shaders.variants), mib(shaders.variantMetadataBytes).c_str(), mib(shaders.variantSpirvBytes).c_str(), static_cast<unsigned long long>(shaders.spilledVariants), mib(shaders.spilledSpirvBytes).c_str(), static_cast<unsigned long long>(shaders.spirvReloads), mib(shaders.spirvReloadBytes).c_str(), static_cast<unsigned long long>(shaders.memoResults), mib(shaders.memoBytes).c_str(), static_cast<unsigned long long>(shaders.bindingPlans), static_cast<unsigned long long>(shaders.specializedModules), mib(shaders.specializedSpirvBytes).c_str(), static_cast<unsigned long long>(shaders.registrationModules));
     text += part;
+    text += changes;
     std::snprintf(part, sizeof(part), " | took %.0f ms over %llu regions", walked, static_cast<unsigned long long>(space.regions));
     text += part;
     return text;
