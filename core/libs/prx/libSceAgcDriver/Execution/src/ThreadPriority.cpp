@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -304,6 +305,32 @@ RealtimePlan PlanRealtime(std::uint32_t priority, const std::optional<RtkitLimit
 void RaiseWorkerThreadPriority(const char* role) {
     if (RequestedMode() == ThreadPriorityMode::Off) return;
     Raise(role);
+}
+
+PreparationPriorityMode ParsePreparationPriorityMode(const char* text) {
+    if (text == nullptr || *text == '\0' || std::strcmp(text, "below") == 0) return PreparationPriorityMode::BelowNormal;
+    if (std::strcmp(text, "normal") == 0) return PreparationPriorityMode::Normal;
+    throw std::invalid_argument(std::string("APS5_PREPARE_PRIORITY=") + text + " is not below or normal");
+}
+
+void LowerPreparationThreadPriority(const char* role) {
+    static const PreparationPriorityMode mode = ParsePreparationPriorityMode(std::getenv("APS5_PREPARE_PRIORITY"));
+    if (mode == PreparationPriorityMode::Normal) return;
+#ifdef _WIN32
+    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)) {
+        throw std::runtime_error(std::string("APS5_PREPARE_PRIORITY=below: ") + role + " SetThreadPriority failed (error " + std::to_string(GetLastError()) + ")");
+    }
+    LogOnce(role, "below normal");
+#elif defined(__linux__)
+    constexpr int nice = 5;
+    const auto tid = static_cast<id_t>(syscall(SYS_gettid));
+    if (setpriority(PRIO_PROCESS, tid, nice) != 0) {
+        throw std::runtime_error(std::string("APS5_PREPARE_PRIORITY=below: ") + role + " setpriority failed: " + std::strerror(errno));
+    }
+    LogOnce(role, "nice " + std::to_string(nice));
+#else
+    LogOnce(role, "priority left unchanged on this platform");
+#endif
 }
 
 }

@@ -9,6 +9,8 @@ using HostThreadEntry = void* (*)(void*);
 
 bool StartDetachedHostThread(HostThreadEntry entry, void* argument, std::size_t stackReserveBytes);
 
+void NameHostThread(const char* name);
+
 }
 
 #endif
