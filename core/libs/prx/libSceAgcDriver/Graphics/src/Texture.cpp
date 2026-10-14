@@ -1931,6 +1931,27 @@ bool StorageTexture::Refresh() {
         }
         std::fprintf(stderr, "[dcc-keys] refresh 0x%llx+0x%llx keys %s -> %s (dirty %d, %zu pending units, %zu cpu-stamped units%s)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), DccKeysName(uploadedKeys), DccKeysName(keys), dirty ? 1 : 0, pendingUnits, stampedUnits, keyFlip ? ", flip keeps unstamped results" : "");
     }
+    std::uint32_t changedPendingUnits = 0, cpuWrittenUnits = 0, driverWrittenUnits = 0, untrackedUnits = 0, keysOnlyUnits = 0, droppedUnits = 0;
+    const auto classifyWriter = [&](std::uint32_t layer) {
+        ++changedPendingUnits;
+        if (stampedBlocks.empty()) {
+            ++keysOnlyUnits;
+            return;
+        }
+        const auto first = static_cast<std::size_t>(layerBegin(layer) / 65536 - descriptor.baseAddress / 65536);
+        const auto last = std::min(static_cast<std::size_t>((layerBegin(layer) + layerBytes(layer) - 1) / 65536 - descriptor.baseAddress / 65536), stampedBlocks.size() - 1);
+        bool cpu = false, driver = false, untracked = false;
+        for (auto k = first; k <= last; ++k) {
+            if (stampedBlocks[k] == GuestMemory::BlockUnchanged) continue;
+            if (!compared && (!tracked || k >= generations.size() || generations[k] == 0)) untracked = true;
+            else if (k < cpuBlocks.size() && cpuBlocks[k] != 0) cpu = true;
+            else driver = true;
+        }
+        if (cpu) ++cpuWrittenUnits;
+        else if (driver) ++driverWrittenUnits;
+        else if (untracked) ++untrackedUnits;
+        else ++keysOnlyUnits;
+    };
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!layerPending[layer]) continue;
         if (keyFlip && layerGeneration[layer] != 0 && stampedBlocks[layer] != GuestMemory::BlockWritten) {
@@ -1943,7 +1964,9 @@ bool StorageTexture::Refresh() {
         }
         if (changed[layer]) {
             pendingResults = true;
+            classifyWriter(layer);
             if (blockUnits && droppable(layer)) {
+                ++droppedUnits;
                 CaptureTrace::Log("drop-unit image=%llx unit=%u generation=%llu stamped=%d keys=%d", static_cast<unsigned long long>(descriptor.baseAddress), layer, static_cast<unsigned long long>(layerGeneration[layer]), layer < stampedBlocks.size() && stampedBlocks[layer] != 0, static_cast<int>(keys));
                 layerPending[layer] = false;
                 dropped = true;
@@ -1958,7 +1981,10 @@ bool StorageTexture::Refresh() {
     if (anyStored && !keysChanged && descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle)) stored.assign(trackedLayers, true);
     if (pendingResults) {
         static std::atomic<int> reports{0};
-        if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx: guest memory changed while GPU results were pending; keeping the CPU's blocks\n", static_cast<unsigned long long>(descriptor.baseAddress));
+        const auto report = reports.fetch_add(1) + 1;
+        if (report <= 8 || report % 256 == 0) {
+            std::fprintf(stderr, "[gpu] storage image 0x%llx+0x%llx %ux%u mips %u layers %u format %u: guest memory changed while GPU results were pending in %u of %u units (writers: %u CPU, %u driver, %u untracked, %u keys only; keys %s -> %s), %u dropped; keeping the CPU's blocks (report %d)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, descriptor.mipCount, arrayLayers, descriptor.format, changedPendingUnits, trackedLayers, cpuWrittenUnits, driverWrittenUnits, untrackedUnits, keysOnlyUnits, DccKeysName(uploadedKeys), DccKeysName(keys), droppedUnits, report);
+        }
     }
     if (anyStored) {
         const auto previous = std::exchange(flushReason, "refresh");
