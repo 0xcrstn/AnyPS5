@@ -1,0 +1,65 @@
+#ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_COMPUTEPIPELINEAHEADREQUEST_HPP
+#define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_COMPUTEPIPELINEAHEADREQUEST_HPP
+
+#include "Recompiler.hpp"
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <stdexcept>
+
+namespace AgcDriver {
+
+struct ComputePipelineAheadRequest {
+    ShaderRecompiler::RecompileResult shader;
+    bool pushes = false;
+    std::size_t retainedBytes = 0;
+
+    static std::size_t EstimateBytes(const ShaderRecompiler::RecompileResult& source) {
+        constexpr std::size_t bound = 64u * 1024u * 1024u;
+        const auto count = source.spirv.WordCount();
+        if (count > bound / sizeof(std::uint32_t) || source.bindings.size() > bound / sizeof(ShaderRecompiler::DescriptorBinding) || source.specialization.size() > bound / sizeof(ShaderRecompiler::PipelineSpecializationConstant)) return bound + 1;
+        return sizeof(ComputePipelineAheadRequest) + 256u + count * sizeof(std::uint32_t) + 2u * source.bindings.size() * sizeof(ShaderRecompiler::DescriptorBinding) + 2u * source.specialization.size() * sizeof(ShaderRecompiler::PipelineSpecializationConstant);
+    }
+
+    static std::shared_ptr<const ComputePipelineAheadRequest> Capture(const ShaderRecompiler::RecompileResult& source, std::size_t maxBytes) {
+        const auto count = source.spirv.WordCount();
+        if (count < 5 || count > maxBytes / sizeof(std::uint32_t) || source.bindings.size() > maxBytes / sizeof(ShaderRecompiler::DescriptorBinding) || source.specialization.size() > maxBytes / sizeof(ShaderRecompiler::PipelineSpecializationConstant)) return nullptr;
+        const auto minimum = sizeof(ComputePipelineAheadRequest) + 256u + count * sizeof(std::uint32_t) + source.bindings.size() * sizeof(ShaderRecompiler::DescriptorBinding) + source.specialization.size() * sizeof(ShaderRecompiler::PipelineSpecializationConstant);
+        if (minimum > maxBytes) return nullptr;
+        auto request = std::make_shared<ComputePipelineAheadRequest>();
+        auto& shader = request->shader;
+        shader.variantId = source.variantId;
+        shader.specializationId = source.specializationId;
+        shader.hostSubgroupSize = source.hostSubgroupSize;
+        shader.workgroupMemoryDwords = source.workgroupMemoryDwords;
+        shader.runtimeAbiVersion = source.runtimeAbiVersion;
+        shader.bdaAbiVersion = source.bdaAbiVersion;
+        shader.specialization = source.specialization;
+        shader.bindings.resize(source.bindings.size());
+        for (std::size_t index = 0; index < source.bindings.size(); ++index) {
+            const auto& from = source.bindings[index];
+            auto& to = shader.bindings[index];
+            to.kind = from.kind;
+            to.role = from.role;
+            to.descriptorSet = from.descriptorSet;
+            to.binding = from.binding;
+            to.count = from.count;
+        }
+        request->pushes = !source.pushConstants.empty();
+        request->retainedBytes = sizeof(ComputePipelineAheadRequest) + 256u + count * sizeof(std::uint32_t) + shader.bindings.capacity() * sizeof(ShaderRecompiler::DescriptorBinding) + shader.specialization.capacity() * sizeof(ShaderRecompiler::PipelineSpecializationConstant);
+        if (request->retainedBytes > maxBytes) return nullptr;
+        const auto resolved = source.spirv.Resolved();
+        const auto code = resolved.Words();
+        if (code.size() != count) throw std::runtime_error("pipeline compile request changed module size");
+        auto words = std::shared_ptr<std::uint32_t[]>(new std::uint32_t[count]);
+        std::copy(code.begin(), code.end(), words.get());
+        std::shared_ptr<const void> owner(words, words.get());
+        shader.spirv = ShaderRecompiler::SharedSpirv(std::move(owner), {words.get(), count});
+        return request;
+    }
+};
+
+}
+
+#endif

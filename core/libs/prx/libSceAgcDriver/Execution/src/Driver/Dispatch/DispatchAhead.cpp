@@ -1,7 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ComputePipelineAheadPackets.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include <algorithm>
@@ -100,9 +103,15 @@ bool OverlapsLabel(std::span<const ShaderRecompiler::MemoryRegion> regions, cons
 
 void Driver::resolveGroupAhead(const Submission& submission, const QueueState& live, std::size_t from) {
     static const bool allQueues = std::getenv("APS5_GROUP_CAPTURE_ALL_QUEUES") != nullptr;
-    if (!allQueues && submission.queue == 0) return;
+    const bool pipelineOnly = !allQueues && submission.queue == 0;
+    if (pipelineOnly && (!VulkanDevice::PipelineCompileAheadEnabled() || !deferredLabels().labels.empty())) return;
     auto& resolved = resolvedAhead();
-    if (resolved.contains(from) || device.Load() == nullptr) return;
+    const auto localDevice = device.Load();
+    if (resolved.contains(from) || localDevice == nullptr) return;
+    struct DiscardHints {
+        bool active;
+        ~DiscardHints() { if (active) resolvedAhead().clear(); }
+    } discard{pipelineOnly};
     auto& stats = groupCaptureStats();
     const auto begin = std::chrono::steady_clock::now();
     ++stats.runs;
@@ -120,22 +129,33 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
         }
     } resolving;
     const auto& commands = submission.commands;
+    std::size_t hints = 0;
     for (std::size_t cursor = from; cursor < commands.size();) {
+        if (pipelineOnly && (cursor - from >= 4096 || hints >= 8)) break;
         const auto header = commands[cursor];
         if (Pm4::FillerPacket(header)) {
             ++cursor;
             continue;
         }
+        if (pipelineOnly && !ComputePipelineAheadPacket(header)) break;
         const auto count = Pm4::PacketWords(header);
         if (cursor + count > commands.size()) break;
+        if (pipelineOnly && count > 4096 - (cursor - from)) break;
         const auto packet = std::span(commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         const auto next = cursor + count;
         if (header == FlipPacketHeader || header == RenderingWaitPacketHeader || opcode == 0x22 || (Pm4::Predicated(header) && scratch.predication.operation != 0)) break;
         if (opcode == 0x3c || opcode == 0x93) {
+            if (pipelineOnly) break;
             if (!Pm4::WaitSatisfiedUnchecked(packet) && !WrittenByRun(packet, labels)) break;
         } else if (opcode == 0x15 || opcode == 0x16) {
             if (resolved.contains(cursor)) break;
+            if (pipelineOnly) {
+                if (opcode == 0x16 || unknownWrites) break;
+                const auto address = (static_cast<std::uint64_t>(readRegister(scratch.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(scratch.shader, 0x20d) & 0xffu) << 40u);
+                const auto registered = RegisteredProgram(*submission.shaders, address, {0});
+                if (registered == nullptr) break;
+            }
             if (opcode == 0x16) {
                 std::uint64_t arguments = 0;
                 try {
@@ -170,12 +190,23 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
                     ++stats.writtenBefore;
                     break;
                 }
+                if (found->second.compiledResult != nullptr && VulkanDevice::PipelineCompileAheadEnabled()) {
+                    try {
+                        localDevice->BuildComputePipelineAhead(*found->second.compiledResult, found->second.address);
+                        ++stats.pipelineHints;
+                        ++hints;
+                    } catch (const std::exception&) {
+                        ++stats.failures;
+                        break;
+                    }
+                }
                 if (found->second.compiledResult != nullptr) appendWrittenRanges(*found->second.compiledResult, writes);
                 if (found->second.compiledResult == nullptr || WritesThroughPointers(*found->second.compiledResult)) unknownWrites = true;
             } else {
                 unknownWrites = true;
             }
         } else if (opcode == 0x37 || opcode == 0x49) {
+            if (pipelineOnly) break;
             const auto label = Pm4::DecodeLabelWrite(packet);
             if (!label) break;
             NoteLabel(labels, label->address, label->Bytes());
@@ -202,10 +233,17 @@ void Driver::reportGroupCapture(std::uint32_t queue) {
     auto& stats = groupCaptureStats();
     const auto now = std::chrono::steady_clock::now();
     if (now - stats.reported < std::chrono::seconds(10)) return;
-    AgcDriver::ProfilePrint_nid_no_patch("[groupcap] queue 0x%x (10 s): %llu runs resolved %llu dispatches (%llu cache hits) in %.1f ms (max %.2f ms); %llu adopted %.2f ms after the resolve on average, max %.2f ms; mismatches: address %llu key %llu; %llu resolve failures, %llu stale, %llu label overlaps, %llu read an earlier dispatch's output, %llu rejected by the device\n",
-                                         queue, static_cast<unsigned long long>(stats.runs), static_cast<unsigned long long>(stats.resolved), static_cast<unsigned long long>(stats.resolvedHits), stats.resolveMs, stats.resolveMaxMs,
+    const auto elapsed = std::chrono::duration<double>(now - stats.reported).count();
+    AgcDriver::ProfilePrint_nid_no_patch("[groupcap] queue 0x%x (%.3f s): %llu runs resolved %llu dispatches (%llu cache hits) in %.1f ms (max %.2f ms); %llu adopted %.2f ms after the resolve on average, max %.2f ms; mismatches: address %llu key %llu; %llu resolve failures, %llu stale, %llu label overlaps, %llu read an earlier dispatch's output, %llu rejected by the device\n",
+                                         queue, elapsed, static_cast<unsigned long long>(stats.runs), static_cast<unsigned long long>(stats.resolved), static_cast<unsigned long long>(stats.resolvedHits), stats.resolveMs, stats.resolveMaxMs,
                                          static_cast<unsigned long long>(stats.adopted), stats.adopted != 0 ? stats.ageMs / static_cast<double>(stats.adopted) : 0.0, stats.ageMaxMs, static_cast<unsigned long long>(stats.addressMismatches), static_cast<unsigned long long>(stats.keyMismatches),
                                          static_cast<unsigned long long>(stats.failures), static_cast<unsigned long long>(stats.stale), static_cast<unsigned long long>(stats.labelOverlaps), static_cast<unsigned long long>(stats.writtenBefore), static_cast<unsigned long long>(stats.deviceRejects));
+    if (VulkanDevice::PipelineCompileAheadEnabled()) {
+        if (const auto localDevice = device.Load()) {
+            const auto pool = localDevice->PipelineAheadCounters();
+            AgcDriver::ProfilePrint_nid_no_patch("[pipeline-ahead] cumulative: accepted %llu built %llu present %llu failed %llu refused %llu duplicate %llu demanded %llu cancelled %llu useful %llu joined %llu; %zu outstanding, %zu retained bytes, peak %zu; queue 0x%x interval hints %llu\n", static_cast<unsigned long long>(pool.accepted), static_cast<unsigned long long>(pool.built), static_cast<unsigned long long>(pool.present), static_cast<unsigned long long>(pool.failed), static_cast<unsigned long long>(pool.refused), static_cast<unsigned long long>(pool.duplicate), static_cast<unsigned long long>(pool.demanded), static_cast<unsigned long long>(pool.cancelled), static_cast<unsigned long long>(pool.useful), static_cast<unsigned long long>(pool.joined), pool.outstanding, pool.retainedBytes, pool.peakBytes, queue, static_cast<unsigned long long>(stats.pipelineHints));
+        }
+    }
     stats = GroupCaptureStats{};
     stats.reported = now;
 }
