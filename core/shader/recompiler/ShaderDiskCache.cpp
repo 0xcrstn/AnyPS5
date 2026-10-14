@@ -1158,16 +1158,20 @@ public:
         return load(key, [&](std::span<const std::byte> file) { return DecodeEntry(file, key, variant); }, hits, misses, loadFailures);
     }
 
+    bool Reload(std::span<const std::byte> key, CompiledVariant& variant) {
+        return load(key, [&](std::span<const std::byte> file) { return DecodeEntry(file, key, variant); }, reloads, reloadFailures, reloadFailures);
+    }
+
     bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
         return load(key, [&](std::span<const std::byte> file) { return DecodePlanEntry(file, key, plan); }, planHits, planMisses, planLoadFailures);
     }
 
-    void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant) {
-        enqueue({std::move(key), std::move(variant), nullptr});
+    void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant, std::function<void()> stored) {
+        enqueue({std::move(key), std::move(variant), nullptr, std::move(stored)});
     }
 
     void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan) {
-        enqueue({std::move(key), nullptr, std::move(plan)});
+        enqueue({std::move(key), nullptr, std::move(plan), {}});
     }
 
     void Flush() {
@@ -1188,6 +1192,8 @@ public:
         counters.planMisses = planMisses.load(std::memory_order_relaxed);
         counters.planWrites = planWrites.load(std::memory_order_relaxed);
         counters.planLoadFailures = planLoadFailures.load(std::memory_order_relaxed);
+        counters.reloads = reloads.load(std::memory_order_relaxed);
+        counters.reloadFailures = reloadFailures.load(std::memory_order_relaxed);
         return counters;
     }
 
@@ -1196,6 +1202,7 @@ private:
         std::vector<std::byte> key;
         std::shared_ptr<const CompiledVariant> variant;
         std::shared_ptr<const IrResourcePlan> plan;
+        std::function<void()> stored;
     };
 
     template<typename TDecode>
@@ -1267,6 +1274,7 @@ private:
         if (!file.empty() && WriteFileAtomically(directory / EntryName(job.key), file)) {
             (job.plan != nullptr ? planWrites : writes).fetch_add(1, std::memory_order_relaxed);
             bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
+            if (job.stored) job.stored();
         } else {
             const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
             if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", (directory / EntryName(job.key)).string().c_str());
@@ -1334,7 +1342,7 @@ private:
     std::deque<Job> jobs;
     bool writing = false;
     std::atomic<std::uint64_t> hits{0}, misses{0}, writes{0}, loadFailures{0}, writeFailures{0}, bytesRead{0}, bytesWritten{0}, loadNanoseconds{0};
-    std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0};
+    std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0}, reloads{0}, reloadFailures{0};
     std::atomic<std::int64_t> lastReport{0};
     std::mutex reportMutex;
     Counters reported;
@@ -1474,9 +1482,14 @@ bool Load(std::span<const std::byte> key, CompiledVariant& variant) {
     return instance.Enabled() && instance.Load(key, variant);
 }
 
-void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant) {
+bool Reload(std::span<const std::byte> key, CompiledVariant& variant) {
     auto& instance = store();
-    if (instance.Enabled()) instance.Store(std::move(key), std::move(variant));
+    return instance.Enabled() && instance.Reload(key, variant);
+}
+
+void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant, std::function<void()> stored) {
+    auto& instance = store();
+    if (instance.Enabled()) instance.Store(std::move(key), std::move(variant), std::move(stored));
 }
 
 bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {

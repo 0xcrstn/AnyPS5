@@ -124,6 +124,9 @@ A cached shader keeps an `IrResourcePlan` (`ResourceMaterializer::ExtractPlan` i
 
 - A control-flow condition is kept only when `Detail::Evaluator::MayEvaluate` finds a runtime it could be evaluated for. A condition that depends on a vector register, or on an opcode the evaluator does not evaluate, takes both successors whatever the runtime holds, so the plan stores it as no condition and does not copy its operands. Such conditions are most of a shader's IR when the masked-lane code feeds its branches.
 - The copied values are allocated in one `IrValueArena` and hold no use lists: the walk only follows arguments.
+### Prepared SPIR-V in the shader disk cache
+
+With the shader disk cache enabled, a cached variant does not keep its SPIR-V. A variant loaded from the cache drops it at once; a compiled one keeps it until the cache writer has stored it. Its `SharedSpirv` keeps the cache key and the word count, and `SharedSpirv::Resolved` reads the words back (`ShaderDiskCache::Reload`) when a result is materialized, a module is specialized or a rectangle shader is built. The words read back are shared through a weak reference, so every result alive at the same time holds one copy, and the copy is freed with the last of them. Reading the words of a spilled `SharedSpirv` without `Resolved` throws. `APS5_NO_SPIRV_SPILL=1` keeps every variant's SPIR-V in memory.
 
 ### Shader MODE register access
 

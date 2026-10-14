@@ -34,7 +34,8 @@ void Run(AgcDriver::VulkanDevice& device, bool integer) {
     const auto& artifact = GetPreparedArtifact(*handle);
     std::uint32_t scalarType = 0;
     unsigned extracts = 0;
-    const auto& words = artifact.spirv.Words();
+    const auto spirv = artifact.spirv.Resolved();
+    const auto& words = spirv.Words();
     for (std::size_t offset = 5; offset < words.size(); offset += words[offset] >> 16u) {
         const auto opcode = words[offset] & 0xffffu;
         if (integer && opcode == spv::OpTypeInt && words[offset + 2] == 32 && words[offset + 3] == 0) scalarType = words[offset + 1];

@@ -430,6 +430,8 @@ struct BarycentricEmulationLayout {
 // The non-const data(), operator[], begin() and end() count as writes: on a shared holder (every
 // cached result) they clone the module, so a consumer that only reads takes the result by const
 // reference, or the per-dispatch copy this class removes comes back without a compiler hint.
+struct SpilledSpirv;
+
 class SharedSpirv {
 public:
     SharedSpirv() = default;
@@ -439,7 +441,12 @@ public:
         return *this;
     }
 
-    [[nodiscard]] const std::vector<std::uint32_t>& Words() const { return words ? *words : Empty(); }
+    [[nodiscard]] const std::vector<std::uint32_t>& Words() const { return words ? *words : spilled ? SpilledWords() : Empty(); }
+    [[nodiscard]] bool Spilled() const { return words == nullptr && spilled != nullptr; }
+    [[nodiscard]] std::size_t WordCount() const;
+    [[nodiscard]] SharedSpirv Resolved() const;
+    [[nodiscard]] SharedSpirv Spill(std::vector<std::byte> key, bool pinned) const;
+    void Unpin() const;
     operator const std::vector<std::uint32_t>&() const { return Words(); }
     [[nodiscard]] std::size_t size() const { return Words().size(); }
     [[nodiscard]] bool empty() const { return Words().empty(); }
@@ -453,20 +460,24 @@ public:
     [[nodiscard]] std::vector<std::uint32_t>::iterator end() { return Mutable().end(); }
     void resize(std::size_t count) { Mutable().resize(count); }
     std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values) { return Mutable().insert(where, values); }
-    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return left.words == right.words || left.Words() == right.Words(); }
+    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return (left.words == right.words && left.spilled == right.spilled) || left.Resolved().Words() == right.Resolved().Words(); }
 
 private:
     static const std::vector<std::uint32_t>& Empty() {
         static const std::vector<std::uint32_t> empty;
         return empty;
     }
+    [[noreturn]] static const std::vector<std::uint32_t>& SpilledWords();
     // Copy on write: a holder whose words are shared gets its own copy before the first write.
     std::vector<std::uint32_t>& Mutable() {
+        if (Spilled()) *this = Resolved();
+        spilled.reset();
         if (words == nullptr || words.use_count() != 1) words = std::make_shared<std::vector<std::uint32_t>>(Words());
         return *words;
     }
 
     std::shared_ptr<std::vector<std::uint32_t>> words;
+    std::shared_ptr<SpilledSpirv> spilled;
 };
 
 struct VertexInput {
@@ -566,6 +577,10 @@ struct RetainedShaderMemory {
     std::uint64_t programs = 0;
     std::uint64_t variants = 0;
     std::uint64_t variantSpirvBytes = 0;
+    std::uint64_t spilledVariants = 0;
+    std::uint64_t spilledSpirvBytes = 0;
+    std::uint64_t spirvReloads = 0;
+    std::uint64_t spirvReloadBytes = 0;
     std::uint64_t memoResults = 0;
     std::uint64_t memoBytes = 0;
     std::uint64_t bindingPlans = 0;

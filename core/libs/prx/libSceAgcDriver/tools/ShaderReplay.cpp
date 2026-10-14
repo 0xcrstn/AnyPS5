@@ -117,7 +117,7 @@ bool Replay(const char* path) {
     if (g_prepare) {
         try {
             const auto handle = ShaderRecompiler::PrepareShader(request.request);
-            std::printf("  prepared: %zu SPIR-V words\n", ShaderRecompiler::GetPreparedArtifact(*handle).spirv.Words().size());
+            std::printf("  prepared: %zu SPIR-V words\n", ShaderRecompiler::GetPreparedArtifact(*handle).spirv.WordCount());
             return true;
         } catch (const std::exception& error) {
             std::printf("  prepare failed: %s\n", FirstLine(error.what()).c_str());

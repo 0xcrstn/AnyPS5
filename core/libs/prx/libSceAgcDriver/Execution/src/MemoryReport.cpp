@@ -41,18 +41,21 @@ std::string Describe(const std::function<std::string()>& device) {
     std::size_t arenaBytes = 0;
     if (GuestArena::GuestArenaAvailable_nid_postfix()) GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
     const auto process = ProcessMemory::ReadProcessCounters();
-    const auto space = ProcessMemory::WalkAddressSpace(arenaBase, arenaBytes);
-    const auto heaps = ProcessMemory::ReadHostHeaps();
+    static std::mutex stacksMutex;
+    static std::vector<std::uintptr_t> stacks;
+    static std::uint64_t reports = 0;
+    std::lock_guard stacksLock(stacksMutex);
+    if (reports++ % 10 == 0) stacks = ProcessMemory::ThreadStackAllocations();
+    const auto space = ProcessMemory::WalkAddressSpace(arenaBase, arenaBytes, stacks);
     GuestHeap::GuestHeapStatistics guestHeap{};
     GuestHeap::GuestHeapGetStatistics_nid_no_patch(&guestHeap);
     const auto shaders = ShaderRecompiler::GetRetainedShaderMemory();
     const auto backlog = DriverDetail::RegistrationPreparationBacklog();
     const auto walked = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-    const auto known = heaps.committed + space.stacks;
     std::string text = "[memory] process commit " + gib(process.commit) + " (peak " + gib(process.peakCommit) + "), working set " + gib(process.workingSet);
-    text += " | guest arena private " + gib(space.arenaPrivate) + ", mapped " + gib(space.arenaMapped);
+    text += " | guest arena private " + gib(process.commit > space.hostPrivate ? process.commit - space.hostPrivate : 0);
     text += "; guest heap live " + mib(guestHeap.largeLiveBytes) + " + small spans " + mib(guestHeap.smallSpanBytes) + ", freed blocks kept " + mib(guestHeap.largeCachedBytes);
-    text += " | host private " + gib(space.hostPrivate) + ": " + std::to_string(heaps.heaps) + " heaps commit " + gib(heaps.committed) + " (" + gib(heaps.allocated) + " allocated; process heap " + gib(heaps.processHeapCommitted) + "), " + std::to_string(space.threads) + " thread stacks " + mib(space.stacks) + ", other " + gib(space.hostPrivate > known ? space.hostPrivate - known : 0);
+    text += " | host private " + gib(space.hostPrivate) + ": " + std::to_string(space.threads) + " thread stacks " + mib(space.stacks) + ", heaps and other allocations " + gib(space.hostPrivate - space.stacks);
     if (!space.largest.empty()) {
         text += " (largest";
         for (const auto& [base, bytes] : space.largest) {
@@ -66,9 +69,9 @@ std::string Describe(const std::function<std::string()>& device) {
     const auto vulkan = device ? device() : std::string{};
     if (!vulkan.empty()) text += " | vulkan " + vulkan;
     char part[1024];
-    std::snprintf(part, sizeof(part), " | shaders registered %llu; preparation queue %llu (%llu running on %llu threads), library prebuilds %llu; plans awaiting preparation %llu holding %llu decoded instructions (%s); recompiler sources %llu, resource plans %llu (%llu values, ~%s), retained IR programs %llu, variants %llu (%s SPIR-V), memoized results %llu (~%s), binding plans %llu, specialized modules %llu (%s SPIR-V), registration modules %llu",
+    std::snprintf(part, sizeof(part), " | shaders registered %llu; preparation queue %llu (%llu running on %llu threads), library prebuilds %llu; plans awaiting preparation %llu holding %llu decoded instructions (%s); recompiler sources %llu, resource plans %llu (%llu values, ~%s), retained IR programs %llu, variants %llu (%s SPIR-V in memory, %llu kept only in the disk cache with %s, %llu read back: %s), memoized results %llu (~%s), binding plans %llu, specialized modules %llu (%s SPIR-V), registration modules %llu",
         static_cast<unsigned long long>(backlog.registered), static_cast<unsigned long long>(backlog.queued), static_cast<unsigned long long>(backlog.running), static_cast<unsigned long long>(backlog.threads), static_cast<unsigned long long>(backlog.prebuildsQueued), static_cast<unsigned long long>(backlog.plans), static_cast<unsigned long long>(backlog.planInstructions), mib(backlog.planInstructionBytes).c_str(),
-        static_cast<unsigned long long>(shaders.sources), static_cast<unsigned long long>(shaders.plans), static_cast<unsigned long long>(shaders.planValues), mib(shaders.planBytes).c_str(), static_cast<unsigned long long>(shaders.programs), static_cast<unsigned long long>(shaders.variants), mib(shaders.variantSpirvBytes).c_str(), static_cast<unsigned long long>(shaders.memoResults), mib(shaders.memoBytes).c_str(), static_cast<unsigned long long>(shaders.bindingPlans), static_cast<unsigned long long>(shaders.specializedModules), mib(shaders.specializedSpirvBytes).c_str(), static_cast<unsigned long long>(shaders.registrationModules));
+        static_cast<unsigned long long>(shaders.sources), static_cast<unsigned long long>(shaders.plans), static_cast<unsigned long long>(shaders.planValues), mib(shaders.planBytes).c_str(), static_cast<unsigned long long>(shaders.programs), static_cast<unsigned long long>(shaders.variants), mib(shaders.variantSpirvBytes).c_str(), static_cast<unsigned long long>(shaders.spilledVariants), mib(shaders.spilledSpirvBytes).c_str(), static_cast<unsigned long long>(shaders.spirvReloads), mib(shaders.spirvReloadBytes).c_str(), static_cast<unsigned long long>(shaders.memoResults), mib(shaders.memoBytes).c_str(), static_cast<unsigned long long>(shaders.bindingPlans), static_cast<unsigned long long>(shaders.specializedModules), mib(shaders.specializedSpirvBytes).c_str(), static_cast<unsigned long long>(shaders.registrationModules));
     text += part;
     std::snprintf(part, sizeof(part), " | took %.0f ms over %llu regions", walked, static_cast<unsigned long long>(space.regions));
     text += part;
@@ -78,7 +81,7 @@ std::string Describe(const std::function<std::string()>& device) {
 std::uint64_t IntervalSeconds() {
     static const std::uint64_t seconds = [] {
         const char* text = std::getenv("APS5_MEMORY_REPORT");
-        if (text == nullptr || *text == '\0') return std::getenv("APS5_PROFILE_DRAW") != nullptr ? std::uint64_t{10} : std::uint64_t{0};
+        if (text == nullptr || *text == '\0') return std::getenv("APS5_PROFILE_DRAW") != nullptr ? std::uint64_t{60} : std::uint64_t{0};
         char* end = nullptr;
         const auto value = std::strtoull(text, &end, 10);
         if (end == text || *end != '\0') throw std::runtime_error("APS5_MEMORY_REPORT is not a whole number of seconds: " + std::string(text));
