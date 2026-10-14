@@ -38,6 +38,21 @@
 
 namespace AgcDriver::Graphics {
 
+namespace {
+
+std::atomic<std::uint64_t> residentTargetLookups{0};
+std::atomic<std::uint64_t> continuedPassTargetReuses{0};
+
+}
+
+std::uint64_t ResidentTargetLookups() {
+    return residentTargetLookups.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ContinuedPassTargetReuses() {
+    return continuedPassTargetReuses.load(std::memory_order_relaxed);
+}
+
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews) {
     std::uint64_t key = 14695981039346656037ull;
     const auto mix = [&](std::uint64_t value) {
@@ -365,6 +380,7 @@ struct TargetLookupSplit {
     double registerClearUs = 0;
     double cmaskClearUs = 0;
     double walkUs = 0;
+    std::uint64_t reused = 0;
     LookupOutcomes outcomes;
 
     void Add(const TargetLookupSplit& other) {
@@ -372,6 +388,7 @@ struct TargetLookupSplit {
         registerClearUs += other.registerClearUs;
         cmaskClearUs += other.cmaskClearUs;
         walkUs += other.walkUs;
+        reused += other.reused;
         for (std::size_t i = 0; i < LookupOutcomes::Count; ++i) {
             outcomes.counts[i] += other.outcomes.counts[i];
             outcomes.ms[i] += other.outcomes.ms[i];
@@ -618,7 +635,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
             const auto& split = profile.lookupSplit;
             const auto& found = split.outcomes;
             const auto count = [&](LookupOutcomes::Kind kind) { return static_cast<unsigned long long>(found.counts[kind]); };
-            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (lookup split, ms: image %.1f [cache hit %llu %.1f, made %llu %.1f; refresh proved %llu %.1f, unchanged %llu %.1f, compared %llu %.1f; uploads %llu %.1f; dcc scans %llu %.1f; pending flushes %llu %.1f], register clears %.1f, cmask clears %.1f, write-watch walks %.1f)", split.imageUs / 1000.0, count(LookupOutcomes::StorageHit), found.ms[LookupOutcomes::StorageHit], count(LookupOutcomes::StorageMade), found.ms[LookupOutcomes::StorageMade], count(LookupOutcomes::RefreshProved), found.ms[LookupOutcomes::RefreshProved], count(LookupOutcomes::RefreshUnchanged), found.ms[LookupOutcomes::RefreshUnchanged], count(LookupOutcomes::RefreshCompared), found.ms[LookupOutcomes::RefreshCompared], count(LookupOutcomes::UploadDirect) + count(LookupOutcomes::UploadCpu) + count(LookupOutcomes::UploadClear), found.ms[LookupOutcomes::UploadDirect] + found.ms[LookupOutcomes::UploadCpu] + found.ms[LookupOutcomes::UploadClear], count(LookupOutcomes::DccScan), found.ms[LookupOutcomes::DccScan], count(LookupOutcomes::PendingFlush), found.ms[LookupOutcomes::PendingFlush], split.registerClearUs / 1000.0, split.cmaskClearUs / 1000.0, split.walkUs / 1000.0);
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (lookup split, ms: image %.1f [cache hit %llu %.1f, made %llu %.1f; refresh proved %llu %.1f, unchanged %llu %.1f, compared %llu %.1f; uploads %llu %.1f; dcc scans %llu %.1f; pending flushes %llu %.1f], register clears %.1f, cmask clears %.1f, write-watch walks %.1f; %llu reused in continued passes)", split.imageUs / 1000.0, count(LookupOutcomes::StorageHit), found.ms[LookupOutcomes::StorageHit], count(LookupOutcomes::StorageMade), found.ms[LookupOutcomes::StorageMade], count(LookupOutcomes::RefreshProved), found.ms[LookupOutcomes::RefreshProved], count(LookupOutcomes::RefreshUnchanged), found.ms[LookupOutcomes::RefreshUnchanged], count(LookupOutcomes::RefreshCompared), found.ms[LookupOutcomes::RefreshCompared], count(LookupOutcomes::UploadDirect) + count(LookupOutcomes::UploadCpu) + count(LookupOutcomes::UploadClear), found.ms[LookupOutcomes::UploadDirect] + found.ms[LookupOutcomes::UploadCpu] + found.ms[LookupOutcomes::UploadClear], count(LookupOutcomes::DccScan), found.ms[LookupOutcomes::DccScan], count(LookupOutcomes::PendingFlush), found.ms[LookupOutcomes::PendingFlush], split.registerClearUs / 1000.0, split.cmaskClearUs / 1000.0, split.walkUs / 1000.0, static_cast<unsigned long long>(split.reused));
         }
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
@@ -1315,7 +1332,107 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
+struct ContinuedTargets {
+    VkDevice device = VK_NULL_HANDLE;
+    const Recorder* recorder = nullptr;
+    std::uint64_t passSerial = 0;
+    std::uint64_t epoch = 0;
+    std::uint64_t generation = 0;
+    std::vector<ColorTarget> colors;
+    std::vector<std::weak_ptr<StorageTexture>> residents;
+};
+
+ContinuedTargets& continuedTargets() {
+    static ContinuedTargets targets;
+    return targets;
+}
+
+bool continuedTargetsEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_CONTINUED_PASS_TARGETS") != nullptr;
+    return !disabled;
+}
+
+bool sameExtent(const VkExtent2D& first, const VkExtent2D& second) {
+    return first.width == second.width && first.height == second.height;
+}
+
+bool sameColorTarget(const ColorTarget& first, const ColorTarget& second) {
+    return first.address == second.address && sameExtent(first.extent, second.extent) && first.format == second.format && first.bytes == second.bytes && first.componentMapping == second.componentMapping && first.tileMode == second.tileMode && first.elementBytes == second.elementBytes && first.packing == second.packing && first.dccAddress == second.dccAddress && first.dccAlphaOnMsb == second.dccAlphaOnMsb && first.dccPipeAligned == second.dccPipeAligned && first.cmaskAddress == second.cmaskAddress && first.cmaskBytes == second.cmaskBytes && first.cmaskFastClear == second.cmaskFastClear && first.surfaceAddress == second.surfaceAddress && sameExtent(first.surfaceExtent, second.surfaceExtent) && first.mipCount == second.mipCount && first.mip == second.mip && first.mipTail == second.mipTail && first.clearWords == second.clearWords && first.slot == second.slot && first.depth == second.depth && first.depthSlice == second.depthSlice && first.arrayAddress == second.arrayAddress && first.arrayLastSlice == second.arrayLastSlice && first.arraySlice == second.arraySlice && first.layers == second.layers && first.exportIndex == second.exportIndex && first.uintExport == second.uintExport && first.pipeBankXor == second.pipeBankXor && first.samples == second.samples;
+}
+
+void targetMemory(const ColorTarget& color, std::uint64_t generation, std::vector<GuestMemory::UnchangedQuery>& queries) {
+    queries.push_back({color.address, color.bytes, generation});
+    if (color.dccAddress != 0) queries.push_back({color.dccAddress, std::max<std::size_t>(colorKeyCount(color, color.bytes), 1), generation});
+    if (color.cmaskAddress != 0 && color.cmaskBytes != 0) queries.push_back({color.cmaskAddress, color.cmaskBytes, generation});
+}
+
+std::vector<std::shared_ptr<StorageTexture>> reusableTargets(const Context& context, const State& state, const Recorder* recorder) {
+    std::vector<std::shared_ptr<StorageTexture>> residents;
+    if (!continuedTargetsEnabled() || recorder == nullptr || !GuestMemory::GpuMutex().HeldByThisThread()) return {};
+    const auto& memo = continuedTargets();
+    const auto serial = recorder->OpenPassSerial();
+    const auto epoch = GuestMemory::CollectEpoch();
+    if (serial == 0 || memo.passSerial != serial || memo.recorder != recorder || memo.device != context.device || epoch == 0 || memo.epoch != epoch || memo.colors.size() != state.colors.size()) return {};
+    std::vector<GuestMemory::UnchangedQuery> queries;
+    residents.reserve(state.colors.size());
+    for (std::size_t index = 0; index < state.colors.size(); ++index) {
+        const auto& color = state.colors[index];
+        if (!sameColorTarget(color, memo.colors[index])) return {};
+        auto resident = memo.residents[index].lock();
+        if (color.samples > 1) {
+            residents.push_back(nullptr);
+            continue;
+        }
+        if (resident == nullptr || !StorageImageCached(context, resident.get()) || !StorageImageServesKeys(*resident, color.dccAddress)) return {};
+        const std::size_t before = queries.size();
+        targetMemory(color, memo.generation, queries);
+        for (auto query = before; query < queries.size(); ++query) {
+            if (recorder->QueuedKeyStoreOverlaps(queries[query].address, queries[query].bytes) || recorder->QueuedStoreOverlaps(queries[query].address, queries[query].bytes)) return {};
+        }
+        residents.push_back(std::move(resident));
+    }
+    if (!queries.empty() && !GuestMemory::UnchangedSinceAll(queries)) return {};
+    return residents;
+}
+
+void forgetContinuedTargets() {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) continuedTargets().passSerial = 0;
+}
+
+std::shared_ptr<StorageTexture> reuseContinuedTarget(const std::shared_ptr<StorageTexture>& resident, DrawOutcome& outcome) {
+    ++outcome.lookupSplit.reused;
+    continuedPassTargetReuses.fetch_add(1, std::memory_order_relaxed);
+    return resident;
+}
+
+void keepContinuedTargets(const Context& context, const State& state, const Recorder* recorder, const ShaderResources& resources, std::span<const std::shared_ptr<StorageTexture>> residents, std::uint64_t epoch, std::uint64_t generation) {
+    auto& memo = continuedTargets();
+    memo.passSerial = 0;
+    if (!continuedTargetsEnabled() || recorder == nullptr || epoch == 0 || generation == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    const auto serial = recorder->OpenPassSerial();
+    if (serial == 0 || resources.HoldsLease() || resources.UsesAddressTable() || resources.HasCopiedWrites()) return;
+    const auto images = resources.StorageImages();
+    if (std::any_of(images.begin(), images.end(), [](const std::pair<VkImage, bool>& image) { return image.second; })) return;
+    std::vector<GuestMemory::UnchangedQuery> queries;
+    for (std::size_t index = 0; index < state.colors.size(); ++index) {
+        if (state.colors[index].samples > 1) continue;
+        if (index >= residents.size() || residents[index] == nullptr) return;
+        targetMemory(state.colors[index], generation, queries);
+    }
+    for (const auto& query : queries) {
+        if (resources.WritesOverlap(query.address, query.bytes)) return;
+    }
+    memo.device = context.device;
+    memo.recorder = recorder;
+    memo.epoch = epoch;
+    memo.generation = generation;
+    memo.colors = state.colors;
+    memo.residents.assign(residents.begin(), residents.end());
+    memo.passSerial = serial;
+}
+
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
+    residentTargetLookups.fetch_add(1, std::memory_order_relaxed);
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     const auto walkNsBefore = profile ? GuestMemory::ThreadCollectedNanoseconds() : 0;
@@ -2052,6 +2169,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const int dumpLimit = DumpTargetLimit();
     static std::mutex dumpMutex;
     static std::map<std::uint64_t, int> dumped;
+    const auto reused = dumpLimit == 0 ? reusableTargets(context, state, Recorder::Active()) : std::vector<std::shared_ptr<StorageTexture>>{};
+    forgetContinuedTargets();
     std::vector<TargetBinding> targets(state.colors.size());
     std::vector<VkImageView> targetViews;
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
@@ -2079,7 +2198,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
-            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+            binding.resident = !reused.empty() ? reuseContinuedTarget(reused[index], outcome) : refreshResidentTarget(context, state, color, outcome, profile, [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -2136,6 +2255,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         binding.target = std::make_unique<RenderTarget>(context, color, state.blends.at(color.exportIndex).blendEnable != 0);
         targetViews.push_back(binding.target->View());
     }
+    const auto targetsEpoch = continuedTargetsEnabled() ? GuestMemory::CollectEpoch() : 0;
+    const auto targetsGeneration = targetsEpoch != 0 ? GuestMemory::TrackerGeneration() : 0;
     if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth));
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
@@ -2306,6 +2427,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.completion = completion;
         record.waited = outcome.waited;
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
+        keepContinuedTargets(context, state, recorder, *resources, owners, targetsEpoch, targetsGeneration);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a

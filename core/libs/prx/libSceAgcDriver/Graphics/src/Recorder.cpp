@@ -1400,6 +1400,8 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;
     if (!pass.open) {
+        static std::atomic<std::uint64_t> passSerials{0};
+        pass.serial = passSerials.fetch_add(1, std::memory_order_relaxed) + 1;
         pass.timing = timing;
         pass.afterPass = std::move(afterPass);
     }
@@ -1407,6 +1409,10 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     pass.key = key;
     pass.fenced = pass.fenced || fenced;
     open->passHazards.Add(access);
+}
+
+std::uint64_t Recorder::OpenPassSerial() const {
+    return open != nullptr && open->renderPass.open ? open->renderPass.serial : 0;
 }
 
 void Recorder::endOpenRenderPass(bool barrier) {
