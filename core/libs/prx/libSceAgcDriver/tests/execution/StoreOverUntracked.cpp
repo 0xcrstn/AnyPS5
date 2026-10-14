@@ -57,12 +57,12 @@ std::uint64_t AddressOf(const void* data) {
     return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
 }
 
-std::array<std::uint32_t, 8> TextureDescriptor(const std::uint32_t* texels) {
+std::array<std::uint32_t, 8> TextureDescriptor(const std::uint32_t* texels, std::uint32_t side = Side) {
     const auto address = AddressOf(texels);
     return {
         static_cast<std::uint32_t>(address >> 8u),
-        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32UInt << 20u) | (((Side - 1u) & 3u) << 30u),
-        ((Side - 1u) >> 2u) | ((Side - 1u) << 14u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32UInt << 20u) | (((side - 1u) & 3u) << 30u),
+        ((side - 1u) >> 2u) | ((side - 1u) << 14u),
         0xfacu | (TileR64KBX << 20u) | (Type2D << 28u),
         0u,
         0u,
@@ -91,9 +91,9 @@ void Dispatch(std::span<const std::uint32_t> code, std::uint32_t threads, std::u
     AgcDriver::Submit(&packet, 0);
 }
 
-void Store(const std::uint32_t* texels) {
+void Store(const std::uint32_t* texels, std::uint32_t side = Side) {
     std::array<std::uint32_t, 16> userData{};
-    const auto texture = TextureDescriptor(texels);
+    const auto texture = TextureDescriptor(texels, side);
     std::copy(texture.begin(), texture.end(), userData.begin() + 8);
     Dispatch(StoreCode, 8, static_cast<std::uint32_t>(userData.size()) << 1u, userData, 1);
 }
@@ -205,7 +205,11 @@ void Settle(THold& hold, const Surface& surface, std::uint32_t result) {
     hold.unlock();
 }
 
-enum class Kind { ReadAfter, ReadBefore, Filled, Copied, LeftWatch, WrittenThenLeftWatch, ImportLeftWatch };
+enum class Kind { ReadAfter, ReadBefore, Filled, Copied, LeftWatch, WrittenThenLeftWatch, ImportLeftWatch, NeighbourCopied };
+
+// One 64 KiB block of the surface: the image of its last block, and the source copied into it.
+constexpr std::uint32_t BlockSide = 128;
+constexpr std::size_t LastBlock = SurfaceBytes - Block;
 
 struct Case {
     const char* name;
@@ -217,7 +221,7 @@ enum class Outcome { Kept, Lost, Missed };
 
 Outcome Run(const Case& test) {
     std::optional<Surface> source;
-    if (test.kind == Kind::Copied) source.emplace();
+    if (test.kind == Kind::Copied || test.kind == Kind::NeighbourCopied) source.emplace();
     const bool leaves = test.kind == Kind::LeftWatch || test.kind == Kind::WrittenThenLeftWatch || test.kind == Kind::ImportLeftWatch;
     Surface surface(leaves);
     auto* bytes = surface.Bytes();
@@ -248,6 +252,50 @@ Outcome Run(const Case& test) {
         if (!to->CopyFrom(*from, refusal)) {
             Require(refusal != nullptr && std::string_view(refusal) == "not imported", "store over untracked: the image copy was refused");
             std::fprintf(stderr, "[store over untracked] %s: not run, the surface has no host import\n", test.name);
+            return Outcome::Kept;
+        }
+    } else if (test.kind == Kind::NeighbourCopied) {
+        // The surface's image has results pending in its first block when a copy replaces the
+        // image of its last block: the copy supersedes the saved bytes there only.
+        const auto settledLive = [&](std::uint64_t at, std::size_t size) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (true) {
+                hold.lock();
+                StorageTexture::FlushAllPending("store over untracked fixture");
+                const bool live = StorageTexture::FindLive(at, size) != nullptr;
+                hold.unlock();
+                if (live) return;
+                Require(std::chrono::steady_clock::now() < deadline, "store over untracked: the block's storage image was never created");
+                std::this_thread::yield();
+            }
+        };
+        Store(surface.Texels() + LastBlock / 4u, BlockSide);
+        settledLive(address + LastBlock, Block);
+        Store(source->Texels(), BlockSide);
+        settledLive(source->Address(), Block);
+        std::fill(surface.Texels(), surface.Texels() + SurfaceBytes / 4u, Untouched);
+        Store(surface.Texels());
+        // Pending results are the surface image's alone once it exists.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (true) {
+            hold.lock();
+            if (StorageTexture::FindLive(address, SurfaceBytes) != nullptr) {
+                if (StorageTexture::AnyPending()) break;
+                hold.unlock();
+                return Outcome::Missed;
+            }
+            hold.unlock();
+            Require(std::chrono::steady_clock::now() < deadline, "store over untracked: the surface's storage image was never created");
+            std::this_thread::yield();
+        }
+        const auto from = StorageTexture::FindLive(source->Address(), Block);
+        const auto to = StorageTexture::FindLive(address + LastBlock, Block);
+        Require(from != nullptr && to != nullptr, "store over untracked: the blocks have no storage images to copy between");
+        const char* refusal = nullptr;
+        if (!to->CopyFrom(*from, refusal)) {
+            Require(refusal != nullptr && std::string_view(refusal) == "not imported", "store over untracked: the image copy was refused");
+            StorageTexture::FlushAllPending("store over untracked fixture");
+            std::fprintf(stderr, "[store over untracked] %s: not run, the block has no host import\n", test.name);
             return Outcome::Kept;
         }
     } else if (!HoldPending(hold, surface, Stored)) {
@@ -300,7 +348,7 @@ int main() {
             Surface probe;
             Require(AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(probe.Texels()))).guestBytes == SurfaceBytes, "store over untracked: unexpected surface size");
         }
-        constexpr std::array<Case, 7> cases{{
+        constexpr std::array<Case, 8> cases{{
             {"another block read after the CPU write", Kind::ReadAfter, Block + Page},
             {"another block read before the CPU write", Kind::ReadBefore, 0xe000},
             {"a fill of the surface", Kind::Filled, 0xe000},
@@ -308,6 +356,7 @@ int main() {
             {"a surface that left the write watch", Kind::LeftWatch, 0xe000},
             {"a surface written before it left the write watch", Kind::WrittenThenLeftWatch, 0xe000},
             {"a surface whose import left the write watch", Kind::ImportLeftWatch, 0xe000},
+            {"an image copy into another block of the surface", Kind::NeighbourCopied, 0xe000},
         }};
         bool kept = true;
         for (const auto& test : cases) {

@@ -200,6 +200,7 @@ public:
     static void FlushDumpSelected(const char* reason);
     static bool StoreAtFlipRequested(const char* value);
     static bool PresentThenStore(bool storeAtFlip, const std::function<bool()>& present);
+    static bool StoreAtLabelRequested(const char* value);
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
     static void BumpPendingSerial();
@@ -307,7 +308,7 @@ public:
     // captures, snapshots) takes the bytes through the flush hook, and this image alone is current.
     // False, naming why in `refusal`, when the fill must be stored as before.
     static constexpr std::uint32_t WholeImage = ~0u;
-    bool FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal);
+    bool FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal, bool allowRegisterClear = false);
     // The cached, live image whose surface is exactly [address, address + bytes), if any (the newest
     // of several: see ClassifyFill).
     static std::shared_ptr<StorageTexture> FindLive(std::uint64_t address, std::uint64_t bytes);
@@ -372,6 +373,9 @@ private:
     void saveBeforeUnwatch();
     void forgetKeptAtUnwatch(std::uint32_t unit);
     bool keptAtUnwatchHolds(std::uint64_t from, std::uint32_t unit) const;
+    // Drops the saved guest bytes of the units over [address, address + bytes) (another image's fill
+    // or copy supersedes them there); the other units' bytes stay valid.
+    void forgetSavedOver(std::uint64_t address, std::size_t bytes);
     bool guestBytesSettled() const;
     // Tracked units as 64 KiB write-stamp blocks (`blockUnits`: a thin tiled surface at a 64 KiB
     // aligned base; APS5_NO_BLOCK_TRACKING=1 tracks array layers as above instead): a fill of one

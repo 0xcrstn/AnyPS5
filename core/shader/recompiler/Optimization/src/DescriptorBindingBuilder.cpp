@@ -98,8 +98,8 @@ DescriptorImageShape ImageShapeForResource(const ImageResource& image) {
     fail("DescriptorBindingBuilder::Populate image resource dimension has no descriptor image shape");
 }
 
-std::vector<std::uint32_t> GuestBuffersDescriptor(const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot) {
-    std::vector<std::uint32_t> result;
+void GuestBuffersDescriptor(std::vector<std::uint32_t>& result, const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot) {
+    result.clear();
     result.reserve(resources.size() * 4u);
     for (const std::uint32_t r : resources) {
         if (r >= snapshot.buffers.size()) {
@@ -113,11 +113,10 @@ std::vector<std::uint32_t> GuestBuffersDescriptor(const std::vector<std::uint32_
             result.push_back(value.dwords[dword]);
         }
     }
-    return result;
 }
 
-std::vector<std::uint32_t> GuestSamplersDescriptor(const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot) {
-    std::vector<std::uint32_t> result;
+void GuestSamplersDescriptor(std::vector<std::uint32_t>& result, const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot) {
+    result.clear();
     std::uint32_t dwordCount = 0;
     for (std::size_t i = 0; i < resources.size(); i++) {
         const std::uint32_t r = resources[i];
@@ -137,7 +136,6 @@ std::vector<std::uint32_t> GuestSamplersDescriptor(const std::vector<std::uint32
             result.push_back(value.dwords[dword]);
         }
     }
-    return result;
 }
 
 constexpr std::uint32_t ForceUnnormalizedBit = 1u << 15u;
@@ -208,27 +206,28 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
     return proof;
 }
 
-std::vector<std::uint32_t> ShaderDataDwordsFor(const IrBindingLayout& layout, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, const std::vector<PreparedImageMetadata>& imageMetadata, std::span<const std::uint32_t> runtimeState) {
-    std::vector<std::uint32_t> result(layout.ShaderDataDwords(), 0u);
+template<typename TElement>
+void ShaderDataFor(std::vector<TElement>& result, const IrBindingLayout& layout, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, const std::vector<PreparedImageMetadata>& imageMetadata, std::span<const std::uint32_t> runtimeState) {
+    result.assign(static_cast<std::size_t>(layout.ShaderDataDwords()) * sizeof(std::uint32_t) / sizeof(TElement), TElement{});
+    auto* bytes = reinterpret_cast<std::byte*>(result.data());
     for (std::size_t i = 0; i < layout.userDataRegisters.size(); ++i) {
         const auto reg = layout.userDataRegisters[i];
         if (reg < userDataBase || reg - userDataBase >= snapshot.userData.size()) fail("shader user-data register is out of range");
-        result[i] = snapshot.userData[reg - userDataBase];
+        std::memcpy(bytes + i * sizeof(std::uint32_t), &snapshot.userData[reg - userDataBase], sizeof(std::uint32_t));
     }
     if (layout.dispatchThreadLimit) {
         if (partialThreads == std::array<std::uint32_t, 3>{}) fail("partial-group shader has no dispatch size");
-        std::copy(partialThreads.begin(), partialThreads.end(), result.begin() + layout.DispatchThreadLimitDword());
+        std::memcpy(bytes + layout.DispatchThreadLimitDword() * sizeof(std::uint32_t), partialThreads.data(), sizeof(partialThreads));
     }
     for (const auto& entry : imageMetadata) {
         auto metadata = entry.metadata;
         const auto& descriptor = snapshot.images.at(entry.resource);
         if (descriptor.dwordCount != metadata.descriptor.size()) fail("invalid runtime image descriptor width");
         std::copy_n(descriptor.dwords.begin(), metadata.descriptor.size(), metadata.descriptor.begin());
-        std::memcpy(result.data() + entry.offset, &metadata, sizeof(metadata));
+        std::memcpy(bytes + entry.offset * sizeof(std::uint32_t), &metadata, sizeof(metadata));
     }
     if (runtimeState.size() != layout.runtimeStateDwords) fail("runtime state does not match its shader data layout");
-    std::copy(runtimeState.begin(), runtimeState.end(), result.begin() + layout.RuntimeStateDword());
-    return result;
+    if (!runtimeState.empty()) std::memcpy(bytes + layout.RuntimeStateDword() * sizeof(std::uint32_t), runtimeState.data(), runtimeState.size_bytes());
 }
 
 }
@@ -503,25 +502,34 @@ DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPl
     return selected;
 }
 
-void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, const CompiledBindingLayout& compiled, const DescriptorBindingPlan& plan, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const {
+namespace {
+
+template<typename TAllocation>
+void PopulateValues(TAllocation& allocation, const CompiledBindingLayout& compiled, const DescriptorBindingPlan& plan, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) {
     const auto& layout = compiled.layout;
     const bool needsShaderData = layout.UsesPushData() || plan.storageData;
-    auto shaderData = needsShaderData ? ShaderDataDwordsFor(layout, userDataBase, snapshot, partialThreads, plan.imageMetadata, plan.runtimeState) : std::vector<std::uint32_t>{};
+    allocation.pushConstants.clear();
+    if (layout.UsesPushData()) ShaderDataFor(allocation.pushConstants, layout, userDataBase, snapshot, partialThreads, plan.imageMetadata, plan.runtimeState);
     allocation.shaderDataUserWords.clear();
     allocation.bufferBaseSlots.clear();
     if (needsShaderData) {
         for (const auto reg : layout.userDataRegisters) allocation.shaderDataUserWords.push_back(reg - userDataBase);
     }
-    std::vector<DescriptorBinding> bindings;
-    bindings.reserve(plan.bindings.size());
+    auto& bindings = allocation.bindings;
+    bindings.resize(plan.bindings.size());
     std::size_t writtenHere = 0;
     std::size_t readOnlyHere = 0;
-    for (const auto& entry : plan.bindings) {
-        auto physical = entry.descriptor;
+    for (std::size_t index = 0; index < plan.bindings.size(); ++index) {
+        const auto& entry = plan.bindings[index];
+        auto& physical = bindings[index];
+        auto words = std::move(physical.guestDescriptor);
+        physical = entry.descriptor;
+        physical.guestDescriptor = std::move(words);
+        physical.guestDescriptor.assign(entry.descriptor.guestDescriptor.begin(), entry.descriptor.guestDescriptor.end());
         switch (physical.role) {
         case DescriptorRole::GuestBuffers:
-            physical.guestDescriptor = GuestBuffersDescriptor(entry.resources, snapshot);
-            for (std::uint32_t element = 0; element < entry.resources.size(); ++element) allocation.bufferBaseSlots.push_back({entry.resources[element], static_cast<std::uint32_t>(bindings.size()), element * 4u});
+            GuestBuffersDescriptor(physical.guestDescriptor, entry.resources, snapshot);
+            for (std::uint32_t element = 0; element < entry.resources.size(); ++element) allocation.bufferBaseSlots.push_back({entry.resources[element], static_cast<std::uint32_t>(index), element * 4u});
             writtenHere += entry.writtenBuffers;
             readOnlyHere += entry.readOnlyBuffers;
             break;
@@ -540,7 +548,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             }
             break;
         case DescriptorRole::GuestSamplers:
-            physical.guestDescriptor = GuestSamplersDescriptor(entry.resources, snapshot);
+            GuestSamplersDescriptor(physical.guestDescriptor, entry.resources, snapshot);
             for (const auto element : entry.samplerFilterElements) {
                 auto& filter = physical.guestDescriptor.at(element * 4u + 2u);
                 filter = PointFilteredSamplerWord(physical.guestDescriptor.at(element * 4u), filter);
@@ -553,7 +561,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             physical.guestDescriptor = snapshot.flattenedSrt;
             break;
         case DescriptorRole::ShaderData:
-            physical.guestDescriptor = std::move(shaderData);
+            ShaderDataFor(physical.guestDescriptor, layout, userDataBase, snapshot, partialThreads, plan.imageMetadata, plan.runtimeState);
             break;
         case DescriptorRole::Gds:
         case DescriptorRole::BdaPagetable:
@@ -567,7 +575,6 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             }
         }
 
-        bindings.push_back(std::move(physical));
     }
 
     if (bufferWrittenTraceEnabled()) {
@@ -577,12 +584,16 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
         const auto readOnly = bufferWrittenCounts.readOnly.fetch_add(readOnlyHere) + readOnlyHere;
         std::fprintf(stderr, "[bindings] guest buffer elements: %zu written, %zu read-only (total so far: %llu / %llu)\n", writtenHere, readOnlyHere, written, readOnly);
     }
-    allocation.bindings = std::move(bindings);
-    allocation.pushConstants.clear();
-    if (layout.UsesPushData()) {
-        allocation.pushConstants.resize(static_cast<std::size_t>(shaderData.size()) * sizeof(std::uint32_t));
-        std::memcpy(allocation.pushConstants.data(), shaderData.data(), allocation.pushConstants.size());
-    }
+}
+
+}
+
+void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, const CompiledBindingLayout& compiled, const DescriptorBindingPlan& plan, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const {
+    PopulateValues(allocation, compiled, plan, userDataBase, snapshot, partialThreads);
+}
+
+void DescriptorBindingBuilder::Populate(RecompileResult& result, const CompiledBindingLayout& compiled, const DescriptorBindingPlan& plan, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const {
+    PopulateValues(result, compiled, plan, userDataBase, snapshot, partialThreads);
 }
 
 }

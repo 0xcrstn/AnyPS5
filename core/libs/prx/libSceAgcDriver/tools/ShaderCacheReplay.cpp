@@ -34,8 +34,8 @@ double Milliseconds(std::chrono::steady_clock::time_point start) {
 
 template<typename TSpirv>
 std::vector<std::uint32_t> PreparedWords(const TSpirv& spirv) {
-    if constexpr (requires { spirv.Resolved(); }) return spirv.Resolved().Words();
-    else return spirv.Words();
+    if constexpr (requires { spirv.Resolved(); }) return spirv.Resolved().Copy();
+    else return spirv.Copy();
 }
 
 void WriteSpirv(const std::filesystem::path& directory, const char* path, std::span<const std::uint32_t> spirv) {

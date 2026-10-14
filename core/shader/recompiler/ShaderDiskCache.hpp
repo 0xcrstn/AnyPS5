@@ -16,7 +16,7 @@
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-inline constexpr std::uint32_t FormatVersion = 34;
+inline constexpr std::uint32_t FormatVersion = 35;
 
 enum class LoadStatus {
     Loaded,
@@ -55,7 +55,7 @@ void EncodeResult(const RecompileResult& result, std::vector<std::byte>& out);
 [[nodiscard]] bool DecodeResult(std::span<const std::byte> bytes, RecompileResult& result);
 
 [[nodiscard]] std::vector<std::byte> EncodeEntry(std::span<const std::byte> key, const CompiledVariant& variant);
-[[nodiscard]] LoadStatus DecodeEntry(std::span<const std::byte> file, std::span<const std::byte> key, CompiledVariant& variant);
+[[nodiscard]] LoadStatus DecodeEntry(std::span<const std::byte> file, std::span<const std::byte> key, CompiledVariant& variant, std::shared_ptr<const void> owner = nullptr);
 
 void BuildPlanKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key);
 [[nodiscard]] bool EncodePlan(const IrResourcePlan& plan, std::vector<std::byte>& out);
@@ -72,6 +72,7 @@ void BuildPlanFailureKey(std::span<const std::byte> planKey, std::vector<std::by
 [[nodiscard]] bool Load(std::span<const std::byte> key, CompiledVariant& variant);
 [[nodiscard]] bool Reload(std::span<const std::byte> key, CompiledVariant& variant);
 void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant, std::function<void()> stored = {});
+[[nodiscard]] std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, const CompiledVariant& variant);
 [[nodiscard]] bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan);
 void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan, std::function<void()> stored = {});
 [[nodiscard]] bool ReloadPlan(std::span<const std::byte> key, IrResourcePlan& plan);

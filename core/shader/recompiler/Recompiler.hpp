@@ -4,6 +4,7 @@
 #include "BufferReadRanges.hpp"
 #include "RuntimeAbi.hpp"
 #include "PipelineSpecialization.hpp"
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -152,6 +153,7 @@ struct ShaderPixelStageInfo {
     bool stencilRefExportEnable;
     RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
     bool layerExported = false;
+    bool ditheredAlphaToCoverage = false;
 };
 
 struct ShaderVertexBufferResource {
@@ -290,6 +292,8 @@ struct TessellationConfiguration {
     std::uint32_t partitioning;
     std::uint32_t outputTopology;
     std::uint32_t patchesPerGroup = 256;
+    std::uint32_t primitiveGroupSize = 0;
+    bool breakAtInstance = false;
 };
 
 inline constexpr std::uint32_t MeshDrawPushOffsetBytes = 104;
@@ -440,48 +444,53 @@ class SharedSpirv {
 public:
     SharedSpirv() = default;
     SharedSpirv(std::vector<std::uint32_t> words) : words(std::make_shared<std::vector<std::uint32_t>>(std::move(words))) {}
+    SharedSpirv(std::shared_ptr<const void> owner, std::span<const std::uint32_t> view) : owner(std::move(owner)), view(view) {}
     SharedSpirv& operator=(std::vector<std::uint32_t> other) {
         words = std::make_shared<std::vector<std::uint32_t>>(std::move(other));
+        spilled.reset();
+        owner.reset();
+        view = {};
         return *this;
     }
 
-    [[nodiscard]] const std::vector<std::uint32_t>& Words() const { return words ? *words : spilled ? SpilledWords() : Empty(); }
+    [[nodiscard]] std::span<const std::uint32_t> Words() const { return words ? std::span<const std::uint32_t>(*words) : spilled ? SpilledWords() : view; }
+    [[nodiscard]] std::vector<std::uint32_t> Copy() const { return {Words().begin(), Words().end()}; }
     [[nodiscard]] bool Spilled() const { return words == nullptr && spilled != nullptr; }
     [[nodiscard]] std::size_t WordCount() const;
     [[nodiscard]] SharedSpirv Resolved() const;
     [[nodiscard]] SharedSpirv Spill(std::vector<std::byte> key, bool pinned) const;
     void Unpin() const;
-    operator const std::vector<std::uint32_t>&() const { return Words(); }
     [[nodiscard]] std::size_t size() const { return Words().size(); }
     [[nodiscard]] bool empty() const { return Words().empty(); }
     [[nodiscard]] const std::uint32_t* data() const { return Words().data(); }
     [[nodiscard]] std::uint32_t* data() { return Mutable().data(); }
     [[nodiscard]] const std::uint32_t& operator[](std::size_t index) const { return Words()[index]; }
     [[nodiscard]] std::uint32_t& operator[](std::size_t index) { return Mutable()[index]; }
-    [[nodiscard]] std::vector<std::uint32_t>::const_iterator begin() const { return Words().begin(); }
-    [[nodiscard]] std::vector<std::uint32_t>::const_iterator end() const { return Words().end(); }
+    [[nodiscard]] std::span<const std::uint32_t>::iterator begin() const { return Words().begin(); }
+    [[nodiscard]] std::span<const std::uint32_t>::iterator end() const { return Words().end(); }
     [[nodiscard]] std::vector<std::uint32_t>::iterator begin() { return Mutable().begin(); }
     [[nodiscard]] std::vector<std::uint32_t>::iterator end() { return Mutable().end(); }
     void resize(std::size_t count) { Mutable().resize(count); }
     std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values) { return Mutable().insert(where, values); }
-    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return (left.words == right.words && left.spilled == right.spilled) || left.Resolved().Words() == right.Resolved().Words(); }
+    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return (left.words != nullptr && left.words == right.words) || (left.spilled != nullptr && left.spilled == right.spilled) || std::ranges::equal(left.Resolved().Words(), right.Resolved().Words()); }
 
 private:
-    static const std::vector<std::uint32_t>& Empty() {
-        static const std::vector<std::uint32_t> empty;
-        return empty;
-    }
-    [[noreturn]] static const std::vector<std::uint32_t>& SpilledWords();
-    // Copy on write: a holder whose words are shared gets its own copy before the first write.
+    [[noreturn]] static std::span<const std::uint32_t> SpilledWords();
     std::vector<std::uint32_t>& Mutable() {
         if (Spilled()) *this = Resolved();
         spilled.reset();
-        if (words == nullptr || words.use_count() != 1) words = std::make_shared<std::vector<std::uint32_t>>(Words());
+        if (words == nullptr || words.use_count() != 1) {
+            words = std::make_shared<std::vector<std::uint32_t>>(Copy());
+            owner.reset();
+            view = {};
+        }
         return *words;
     }
 
     std::shared_ptr<std::vector<std::uint32_t>> words;
     std::shared_ptr<SpilledSpirv> spilled;
+    std::shared_ptr<const void> owner;
+    std::span<const std::uint32_t> view;
 };
 
 struct VertexInput {

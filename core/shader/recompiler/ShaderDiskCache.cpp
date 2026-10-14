@@ -14,6 +14,12 @@
 #elif defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include "ShaderCacheVersion.hpp"
 #include <algorithm>
 #include <atomic>
@@ -77,9 +83,9 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 200, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 248, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 112, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 320, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(RecompileResult) == 416, "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 592, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
@@ -158,6 +164,69 @@ struct FileHeader {
     std::uint64_t keyHash;
     std::uint64_t payloadHash;
 };
+
+std::size_t PayloadOffset(std::size_t keyBytes) {
+    constexpr std::size_t alignment = 8;
+    return (sizeof(FileHeader) + keyBytes + alignment - 1) / alignment * alignment;
+}
+
+class MappedFile {
+public:
+    MappedFile(const void* data, std::size_t size) : data(data), size(size) {}
+    MappedFile(const MappedFile&) = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+    ~MappedFile() {
+#ifdef _WIN32
+        UnmapViewOfFile(data);
+#else
+        munmap(const_cast<void*>(data), size);
+#endif
+    }
+
+    [[nodiscard]] std::span<const std::byte> Bytes() const { return {static_cast<const std::byte*>(data), size}; }
+
+private:
+    const void* data;
+    std::size_t size;
+};
+
+std::shared_ptr<const MappedFile> MapFile(const std::filesystem::path& path) {
+#ifdef _WIN32
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return nullptr;
+    LARGE_INTEGER length{};
+    if (!GetFileSizeEx(file, &length) || length.QuadPart <= 0 || static_cast<unsigned long long>(length.QuadPart) > std::numeric_limits<std::size_t>::max()) {
+        CloseHandle(file);
+        return nullptr;
+    }
+    const HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    CloseHandle(file);
+    if (mapping == nullptr) return nullptr;
+    const void* data = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(mapping);
+    if (data == nullptr) return nullptr;
+    try {
+        return std::make_shared<const MappedFile>(data, static_cast<std::size_t>(length.QuadPart));
+    } catch (...) {
+        UnmapViewOfFile(data);
+        throw;
+    }
+#else
+    const int descriptor = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) return nullptr;
+    struct stat status{};
+    void* data = MAP_FAILED;
+    if (fstat(descriptor, &status) == 0 && status.st_size > 0) data = mmap(nullptr, static_cast<std::size_t>(status.st_size), PROT_READ, MAP_PRIVATE, descriptor, 0);
+    close(descriptor);
+    if (data == MAP_FAILED) return nullptr;
+    try {
+        return std::make_shared<const MappedFile>(data, static_cast<std::size_t>(status.st_size));
+    } catch (...) {
+        munmap(data, static_cast<std::size_t>(status.st_size));
+        throw;
+    }
+#endif
+}
 static_assert(sizeof(FileHeader) == 48 && std::is_trivially_copyable_v<FileHeader>);
 
 class Writer {
@@ -220,7 +289,7 @@ private:
 
 class Reader {
 public:
-    explicit Reader(std::span<const std::byte> bytes) : bytes(bytes) {}
+    explicit Reader(std::span<const std::byte> bytes, std::shared_ptr<const void> owner = nullptr) : bytes(bytes), owner(std::move(owner)) {}
 
     [[nodiscard]] bool Ok() const { return ok; }
     [[nodiscard]] bool Done() const { return ok && position == bytes.size(); }
@@ -271,6 +340,18 @@ public:
         }
     }
 
+    SharedSpirv Spirv() {
+        const auto count = Count(sizeof(std::uint32_t));
+        const auto* first = bytes.data() + position;
+        position += count * sizeof(std::uint32_t);
+        if (owner != nullptr && reinterpret_cast<std::uintptr_t>(first) % alignof(std::uint32_t) == 0) {
+            return SharedSpirv(owner, std::span(reinterpret_cast<const std::uint32_t*>(first), count));
+        }
+        std::vector<std::uint32_t> words(count);
+        if (count != 0) std::memcpy(words.data(), first, count * sizeof(std::uint32_t));
+        return SharedSpirv(std::move(words));
+    }
+
     void Flags(std::vector<bool>& flags) {
         const auto count = Count(1);
         flags.assign(count, false);
@@ -316,6 +397,7 @@ private:
     }
 
     std::span<const std::byte> bytes;
+    std::shared_ptr<const void> owner;
     std::size_t position = 0;
     bool ok = true;
 };
@@ -470,9 +552,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
 
 void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.runtimeAbiVersion);
-    std::vector<std::uint32_t> words;
-    reader.Values(words);
-    result.spirv = std::move(words);
+    result.spirv = reader.Spirv();
     reader.Value(result.bdaAbiVersion);
     reader.Value(result.memoryOffsetDword);
     reader.Value(result.shaderDataDwords);
@@ -1147,10 +1227,12 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",
     "APS5_NO_FAILURE_MEMO",
+    "APS5_NO_MATERIALIZE_STORAGE_REUSE",
     "APS5_NO_PERF_FRONTEND_PAIR",
     "APS5_NO_PERF_DISK_PLANS",
     "APS5_NO_PERF_DOM_INTERSECTION",
     "APS5_NO_PERF_ITERATION_SELECTION",
+    "APS5_NO_PERF_LAYOUT_PAIR",
     "APS5_NO_RESULT_MEMO",
 };
 
@@ -1178,10 +1260,11 @@ std::string hex(std::uint64_t value) {
 
 std::vector<std::byte> wrapEntry(std::span<const std::byte> key, std::span<const std::byte> payload) {
     const FileHeader header{FileMagic, FormatVersion, SourceVersion(), key.size(), payload.size(), HashBytes(key), HashBytes(payload)};
-    std::vector<std::byte> file(sizeof(header) + key.size() + payload.size());
+    const auto payloadOffset = PayloadOffset(key.size());
+    std::vector<std::byte> file(payloadOffset + payload.size());
     std::memcpy(file.data(), &header, sizeof(header));
     std::memcpy(file.data() + sizeof(header), key.data(), key.size());
-    if (!payload.empty()) std::memcpy(file.data() + sizeof(header) + key.size(), payload.data(), payload.size());
+    if (!payload.empty()) std::memcpy(file.data() + payloadOffset, payload.data(), payload.size());
     return file;
 }
 
@@ -1191,9 +1274,13 @@ LoadStatus unwrapEntry(std::span<const std::byte> file, std::span<const std::byt
     std::memcpy(&header, file.data(), sizeof(header));
     if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != SourceVersion()) return LoadStatus::Rejected;
     const auto body = file.size() - sizeof(header);
-    if (header.keyBytes > body || header.payloadBytes != body - header.keyBytes) return LoadStatus::Rejected;
+    if (header.keyBytes > body) return LoadStatus::Rejected;
+    const auto payloadOffset = PayloadOffset(static_cast<std::size_t>(header.keyBytes));
+    if (payloadOffset > file.size() || header.payloadBytes != file.size() - payloadOffset) return LoadStatus::Rejected;
     const auto storedKey = file.subspan(sizeof(header), static_cast<std::size_t>(header.keyBytes));
-    payload = file.subspan(sizeof(header) + static_cast<std::size_t>(header.keyBytes));
+    const auto padding = file.subspan(sizeof(header) + storedKey.size(), payloadOffset - sizeof(header) - storedKey.size());
+    if (std::ranges::any_of(padding, [](std::byte value) { return value != std::byte{0}; })) return LoadStatus::Rejected;
+    payload = file.subspan(payloadOffset);
     if (HashBytes(storedKey) != header.keyHash) return LoadStatus::Rejected;
     if (storedKey.size() != key.size() || !std::equal(storedKey.begin(), storedKey.end(), key.begin())) return LoadStatus::KeyMismatch;
     if (HashBytes(payload) != header.payloadHash) return LoadStatus::Rejected;
@@ -1214,19 +1301,19 @@ public:
     [[nodiscard]] const std::filesystem::path& Directory() const { return directory; }
 
     bool Load(std::span<const std::byte> key, CompiledVariant& variant) {
-        return load(key, [&](std::span<const std::byte> file) { return DecodeEntry(file, key, variant); }, hits, misses, loadFailures);
+        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void> owner) { return DecodeEntry(file, key, variant, std::move(owner)); }, hits, misses, loadFailures);
     }
 
     bool Reload(std::span<const std::byte> key, CompiledVariant& variant) {
-        return load(key, [&](std::span<const std::byte> file) { return DecodeEntry(file, key, variant); }, reloads, reloadFailures, reloadFailures);
+        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void> owner) { return DecodeEntry(file, key, variant, std::move(owner)); }, reloads, reloadFailures, reloadFailures);
     }
 
     bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
-        return load(key, [&](std::span<const std::byte> file) { return DecodePlanEntry(file, key, plan); }, planHits, planMisses, planLoadFailures);
+        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanEntry(file, key, plan); }, planHits, planMisses, planLoadFailures);
     }
 
     bool LoadPlanFailure(std::span<const std::byte> key, std::string& message) {
-        return load(key, [&](std::span<const std::byte> file) { return DecodePlanFailureEntry(file, key, message); }, planFailureHits, planFailureMisses, planLoadFailures);
+        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanFailureEntry(file, key, message); }, planFailureHits, planFailureMisses, planLoadFailures);
     }
 
     void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant, std::function<void()> stored) {
@@ -1238,7 +1325,7 @@ public:
     }
 
     bool ReloadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
-        return load(key, [&](std::span<const std::byte> file) { return DecodePlanEntry(file, key, plan); }, planReloads, planReloadFailures, planReloadFailures);
+        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanEntry(file, key, plan); }, planReloads, planReloadFailures, planReloadFailures);
     }
 
     void StoreFile(std::filesystem::path path, std::vector<std::byte> file) {
@@ -1247,6 +1334,22 @@ public:
 
     void StorePlanFailure(std::vector<std::byte> key, std::string message) {
         enqueue({std::move(key), nullptr, nullptr, {}, {}, {}, std::move(message)});
+    }
+
+    std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, const CompiledVariant& variant) {
+        const auto path = directory / EntryName(key);
+        const auto file = EncodeEntry(key, variant);
+        if (!WriteFileAtomically(path, file)) return nullptr;
+        writes.fetch_add(1, std::memory_order_relaxed);
+        bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
+        auto mapped = MapFile(path);
+        if (mapped == nullptr) return nullptr;
+        auto persisted = std::make_shared<CompiledVariant>();
+        const auto bytes = mapped->Bytes();
+        if (DecodeEntry(bytes, key, *persisted, std::move(mapped)) != LoadStatus::Loaded) return nullptr;
+        persisted->layout = variant.layout;
+        persisted->artifact.variantId = variant.artifact.variantId;
+        return persisted;
     }
 
     void Flush() {
@@ -1294,13 +1397,21 @@ private:
         thread_local std::vector<std::byte>* fileSlot = nullptr;
         auto& file = ThreadOwned(fileSlot);
         bool loaded = false;
-        if (!ReadWholeFile(directory / name, file)) {
+        std::span<const std::byte> bytes;
+        std::shared_ptr<const void> owner;
+        if (auto mapped = MapFile(directory / name)) {
+            bytes = mapped->Bytes();
+            owner = std::move(mapped);
+        }
+        const bool present = owner != nullptr || ReadWholeFile(directory / name, file);
+        if (owner == nullptr) bytes = file;
+        if (!present) {
             missCount.fetch_add(1, std::memory_order_relaxed);
         } else {
-            switch (decode(std::span<const std::byte>(file))) {
+            switch (decode(bytes, std::move(owner))) {
                 case LoadStatus::Loaded:
                     hitCount.fetch_add(1, std::memory_order_relaxed);
-                    bytesRead.fetch_add(file.size(), std::memory_order_relaxed);
+                    bytesRead.fetch_add(bytes.size(), std::memory_order_relaxed);
                     loaded = true;
                     break;
                 case LoadStatus::Absent:
@@ -1309,7 +1420,7 @@ private:
                     break;
                 case LoadStatus::Rejected: {
                     const auto failures = failureCount.fetch_add(1, std::memory_order_relaxed);
-                    if (failures < 8) std::fprintf(stderr, "[shader-disk-cache] rejected %s (%zu bytes): truncated, corrupt or another format; recompiling\n", name.c_str(), file.size());
+                    if (failures < 8) std::fprintf(stderr, "[shader-disk-cache] rejected %s (%zu bytes): truncated, corrupt or another format; recompiling\n", name.c_str(), bytes.size());
                     break;
                 }
             }
@@ -1523,11 +1634,11 @@ std::vector<std::byte> EncodeEntry(std::span<const std::byte> key, const Compile
     return wrapEntry(key, payload);
 }
 
-LoadStatus DecodeEntry(std::span<const std::byte> file, std::span<const std::byte> key, CompiledVariant& variant) {
+LoadStatus DecodeEntry(std::span<const std::byte> file, std::span<const std::byte> key, CompiledVariant& variant, std::shared_ptr<const void> owner) {
     std::span<const std::byte> payload;
     const auto status = unwrapEntry(file, key, payload);
     if (status != LoadStatus::Loaded) return status;
-    Reader reader(payload);
+    Reader reader(payload, std::move(owner));
     CompiledVariant decoded;
     decodeArtifact(reader, decoded.artifact);
     decodeInfo(reader, decoded.info);
@@ -1644,6 +1755,11 @@ void StorePlanFailure(std::span<const std::byte> planKey, std::string message) {
     std::vector<std::byte> key;
     BuildPlanFailureKey(planKey, key);
     instance.StorePlanFailure(std::move(key), std::move(message));
+}
+
+std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, const CompiledVariant& variant) {
+    auto& instance = store();
+    return instance.Enabled() ? instance.Persist(key, variant) : nullptr;
 }
 
 void Flush() {

@@ -233,7 +233,7 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::lookup(Recorder& recor
             unchanged = GuestMemory::UnchangedSinceDirtySerial(begin, ownedBytes, entry.dirtySerial, &through);
             if (unchanged && GuestMemory::EpochDirtySetVerify()) {
                 const bool slow = GuestMemory::UnchangedSince(begin, ownedBytes, entry.generation);
-                GuestMemory::NoteDirtySetVerify(slow);
+                GuestMemory::NoteDirtySetVerify(slow, {"snapshot-arena", entry.dirtySerial, through, entry.generation}, begin, ownedBytes);
                 unchanged = slow;
             }
             if (unchanged) entry.dirtySerial = through;

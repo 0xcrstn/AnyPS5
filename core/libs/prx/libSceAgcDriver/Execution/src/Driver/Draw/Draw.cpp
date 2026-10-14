@@ -6,6 +6,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 
 namespace AgcDriver::DriverDetail {
 
@@ -198,7 +199,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         decodeReads[i].clear();
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
-        if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, readRegister(queue.context, 0x207)) | graphics.layerExports;
+        if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, readRegister(queue.context, 0x207), program.tailContinuation.get()) | graphics.layerExports;
     };
     if (!registerKey) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
@@ -207,7 +208,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
     std::vector<ShaderRecompiler::RecompileResult> results;
     std::vector<Graphics::CompiledShader> stages;
-    results.reserve(programs.size() + 2u);
+    static const bool copyStageResults = std::getenv("APS5_COPY_DRAW_STAGE_RESULTS") != nullptr;
+    if (copyStageResults) results.reserve(programs.size() + 2u);
     stages.reserve(programs.size());
     std::uint32_t pushCursorBytes = 0;
 
@@ -268,7 +270,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
-    std::vector<std::size_t> resultIndex(programs.size(), 0);
+    const auto sharedResult = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> resultIndex(programs.size(), sharedResult);
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
@@ -291,14 +294,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             programResults[i] = matched[i]->compiled.get();
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
-            resultIndex[i] = results.size();
             if (front != nullptr) {
                 pixel = Graphics::DefaultUnexportedInputs(decode->pixel, front->parameterExports);
                 stageCaptures[i].inputExports = front->parameterExports;
             }
-            results.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
+            const auto compiled = materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
             if (!rejected.empty()) return DrawVerdict::Rejected;
-            programResults[i] = &results.back();
+            require(compiled != nullptr, "draw stage materialization returned no result");
+            if (copyStageResults) {
+                resultIndex[i] = results.size();
+                results.push_back(*compiled);
+                programResults[i] = &results.back();
+            } else {
+                programResults[i] = compiled.get();
+            }
         }
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
@@ -337,6 +346,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             return;
         }
         require(stages.size() == 2, "rect-list requires vertex and fragment programs");
+        results.reserve(programs.size() + 2u);
         rectIndex = results.size();
         results.push_back(std::move(rectangle.control));
         results.push_back(std::move(rectangle.evaluation));
@@ -347,6 +357,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (graphics.rectList) buildRectList();
     if (!programs.empty() && programResults.back() != nullptr && programResults.back()->barycentricEmulation.active) {
         require(!graphics.rectList && graphics.stages.path == Graphics::ShaderPath::Vertex && programs.size() == 2 && programResults[0] != nullptr && stages.size() == 2, "a pixel shader that reads barycentrics without VK_KHR_fragment_shader_barycentric needs a vertex shader before it");
+        results.reserve(programs.size() + 2u);
         results.push_back(ShaderRecompiler::BuildBarycentricGeometryShader(*programResults[0], *programResults[1], localDevice->Target(), localDevice->GeometryLimits()));
         stages.insert(stages.begin() + 1, Graphics::CompiledShader{Stage::Geometry, &results.back(), 0});
     }
@@ -377,17 +388,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (drawParameters.indirect && indirectCpu) {
 
         const auto indirect = *drawParameters.indirect;
-        if (drawHit) {
-
-            for (std::size_t i = 0; i < programs.size(); ++i) {
-                if (programResults[i] == nullptr) continue;
-                resultIndex[i] = results.size();
-                results.push_back(ShaderRecompiler::RecompileResult(*programResults[i]));
-                for (auto& stage : stages) {
-                    if (stage.program == programResults[i]) stage.program = &results[resultIndex[i]];
-                }
-                programResults[i] = &results[resultIndex[i]];
+        results.reserve(programs.size() + 2u);
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            if (programResults[i] == nullptr || resultIndex[i] != sharedResult) continue;
+            resultIndex[i] = results.size();
+            results.push_back(ShaderRecompiler::RecompileResult(*programResults[i]));
+            for (auto& stage : stages) {
+                if (stage.program == programResults[i]) stage.program = &results[resultIndex[i]];
             }
+            programResults[i] = &results[resultIndex[i]];
         }
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
@@ -429,8 +438,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 auto& result = results[resultIndex[programIndex]];
                 const auto pushBytes = result.pushConstants.size();
                 decodeVertexInfo(programIndex);
-                result = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
+                const auto compiled = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
+                require(compiled != nullptr, "patched draw stage materialization returned no result");
+                result = *compiled;
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
             }
             fold(*programResults[0], direct);

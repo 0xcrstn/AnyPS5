@@ -201,7 +201,14 @@ std::uint64_t DirtySerial();
 using DirtyRange = std::pair<std::uint64_t, std::uint64_t>;
 bool UnchangedSinceDirtySerial(std::span<const DirtyRange> ranges, std::uint64_t serial, std::uint64_t* checkedThrough = nullptr);
 bool UnchangedSinceDirtySerial(std::uint64_t address, std::size_t bytes, std::uint64_t serial, std::uint64_t* checkedThrough = nullptr);
-void NoteDirtySetVerify(bool agreed);
+struct DirtySetVerifyContext {
+    const char* site = "unknown";
+    std::uint64_t serial = 0;
+    std::uint64_t checkedThrough = 0;
+    std::uint64_t generation = 0;
+};
+void NoteDirtySetVerify(bool agreed, const DirtySetVerifyContext& context = {}, std::span<const DirtyRange> ranges = {});
+void NoteDirtySetVerify(bool agreed, const DirtySetVerifyContext& context, std::uint64_t address, std::size_t bytes);
 struct DirtySetCounts {
     std::uint64_t serial = 0;
     std::uint64_t checks = 0;
@@ -279,5 +286,6 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
 }
 
 extern "C" void AgcDriverCheckGuestMemory_nid_postfix(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
+extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std::uint64_t value);
 
 #endif

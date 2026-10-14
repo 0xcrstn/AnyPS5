@@ -33,7 +33,7 @@ extern std::atomic<std::uint64_t> triesFailed[TrySites];
 
 extern std::atomic<std::uint64_t> reapsSkipped[TrySites];
 
-extern std::atomic<std::uint64_t> storesOnGpu, storesBehindCompletions, storesOnCpu, storesToHostMemory, storesDrained, copiesToHostMemory, copiesOnGpu;
+extern std::atomic<std::uint64_t> storesOnGpu, storesBehindCompletions, storesOnCpu, storesToHostMemory, storesDrained, dmaFills, copiesToHostMemory, copiesOnGpu;
 
 extern std::map<std::uint32_t, std::uint64_t> drainCounts;
 

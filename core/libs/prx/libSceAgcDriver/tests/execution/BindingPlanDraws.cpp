@@ -58,6 +58,7 @@ alignas(16) std::array<std::uint32_t, 4> SecondPixelTable{};
 alignas(16) std::array<float, 4> Other{1.0f, 0.0f, 0.0f, 0.0f};
 alignas(16) std::array<float, 4> First{1.0f, 0.0f, 0.0f, 0.0f};
 alignas(16) std::array<float, 4> Moved{0.5f, 0.0f, 0.0f, 0.0f};
+alignas(16) std::array<std::uint32_t, 8> IndirectRecords{3u, 1u, 0u, 0u, 3u, 1u, 0u, 0u};
 alignas(64) volatile std::uint32_t EndOfPipe = 0;
 std::byte* ColorMemory = nullptr;
 
@@ -123,7 +124,7 @@ const std::vector<std::pair<std::uint32_t, std::uint32_t>> ContextBaseline{
     {0xb4, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)}, {0x114, 0}, {0x113, std::bit_cast<std::uint32_t>(1.0f)},
 };
 
-std::vector<std::uint32_t> Frame(const std::uint32_t* pixelCode, const void* pixelPointer) {
+std::vector<std::uint32_t> Frame(const std::uint32_t* pixelCode, const void* pixelPointer, bool indirect = false) {
     const auto colorAddress = reinterpret_cast<std::uintptr_t>(ColorMemory);
     const auto vertexAddress = reinterpret_cast<std::uintptr_t>(VertexCode.data());
     const auto pixelAddress = reinterpret_cast<std::uintptr_t>(pixelCode);
@@ -151,19 +152,26 @@ std::vector<std::uint32_t> Frame(const std::uint32_t* pixelCode, const void* pix
     SetRegister(words, SetShReg, 0x00d, static_cast<std::uint32_t>(pixelTable >> 32u));
     SetRegister(words, SetShReg, 0x0c8, static_cast<std::uint32_t>(vertexAddress >> 8u));
     SetRegister(words, SetShReg, 0x0c9, static_cast<std::uint32_t>(vertexAddress >> 40u));
-    SetRegister(words, SetShReg, 0x08b, 2u << 1u);
+    SetRegister(words, SetShReg, 0x08b, (indirect ? 3u : 2u) << 1u);
     SetRegister(words, SetShReg, 0x08c, static_cast<std::uint32_t>(vertexTable));
     SetRegister(words, SetShReg, 0x08d, static_cast<std::uint32_t>(vertexTable >> 32u));
-    words.insert(words.end(), {0xc0012d00u, 3u, 2u});
+    if (indirect) {
+        SetRegister(words, SetShReg, 0x08e, 0u);
+        const auto records = reinterpret_cast<std::uintptr_t>(IndirectRecords.data());
+        words.insert(words.end(), {0xc0021100u, 1u, static_cast<std::uint32_t>(records), static_cast<std::uint32_t>(static_cast<std::uint64_t>(records) >> 32u)});
+        words.insert(words.end(), {0xc0082c00u, 0u, 0x280u, 0x280u, 0x8eu | (1u << 31u), 2u, 0u, 0u, 16u, 2u});
+    } else {
+        words.insert(words.end(), {0xc0012d00u, 3u, 2u});
+    }
     const auto labelAddress = reinterpret_cast<std::uintptr_t>(&EndOfPipe);
     words.insert(words.end(), {0xc0064900u, 0x514u, (1u << 29u) | (2u << 24u), static_cast<std::uint32_t>(labelAddress), static_cast<std::uint32_t>(static_cast<std::uint64_t>(labelAddress) >> 32u), 1u, 0u, 0u});
     return words;
 }
 
-void Draw(const std::uint32_t* pixelCode, const void* pixelPointer, std::uint32_t expectedRed, const std::string& what) {
+void Draw(const std::uint32_t* pixelCode, const void* pixelPointer, std::uint32_t expectedRed, const std::string& what, bool indirect = false) {
     std::fill_n(ColorMemory, ColorBytes, std::byte{0});
     EndOfPipe = 0;
-    auto words = Frame(pixelCode, pixelPointer);
+    auto words = Frame(pixelCode, pixelPointer, indirect);
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, what + ": the draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
@@ -223,6 +231,18 @@ void PlannedDrawsFollowTheirBuffers(bool libraries) {
     Require(plan.verifiedDecodes == 5 && plan.decodeMismatches == 0, std::to_string(plan.decodeMismatches) + " of " + std::to_string(plan.verifiedDecodes) + " kept decodes differ from a fresh decode" + mode);
 }
 
+void PlannedIndirectDrawsKeepOwnedResults() {
+    SetVertexRecords(3);
+    SetPixelBuffer(First.data());
+    const auto before = Counters();
+    Draw(BufferPixelCode.data(), PixelTable.data(), 255, "the first CPU-expanded indirect planned draw", true);
+    SetPixelBuffer(Moved.data());
+    Draw(BufferPixelCode.data(), PixelTable.data(), 128, "a CPU-expanded indirect planned draw with moved pixel values", true);
+    const auto after = Counters();
+    Require(after.stages == before.stages + 8u, "indirect planned draws did not materialize both initial stages and both patched vertex records");
+    Require(after.verifiedStages == before.verifiedStages + 8u && after.stageMismatches == before.stageMismatches, "CPU-expanded planned stages differ from full materialization");
+}
+
 }
 
 int main() {
@@ -239,6 +259,7 @@ int main() {
         Register(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Register(BufferPixelHeader, BufferPixelCode.data(), sizeof(BufferPixelCode), 1);
         PlannedDrawsFollowTheirBuffers(libraries);
+        PlannedIndirectDrawsKeepOwnedResults();
         AgcDriverShutdown_nid_postfix();
         std::cout << "Planned draws read their buffers, reuse their decode and templates, and match the full capture " << (libraries ? "with" : "without") << " graphics pipeline libraries" << std::endl;
         return 0;

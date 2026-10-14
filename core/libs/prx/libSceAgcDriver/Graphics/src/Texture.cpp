@@ -3108,6 +3108,13 @@ void StorageTexture::refreshGeneration() {
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    std::vector<bool> unsaved(trackedLayers, false);
+    bool anyUnsaved = false;
+    for (std::uint32_t layer = first; layer < first + count; ++layer) {
+        unsaved[layer] = !layerPending[layer] && !layerOriginal[layer] && layerGeneration[layer] == 0;
+        anyUnsaved = anyUnsaved || unsaved[layer];
+    }
+    if (anyUnsaved && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(&unsaved);
     for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
@@ -3299,6 +3306,15 @@ bool StorageTexture::keptAtUnwatchHolds(std::uint64_t from, std::uint32_t unit) 
     return found != keptAtUnwatch.end() && layerOriginal[unit] && found->second == layerGeneration[unit];
 }
 
+void StorageTexture::forgetSavedOver(std::uint64_t address, std::size_t bytes) {
+    // Only these units' bytes changed under the saved copy. Units outside keep it: results still
+    // pending there (the flush before the fill or copy stored only the units it overlaps) are
+    // compared with it at their store when the memory is outside the write watch.
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        if (layerBegin(unit) < address + bytes && address < layerBegin(unit) + layerBytes(unit)) layerOriginal[unit] = false;
+    }
+}
+
 void StorageTexture::saveBeforeUnwatch() {
     std::vector<bool> units(trackedLayers, false);
     for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) units[unit] = layerPending[unit] && !layerOriginal[unit] && layerGeneration[unit] != 0;
@@ -3401,6 +3417,12 @@ bool StorageTexture::PresentThenStore(bool storeAtFlip, const std::function<bool
     const bool presented = present();
     if (storeAtFlip) FlushAllPending("flip");
     return presented;
+}
+
+bool StorageTexture::StoreAtLabelRequested(const char* value) {
+    if (value == nullptr) return false;
+    if (std::strcmp(value, "1") == 0) return true;
+    throw std::runtime_error(std::string("APS5_STORE_AT_LABEL=") + value + ": expected 1");
 }
 
 std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t address, std::uint64_t bytes) {
@@ -3898,7 +3920,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     return true;
 }
 
-bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal) {
+bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal, bool allowRegisterClear) {
     // Debug aid (APS5_TRACE_FILL_COVER=1): the first layer covers refused, with the surface, the
     // pattern and the generation the refusal was memoized at (ClassifyFill's layerRefusedGeneration).
     static const bool trace = std::getenv("APS5_TRACE_FILL_COVER") != nullptr;
@@ -3929,7 +3951,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
         // Under a clear code reads see that value whatever the texels hold, and keys a recorded
         // kernel still writes are not in the bytes yet: only keys that read as uncompressed now let
         // the image stand for the texels.
-        if (Recorder::SnapshotWriteOverlaps(descriptor.dccAddress, static_cast<std::size_t>(guestBytes / 256))) {
+        if (!allowRegisterClear && Recorder::SnapshotWriteOverlaps(descriptor.dccAddress, static_cast<std::size_t>(guestBytes / 256))) {
             refusal = "keys pending";
             return false;
         }
@@ -3979,7 +4001,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
         std::lock_guard lock(live.mutex);
         for (auto* texture : live.textures) {
             if (texture == this || texture->released || !texture->overlaps(begin, bytes)) continue;
-            texture->layerOriginal.assign(texture->trackedLayers, false);
+            texture->forgetSavedOver(begin, bytes);
             if (texture->descriptor.dccAddress != 0) aliasedKeys = true;
         }
     }
@@ -4113,7 +4135,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
         for (auto* texture : live.textures) {
-            if (texture != this && !texture->released && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) texture->layerOriginal.assign(texture->trackedLayers, false);
+            if (texture != this && !texture->released && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) texture->forgetSavedOver(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
         }
     }
     GuestMemory::MarkWritten(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));

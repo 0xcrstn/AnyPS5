@@ -9,9 +9,12 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -44,6 +47,116 @@ void RequireSameResult(const RecompileResult& a, const RecompileResult& b, const
         const auto& right = b.vertexAttributes[index];
         Require(left.location == right.location && left.components == right.components && left.resource.fields == right.resource.fields && left.fetchIndex == right.fetchIndex && left.formatComponents == right.formatComponents, message + ": vertex attribute differs");
     }
+}
+
+void VerifyStorageReuse(const PreparedShaderInvocation& prepared, const ResourceCapture& capture, bool templates) {
+    const bool reuse = templates && std::getenv("APS5_NO_MATERIALIZE_STORAGE_REUSE") == nullptr;
+    auto changed = capture;
+    changed.snapshot.buffers[0].dwords[0] += 512u;
+    changed.snapshot.images[0].dwords[0] += 512u;
+    changed.snapshot.userData.back() ^= 3u;
+    const auto original = prepared.Materialize(capture);
+    const auto updated = prepared.Materialize(changed);
+    {
+        std::shared_ptr<const RecompileResult> fromExitedThread;
+        std::exception_ptr producerFailure;
+        std::thread producer([&] {
+            try {
+                fromExitedThread = prepared.MaterializeValues(capture);
+            } catch (...) {
+                producerFailure = std::current_exception();
+            }
+        });
+        producer.join();
+        if (producerFailure) std::rethrow_exception(producerFailure);
+        auto stillOwned = prepared.MaterializeValues(changed);
+        RequireSameResult(*fromExitedThread, *original, "result retained after its producer thread exited");
+        RequireSameResult(*stillOwned, *updated, "concurrent result has fresh values");
+        auto anotherOwner = fromExitedThread;
+        std::thread releaseOne([owned = std::move(anotherOwner)]() mutable { owned.reset(); });
+        releaseOne.join();
+        auto independent = prepared.MaterializeValues(changed);
+        Require(independent.get() != fromExitedThread.get() && independent.get() != stillOwned.get(), "a result was reused while another owner retained it");
+        RequireSameResult(*fromExitedThread, *original, "retained result changed after another owner's release");
+        const auto* address = fromExitedThread.get();
+        const auto* bindings = fromExitedThread->bindings.data();
+        const auto* push = fromExitedThread->pushConstants.data();
+        std::vector<const std::uint32_t*> descriptors;
+        for (const auto& binding : fromExitedThread->bindings) descriptors.push_back(binding.guestDescriptor.data());
+        const auto before = GetMaterializeValuesCounts();
+        std::thread releaseLast([owned = std::move(fromExitedThread)]() mutable { owned.reset(); });
+        releaseLast.join();
+        const auto recycled = prepared.MaterializeValues(changed);
+        if (reuse) {
+            Require(recycled.get() == address, "last-owner release on another thread did not recycle the result");
+            Require(recycled->bindings.data() == bindings && recycled->pushConstants.data() == push, "recycled result replaced its output vectors");
+            for (std::size_t index = 0; index < descriptors.size(); ++index) Require(recycled->bindings[index].guestDescriptor.data() == descriptors[index], "recycled binding replaced its descriptor storage");
+            Require(GetMaterializeValuesCounts().storageReused == before.storageReused + 1u, "cross-thread storage reuse was not counted");
+        }
+        RequireSameResult(*recycled, *updated, "recycled result has stale dynamic values");
+        RequireSameResult(*stillOwned, *updated, "another retained result changed during recycling");
+    }
+    {
+        auto occupied = prepared.MaterializeValues(capture);
+        auto oversized = prepared.MaterializeValues(capture);
+        Require(oversized.use_count() == 1, "oversized retention fixture does not own its result");
+        auto writable = std::const_pointer_cast<RecompileResult>(std::move(oversized));
+        writable->pushConstants.reserve(512u * 1024u);
+        oversized = std::move(writable);
+        const auto before = GetMaterializeValuesCounts();
+        oversized.reset();
+        if (reuse) {
+            const auto after = GetMaterializeValuesCounts();
+            Require(after.storageRefused == before.storageRefused + 1u && after.storageRetainedBytes == before.storageRetainedBytes, "oversized unused vector capacity was retained");
+        }
+        RequireSameResult(*occupied, *original, "oversized release changed a retained result");
+    }
+    {
+        std::array<std::exception_ptr, 2> failures{};
+        std::array<std::thread, 2> workers;
+        for (std::size_t worker = 0; worker < workers.size(); ++worker) {
+            workers[worker] = std::thread([&, worker] {
+                try {
+                    auto current = capture;
+                    std::shared_ptr<const RecompileResult> previous;
+                    std::optional<RecompileResult> expectedPrevious;
+                    for (std::uint32_t iteration = 0; iteration < 16u; ++iteration) {
+                        current.snapshot.buffers[0].dwords[0] = capture.snapshot.buffers[0].dwords[0] + (iteration + 1u + worker * 16u) * 256u;
+                        current.snapshot.userData.back() = capture.snapshot.userData.back() + iteration + static_cast<std::uint32_t>(worker);
+                        const auto values = prepared.MaterializeValues(current);
+                        const auto reference = prepared.Materialize(current);
+                        RequireSameResult(*values, *reference, "concurrent materialization differs");
+                        if (previous) RequireSameResult(*previous, *expectedPrevious, "concurrent refill changed a result still owned");
+                        previous = values;
+                        expectedPrevious = *reference;
+                    }
+                } catch (...) {
+                    failures[worker] = std::current_exception();
+                }
+            });
+        }
+        for (auto& worker : workers) worker.join();
+        for (const auto& failure : failures) if (failure) std::rethrow_exception(failure);
+    }
+    if (reuse) {
+        auto evicted = prepared.MaterializeValues(capture);
+        for (std::uint32_t stride = 1u; stride <= 40u; ++stride) {
+            auto specialized = capture;
+            specialized.snapshot.buffers[0].dwords[1] = (specialized.snapshot.buffers[0].dwords[1] & 0xffffu) | (stride << 16u);
+            const auto values = prepared.MaterializeValues(specialized);
+            RequireSameResult(*values, *prepared.Materialize(specialized), "storage refill after a specialization change");
+        }
+        RequireSameResult(*evicted, *original, "template eviction changed an owned result");
+        const auto before = GetMaterializeValuesCounts();
+        std::thread releaseEvicted([owned = std::move(evicted)]() mutable { owned.reset(); });
+        releaseEvicted.join();
+        Require(GetMaterializeValuesCounts().storageRetainedBytes == before.storageRetainedBytes, "evicted template kept recycled storage after its last owner released it");
+        bool hit = false;
+        const auto rebuilt = prepared.MaterializeValues(capture, &hit);
+        Require(!hit, "storage lifetime fixture did not evict the original specialization");
+        RequireSameResult(*rebuilt, *original, "recreated template has stale values");
+    }
+    Require(GetMaterializeValuesCounts().storageRetainedBytes <= 32u * 1024u * 1024u, "materialized storage exceeded its retained-byte budget");
 }
 
 void VerifyTemplates() {
@@ -139,6 +252,7 @@ void VerifyTemplates() {
     Require(!hit, "changed push offset reused a materialized template");
     RequireSameResult(*offset, *offsetPrepared->Materialize(*captured), "changed push offset");
     check(*captured, true, "original template after specialization misses");
+    VerifyStorageReuse(*prepared, *captured, templates);
 }
 
 }

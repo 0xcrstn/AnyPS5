@@ -553,6 +553,100 @@ void EpochDirtyOwnedRangeTests(const Context& context) {
     }
 }
 
+void EpochDirtyReferenceTests(const Context& context) {
+    const Settings settings;
+    struct Restore {
+        bool enabled = GuestMemory::EpochDirtySetEnabled();
+        bool verify = GuestMemory::EpochDirtySetVerify();
+        ~Restore() {
+            GuestMemory::SetEpochDirtySet(enabled);
+            GuestMemory::SetEpochDirtySetVerify(verify);
+        }
+    } restore;
+    constexpr std::size_t blockBytes = 65536;
+    constexpr std::size_t snapshotBytes = 16;
+    DrawSnapshotArena::SetEnabled(false);
+    GuestMemory::SetEpochDirtySet(true);
+    for (const bool verify : {false, true}) {
+        Fixture fixture(context, 2 * blockBytes);
+        Require(fixture.Ready(), "the reference-granularity fixture lost its host import");
+        GuestMemory::SetEpochDirtySetVerify(verify);
+        auto& recorder = fixture.GetRecorder();
+        const auto address = fixture.Address();
+        const auto disagreementsBefore = GuestMemory::DirtySetStatistics().verifyDisagreements;
+        std::memset(fixture.Bytes(0), 0x71, 2 * blockBytes);
+        const auto snapshot = [&] {
+            auto buffer = std::make_shared<Buffer>(fixture.GetContext(), snapshotBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            std::memcpy(buffer->Bytes().data(), fixture.Bytes(0), snapshotBytes);
+            return buffer;
+        };
+        const auto stamp = [&] {
+            return std::array<std::uint64_t, 3>{GuestMemory::DirtySerial(), GuestMemory::CollectEpoch(), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
+        };
+        auto unknown = snapshot();
+        const auto knownGeneration = GuestMemory::CollectWritesUncached(address + blockBytes, snapshotBytes);
+        Require(knownGeneration != 0, "the unknown-generation control snapshot was not collected");
+        const auto unknownStamp = stamp();
+        recorder.NoteUnwrittenDrawSnapshot(address + blockBytes, snapshotBytes, unknownStamp, knownGeneration, unknown);
+        Require(recorder.UnwrittenDrawSnapshot(address + blockBytes, snapshotBytes, unknownStamp) == unknown, "a valid generation failed the unknown-generation control");
+        recorder.NoteUnwrittenDrawSnapshot(address + blockBytes, snapshotBytes, unknownStamp, 0, unknown);
+        Require(recorder.UnwrittenDrawSnapshot(address + blockBytes, snapshotBytes, unknownStamp) == nullptr, "an unknown generation reused an unwritten snapshot at an equal serial");
+        Require(GuestMemory::MarkWritten(address, snapshotBytes) != 0, "the unknown-generation fixture could not advance the dirty serial");
+        Require(recorder.UnwrittenDrawSnapshot(address + blockBytes, snapshotBytes, stamp()) == nullptr, "an unknown generation reused an unwritten snapshot across serials");
+        for (const auto offset : {snapshotBytes, std::size_t{4096}}) {
+            GuestMemory::BumpCollectEpoch();
+            const auto generation = GuestMemory::CollectWritesUncached(address, 2 * blockBytes);
+            Require(generation != 0, "the reference-granularity snapshot was not collected");
+            auto buffer = snapshot();
+            const auto captured = stamp();
+            recorder.KeepDrawSnapshot(address, snapshotBytes, generation, captured[2], buffer, Recorder::SnapshotUse::Vertex, 0, captured[0]);
+            recorder.NoteUnwrittenDrawSnapshot(address, snapshotBytes, captured, generation, buffer);
+            Require(GuestMemory::MarkWritten(address + offset, snapshotBytes) != 0, "a sibling driver store was not stamped");
+            Require(recorder.ReusableDrawSnapshot(address, snapshotBytes, Recorder::SnapshotUse::Vertex) == nullptr, "a disjoint driver store in the reference block retained a vertex proof");
+            Require(recorder.UnwrittenDrawSnapshot(address, snapshotBytes, stamp()) == nullptr, "a disjoint driver store in the reference block retained an unwritten proof");
+            Require(buffer->Bytes().front() == std::byte{0x71}, "rejecting a sibling driver store changed an earlier snapshot");
+        }
+        GuestMemory::BumpCollectEpoch();
+        const auto unrelatedGeneration = GuestMemory::CollectWritesUncached(address, 2 * blockBytes);
+        Require(unrelatedGeneration != 0, "the unrelated-block snapshot was not collected");
+        auto unrelated = snapshot();
+        const auto unrelatedStamp = stamp();
+        recorder.KeepDrawSnapshot(address, snapshotBytes, unrelatedGeneration, unrelatedStamp[2], unrelated, Recorder::SnapshotUse::Vertex, 0, unrelatedStamp[0]);
+        recorder.NoteUnwrittenDrawSnapshot(address, snapshotBytes, unrelatedStamp, unrelatedGeneration, unrelated);
+        Require(GuestMemory::MarkWritten(address + blockBytes + 4096, snapshotBytes) != 0, "a driver store in a distinct block was not stamped");
+        Require(recorder.ReusableDrawSnapshot(address, snapshotBytes, Recorder::SnapshotUse::Vertex) == unrelated && recorder.UnwrittenDrawSnapshot(address, snapshotBytes, stamp()) == unrelated, "a store in a distinct 64 KiB block prevented snapshot reuse");
+        Require(GuestMemory::MarkWritten(address, snapshotBytes) != 0, "the serial-advancement store was not stamped");
+        Require(recorder.ReusableDrawSnapshot(address, snapshotBytes, Recorder::SnapshotUse::Vertex) == nullptr && recorder.UnwrittenDrawSnapshot(address, snapshotBytes, stamp()) == nullptr, "advancing a reusable snapshot serial hid a later overlapping store");
+        Require(unrelated->Bytes().front() == std::byte{0x71}, "advancing a reusable snapshot serial changed an earlier draw's bytes");
+        GuestMemory::BumpCollectEpoch();
+        const auto generation = GuestMemory::CollectWritesUncached(address, 2 * blockBytes);
+        Require(generation != 0, "the overlapping snapshot was not collected");
+        auto buffer = snapshot();
+        const auto captured = stamp();
+        recorder.KeepDrawSnapshot(address, snapshotBytes, generation, captured[2], buffer, Recorder::SnapshotUse::Vertex, 0, captured[0]);
+        recorder.NoteUnwrittenDrawSnapshot(address, snapshotBytes, captured, generation, buffer);
+        fixture.Bytes(0)[0] = std::byte{0x72};
+        Require(GuestMemory::CollectWritesUncached(address, snapshotBytes) != 0, "the overlapping CPU store was not collected");
+        Require(recorder.ReusableDrawSnapshot(address, snapshotBytes, Recorder::SnapshotUse::Vertex) == nullptr && recorder.UnwrittenDrawSnapshot(address, snapshotBytes, stamp()) == nullptr, "a collected overlapping CPU store reused an earlier snapshot");
+        Require(buffer->Bytes().front() == std::byte{0x71}, "rejecting an overlapping CPU store changed an earlier snapshot");
+        Require(GuestMemory::DirtySetStatistics().verifyDisagreements == disagreementsBefore, "reference-granularity proofs still disagreed with the block stamps");
+        if (verify) {
+            const auto staleGeneration = GuestMemory::CollectWritesUncached(address, snapshotBytes);
+            Require(staleGeneration != 0, "the stale-proof fixture was not collected");
+            auto stale = snapshot();
+            fixture.Bytes(0)[0] = std::byte{0x73};
+            Require(GuestMemory::MarkWritten(address, snapshotBytes) != 0, "the stale-proof store was not stamped");
+            recorder.KeepDrawSnapshot(address, snapshotBytes, staleGeneration, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), stale, Recorder::SnapshotUse::Vertex, 0, GuestMemory::DirtySerial());
+            Require(recorder.ReusableDrawSnapshot(address, snapshotBytes, Recorder::SnapshotUse::Vertex) == nullptr, "verification accepted a stale snapshot with an incorrectly advanced dirty serial");
+            Require(GuestMemory::DirtySetStatistics().verifyDisagreements == disagreementsBefore + 1, "a genuine stale snapshot disagreement was suppressed");
+            Require(stale->Bytes().front() == std::byte{0x72}, "a stale proof rewrote the earlier draw's snapshot");
+            std::cout << "epoch reference proofs: one deliberately stale serial rejected and counted\n";
+        }
+        fixture.Release();
+        recorder.Sync();
+    }
+}
+
 struct Pattern {
     const char* name;
     std::size_t draws;
@@ -609,6 +703,7 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
         EpochDirtySetTests(fixture);
     }
     EpochDirtyOwnedRangeTests(context);
+    EpochDirtyReferenceTests(context);
     {
         DrawSnapshotArena::SetChunkBytes(65536);
         DrawSnapshotArena::SetBudgetBytes(2 * 65536);

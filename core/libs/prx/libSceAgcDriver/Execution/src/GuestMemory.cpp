@@ -102,6 +102,7 @@ struct DirtyEntry {
     std::atomic<std::uint64_t> end{0};
 };
 constexpr std::size_t DirtyLogEntries = 4096;
+constexpr std::size_t WriteBlockBytes = 65536;
 
 std::array<DirtyEntry, DirtyLogEntries>& dirtyLog() {
     static auto& log = *new std::array<DirtyEntry, DirtyLogEntries>();
@@ -135,6 +136,10 @@ std::atomic<bool>& epochDirtySetFlag() {
 
 void publishDirty(std::uint64_t begin, std::uint64_t end) {
     if (end <= begin) return;
+    constexpr std::uint64_t mask = WriteBlockBytes - 1;
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    begin &= ~mask;
+    end = end > maximum - mask ? maximum : (end + mask) & ~mask;
     while (dirtyLogLock.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
     const auto serial = dirtySerial.load(std::memory_order_relaxed);
     auto& entry = dirtyLog()[serial % DirtyLogEntries];
@@ -887,18 +892,23 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> CommittedRanges(std::uint64
 
 namespace {
 
-constexpr std::size_t WriteBlockBytes = 65536;
 constexpr std::size_t WritePageBytes = 4096;
 constexpr std::size_t WritePagesPerBlock = WriteBlockBytes / WritePageBytes;
 
 enum class StampKind : std::uint8_t { Cpu, Driver, ImportWindow, Fresh };
 
+constexpr std::array<std::byte, WritePageBytes> ZeroPage{};
+
 struct WindowCopy {
+    static constexpr std::uint32_t Zero = std::numeric_limits<std::uint32_t>::max();
     std::uint64_t first;
     std::span<const std::byte> bytes;
+    std::span<const std::uint32_t> slots;
 
     bool Holds(std::uintptr_t page) const {
-        return std::memcmp(reinterpret_cast<const void*>(page), bytes.data() + (page - first), WritePageBytes) == 0;
+        const auto slot = slots[(page - first) / WritePageBytes];
+        const auto* expected = slot == Zero ? ZeroPage.data() : bytes.data() + static_cast<std::size_t>(slot) * WritePageBytes;
+        return std::memcmp(reinterpret_cast<const void*>(page), expected, WritePageBytes) == 0;
     }
 };
 
@@ -1479,10 +1489,28 @@ bool UnchangedSinceDirtySerial(std::uint64_t address, std::size_t bytes, std::ui
     return UnchangedSinceDirtySerial(std::span<const DirtyRange>(&range, 1), serial, checkedThrough);
 }
 
-void NoteDirtySetVerify(bool agreed) {
+void NoteDirtySetVerify(bool agreed, const DirtySetVerifyContext& context, std::span<const DirtyRange> ranges) {
     auto& counters = dirtySetCounters();
     counters.verifyChecks.fetch_add(1, std::memory_order_relaxed);
-    if (!agreed) counters.verifyDisagreements.fetch_add(1, std::memory_order_relaxed);
+    if (agreed) return;
+    counters.verifyDisagreements.fetch_add(1, std::memory_order_relaxed);
+    static const bool trace = std::getenv("APS5_TRACE_EPOCH_DIRTY_SET") != nullptr && std::strcmp(std::getenv("APS5_TRACE_EPOCH_DIRTY_SET"), "0") != 0;
+    if (!trace) return;
+    static std::atomic<std::uint64_t> reports{0};
+    const auto report = reports.fetch_add(1, std::memory_order_relaxed);
+    if (report >= 32) return;
+    std::fprintf(stderr, "[dirty-set] verify disagreement %llu: site=%.32s serial=%llu through=%llu current=%llu generation=%llu ranges=%zu proposal=clean reference=not-proven\n", static_cast<unsigned long long>(report + 1), context.site != nullptr ? context.site : "unknown", static_cast<unsigned long long>(context.serial), static_cast<unsigned long long>(context.checkedThrough), static_cast<unsigned long long>(DirtySerial()), static_cast<unsigned long long>(context.generation), ranges.size());
+    for (std::size_t index = 0; index < std::min(ranges.size(), std::size_t{4}); ++index) {
+        std::fprintf(stderr, "[dirty-set] verify range %llu/%zu: 0x%llx..0x%llx\n", static_cast<unsigned long long>(report + 1), index, static_cast<unsigned long long>(ranges[index].first), static_cast<unsigned long long>(ranges[index].second));
+    }
+    if (ranges.size() > 4) std::fprintf(stderr, "[dirty-set] verify range %llu: %zu further ranges omitted\n", static_cast<unsigned long long>(report + 1), ranges.size() - 4);
+    if (report == 31) std::fprintf(stderr, "[dirty-set] verification detail limit reached; further disagreements remain counted\n");
+}
+
+void NoteDirtySetVerify(bool agreed, const DirtySetVerifyContext& context, std::uint64_t address, std::size_t bytes) {
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    const DirtyRange range{address, bytes > maximum - address ? maximum : address + bytes};
+    NoteDirtySetVerify(agreed, context, std::span<const DirtyRange>(&range, 1));
 }
 
 DirtySetCounts DirtySetStatistics() {
@@ -1559,10 +1587,21 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
     const bool covered = tracker.covers(first, static_cast<std::size_t>(stop - first));
     std::vector<std::byte> saved;
+    std::vector<std::uint32_t> slots;
     if (covered && staysWatched) {
-        CheckRange(reinterpret_cast<const void*>(first), static_cast<std::size_t>(stop - first), 1, false);
+        const auto length = static_cast<std::size_t>(stop - first);
+        CheckRange(reinterpret_cast<const void*>(first), length, 1, false);
         const auto* source = reinterpret_cast<const std::byte*>(first);
-        saved.assign(source, source + (stop - first));
+        slots.resize(length / page);
+        std::size_t kept = 0;
+        for (std::size_t index = 0; index < slots.size(); ++index) {
+            const bool zero = std::memcmp(source + index * page, ZeroPage.data(), page) == 0;
+            slots[index] = zero ? WindowCopy::Zero : static_cast<std::uint32_t>(kept++);
+        }
+        saved.reserve(kept * page);
+        for (std::size_t index = 0; index < slots.size(); ++index) {
+            if (slots[index] != WindowCopy::Zero) saved.insert(saved.end(), source + index * page, source + (index + 1) * page);
+        }
     }
     const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
     bool imported = false;
@@ -1582,7 +1621,7 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         unwatchLocked(tracker, address, bytes);
         return true;
     }
-    const WindowCopy window{first, saved};
+    const WindowCopy window{first, saved, slots};
     if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
     return true;
 }
@@ -2520,4 +2559,11 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
 
 extern "C" void AgcDriverCheckGuestMemory_nid_postfix(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable) {
     AgcDriver::GuestMemory::CheckRange(pointer, bytes, alignment, writable);
+}
+
+extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std::uint64_t value) {
+    AgcDriver::GuestMemory::CheckRange(pointer, sizeof(*pointer), std::atomic_ref<std::uint64_t>::required_alignment, true);
+    AgcDriver::GuestMemory::StoreOwnBytes(reinterpret_cast<std::uintptr_t>(pointer), sizeof(*pointer), [&] {
+        std::atomic_ref(*pointer).store(value, std::memory_order_release);
+    });
 }

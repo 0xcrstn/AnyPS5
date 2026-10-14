@@ -189,7 +189,7 @@ public:
                     const auto& view = views.at(held.page->aliases.front());
                     if (view.offset >= offset + bytes || offset >= view.offset + pageBytes) continue;
                     const auto existing = physical.find(std::make_pair(reinterpret_cast<std::uintptr_t>(section), view.offset));
-                    const bool sharesSlot = existing != physical.end() && existing->second.page.lock() == held.page;
+                    const bool sharesSlot = existing != physical.end() && existing->second->page.lock() == held.page;
                     if (sameSection(view.section->handle, section) != sharesSlot) throw std::runtime_error("mapping protected backing with a different section identity is not implemented");
                     if (sharesSlot && protection != PAGE_READONLY && protection != PAGE_READWRITE) throw std::runtime_error("mapping protected backing with unsupported CPU protection is not implemented");
                 }
@@ -202,7 +202,11 @@ public:
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) fail("keep shared guest section");
         const auto owned = std::make_shared<Section>(duplicate);
-        const auto slotOf = [&](std::size_t done) -> Physical& { return physical[std::make_pair(reinterpret_cast<std::uintptr_t>(section), offset + done)]; };
+        const auto slotOf = [&](std::size_t done) -> const std::shared_ptr<Physical>& {
+            auto& slot = physical[std::make_pair(reinterpret_cast<std::uintptr_t>(section), offset + done)];
+            if (!slot) slot = std::make_shared<Physical>();
+            return slot;
+        };
         const auto pageOf = [](Physical& slot) {
             auto shared = slot.page.lock();
             if (!shared) {
@@ -212,7 +216,7 @@ public:
             return shared;
         };
         const auto single = [&](std::size_t done) {
-            const auto& slot = slotOf(done);
+            const auto& slot = *slotOf(done);
             const auto shared = slot.page.lock();
             return resident && !slot.stored && (!shared || shared->aliases.empty());
         };
@@ -225,14 +229,14 @@ public:
                 commitResident(base, runBytes);
                 residentRuns.emplace(base, Run{base + runBytes, {}, static_cast<std::uint32_t>(runBytes >> 12)});
                 for (std::size_t at = 0; at < runBytes; at += pageBytes) {
-                    auto& slot = slotOf(done + at);
-                    const auto shared = pageOf(slot);
-                    if (slot.saved) {
-                        std::memcpy(reinterpret_cast<void*>(base + at), slot.saved->bytes + slot.savedOffset, pageBytes);
-                        slot.saved.reset();
+                    const auto slot = slotOf(done + at);
+                    const auto shared = pageOf(*slot);
+                    if (slot->saved) {
+                        std::memcpy(reinterpret_cast<void*>(base + at), slot->saved->bytes + slot->savedOffset, pageBytes);
+                        slot->saved.reset();
                     }
                     shared->aliases.push_back(base + at);
-                    const auto added = views.emplace(base + at, View{shared, protection, {}, 0, owned, offset + done + at, 0, 0, true, &slot}).first;
+                    const auto added = views.emplace(base + at, View{shared, protection, {}, 0, owned, offset + done + at, 0, 0, true, slot}).first;
                     added->second.identity = ++viewIdentity;
                     invalidate(*shared);
                 }
@@ -242,8 +246,8 @@ public:
                 done += runBytes;
                 continue;
             }
-            auto& slot = slotOf(done);
-            const auto shared = pageOf(slot);
+            const auto slot = slotOf(done);
+            const auto shared = pageOf(*slot);
             const auto aliases = shared->aliases;
             for (const auto alias : aliases) {
                 if (views.at(alias).resident) demote(alias);
@@ -251,9 +255,9 @@ public:
             split(base, pageBytes);
             const auto guarded = protectedAccess(*shared);
             mapShared(base, section, offset + done, guarded != 0 ? PAGE_NOACCESS : protection);
-            slot.stored = true;
+            slot->stored = true;
             shared->aliases.push_back(base);
-            const auto added = views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0, 0, false, &slot}).first;
+            const auto added = views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0, 0, false, slot}).first;
             added->second.identity = ++viewIdentity;
             if (guarded != 0) protectAccess(base, added->second, allSubpages);
             remember(freshRanges, base, base + pageBytes);
@@ -359,14 +363,7 @@ public:
     void ForgetSection(HANDLE section) {
         std::lock_guard lock(mutex);
         const auto key = reinterpret_cast<std::uintptr_t>(section);
-        for (auto slot = physical.lower_bound(std::make_pair(key, std::uint64_t{0})); slot != physical.end() && slot->first.first == key;) {
-            const auto shared = slot->second.page.lock();
-            if (shared && !shared->aliases.empty()) {
-                ++slot;
-                continue;
-            }
-            slot = physical.erase(slot);
-        }
+        physical.erase(physical.lower_bound(std::make_pair(key, std::uint64_t{0})), physical.lower_bound(std::make_pair(key + 1, std::uint64_t{0})));
     }
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
@@ -728,7 +725,7 @@ private:
         std::uint32_t hostWrites;
         std::uint8_t collected = 0;
         bool resident = false;
-        Physical* slot = nullptr;
+        std::shared_ptr<Physical> slot;
         std::uint64_t identity = 0;
     };
     struct Run {
@@ -1091,7 +1088,7 @@ private:
         }
         return position != views.end() && position->first == base ? position : views.end();
     }
-    std::map<std::pair<std::uintptr_t, std::uint64_t>, Physical> physical;
+    std::map<std::pair<std::uintptr_t, std::uint64_t>, std::shared_ptr<Physical>> physical;
     std::map<std::uintptr_t, Run> residentRuns;
     std::map<std::uintptr_t, std::size_t> splitAliases;
     std::size_t granularity = 0x10000;

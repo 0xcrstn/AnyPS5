@@ -69,7 +69,7 @@ bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<
 
 void requireSameArtifact(const CompiledShaderArtifact& left, const CompiledShaderArtifact& right, const char* what) {
     const std::string prefix = std::string(what) + ": ";
-    require(left.spirv.Words() == right.spirv.Words(), prefix + "SPIR-V differs");
+    require(left.spirv == right.spirv, prefix + "SPIR-V differs");
     require(left.bdaAbiVersion == right.bdaAbiVersion, prefix + "BDA ABI version differs");
     require(left.runtimeAbiVersion == right.runtimeAbiVersion, prefix + "runtime ABI version differs");
     require(left.memoryOffsetDword == right.memoryOffsetDword, prefix + "memory offset differs");
@@ -606,6 +606,73 @@ void verifyStore() {
     require(ShaderDiskCache::Load(key, loaded), "a rewritten entry does not load");
 }
 
+void verifyPersist() {
+    SampleRequest sample;
+    const auto key = sample.Key();
+    const auto variant = sampleVariant();
+    const auto persisted = ShaderDiskCache::Persist(key, variant);
+    require(persisted != nullptr, "a persisted entry was not read back");
+    const auto path = ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key);
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION region{};
+    require(VirtualQuery(persisted->artifact.spirv.data(), &region, sizeof(region)) == sizeof(region) && region.Type == MEM_MAPPED, "persisted SPIR-V is not a mapped cache entry");
+    const auto close = [](void* handle) { CloseHandle(handle); };
+    std::unique_ptr<void, decltype(close)> writer(CreateFileW(path.c_str(), GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr), close);
+    require(writer.get() != INVALID_HANDLE_VALUE, "cannot retain the published cache writer");
+    CompiledVariant loaded;
+    require(ShaderDiskCache::Load(key, loaded), "cannot load a cache entry while its writer retains rename access");
+    const auto& loadedWords = loaded.artifact.spirv;
+    require(VirtualQuery(loadedWords.data(), &region, sizeof(region)) == sizeof(region) && region.Type == MEM_MAPPED, "cache loading with a retained writer did not map the entry");
+    writer.reset();
+#endif
+    requireSameVariant(variant, *persisted, "persist round trip");
+    auto detached = persisted->artifact.spirv;
+    detached[0] ^= 1u;
+    require(detached[0] != persisted->artifact.spirv[0], "changing a copied mapped module changed its owner");
+    require(WriteFileAtomically(path, std::vector<std::byte>(64, std::byte{0x5a})), "cannot replace the persisted entry");
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    require(!error, "cannot remove the replaced cache entry");
+    requireSameArtifact(variant.artifact, persisted->artifact, "a persisted entry whose file was replaced and removed");
+}
+
+void verifyMappedSpill() {
+    SampleRequest sample;
+    const auto key = sample.Key();
+    const auto variant = sampleVariant();
+    auto persisted = ShaderDiskCache::Persist(key, variant);
+    require(persisted != nullptr, "cannot persist the mapped spill fixture");
+    auto spilled = persisted->artifact.spirv.Spill(key, false);
+    require(spilled.Spilled() && spilled.WordCount() == variant.artifact.spirv.WordCount(), "a mapped module did not retain the spill contract");
+    const auto before = GetRetainedShaderMemory();
+    {
+        const auto resolved = spilled.Resolved();
+        require(resolved == variant.artifact.spirv && GetRetainedShaderMemory().spirvReloads == before.spirvReloads, "a mapped spill reloaded while its owner was retained");
+    }
+    persisted.reset();
+    {
+        const auto resolved = spilled.Resolved();
+        require(resolved == variant.artifact.spirv && GetRetainedShaderMemory().spirvReloads == before.spirvReloads + 1, "a released mapped spill was not reloaded");
+        const auto again = spilled.Resolved();
+        require(again == resolved && GetRetainedShaderMemory().spirvReloads == before.spirvReloads + 1, "a live mapped reload did not retain its owner");
+        auto detached = resolved;
+        detached[0] ^= 1u;
+        require(detached[0] != resolved[0], "a mapped spill mutation changed a retained read");
+    }
+    persisted = ShaderDiskCache::Persist(key, variant);
+    require(persisted != nullptr, "cannot persist the pinned mapped spill fixture");
+    auto pinned = persisted->artifact.spirv.Spill(key, true);
+    persisted.reset();
+    const auto pinnedBefore = GetRetainedShaderMemory().spirvReloads;
+    {
+        const auto resolved = pinned.Resolved();
+        require(resolved == variant.artifact.spirv && GetRetainedShaderMemory().spirvReloads == pinnedBefore, "a pinned mapped spill lost its owner");
+    }
+    pinned.Unpin();
+    const auto resolved = pinned.Resolved();
+    require(resolved == variant.artifact.spirv && GetRetainedShaderMemory().spirvReloads == pinnedBefore + 1, "an unpinned mapped spill did not release its owner");
+}
+
 struct ComputeRequest {
     std::vector<std::uint32_t> code{0xe0700000u, 0x80000000u, 0xbf810000u};
     std::array<std::uint32_t, 4> userData{0x10000000u, 0x00000000u, 0x40u, 0x00027facu};
@@ -1004,7 +1071,7 @@ void verifyVertexTypeSpecialization() {
                 }
             }
             require(checked == 4u, "vertex specialization lost attribute loads");
-            require(artifact.spirv.Words() == original, "vertex specialization mutated the shared template");
+            require(std::ranges::equal(artifact.spirv.Words(), original), "vertex specialization mutated the shared template");
         }
     }
     auto invalid = artifact;
@@ -1840,6 +1907,7 @@ void verifyPlanFailureEntry() {
 int runPlanLoadingProcess(std::string_view mode) {
     if (mode == "--load-plan-switch") setEnvironment("APS5_TRACE_BINDLESS", "1");
     if (mode == "--load-plan-off") setEnvironment("APS5_NO_PERF_DISK_PLANS", "1");
+    if (mode == "--load-plan-storage-off") setEnvironment("APS5_NO_MATERIALIZE_STORAGE_REUSE", "1");
     auto fixtures = planFixtures();
     const auto count = fixtures.size();
     std::vector<std::shared_ptr<const IrResourcePlan>> plans;
@@ -1853,7 +1921,7 @@ int runPlanLoadingProcess(std::string_view mode) {
         std::cout << "a process with another switch value rebuilt all " << count << " plans\n";
         return 0;
     }
-    if (mode == "--load-plan") {
+    if (mode == "--load-plan" || mode == "--load-plan-storage-off") {
         require(builds == 0u && totals.planHits == count && totals.planMisses == 0u && totals.planLoadFailures == 0u && totals.hits == count && totals.misses == 0u, "the second process ran the front end" + counts);
     } else if (mode == "--load-plan-off") {
         require(builds == count && totals.planHits == 0u && totals.planMisses == 0u && totals.planWrites == 0u && totals.hits == count && totals.misses == 0u, "APS5_NO_PERF_DISK_PLANS=1 used the stored plans or missed the stored variants" + counts);
@@ -1865,7 +1933,9 @@ int runPlanLoadingProcess(std::string_view mode) {
         require(ReadWholeFile(planOutputPath(index), expected), "cannot read the first process's output for " + fixtures[index].name);
         require(outputs[index] == expected, fixtures[index].name + ": the SPIR-V, bindings, push constants, snapshot or plan differ from the first process");
     }
-    if (mode == "--load-plan") {
+    if (mode == "--load-plan-storage-off") {
+        std::cout << "materialization storage reuse was disabled without changing cached plans, variants or outputs\n";
+    } else if (mode == "--load-plan") {
         auto changed = planFixtures();
         auto& fixture = changed.front();
         fixture.code.insert(fixture.code.end() - 1, 0xbf800000u);
@@ -1922,6 +1992,7 @@ void verifyPlanAcrossProcesses(const char* self) {
         require(std::system(command.c_str()) == 0, std::string("the process ") + mode + " failed");
     };
     run("--load-plan");
+    run("--load-plan-storage-off");
     run("--load-plan-off");
     std::vector<std::byte> entry;
     const auto damaged = planEntryPath(fixtures.front());
@@ -1970,6 +2041,8 @@ int main(int argc, char** argv) {
         verifyPlanKey();
         verifyPlanFailureEntry();
         verifyStore();
+        verifyPersist();
+        verifyMappedSpill();
         verifyAcrossProcesses(argv[0]);
         verifySpilledSpirv();
         verifySpilledPlan();
