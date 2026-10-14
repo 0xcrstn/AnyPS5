@@ -6885,6 +6885,12 @@ void pipelineLibraryTests(const Device& device) {
     state.depthCompare = VK_COMPARE_OP_LESS;
     static_cast<void>(lookup());
     Require(counters().built == std::array<std::uint64_t, 4>{2, 3, 5, 5}, "a depth target shared the shader libraries built with no depth format");
+    state.depthBias = true;
+    state.depthBiasConstant = 4.0f;
+    state.depthBiasSlope = 2.0f;
+    static_cast<void>(lookup());
+    state.depthBias = false;
+    Require(counters().built == std::array<std::uint64_t, 4>{2, 3, 5, 5}, "a depth bias built its own pre-rasterization library instead of setting zero bias on the shared one");
     state.depth.reset();
     state.depthTest = false;
     if ((context.sampleLocationSampleCounts & VK_SAMPLE_COUNT_4_BIT) != 0) {
