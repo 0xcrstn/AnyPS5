@@ -116,6 +116,7 @@ private:
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
     void storeDispatchVariant(std::uint64_t key, std::shared_ptr<DispatchVariant> fresh, const std::shared_ptr<DispatchEntry>& missedEntry, std::shared_ptr<DispatchVariant>& attachVariant);
     static bool dispatchRelocationEnabled();
+    static bool sameResourceBindings(const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b);
     static std::uint64_t userDataCallWords(std::span<const std::uint32_t> code, std::size_t userWords);
     static bool dispatchMissDiagnosisEnabled();
     static std::uint64_t dispatchStructureKey(const DispatchKeyParts& parts, const DispatchShape& shape);

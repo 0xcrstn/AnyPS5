@@ -376,13 +376,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     phaseTiming.Phase(PhaseSnapshots);
 
     std::shared_ptr<RecipeHit> recipeHit;
-    if (cached && keepVariant != nullptr && !stampValidate()) {
+    const auto* variantCompiled = keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
+    const bool recipeBindings = variantCompiled != nullptr && variantCompiled->compiled != nullptr && sameResourceBindings(compiled, *variantCompiled->compiled);
+    if (cached && keepVariant != nullptr && !stampValidate() && recipeBindings) {
         recipeHit = localDevice->PrepareRecipe(keepVariant->recipe.load(std::memory_order_acquire), indirectArguments != 0);
         phaseTiming.Phase(PhaseRecipePrecheck);
     }
 
     std::shared_ptr<const Recipe> builtRecipe;
-    auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
+    auto* const attachTo = stampValidate() || !recipeBindings ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 

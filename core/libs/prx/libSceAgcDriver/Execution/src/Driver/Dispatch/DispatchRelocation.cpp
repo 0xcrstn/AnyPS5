@@ -26,6 +26,19 @@ std::size_t WordBucket(std::size_t words) {
 
 }
 
+bool Driver::sameResourceBindings(const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b) {
+    if (&a == &b) return true;
+    if (a.bindings.size() != b.bindings.size() || a.pushConstants != b.pushConstants) return false;
+    for (std::size_t index = 0; index < a.bindings.size(); ++index) {
+        const auto& left = a.bindings[index];
+        const auto& right = b.bindings[index];
+        if (left.kind != right.kind || left.role != right.role || left.binding != right.binding || left.count != right.count) return false;
+        const bool data = left.role == ShaderRecompiler::DescriptorRole::ShaderData || left.role == ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        if (!data && left.guestDescriptor != right.guestDescriptor) return false;
+    }
+    return true;
+}
+
 bool Driver::dispatchRelocationEnabled() {
     static const bool enabled = std::getenv("APS5_NO_DISPATCH_RELOCATION") == nullptr;
     return enabled;
