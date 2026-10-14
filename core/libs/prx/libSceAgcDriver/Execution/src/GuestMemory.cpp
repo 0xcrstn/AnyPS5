@@ -287,6 +287,19 @@ void CountWriteCaller(const void* returnAddress) {
     CountCaller(Profile().writeCallers, sampled, 16, returnAddress);
 }
 
+struct CollectRefusals {
+    std::atomic<std::uint64_t> unwatched{0};
+    std::atomic<std::uint64_t> uncovered{0};
+    std::atomic<std::uint64_t> walk{0};
+    std::atomic<std::uint64_t> lastUncovered{0};
+    std::atomic<std::uint64_t> lastWalk{0};
+};
+
+CollectRefusals& collectRefusals() {
+    static CollectRefusals refusals;
+    return refusals;
+}
+
 bool MemoryProfiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
@@ -309,6 +322,8 @@ public:
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        auto& refusals = collectRefusals();
+        AgcDriver::ProfilePrint_nid_no_patch(" collect refused: unwatched %llu, outside the watched coverage %llu (last 0x%llx), walk failed %llu (last 0x%llx);", static_cast<unsigned long long>(refusals.unwatched.load()), static_cast<unsigned long long>(refusals.uncovered.load()), static_cast<unsigned long long>(refusals.lastUncovered.load()), static_cast<unsigned long long>(refusals.walk.load()), static_cast<unsigned long long>(refusals.lastWalk.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
@@ -1143,7 +1158,18 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
+    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) {
+        if (MemoryProfiled()) {
+            auto& refusals = collectRefusals();
+            if (!tracker.watched) {
+                refusals.unwatched.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                refusals.uncovered.fetch_add(1, std::memory_order_relaxed);
+                refusals.lastUncovered.store(address, std::memory_order_relaxed);
+            }
+        }
+        return 0;
+    }
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
@@ -1164,7 +1190,13 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
 #endif
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
+        if (MemoryProfiled()) {
+            collectRefusals().walk.fetch_add(1, std::memory_order_relaxed);
+            collectRefusals().lastWalk.store(address, std::memory_order_relaxed);
+        }
+        return 0;
+    }
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
