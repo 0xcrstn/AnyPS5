@@ -13,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -65,6 +66,7 @@ struct MemoProfile {
     std::atomic<std::uint64_t> dataPatched{0};
     std::atomic<std::uint64_t> descriptorWords{0};
     std::atomic<std::uint64_t> nestedBases{0};
+    std::atomic<std::uint64_t> memoryRelocated{0};
     std::array<std::atomic<std::uint64_t>, 8> roles{};
     std::atomic<std::uint64_t> warmWalks{0};
     std::atomic<std::uint64_t> warmNanoseconds{0};
@@ -94,6 +96,11 @@ MemoProfile& MemoTotals() {
 }
 
 std::atomic<std::uint64_t> memoizedCaptures{0};
+
+bool CaptureMemoTraced() {
+    static const bool traced = std::getenv("APS5_TRACE_CAPTURE_MEMO") != nullptr;
+    return traced;
+}
 
 bool CaptureMemoEnabled() {
     static const bool enabled = std::getenv("APS5_NO_CAPTURE_MEMO") == nullptr;
@@ -253,16 +260,15 @@ const std::vector<std::pair<std::uint64_t, std::uint32_t>>& DataLeaves(MemoEntry
     const auto& use = entry.capture->userDataUse;
     if (use.readBases.size() != use.reads.size() || use.readInstructions.size() != use.reads.size()) return entry.dataLeaves;
     for (const auto& [flatOffset, address] : entry.capture->baseSlots) {
-        if (flatOffset >= entry.capture->snapshot.flattenedSrt.size()) continue;
+        if (flatOffset != ShaderRecompiler::NoBaseSlot && flatOffset >= entry.capture->snapshot.flattenedSrt.size()) continue;
         const void* instruction = nullptr;
-        for (const auto& read : plan.srtReads) {
-            if (read.flatOffset == flatOffset && read.value != nullptr) instruction = read.value->Resolve();
-        }
-        bool only = instruction != nullptr;
+        bool only = true;
         for (std::size_t read = 0; only && read < use.reads.size(); ++read) {
-            if (use.reads[read].first == address && use.readInstructions[read] != instruction) only = false;
+            if (use.reads[read].first != address) continue;
+            if (instruction != nullptr && use.readInstructions[read] != instruction) only = false;
+            instruction = use.readInstructions[read];
         }
-        if (only) entry.baseWords.emplace_back(address, flatOffset);
+        if (only && instruction != nullptr) entry.baseWords.emplace_back(address, flatOffset);
     }
     std::sort(entry.baseWords.begin(), entry.baseWords.end());
     if (entry.baseWords.empty()) return entry.dataLeaves;
@@ -505,6 +511,54 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> FollowedCapture(const M
     return capture;
 }
 
+void traceMiss(const MemoEntry& entry, const ShaderMemory::ReplayResult& result, std::uint8_t roles) {
+    static std::atomic<std::uint64_t> reports{0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) >= 40) return;
+    const auto& use = entry.capture->userDataUse;
+    const auto& plan = *entry.capture->plan;
+    const auto index = result.addresses.empty() ? 0 : result.addresses.size() - 1;
+    const auto& access = index < entry.accesses.size() ? entry.accesses[index] : ShaderMemory::RecordedAccess{};
+    std::uint32_t now = 0;
+    if (access.bytes == 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(access.address), sizeof(now))) std::memcpy(&now, reinterpret_cast<const void*>(access.address), sizeof(now));
+    std::size_t inReads = 0;
+    std::string slots;
+    for (std::size_t read = 0; read < use.reads.size(); ++read) {
+        if (use.reads[read].first == result.mismatch) ++inReads;
+    }
+    for (const auto& [slot, address] : entry.capture->readTrace.leaves) {
+        if (address == result.mismatch) slots += " leaf" + std::to_string(slot) + (slot < plan.pureFlatSlots.size() && plan.pureFlatSlots[slot] != 0 ? "p" : "");
+    }
+    const bool other = std::binary_search(entry.capture->readTrace.otherReads.begin(), entry.capture->readTrace.otherReads.end(), result.mismatch);
+    const bool leafListed = std::binary_search(entry.dataLeaves.begin(), entry.dataLeaves.end(), std::pair<std::uint64_t, std::uint32_t>{result.mismatch, 0u}, [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::fprintf(stderr, "[capture-memo] miss: shader 0x%llx access %zu of %zu at 0x%llx: recorded 0x%08x now 0x%08x, %s; in walk reads %zu, other read %d, data leaf %d, roles 0x%02x,%s; plan: %zu flat slots (%zu pure), %zu sources, %zu blocks\n", static_cast<unsigned long long>(entry.shaderBase), index, entry.accesses.size(), static_cast<unsigned long long>(result.mismatch), access.value, now, access.bytes == 0 ? "word" : "probe", inReads, other ? 1 : 0, leafListed ? 1 : 0, roles, slots.c_str(), plan.srtReads.size(), static_cast<std::size_t>(std::count(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), std::uint8_t{1})), plan.descriptorSources.size(), plan.controlFlow.size());
+}
+
+MemoEntry& scratchEntry() {
+    struct ScratchEntryStorage {};
+    return HostThreadLocal<MemoEntry, ScratchEntryStorage>();
+}
+
+bool RelocateEntry(MemoEntry& entry, std::span<const std::uint32_t> userData, MemoEntry& scratch) {
+    Relocation relocation;
+    if (!RelocationFor(entry, userData, relocation)) return false;
+    const auto origins = std::span(Origins(entry));
+    scratch.accesses.clear();
+    scratch.accesses.reserve(entry.accesses.size());
+    for (const auto& access : entry.accesses) {
+        std::uint64_t address = 0;
+        if (!RelocatedAddress(origins, access.address, relocation, address)) return false;
+        scratch.accesses.push_back({address, access.bytes, access.value});
+    }
+    auto capture = RelocatedCapture(entry, userData, relocation);
+    if (capture == nullptr) return false;
+    scratch.handle = entry.handle;
+    scratch.shaderBase = entry.shaderBase;
+    scratch.userData.assign(userData.begin(), userData.end());
+    scratch.capture = std::move(capture);
+    ClearDerived(scratch);
+    return true;
+}
+
 double Per(std::uint64_t value, std::uint64_t count) {
     return count != 0 ? static_cast<double>(value) / static_cast<double>(count) : 0.0;
 }
@@ -524,6 +578,7 @@ void ReportMemo() {
     const auto dataPatched = take(memo.dataPatched);
     const auto descriptorWords = take(memo.descriptorWords);
     const auto nestedBases = take(memo.nestedBases);
+    const auto memoryRelocated = take(memo.memoryRelocated);
     std::array<std::uint64_t, 8> roles{};
     for (std::size_t bit = 0; bit < roles.size(); ++bit) roles[bit] = take(memo.roles[bit]);
     const auto warmWalks = take(memo.warmWalks);
@@ -546,7 +601,7 @@ void ReportMemo() {
     const auto phis = take(memo.phis);
     const auto served = hits + patched + relocated + dataPatched + nestedBases;
     const auto misses = total > served ? total - served : 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[capture-memo] (10 s) %llu prepared captures: %llu served from the memo (%llu with unread user words patched, %llu relocated to moved pointer words, %llu with changed pure SRT data words patched, %llu following moved base words read from guest memory; %.1f words replayed each, %.1f us each); %llu walked (%.1f us each: SRT evaluation %.1f with page setup %.1f and page reads %.1f inside; %.1f word reads, %.2f new pages, %.1f values evaluated, %.2f lane evaluators, %.1f phis each; %llu walks of the plan this thread walked last at %.1f us each), because: no entry %llu, read user words differ %llu (only pointer words %llu, %llu of them not relocatable), guest words differ %llu (first differing word a whole descriptor dword %llu; its roles: descriptor %llu, branch condition %llu, uniform fill %llu, address or offset %llu, flat SRT data %llu, low base word of reads %llu, probe %llu, untraced %llu)\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(served), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(relocated), static_cast<unsigned long long>(dataPatched), static_cast<unsigned long long>(nestedBases), Per(replayed, served), Per(hitNs, served) / 1e3, static_cast<unsigned long long>(misses), Per(missNs, misses) / 1e3, Per(evaluationNs, misses) / 1e3, Per(setupNs, misses) / 1e3, Per(pageNs, misses) / 1e3, Per(reads, misses), Per(pages, misses), Per(values, misses), Per(laneEvaluators, misses), Per(phis, misses), static_cast<unsigned long long>(warmWalks), Per(warmNs, warmWalks) / 1e3, static_cast<unsigned long long>(absent), static_cast<unsigned long long>(valueWords + pointerWords), static_cast<unsigned long long>(pointerWords), static_cast<unsigned long long>(relocationRefused), static_cast<unsigned long long>(memory), static_cast<unsigned long long>(descriptorWords), static_cast<unsigned long long>(roles[0]), static_cast<unsigned long long>(roles[1]), static_cast<unsigned long long>(roles[2]), static_cast<unsigned long long>(roles[3]), static_cast<unsigned long long>(roles[4]), static_cast<unsigned long long>(roles[5]), static_cast<unsigned long long>(roles[6]), static_cast<unsigned long long>(roles[7]));
+    AgcDriver::ProfilePrint_nid_no_patch("[capture-memo] (10 s) %llu prepared captures: %llu served from the memo (%llu with unread user words patched, %llu relocated to moved pointer words, %llu with changed pure SRT data words patched, %llu following moved base words read from guest memory; %.1f words replayed each, %.1f us each); %llu walked (%.1f us each: SRT evaluation %.1f with page setup %.1f and page reads %.1f inside; %.1f word reads, %.2f new pages, %.1f values evaluated, %.2f lane evaluators, %.1f phis each; %llu walks of the plan this thread walked last at %.1f us each), because: no entry %llu, read user words differ %llu (only pointer words %llu, %llu of them not relocatable), guest words differ %llu (%llu behind moved user pointer words; first differing word a whole descriptor dword %llu; its roles: descriptor %llu, branch condition %llu, uniform fill %llu, address or offset %llu, flat SRT data %llu, low base word of reads %llu, probe %llu, untraced %llu)\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(served), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(relocated), static_cast<unsigned long long>(dataPatched), static_cast<unsigned long long>(nestedBases), Per(replayed, served), Per(hitNs, served) / 1e3, static_cast<unsigned long long>(misses), Per(missNs, misses) / 1e3, Per(evaluationNs, misses) / 1e3, Per(setupNs, misses) / 1e3, Per(pageNs, misses) / 1e3, Per(reads, misses), Per(pages, misses), Per(values, misses), Per(laneEvaluators, misses), Per(phis, misses), static_cast<unsigned long long>(warmWalks), Per(warmNs, warmWalks) / 1e3, static_cast<unsigned long long>(absent), static_cast<unsigned long long>(valueWords + pointerWords), static_cast<unsigned long long>(pointerWords), static_cast<unsigned long long>(relocationRefused), static_cast<unsigned long long>(memory), static_cast<unsigned long long>(memoryRelocated), static_cast<unsigned long long>(descriptorWords), static_cast<unsigned long long>(roles[0]), static_cast<unsigned long long>(roles[1]), static_cast<unsigned long long>(roles[2]), static_cast<unsigned long long>(roles[3]), static_cast<unsigned long long>(roles[4]), static_cast<unsigned long long>(roles[5]), static_cast<unsigned long long>(roles[6]), static_cast<unsigned long long>(roles[7]));
 }
 
 constexpr std::uint64_t WordWaitNanoseconds = 50000;
@@ -851,81 +906,59 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
     for (auto& entry : shader.ways) {
         if (entry.handle != handle) continue;
         const auto match = MatchUserData(entry, shaderBase, userData);
-        if (match == MemoMatch::Exact || match == MemoMatch::UnreadWords) {
-            auto& result = scratchReplay();
-            DataLeaves(entry);
-            const ReplayPlan plan{entry.dataLeaves, entry.baseWords, entry.accessBases};
-            if (!replay(entry.accesses, &plan, &result)) {
-                if (slot == nullptr) slot = &entry;
-                if (profile) {
-                    ++memo.memory;
-                    if (result.mismatch != 0 && FeedsDescriptorDirectly(*entry.capture, result.mismatch)) ++memo.descriptorWords;
-                    const auto roles = result.mismatch != 0 ? ReadRoles(*entry.capture, result.mismatch) : std::uint8_t{0x40};
-                    for (std::size_t bit = 0; bit < memo.roles.size(); ++bit) {
-                        if ((roles >> bit) & 1u) ++memo.roles[bit];
-                    }
-                }
-                reason = MemoMatch::Exact;
-                continue;
-            }
-            if (match == MemoMatch::UnreadWords || !result.changed.empty()) {
-                auto patched = FollowedCapture(entry, userData, result);
-                if (patched == nullptr) {
-                    if (slot == nullptr) slot = &entry;
-                    if (profile) ++memo.memory;
-                    reason = MemoMatch::Exact;
-                    continue;
-                }
-                for (const auto& [index, word] : result.changed) entry.accesses[index].value = word;
-                if (!result.moved.empty()) {
-                    for (std::size_t index = 0; index < entry.accesses.size(); ++index) entry.accesses[index].address = result.addresses[index];
-                    ClearDerived(entry);
-                }
-                entry.capture = std::move(patched);
-                entry.userData.assign(userData.begin(), userData.end());
-            }
-            return serve(entry, !result.moved.empty() ? MemoMatch::NestedBases : !result.changed.empty() ? MemoMatch::DataWords : match, entry.accesses.size());
+        if (match != MemoMatch::Exact && match != MemoMatch::UnreadWords && match != MemoMatch::PointerWords) {
+            if (match == MemoMatch::ValueWords && reason == MemoMatch::Other) reason = MemoMatch::ValueWords;
+            continue;
         }
+        MemoEntry* candidate = &entry;
+        auto& scratch = scratchEntry();
         if (match == MemoMatch::PointerWords) {
-            Relocation relocation;
-            std::vector<RecordedAccess> moved;
-            bool relocatable = RelocationFor(entry, userData, relocation);
-            if (relocatable) {
-                const auto origins = std::span(Origins(entry));
-                moved.reserve(entry.accesses.size());
-                for (const auto& access : entry.accesses) {
-                    std::uint64_t address = 0;
-                    if (!RelocatedAddress(origins, access.address, relocation, address)) {
-                        relocatable = false;
-                        break;
-                    }
-                    moved.push_back({address, access.bytes, access.value});
-                }
-            }
-            if (!relocatable) {
+            if (!RelocateEntry(entry, userData, scratch)) {
                 if (profile) ++memo.relocationRefused;
                 if (reason != MemoMatch::Exact) reason = MemoMatch::PointerWords;
                 continue;
             }
-            if (!replay(moved)) {
+            candidate = &scratch;
+        }
+        auto& result = scratchReplay();
+        DataLeaves(*candidate);
+        const ReplayPlan plan{candidate->dataLeaves, candidate->baseWords, candidate->accessBases};
+        if (!replay(candidate->accesses, &plan, &result)) {
+            if (slot == nullptr) slot = &entry;
+            if (profile) {
+                ++memo.memory;
+                if (match == MemoMatch::PointerWords) ++memo.memoryRelocated;
+                if (result.mismatch != 0 && FeedsDescriptorDirectly(*candidate->capture, result.mismatch)) ++memo.descriptorWords;
+                const auto roles = result.mismatch != 0 ? ReadRoles(*candidate->capture, result.mismatch) : std::uint8_t{0x40};
+                for (std::size_t bit = 0; bit < memo.roles.size(); ++bit) {
+                    if ((roles >> bit) & 1u) ++memo.roles[bit];
+                }
+                if (CaptureMemoTraced()) traceMiss(*candidate, result, roles);
+            }
+            reason = MemoMatch::Exact;
+            continue;
+        }
+        if (match == MemoMatch::UnreadWords || !result.changed.empty()) {
+            auto patched = FollowedCapture(*candidate, userData, result);
+            if (patched == nullptr) {
                 if (slot == nullptr) slot = &entry;
                 if (profile) ++memo.memory;
                 reason = MemoMatch::Exact;
                 continue;
             }
-            auto capture = RelocatedCapture(entry, userData, relocation);
-            if (capture == nullptr) {
-                if (profile) ++memo.relocationRefused;
-                if (reason != MemoMatch::Exact) reason = MemoMatch::PointerWords;
-                continue;
+            for (const auto& [index, word] : result.changed) candidate->accesses[index].value = word;
+            if (!result.moved.empty()) {
+                for (std::size_t index = 0; index < candidate->accesses.size(); ++index) candidate->accesses[index].address = result.addresses[index];
+                ClearDerived(*candidate);
             }
-            ClearDerived(entry);
-            entry.accesses = std::move(moved);
-            entry.userData.assign(userData.begin(), userData.end());
-            entry.capture = std::move(capture);
-            return serve(entry, MemoMatch::PointerWords, entry.accesses.size());
+            candidate->capture = std::move(patched);
+            candidate->userData.assign(userData.begin(), userData.end());
         }
-        if (match == MemoMatch::ValueWords && reason == MemoMatch::Other) reason = MemoMatch::ValueWords;
+        if (candidate == &scratch) {
+            std::swap(entry, scratch);
+            scratch = MemoEntry{};
+        }
+        return serve(entry, !result.moved.empty() ? MemoMatch::NestedBases : !result.changed.empty() ? MemoMatch::DataWords : match, entry.accesses.size());
     }
     if (profile && reason != MemoMatch::Exact) {
         if (reason == MemoMatch::PointerWords) ++memo.pointerWords;
