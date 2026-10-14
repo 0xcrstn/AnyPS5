@@ -224,6 +224,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             }
         }
         ++device.counters.built[part];
+        ++ThreadBuiltLibraryParts()[part];
         libraries.push_back(handle);
     }
     if (partsOnly) return VK_NULL_HANDLE;
@@ -289,6 +290,11 @@ void ClearPipelineLibraries(VkDevice device) {
     for (const auto& [key, handle] : libraries.layouts) libraries.destroyLayout(device, handle, nullptr);
     for (const auto module : libraries.modules) libraries.destroyModule(device, module, nullptr);
     store.devices.erase(found);
+}
+
+std::array<std::uint64_t, 4>& ThreadBuiltLibraryParts() {
+    thread_local std::array<std::uint64_t, 4> built{};
+    return built;
 }
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device) {
