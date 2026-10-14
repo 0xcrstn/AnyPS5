@@ -35,6 +35,7 @@
 #include <map>
 #include <future>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <span>
 #include <string>
@@ -4440,6 +4441,10 @@ void verifyBdaReadFallbackFunctions() {
             const auto adjacent = compile(5u, barrier, coherent, 4u);
             std::map<std::uint32_t, std::string> names;
             std::map<std::string, std::uint32_t> definitions;
+            std::map<std::uint32_t, std::uint32_t> constants;
+            std::set<std::uint32_t> byteTypes;
+            std::set<std::uint32_t> physicalPointerTypes;
+            std::set<std::uint32_t> physicalPointers;
             const auto reader = std::string("read_bda_dword_bytes") + (barrier ? "" : "_stop") + (coherent ? "_coherent" : "");
             const auto span = std::string("read_bda_span") + (barrier ? "" : "_stop") + (coherent ? "_coherent" : "");
             const auto loader = std::string("load_bda_span") + (coherent ? "_coherent" : "");
@@ -4454,6 +4459,7 @@ void verifyBdaReadFallbackFunctions() {
             std::size_t loaderCalls = 0;
             std::size_t spanReaderCalls = 0;
             std::array<std::size_t, 2> readerLoads{};
+            std::size_t readerAtomics = 0;
             std::size_t lookupFaults = 0;
             std::size_t lookupVariables = 0;
             std::size_t readerLookups = 0;
@@ -4462,6 +4468,10 @@ void verifyBdaReadFallbackFunctions() {
                 require(length != 0 && length <= five.size() - cursor, "BDA read functions: truncated SPIR-V instruction");
                 const auto op = five[cursor] & 0xffffu;
                 if (op == spv::OpName) names[five[cursor + 1]] = reinterpret_cast<const char*>(&five[cursor + 2]);
+                if (op == spv::OpTypeInt && length == 4u && five[cursor + 2] == 8u && five[cursor + 3] == 0u) byteTypes.insert(five[cursor + 1]);
+                if (op == spv::OpTypePointer && length == 4u && five[cursor + 2] == spv::StorageClassPhysicalStorageBuffer) physicalPointerTypes.insert(five[cursor + 1]);
+                if (op == spv::OpConvertUToPtr && length == 4u && physicalPointerTypes.contains(five[cursor + 1])) physicalPointers.insert(five[cursor + 2]);
+                if (op == spv::OpConstant && length == 4u) constants[five[cursor + 2]] = five[cursor + 3];
                 if (op == spv::OpFunction) {
                     function = names[five[cursor + 2]];
                     if (function == "record_bda_fault" || function.starts_with("read_bda_dword_bytes") || function.starts_with("read_bda_span") || function.starts_with("load_bda_span")) {
@@ -4481,7 +4491,14 @@ void verifyBdaReadFallbackFunctions() {
                 if ((op == spv::OpLoad || op == spv::OpAtomicLoad) && function == loader) ++loaderLoads;
                 if (op == spv::OpFunctionCall && function == loader) ++loaderCalls;
                 if (op == spv::OpFunctionCall && function == span && names[five[cursor + 3]] == reader) ++spanReaderCalls;
-                if (op == spv::OpLoad && function == reader) ++readerLoads[length > 4u && (five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
+                if (op == spv::OpLoad && function == reader) {
+                    require(length == 6u && byteTypes.contains(five[cursor + 1]) && physicalPointers.contains(five[cursor + 3]) && (five[cursor + 4] & spv::MemoryAccessAlignedMask) != 0u && five[cursor + 5] == 1u, "BDA read functions: the byte fallback is not an aligned physical byte load");
+                    ++readerLoads[(five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
+                }
+                if (op == spv::OpAtomicLoad && function == reader) {
+                    require(length == 6u && physicalPointers.contains(five[cursor + 3]) && constants.contains(five[cursor + 4]) && constants.at(five[cursor + 4]) == spv::ScopeDevice && constants.contains(five[cursor + 5]) && constants.at(five[cursor + 5]) == spv::MemorySemanticsMaskNone, "BDA read functions: the aligned coherent load is not a relaxed device-scope atomic");
+                    ++readerAtomics;
+                }
                 if (op == spv::OpFunctionCall && function == "get_bda_pointer" && names[five[cursor + 3]] == "record_bda_fault") ++lookupFaults;
                 if (op == spv::OpVariable && function == "get_bda_pointer") ++lookupVariables;
                 if (op == spv::OpFunctionCall && function == reader && names[five[cursor + 3]] == "get_bda_pointer") ++readerLookups;
@@ -4494,6 +4511,7 @@ void verifyBdaReadFallbackFunctions() {
             require(compareExchanges == 1u, "BDA read functions: a fault is recorded outside record_bda_fault");
             require(mainLookups == 0u, "BDA read functions: a read site looks up its bytes inline");
             require(readerLoads[coherent] == 1u && readerLoads[!coherent] == 0u, "BDA read functions: the looped byte load does not keep the access's coherence");
+            require(readerAtomics == (coherent ? 1u : 0u), "BDA read functions: aligned coherent reads do not retain their atomic path");
             require(spanReaderCalls == 1u, "BDA read functions: the span read does not call the byte read from one looped site");
             require(lookupFaults <= 4u, "BDA read functions: the page-table lookup records its faults from more than 4 call sites");
             require(lookupVariables == 0u, "BDA read functions: the page-table lookup keeps its search bounds in function variables");
