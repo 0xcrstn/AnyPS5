@@ -239,12 +239,25 @@ std::vector<ModuleUse> Read() {
     std::lock_guard lock(state.mutex);
     return state.modules;
 }
+
+std::string Owner(std::uintptr_t address) {
+    auto& state = Traced();
+    std::lock_guard lock(state.mutex);
+    auto found = state.virtualBlocks.upper_bound(address);
+    if (found == state.virtualBlocks.begin()) return {};
+    --found;
+    return address - found->first < found->second.bytes ? state.modules[found->second.module].name : std::string{};
+}
 #else
 std::size_t HookModules(std::string_view) {
     return 0;
 }
 
 std::vector<ModuleUse> Read() {
+    return {};
+}
+
+std::string Owner(std::uintptr_t) {
     return {};
 }
 #endif
