@@ -428,6 +428,39 @@ void importNeighbouringEdgesTests(const Context& context) {
     }
 }
 
+void importOverHeldWindowTests(const Context& context) {
+    WindowedRange range(context, 2 * WindowedRange::piece, 3);
+    const auto first = range.First();
+    const auto inside = first;
+    const auto across = first + range.window - WindowedRange::piece;
+    for (int round = 0; round < 3; ++round) {
+        GuestBufferMemory build(range.importing);
+        build.AddReadable(inside, 4096);
+        build.AddReadable(across, 2 * WindowedRange::piece);
+        build.Upload(false);
+        Require(build.CopiedBytes() == 0, "a region across a cell edge was copied because the build's own region held the window it overlaps (round " + std::to_string(round) + ")");
+        build.WriteBack();
+    }
+    Require(HostImportCovers(range.importing, first, 2 * range.window), "the window held by the build was not grown over the region across its edge");
+    const auto use = [&](std::uintptr_t address) {
+        GuestBufferMemory other(range.importing);
+        other.AddReadable(address, 4096);
+        other.Upload(false);
+        other.WriteBack();
+    };
+    const auto last = first + 2 * range.window;
+    use(last);
+    Require(HostImportCovers(range.importing, last, 4096) && !HostImportCovers(range.importing, last - WindowedRange::piece, 2 * WindowedRange::piece), "the last cell was not imported apart");
+    GuestBufferMemory late(range.importing);
+    late.AddReadable(last - WindowedRange::piece, 2 * WindowedRange::piece);
+    late.UploadPrepare(false);
+    use(last);
+    late.UploadFinish(false);
+    Require(late.CopiedBytes() == 0, "a region across a cell edge was copied because another build used the window it overlaps between its two upload stages");
+    late.WriteBack();
+    Require(HostImportCovers(range.importing, first, range.bytes), "the windows were not grown into one over the region across the last edge");
+}
+
 // A range mapped while the imports are at the budget is refused at map time without retiring an import: the map
 // observer holds no GPU lock, so it must not evict (before, it evicted the least recently used import to fit).
 void importAtMapOverBudgetTests(const Context& context) {
@@ -1475,6 +1508,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importWholeRangeOverWindowTests(context);
     importRefusedWholeRangeTests(context);
     importNeighbouringEdgesTests(context);
+    importOverHeldWindowTests(context);
     importAtMapOverBudgetTests(context);
     heapMirrorTests(context, access);
     importedHeapMirrorTests(context, access);

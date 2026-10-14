@@ -841,7 +841,7 @@ void noteCopyReason(ImportRefusal reason, std::uint64_t begin, std::uint64_t byt
 
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
 bool importsStale(const Context& context, const HostImports& state);
-const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict);
+const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict, bool replaceHeld);
 
 // The bytes retireLeastRecent could free outside [begin, end).
 std::uint64_t evictableBytes(const HostImports& state, std::uint64_t begin, std::uint64_t end) {
@@ -852,7 +852,7 @@ std::uint64_t evictableBytes(const HostImports& state, std::uint64_t begin, std:
     return bytes;
 }
 
-const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end = 0, bool evict = true) {
+const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end = 0, bool evict = true, bool replaceHeld = false) {
     const bool fresh = !importsStale(context, state);
     if (fresh && end != 0) {
         if (const auto* current = findImport(state, address, end)) return current;
@@ -867,7 +867,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
     if (end != 0) run = windowRun(state, std::move(run), address, end, context.hostImportAlignment);
     if (run.ranges.empty()) return refuseImport(ImportRefusal::NoRun);
-    return importRunAt(context, state, std::move(run), false, address, lease, end, evict);
+    return importRunAt(context, state, std::move(run), false, address, lease, end, evict, replaceHeld);
 }
 
 const HostImport* importJoined(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
@@ -876,10 +876,10 @@ const HostImport* importJoined(const Context& context, HostImports& state, std::
     auto run = joinedRun(lease, begin, end);
     if (run.ranges.empty()) return nullptr;
     if (const auto failed = state.failedJoins.find(run.base); failed != state.failedJoins.end() && sameRun(failed->second, run)) return nullptr;
-    return importRunAt(context, state, std::move(run), true, begin, lease, end, true);
+    return importRunAt(context, state, std::move(run), true, begin, lease, end, true, false);
 }
 
-const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict) {
+const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict, bool replaceHeld) {
     const auto base = run.base;
     const auto bytes = run.bytes;
     auto& failures = joined ? state.failedJoins : state.failed;
@@ -902,7 +902,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     // A join may replace imports this build already looked up: it runs before any region confirms an import
     // (UploadFinish's pre-pass re-resolves every pointer after it), and a retired import stays alive through the
     // hold (KeepThroughHold). Refusing it there would keep the run copied for good.
-    const auto held = [&](const HostImport& entry) { return !joined && pointerHeld(state, entry); };
+    const auto held = [&](const HostImport& entry) { return !joined && pointerHeld(state, entry) && !(replaceHeld && entry.base >= base && entry.base + entry.bytes <= base + bytes); };
     for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
         if (held(it->second)) return refuseImport(ImportRefusal::Held);
         replaced += it->second.bytes;
@@ -968,7 +968,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
                 return refuseImport(ImportRefusal::ImportFailed);
             }
             state.unaliasedSpans.insert(base);
-            return importAllocation(context, state, address, lease, end, evict);
+            return importAllocation(context, state, address, lease, end, evict, replaceHeld);
         }
     }
 #else
@@ -3234,8 +3234,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         importsRefreshed = true;
         for (const auto& region : regions) {
             if (!region.pending || region.mirror != nullptr || region.direct != nullptr || sparseHeapCandidate(region)) continue;
-            if (findImport(state, region.begin, region.end) != nullptr || runCovers(importRanges(), region.begin, region.end)) continue;
-            static_cast<void>(importJoined(context, state, region.begin, region.end, importRanges()));
+            if (findImport(state, region.begin, region.end) != nullptr) continue;
+            if (runCovers(importRanges(), region.begin, region.end)) static_cast<void>(importAllocation(context, state, region.begin, importRanges(), region.end, true, true));
+            else static_cast<void>(importJoined(context, state, region.begin, region.end, importRanges()));
         }
     }
     if (space != nullptr && context.hostImportAlignment != 0) {
