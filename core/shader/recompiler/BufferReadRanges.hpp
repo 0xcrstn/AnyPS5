@@ -8,11 +8,18 @@
 
 namespace ShaderRecompiler {
 
+enum class BufferIndexSource : std::uint8_t { None, VertexIndex, InstanceIndex, Count };
+
+enum class BufferIndexOrigin : std::uint8_t { Bounded, VertexIndex, InstanceIndex, Memory, UserData, Other, Count };
+
 struct BufferReadRange {
     std::uint32_t firstIndex = 0;
     std::uint32_t lastIndex = 0;
     std::uint64_t begin = 0;
     std::uint64_t end = 0;
+    BufferIndexSource indexSource = BufferIndexSource::None;
+    BufferIndexOrigin indexOrigin = BufferIndexOrigin::Bounded;
+    std::uint32_t indexScale = 0;
 
     bool operator==(const BufferReadRange& other) const = default;
 };
@@ -31,7 +38,7 @@ struct BufferReadRanges {
     void Add(const BufferReadRange& range) {
         if (!bounded) return;
         for (auto& held : ranges) {
-            if (held.firstIndex == range.firstIndex && held.lastIndex == range.lastIndex && range.begin <= held.end && held.begin <= range.end) {
+            if (held.firstIndex == range.firstIndex && held.lastIndex == range.lastIndex && held.indexSource == range.indexSource && held.indexScale == range.indexScale && held.indexOrigin == range.indexOrigin && range.begin <= held.end && held.begin <= range.end) {
                 held.begin = std::min(held.begin, range.begin);
                 held.end = std::max(held.end, range.end);
                 return;
@@ -41,18 +48,23 @@ struct BufferReadRanges {
             ranges.push_back(range);
             return;
         }
-        auto& hull = ranges.front();
+        auto hull = range;
         for (const auto& held : ranges) {
+            const bool sameSource = held.indexSource == hull.indexSource && held.indexScale == hull.indexScale;
             hull.firstIndex = std::min(hull.firstIndex, held.firstIndex);
             hull.lastIndex = std::max(hull.lastIndex, held.lastIndex);
             hull.begin = std::min(hull.begin, held.begin);
             hull.end = std::max(hull.end, held.end);
+            if (!sameSource) {
+                hull.indexSource = BufferIndexSource::None;
+                hull.indexScale = 0;
+                hull.firstIndex = 0;
+                hull.lastIndex = AnyIndex;
+                hull.indexOrigin = BufferIndexOrigin::Other;
+            }
         }
-        hull.firstIndex = std::min(hull.firstIndex, range.firstIndex);
-        hull.lastIndex = std::max(hull.lastIndex, range.lastIndex);
-        hull.begin = std::min(hull.begin, range.begin);
-        hull.end = std::max(hull.end, range.end);
-        ranges.resize(1);
+        if (hull.indexSource == BufferIndexSource::None && hull.lastIndex == AnyIndex && hull.indexOrigin == BufferIndexOrigin::Bounded) hull.indexOrigin = BufferIndexOrigin::Other;
+        ranges.assign(1, hull);
     }
     void Unbound(BufferReadUnbound reason) {
         if (bounded) unbound = reason;

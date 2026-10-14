@@ -2417,7 +2417,19 @@ void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
     anyIndex.ranges = {{0u, ShaderRecompiler::BufferReadRanges::AnyIndex, 32u, 48u}};
     const auto raw = ShaderResources::GuestReadRanges(words(0x10000, 0u, 256u, 0u), &anyIndex, 256u);
     Require(raw.has_value() && *raw == ShaderResources::ByteRanges{{32u, 48u}}, "a load at any index of a stride-0 buffer, which ignores the index, was not limited to its offsets");
-    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 16u, 0u), &anyIndex, 256u, &reason).has_value() && reason == ShaderResources::WholeCopy::Index, "a load at any index of a strided buffer was given read ranges or another reason");
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 16u, 0u), &anyIndex, 256u, &reason).has_value() && reason == ShaderResources::WholeCopy::IndexOther, "a load at any index of a strided buffer was given read ranges or another reason");
+    anyIndex.ranges.front().indexOrigin = ShaderRecompiler::BufferIndexOrigin::Memory;
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 16u, 0u), &anyIndex, 256u, &reason).has_value() && reason == ShaderResources::WholeCopy::IndexMemory, "a load at an index read from memory was not counted under that origin");
+    ShaderRecompiler::BufferReadRanges byVertex;
+    byVertex.ranges = {{2u, 5u, 0u, 16u, ShaderRecompiler::BufferIndexSource::VertexIndex, ShaderRecompiler::BufferIndexOrigin::Bounded, 3u}};
+    const ShaderResources::DrawIndexRanges draw{10u, 12u, 0u, 0u};
+    const auto vertexRanges = ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byVertex, 65536u, &reason, &draw);
+    Require(vertexRanges.has_value() && *vertexRanges == ShaderResources::ByteRanges{{512u, 672u}}, "records 3 * vertex + 2 to 3 * vertex + 5 of vertices 10 to 12 were not placed at bytes 512 to 672");
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byVertex, 65536u, &reason).has_value() && reason == ShaderResources::WholeCopy::NoDrawRange, "a vertex-indexed load without the draw's vertex range was given read ranges");
+    const ShaderResources::DrawIndexRanges wide{0u, 0x60000000u, 0u, 0u};
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byVertex, 65536u, &reason, &wide).has_value() && reason == ShaderResources::WholeCopy::BeyondFourGiB, "a vertex-indexed load whose index wraps 32 bits was given read ranges");
+    const auto rawVertex = ShaderResources::GuestReadRanges(words(0x10000, 0u, 256u, 0u), &byVertex, 256u, &reason);
+    Require(rawVertex.has_value() && *rawVertex == ShaderResources::ByteRanges{{0u, 16u}}, "a vertex-indexed load of a stride-0 buffer, which ignores the index, was not limited to its offsets");
     constexpr std::size_t bytes = 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
@@ -2507,8 +2519,7 @@ void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
         ShaderResources resources(snapshotContext, limited);
         const auto movedElement = element + elementBytes;
         ShaderResources::MovedBuffer moved{0, movedElement, elementBytes};
-        moved.readRanges = ShaderResources::GuestReadRanges(words(movedElement, 0u, elementBytes, 0x31000000u), &read, elementBytes, &moved.wholeCopy);
-        Require(moved.readRanges.has_value(), "the moved element's read ranges were not placed");
+        moved.readAnalysis = ShaderResources::ReadAnalysis{words(movedElement, 0u, elementBytes, 0x31000000u), read};
         ShaderResources::DrawBindingsStatistics statistics;
         const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, std::span(&moved, 1), &statistics);
         Require(bindings != nullptr && bindings->snapshots.size() == 1 && bindings->snapshots[0].address == movedElement, "a moved range-limited draw input was not snapshotted at its new address");

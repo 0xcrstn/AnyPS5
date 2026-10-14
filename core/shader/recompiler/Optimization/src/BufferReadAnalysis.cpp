@@ -1,5 +1,7 @@
 #include "Optimization/BufferReadAnalysis.hpp"
 #include <algorithm>
+#include <utility>
+#include <vector>
 
 namespace ShaderRecompiler {
 
@@ -111,6 +113,86 @@ std::optional<BufferReadAnalysis::Interval> BufferReadAnalysis::compute(const Ir
     }
 }
 
+std::optional<BufferReadAnalysis::Affine> BufferReadAnalysis::AffineOf(const IrValue* value, std::uint32_t depth) {
+    if (value == nullptr) return std::nullopt;
+    value = value->Resolve();
+    if (value == nullptr) return std::nullopt;
+    if (const auto plain = Of(value)) return Affine{BufferIndexSource::None, 0u, plain->low, plain->high};
+    if (depth >= MaxAffineDepth) return std::nullopt;
+    const auto argument = [&](std::size_t index) { return index < value->ArgumentCount() ? AffineOf(value->Argument(index), depth + 1u) : std::nullopt; };
+    const auto sourced = [](const std::optional<Affine>& affine) { return affine && affine->source != BufferIndexSource::None; };
+    const auto constant = [](const std::optional<Affine>& affine) { return affine && affine->source == BufferIndexSource::None && affine->low == affine->high; };
+    switch (value->Opcode()) {
+    case IrOpcode::GetBuiltin: {
+        if (value->ArgumentCount() != 2u) return std::nullopt;
+        const auto* kind = value->Argument(0)->Resolve();
+        const auto* component = value->Argument(1)->Resolve();
+        if (!kind->HasImmediate() || !component->HasImmediate() || component->ImmediateU32() != 0u) return std::nullopt;
+        if (kind->ImmediateU32() == static_cast<std::uint32_t>(StageInputKind::VertexIndex)) return Affine{BufferIndexSource::VertexIndex, 1u, 0u, 0u};
+        if (kind->ImmediateU32() == static_cast<std::uint32_t>(StageInputKind::InstanceIndex)) return Affine{BufferIndexSource::InstanceIndex, 1u, 0u, 0u};
+        return std::nullopt;
+    }
+    case IrOpcode::IAdd32: {
+        auto a = argument(0), b = argument(1);
+        if (!a || !b || (sourced(a) && sourced(b))) return std::nullopt;
+        if (sourced(b)) std::swap(a, b);
+        if (a->low + b->low > Max32 || a->high + b->high > Max32) return std::nullopt;
+        return Affine{a->source, a->scale, a->low + b->low, a->high + b->high};
+    }
+    case IrOpcode::IMul32: {
+        auto a = argument(0), b = argument(1);
+        if (sourced(b)) std::swap(a, b);
+        if (!sourced(a) || !constant(b)) return std::nullopt;
+        const auto factor = b->low;
+        if (factor != 0 && (a->scale > Max32 / factor || a->high > Max32 / factor)) return std::nullopt;
+        return Affine{a->source, a->scale * factor, a->low * factor, a->high * factor};
+    }
+    case IrOpcode::ShiftLeftLogical32:
+    case IrOpcode::IShiftLeft32: {
+        const auto a = argument(0), b = argument(1);
+        if (!sourced(a) || !constant(b) || b->low >= 32u) return std::nullopt;
+        if ((a->scale << b->low) > Max32 || (a->high << b->low) > Max32) return std::nullopt;
+        return Affine{a->source, a->scale << b->low, a->low << b->low, a->high << b->low};
+    }
+    default:
+        return std::nullopt;
+    }
+}
+
+BufferIndexOrigin BufferReadAnalysis::OriginOf(const IrValue* value) {
+    std::vector<const IrValue*> pending{value};
+    std::unordered_set<const IrValue*> seen;
+    bool vertex = false, instance = false, memory = false, userData = false;
+    while (!pending.empty() && seen.size() < MaxOriginValues) {
+        const auto* current = pending.back();
+        pending.pop_back();
+        if (current == nullptr) continue;
+        current = current->Resolve();
+        if (current == nullptr || current->HasImmediate() || !seen.insert(current).second) continue;
+        const auto op = current->Opcode();
+        if (op == IrOpcode::GetBuiltin && current->ArgumentCount() == 2u && current->Argument(0)->Resolve()->HasImmediate()) {
+            const auto kind = current->Argument(0)->Resolve()->ImmediateU32();
+            vertex = vertex || kind == static_cast<std::uint32_t>(StageInputKind::VertexIndex);
+            instance = instance || kind == static_cast<std::uint32_t>(StageInputKind::InstanceIndex);
+            continue;
+        }
+        if (op == IrOpcode::GetUserData) {
+            userData = true;
+            continue;
+        }
+        if (BufferAccessOf(op) != BufferAccess::None || AddressOpcodeInfoOf(op).access != AddressAccess::None || SharedAccessOf(op) != SharedAccess::None || ImageOpcodeInfoOf(op).access != ImageAccess::None || op == IrOpcode::GetAttribute) {
+            memory = true;
+            continue;
+        }
+        for (std::size_t index = 0; index < current->ArgumentCount(); ++index) pending.push_back(current->Argument(index));
+    }
+    if (vertex) return BufferIndexOrigin::VertexIndex;
+    if (instance) return BufferIndexOrigin::InstanceIndex;
+    if (memory) return BufferIndexOrigin::Memory;
+    if (userData) return BufferIndexOrigin::UserData;
+    return BufferIndexOrigin::Other;
+}
+
 void BufferReadAnalysis::Note(BufferReadRanges& ranges, const IrValue& inst, const MemoryInfo& memory) {
     const auto op = inst.Opcode();
     if (BufferAccessOf(op) != BufferAccess::Read || !ranges.bounded) return;
@@ -130,14 +212,24 @@ void BufferReadAnalysis::Note(BufferReadRanges& ranges, const IrValue& inst, con
         ranges.Unbound(BufferReadUnbound::Opcode);
         return;
     }
-    const auto index = Of(inst.Argument(1)).value_or(Interval{0u, BufferReadRanges::AnyIndex});
+    const auto affine = AffineOf(inst.Argument(1));
     const auto offset = Of(inst.Argument(2));
     const auto soffset = Of(inst.Argument(3));
     if (!offset || !soffset || offset->high + memory.offset > Max32) {
         ranges.Unbound(!offset ? BufferReadUnbound::Offset : !soffset ? BufferReadUnbound::Soffset : BufferReadUnbound::Wrap);
         return;
     }
-    ranges.Add({static_cast<std::uint32_t>(index.low), static_cast<std::uint32_t>(index.high), offset->low + memory.offset + soffset->low, offset->high + memory.offset + soffset->high + extent});
+    BufferReadRange range{0u, BufferReadRanges::AnyIndex, offset->low + memory.offset + soffset->low, offset->high + memory.offset + soffset->high + extent};
+    if (affine) {
+        range.firstIndex = static_cast<std::uint32_t>(affine->low);
+        range.lastIndex = static_cast<std::uint32_t>(affine->high);
+        range.indexSource = affine->source;
+        range.indexScale = static_cast<std::uint32_t>(affine->scale);
+        if (affine->source == BufferIndexSource::None && affine->high == BufferReadRanges::AnyIndex) range.indexOrigin = OriginOf(inst.Argument(1));
+    } else {
+        range.indexOrigin = OriginOf(inst.Argument(1));
+    }
+    ranges.Add(range);
 }
 
 }

@@ -63,11 +63,24 @@ alignas(256) constexpr std::array<std::uint32_t, 6> FormattedCode{
     0xe00c0100u, 0x80000000u, 0xbf8c3f70u, 0xf800180fu, 0x03020100u, 0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 11> ConstantCode{
+    0x7e0002ffu, 0x3e800000u, 0x7e0202ffu, 0x00000000u, 0x7e0402ffu, 0x00000000u, 0x7e0602ffu, 0x3f800000u, 0xf800180fu, 0x03020100u, 0xbf810000u,
+};
+
+constexpr float ConstantRed = 0.25f;
+constexpr std::uint32_t VertexRecords = 1024;
+constexpr std::uint32_t FirstVertex = 100;
+
 struct PixelProgram {
     std::span<const std::uint32_t> code;
     std::uint32_t word3;
     const char* name;
 };
+
+std::array<std::uint32_t, 4> TriangleDescriptor() {
+    const auto address = reinterpret_cast<std::uintptr_t>(Triangle.data());
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (16u << 16u), static_cast<std::uint32_t>(Triangle.size()), 0x01016facu};
+}
 
 constexpr std::uint32_t ReadOffset = 0x100;
 constexpr std::uint32_t InputBytes = 0x4000;
@@ -159,12 +172,10 @@ ShaderRecompiler::RecompileResult CompilePixel(AgcDriver::VulkanDevice& device, 
     return ShaderRecompiler::Recompile(fragment);
 }
 
-void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> descriptor, const PixelProgram& program, bool checkRanges) {
+void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> descriptor, const PixelProgram& program, bool checkRanges, const std::array<std::uint32_t, 4>& vertexBuffer, std::uint32_t firstVertex) {
     const auto target = device.Target();
     constexpr std::uint32_t waveSize = 64;
     std::vector<std::uint32_t> vertexUserData(4, 0u);
-    const auto address = reinterpret_cast<std::uintptr_t>(Triangle.data());
-    const std::array<std::uint32_t, 4> vertexBuffer{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (16u << 16u), static_cast<std::uint32_t>(Triangle.size()), 0x01016facu};
     std::copy(vertexBuffer.begin(), vertexBuffer.end(), vertexUserData.begin());
     const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(VertexCode.data()), std::as_bytes(std::span(VertexCode))}}};
     ShaderRecompiler::RecompileRequest vertex{
@@ -175,6 +186,12 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     };
     vertex.useCache = false;
     const auto vertexResult = ShaderRecompiler::Recompile(vertex);
+    if (checkRanges && firstVertex != 0) {
+        const auto binding = std::find_if(vertexResult.bindings.begin(), vertexResult.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& candidate) { return candidate.role == ShaderRecompiler::DescriptorRole::GuestBuffers; });
+        Require(binding != vertexResult.bindings.end() && binding->bufferReadRanges.size() == 1, "the vertex shader has no guest buffer binding with read ranges");
+        const auto& ranges = binding->bufferReadRanges.front();
+        Require(ranges.bounded && ranges.ranges.size() == 1 && ranges.ranges.front().indexSource == ShaderRecompiler::BufferIndexSource::VertexIndex && ranges.ranges.front().indexScale == 1u && ranges.ranges.front().firstIndex == 0u && ranges.ranges.front().lastIndex == 0u && ranges.ranges.front().begin == 0u && ranges.ranges.front().end == 16u, "a buffer_load_dwordx4 at the vertex id was not analysed as reading 16 bytes of the vertex id's record");
+    }
     const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
     AgcDriver::Graphics::State state{};
     state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, waveSize, waveSize, std::nullopt, std::nullopt};
@@ -194,7 +211,7 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     state.blend = blend;
     state.blendConstants = {};
     const auto pixelResult = CompilePixel(device, vertexPush, descriptor, state, program.code);
-    if (checkRanges) {
+    if (checkRanges && firstVertex == 0) {
         const auto binding = std::find_if(pixelResult.bindings.begin(), pixelResult.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& candidate) { return candidate.role == ShaderRecompiler::DescriptorRole::GuestBuffers; });
         Require(binding != pixelResult.bindings.end() && binding->bufferReadRanges.size() == 1, "the pixel shader has no guest buffer binding with read ranges");
         const auto& ranges = binding->bufferReadRanges.front();
@@ -204,7 +221,7 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
         {ShaderStage::Vertex, &vertexResult, 0},
         {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)}
     }};
-    const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
+    const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false, firstVertex};
     device.Draw(state, draw, shaders);
 }
 
@@ -249,7 +266,7 @@ void ReadRangeTests(AgcDriver::VulkanDevice& device, Block& target, Block& input
             auto* floats = reinterpret_cast<float*>(input.data);
             for (std::size_t i = 0; i < InputBytes / 4u; ++i) floats[i] = 0.5f;
             std::memcpy(input.data + ReadOffset, expected.data(), sizeof(expected));
-            Draw(device, color, descriptor, program, first);
+            Draw(device, color, descriptor, program, first, TriangleDescriptor(), 0u);
             first = false;
             std::memset(input.data, 0, InputBytes);
             char what[200];
@@ -257,6 +274,15 @@ void ReadRangeTests(AgcDriver::VulkanDevice& device, Block& target, Block& input
             ExpectSurface(device, target, layout, expected[0], what);
         }
     }
+    const std::array<std::uint32_t, 4> vertexDescriptor{static_cast<std::uint32_t>(input.Address()), static_cast<std::uint32_t>((input.Address() >> 32u) & 0xffffu) | (16u << 16u), VertexRecords, 0x01016facu};
+    const PixelProgram constant{ConstantCode, 0u, "a constant pixel shader"};
+    const std::array<std::uint32_t, 4> unused{};
+    auto* floats = reinterpret_cast<float*>(input.data);
+    for (std::size_t i = 0; i < InputBytes / 4u; ++i) floats[i] = 0.0f;
+    std::memcpy(input.data + FirstVertex * 16u, Triangle.data(), sizeof(Triangle));
+    Draw(device, color, unused, constant, true, vertexDescriptor, FirstVertex);
+    std::memset(input.data, 0, InputBytes);
+    ExpectSurface(device, target, layout, ConstantRed, "a draw whose vertex shader loads its position at the vertex id from vertices 100 to 102 of a 1024-vertex buffer");
 }
 
 }
