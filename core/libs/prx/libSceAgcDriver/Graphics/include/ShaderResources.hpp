@@ -150,23 +150,7 @@ public:
         std::size_t size;
         std::vector<std::uint32_t> words;
     };
-    struct DrawBindingsStatistics {
-        std::uint64_t snapshots = 0;
-        std::uint64_t reused = 0;
-        std::uint64_t copied = 0;
-        std::uint64_t skipped = 0;
-        std::uint64_t copiedBytes = 0;
-        std::uint64_t descriptorWrites = 0;
-        double checkUs = 0;
-        double collectUs = 0;
-        double lookupUs = 0;
-        double bufferUs = 0;
-        double copyUs = 0;
-        double keepUs = 0;
-        double allocateUs = 0;
-        double updateUs = 0;
-    };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsStatistics* statistics = nullptr) const;
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();

@@ -3572,15 +3572,8 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     return static_cast<std::size_t>(mib * 1024ull * 1024ull);
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindingsStatistics* statistics) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
-    auto lapStart = statistics != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto lap = [&](double DrawBindingsStatistics::*bucket) {
-        if (statistics == nullptr) return;
-        const auto now = std::chrono::steady_clock::now();
-        statistics->*bucket += std::chrono::duration<double, std::micro>(now - lapStart).count();
-        lapStart = now;
-    };
     const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     std::size_t totalSnapshotBytes = 0;
@@ -3597,10 +3590,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             }
             selected.push_back(index);
             result->snapshots.push_back({0, std::move(buffer)});
-            if (statistics != nullptr) {
-                ++statistics->copied;
-                statistics->copiedBytes += override->size;
-            }
             continue;
         }
         std::uint64_t address = item.address;
@@ -3611,44 +3600,24 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         } else {
             if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) {
-                if (statistics != nullptr) ++statistics->skipped;
-                continue;
-            }
+            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) {
-            if (statistics != nullptr) ++statistics->skipped;
-            continue;
-        }
-        lap(&DrawBindingsStatistics::checkUs);
+        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
-        lap(&DrawBindingsStatistics::collectUs);
         auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
-        lap(&DrawBindingsStatistics::lookupUs);
         if (buffer == nullptr) {
             buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            lap(&DrawBindingsStatistics::bufferUs);
             std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-            lap(&DrawBindingsStatistics::copyUs);
             recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
-            if (statistics != nullptr) {
-                ++statistics->copied;
-                statistics->copiedBytes += bytes;
-            }
-        } else if (statistics != nullptr) {
-            ++statistics->reused;
         }
-        lap(&DrawBindingsStatistics::keepUs);
         selected.push_back(index);
         result->snapshots.push_back({begin, std::move(buffer)});
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
-    if (statistics != nullptr) statistics->snapshots += selected.size();
-    lap(&DrawBindingsStatistics::checkUs);
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
@@ -3662,7 +3631,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         result->fragmentAllocation = result->cache->Allocate(fragment.layout, PoolSizes(descriptions[1]));
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
-    lap(&DrawBindingsStatistics::allocateUs);
     auto buffers = descriptorBuffers;
     auto writes = descriptorWrites;
     std::vector<std::size_t> snapshotIndices(allocations.size(), selected.size());
@@ -3684,8 +3652,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
-    if (statistics != nullptr) statistics->descriptorWrites += writes.size();
-    lap(&DrawBindingsStatistics::updateUs);
     return result;
 }
 
