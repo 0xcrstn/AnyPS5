@@ -2,7 +2,10 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
+#include <array>
 #include <cstdio>
+#include <span>
+#include <vector>
 #include <cstdlib>
 #include <string>
 #include <spirv/unified1/spirv.hpp>
@@ -278,6 +281,82 @@ void Invoke(TReturn (*emit)(TContext&, TArguments...), SpirvValueEmitContext& ct
     }(std::index_sequence_for<TArguments...>{});
 }
 
+template<typename... TArguments>
+void InvokeOutlined(std::uint32_t (*emit)(SpirvEmitterState&, TArguments...), SpirvValueEmitContext& ctx, const IrValue& inst) {
+    static_assert(((std::is_same_v<TArguments, std::uint32_t> || std::is_same_v<TArguments, const IrValue*>) && ...));
+    auto& state = ctx.state;
+    constexpr std::size_t count = sizeof...(TArguments);
+    if (inst.ArgumentCount() < count) ctx.Fail(inst, "has fewer arguments than its emitter takes");
+    std::vector<std::uint64_t> key{static_cast<std::uint64_t>(inst.Opcode()), static_cast<std::uint64_t>(inst.Type())};
+    std::array<std::uint32_t, count> types{};
+    bool outlined = true;
+    [&]<std::size_t... TIndices>(std::index_sequence<TIndices...>) {
+        const auto describe = [&]<typename TArgument>(std::size_t index) {
+            const IrValue* argument = inst.Argument(index);
+            if (argument == nullptr) {
+                outlined = false;
+                return;
+            }
+            const IrValue* resolved = argument->Resolve();
+            key.push_back(static_cast<std::uint64_t>(resolved->Type()));
+            if constexpr (std::is_same_v<TArgument, const IrValue*>) {
+                if (!resolved->HasImmediate()) outlined = false;
+                key.push_back(resolved->ImmediateU64());
+            } else {
+                types[index] = TypeId(state, resolved->Type());
+                if (types[index] == 0u) outlined = false;
+            }
+        };
+        (describe.template operator()<TArguments>(TIndices), ...);
+    }(std::index_sequence_for<TArguments...>{});
+    const auto resultType = TypeId(state, inst.Type());
+    if (!outlined || resultType == 0u) return Invoke(emit, ctx, inst);
+    auto function = state.outlinedFunctions.find(key);
+    if (function == state.outlinedFunctions.end()) {
+        std::vector<std::uint32_t> parameterTypes;
+        for (std::size_t index = 0; index < count; ++index) {
+            if (types[index] != 0u) parameterTypes.push_back(types[index]);
+        }
+        const auto functionType = state.module.Type(spv::OpTypeFunction, resultType, std::span<const std::uint32_t>(parameterTypes));
+        const auto id = state.module.AllocateId();
+        const auto label = state.currentLabel;
+        const auto block = state.currentBlock;
+        state.module.BeginHelperFunction();
+        state.module.AddName(id, "outlined_" + std::string(IrOpcodeName(inst.Opcode())));
+        state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlInlineMask, functionType);
+        std::array<std::uint32_t, count> parameters{};
+        for (std::size_t index = 0; index < count; ++index) {
+            if (types[index] == 0u) continue;
+            parameters[index] = state.module.AllocateId();
+            state.module.AddFunction(spv::OpFunctionParameter, types[index], parameters[index]);
+        }
+        EmitLabel(state, state.module.AllocateId());
+        const auto result = [&]<std::size_t... TIndices>(std::index_sequence<TIndices...>) {
+            const auto argument = [&]<typename TArgument>(std::size_t index) -> TArgument {
+                if constexpr (std::is_same_v<TArgument, const IrValue*>) {
+                    return inst.Argument(index)->Resolve();
+                } else {
+                    return parameters[index];
+                }
+            };
+            return emit(state, argument.template operator()<TArguments>(TIndices)...);
+        }(std::index_sequence_for<TArguments...>{});
+        state.module.AddFunction(spv::OpReturnValue, result);
+        state.module.AddFunction(spv::OpFunctionEnd);
+        state.module.EndHelperFunction();
+        state.currentLabel = label;
+        state.currentBlock = block;
+        function = state.outlinedFunctions.emplace(std::move(key), id).first;
+    }
+    std::vector<std::uint32_t> arguments;
+    for (std::size_t index = 0; index < count; ++index) {
+        if (types[index] != 0u) arguments.push_back(ctx.Def(inst.Argument(index)));
+    }
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, resultType, result, function->second, std::span<const std::uint32_t>(arguments));
+    ctx.Define(inst, result);
+}
+
 void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
     switch (inst.Opcode()) {
         case IrOpcode::Identity: return Invoke(EmitIdentity, ctx, inst);
@@ -347,7 +426,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::ConvertU8U32: return Invoke(EmitConvertU8U32, ctx, inst);
         case IrOpcode::ConvertU32U8: return Invoke(EmitConvertU32U8, ctx, inst);
         case IrOpcode::ConvertF32F16: return Invoke(EmitConvertF32F16, ctx, inst);
-        case IrOpcode::ConvertF16F32: return Invoke(EmitConvertF16F32, ctx, inst);
+        case IrOpcode::ConvertF16F32: return InvokeOutlined(EmitConvertF16F32, ctx, inst);
         case IrOpcode::ConvertS32F32: return Invoke(EmitConvertS32F32, ctx, inst);
         case IrOpcode::ConvertU32F32: return Invoke(EmitConvertU32F32, ctx, inst);
         case IrOpcode::ConvertF32S32: return Invoke(EmitConvertF32S32, ctx, inst);
@@ -361,13 +440,13 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::CompositeExtractU32x2: return Invoke(EmitCompositeExtractU32x2, ctx, inst);
         case IrOpcode::CompositeExtractU32x3: return Invoke(EmitCompositeExtractU32x3, ctx, inst);
         case IrOpcode::CompositeExtractU32x4: return Invoke(EmitCompositeExtractU32x4, ctx, inst);
-        case IrOpcode::PackHalf2x16: return Invoke(EmitPackHalf2x16, ctx, inst);
+        case IrOpcode::PackHalf2x16: return InvokeOutlined(EmitPackHalf2x16, ctx, inst);
         case IrOpcode::PackFloat2x16Rtz: return Invoke(EmitPackFloat2x16Rtz, ctx, inst);
         case IrOpcode::FPAdd16x2: return Invoke(EmitFPAdd16x2, ctx, inst);
         case IrOpcode::FPMul16x2: return Invoke(EmitFPMul16x2, ctx, inst);
         case IrOpcode::FPAbs32: return Invoke(EmitFPAbs32, ctx, inst);
         case IrOpcode::FPNeg32: return Invoke(EmitFPNeg32, ctx, inst);
-        case IrOpcode::FPSaturate32: return Invoke(EmitFPSaturate32, ctx, inst);
+        case IrOpcode::FPSaturate32: return InvokeOutlined(EmitFPSaturate32, ctx, inst);
         case IrOpcode::BitFieldInsert: return Invoke(EmitBitFieldInsert, ctx, inst);
         case IrOpcode::BitFieldUExtract: return Invoke(EmitBitFieldUExtract, ctx, inst);
         case IrOpcode::BitFieldSExtract: return Invoke(EmitBitFieldSExtract, ctx, inst);
@@ -434,7 +513,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::FPUnordEqual32: return Invoke(EmitFPUnordEqual32, ctx, inst);
         case IrOpcode::FPOrdNotEqual32: return Invoke(EmitFPOrdNotEqual32, ctx, inst);
         case IrOpcode::FPUnordNotEqual32: return Invoke(EmitFPUnordNotEqual32, ctx, inst);
-        case IrOpcode::FPOrdLessThan32: return Invoke(EmitFPOrdLessThan32, ctx, inst);
+        case IrOpcode::FPOrdLessThan32: return InvokeOutlined(EmitFPOrdLessThan32, ctx, inst);
         case IrOpcode::FPUnordLessThan32: return Invoke(EmitFPUnordLessThan32, ctx, inst);
         case IrOpcode::FPOrdGreaterThan32: return Invoke(EmitFPOrdGreaterThan32, ctx, inst);
         case IrOpcode::FPUnordGreaterThan32: return Invoke(EmitFPUnordGreaterThan32, ctx, inst);
@@ -443,30 +522,30 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::FPOrdGreaterThanEqual32: return Invoke(EmitFPOrdGreaterThanEqual32, ctx, inst);
         case IrOpcode::FPUnordGreaterThanEqual32: return Invoke(EmitFPUnordGreaterThanEqual32, ctx, inst);
         case IrOpcode::FPIsNan32: return Invoke(EmitFPIsNan32, ctx, inst);
-        case IrOpcode::FPCmpClass32: return Invoke(EmitFPCmpClass32, ctx, inst);
+        case IrOpcode::FPCmpClass32: return InvokeOutlined(EmitFPCmpClass32, ctx, inst);
         case IrOpcode::FPAdd32: return Invoke(EmitFPAdd32, ctx, inst);
         case IrOpcode::FPSub32: return Invoke(EmitFPSub32, ctx, inst);
         case IrOpcode::FPFma32: return Invoke(EmitFPFma32, ctx, inst);
         case IrOpcode::FPMad32: return Invoke(EmitFPMad32, ctx, inst);
         case IrOpcode::FPMul32: return Invoke(EmitFPMul32, ctx, inst);
-        case IrOpcode::FPMin32: return Invoke(EmitFPMin32, ctx, inst);
-        case IrOpcode::FPMax32: return Invoke(EmitFPMax32, ctx, inst);
+        case IrOpcode::FPMin32: return InvokeOutlined(EmitFPMin32, ctx, inst);
+        case IrOpcode::FPMax32: return InvokeOutlined(EmitFPMax32, ctx, inst);
         case IrOpcode::FPMinTri32: return Invoke(EmitFPMinTri32, ctx, inst);
         case IrOpcode::FPMaxTri32: return Invoke(EmitFPMaxTri32, ctx, inst);
-        case IrOpcode::FPMedTri32: return Invoke(EmitFPMedTri32, ctx, inst);
+        case IrOpcode::FPMedTri32: return InvokeOutlined(EmitFPMedTri32, ctx, inst);
         case IrOpcode::FPRecip32: return Invoke(EmitFPRecip32, ctx, inst);
         case IrOpcode::FPRecipIFlag32: return Invoke(EmitFPRecipIFlag32, ctx, inst);
         case IrOpcode::FPRecipSqrt32: return Invoke(EmitFPRecipSqrt32, ctx, inst);
         case IrOpcode::FPSqrt: return Invoke(EmitFPSqrt, ctx, inst);
-        case IrOpcode::FPSin: return Invoke(EmitFPSin, ctx, inst);
-        case IrOpcode::FPCos: return Invoke(EmitFPCos, ctx, inst);
+        case IrOpcode::FPSin: return InvokeOutlined(EmitFPSin, ctx, inst);
+        case IrOpcode::FPCos: return InvokeOutlined(EmitFPCos, ctx, inst);
         case IrOpcode::FPExp2: return Invoke(EmitFPExp2, ctx, inst);
-        case IrOpcode::FPLog2: return Invoke(EmitFPLog2, ctx, inst);
+        case IrOpcode::FPLog2: return InvokeOutlined(EmitFPLog2, ctx, inst);
         case IrOpcode::FPRoundEven32: return Invoke(EmitFPRoundEven32, ctx, inst);
         case IrOpcode::FPFloor32: return Invoke(EmitFPFloor32, ctx, inst);
         case IrOpcode::FPCeil32: return Invoke(EmitFPCeil32, ctx, inst);
         case IrOpcode::FPTrunc32: return Invoke(EmitFPTrunc32, ctx, inst);
-        case IrOpcode::FPFract32: return Invoke(EmitFPFract32, ctx, inst);
+        case IrOpcode::FPFract32: return InvokeOutlined(EmitFPFract32, ctx, inst);
         case IrOpcode::FPAdd64: return Invoke(EmitFPAdd64, ctx, inst);
         case IrOpcode::FPMul64: return Invoke(EmitFPMul64, ctx, inst);
         case IrOpcode::FPFma64: return Invoke(EmitFPFma64, ctx, inst);
@@ -488,7 +567,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::FPTrigPreop64: return Invoke(EmitFPTrigPreop64, ctx, inst);
         case IrOpcode::FPDot2F32F16: return Invoke(EmitFPDot2F32F16, ctx, inst);
         case IrOpcode::FPInterpolateF32: return Invoke(EmitFPInterpolateF32, ctx, inst);
-        case IrOpcode::FPInterpolateF16: return Invoke(EmitFPInterpolateF16, ctx, inst);
+        case IrOpcode::FPInterpolateF16: return InvokeOutlined(EmitFPInterpolateF16, ctx, inst);
         case IrOpcode::ConvertF32F64: return Invoke(EmitConvertF32F64, ctx, inst);
         case IrOpcode::ConvertF64F32: return Invoke(EmitConvertF64F32, ctx, inst);
         case IrOpcode::ConvertF64S32: return Invoke(EmitConvertF64S32, ctx, inst);
@@ -700,6 +779,71 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
     }
 }
 
+namespace {
+
+enum FloatIdiom : std::uint8_t {
+    NoIdiom,
+    FlushIdiom,
+    IsNanIdiom,
+    FoldedIntoIdiom,
+};
+
+bool immediateU32(const IrValue* value, std::uint32_t bits) {
+    return value != nullptr && value->HasImmediate() && value->Type() == IrType::U32 && value->ImmediateU32() == bits;
+}
+
+const IrValue* maskedBy(const IrValue* value, std::uint32_t mask) {
+    if (value == nullptr || value->Opcode() != IrOpcode::BitwiseAnd32 || value->ArgumentCount() != 2u || !immediateU32(value->Argument(1), mask)) return nullptr;
+    return value->Argument(0);
+}
+
+const IrValue* flushedSource(const IrValue& value) {
+    if (value.Opcode() != IrOpcode::SelectU32 || value.ArgumentCount() != 3u) return nullptr;
+    const IrValue* source = value.Argument(2);
+    const IrValue* denormal = value.Argument(0);
+    if (source == nullptr || denormal == nullptr || denormal->Opcode() != IrOpcode::IEqual32 || denormal->ArgumentCount() != 2u || !immediateU32(denormal->Argument(1), 0u)) return nullptr;
+    if (maskedBy(denormal->Argument(0), 0x7f800000u) != source || maskedBy(value.Argument(1), 0x80000000u) != source) return nullptr;
+    return source;
+}
+
+const IrValue* nanTestSource(const IrValue& value) {
+    if (value.Opcode() != IrOpcode::UGreaterThan32 || value.ArgumentCount() != 2u || !immediateU32(value.Argument(1), 0x7f800000u)) return nullptr;
+    return maskedBy(value.Argument(0), 0x7fffffffu);
+}
+
+std::uint8_t idiomOf(const std::vector<std::uint8_t>& idioms, const IrValue* value) {
+    return value->Id() < idioms.size() ? idioms[value->Id()] : static_cast<std::uint8_t>(NoIdiom);
+}
+
+bool foldable(const std::vector<std::uint8_t>& idioms, const std::vector<std::uint8_t>& pinned, const IrValue* value, std::uint8_t user) {
+    if (value->Parent() == nullptr || value->Id() >= idioms.size() || pinned[value->Id()] != 0u || idioms[value->Id()] != NoIdiom || value->Uses().empty()) return false;
+    return std::ranges::all_of(value->Uses(), [&](const IrValue* consumer) { return idiomOf(idioms, consumer) == user; });
+}
+
+bool EmitFloatIdiom(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    auto& state = ctx.state;
+    switch (idiomOf(state.floatIdioms, &inst)) {
+    case FlushIdiom: {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, TypeU32(state), result, state.flushF32DenormalFunction, ctx.Def(inst.Argument(2)));
+        ctx.Define(inst, result);
+        return true;
+    }
+    case IsNanIdiom: {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, TypeBool(state), result, state.isNanF32Function, ctx.Def(nanTestSource(inst)));
+        ctx.Define(inst, result);
+        return true;
+    }
+    case FoldedIntoIdiom:
+        return true;
+    default:
+        return false;
+    }
+}
+
+}
+
 void EmitStructuredInstruction(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrValue& inst) {
     if (inst.Opcode() == IrOpcode::Phi) {
         const auto type = TypeId(ctx.state, inst.Type());
@@ -715,6 +859,7 @@ void EmitStructuredInstruction(SpirvValueEmitContext& ctx, StructuredFunctionSta
         functionState.deferredPhis.push_back({ctx.state.module.AddDeferredPhi(type, ctx.Result(inst), inst.ArgumentCount()), &inst, ctx.half});
         return;
     }
+    if (EmitFloatIdiom(ctx, inst)) return;
     EmitDirectInstruction(ctx, inst);
 }
 
@@ -793,6 +938,87 @@ bool CommunicatesThroughMemory(IrOpcode opcode) {
     return SharedAccessOf(opcode) != SharedAccess::None || buffer == BufferAccess::Write || buffer == BufferAccess::Atomic || address == AddressAccess::Write || address == AddressAccess::Atomic || image == ImageAccess::Write || image == ImageAccess::Atomic;
 }
 
+}
+
+void DefineFloatIdiomFunctions(SpirvEmitterState& state) {
+    const auto& program = state.program;
+    std::uint32_t count = 0;
+    for (const IrBlock* block : program.BlockOrder()) {
+        for (const IrValue* inst : block->Instructions()) count = std::max(count, inst->Id() + 1u);
+    }
+    auto& idioms = state.floatIdioms;
+    idioms.assign(count, NoIdiom);
+    std::vector<std::uint8_t> pinned(count, 0u);
+    const auto pin = [&](const IrValue* value) {
+        if (value != nullptr && value->Id() < count) pinned[value->Id()] = 1u;
+    };
+    for (const auto& info : program.Metadata().blockInfo) {
+        pin(info.condition);
+        pin(info.indirectTarget);
+    }
+    for (const IrValue* value : program.Metadata().dynamicReads) pin(value);
+    bool flush = false;
+    bool nan = false;
+    for (const IrBlock* block : program.BlockOrder()) {
+        for (const IrValue* inst : block->Instructions()) {
+            if (pinned[inst->Id()] != 0u) continue;
+            if (flushedSource(*inst) != nullptr) {
+                idioms[inst->Id()] = FlushIdiom;
+                flush = true;
+            } else if (nanTestSource(*inst) != nullptr) {
+                idioms[inst->Id()] = IsNanIdiom;
+                nan = true;
+            }
+        }
+    }
+    if (!flush && !nan) return;
+    std::vector<const IrValue*> denormalTests;
+    for (const IrBlock* block : program.BlockOrder()) {
+        for (const IrValue* inst : block->Instructions()) {
+            const auto idiom = idioms[inst->Id()];
+            if (idiom == FlushIdiom) {
+                if (foldable(idioms, pinned, inst->Argument(0), FlushIdiom)) denormalTests.push_back(inst->Argument(0));
+                if (foldable(idioms, pinned, inst->Argument(1), FlushIdiom)) idioms[inst->Argument(1)->Id()] = FoldedIntoIdiom;
+            } else if (idiom == IsNanIdiom && foldable(idioms, pinned, inst->Argument(0), IsNanIdiom)) {
+                idioms[inst->Argument(0)->Id()] = FoldedIntoIdiom;
+            }
+        }
+    }
+    for (const IrValue* test : denormalTests) {
+        if (idioms[test->Id()] != NoIdiom) continue;
+        idioms[test->Id()] = FoldedIntoIdiom;
+    }
+    for (const IrValue* test : denormalTests) {
+        const IrValue* exponent = test->Argument(0);
+        if (exponent->Parent() == nullptr || exponent->Id() >= count || pinned[exponent->Id()] != 0u || idioms[exponent->Id()] != NoIdiom || exponent->Uses().empty()) continue;
+        if (std::ranges::all_of(exponent->Uses(), [&](const IrValue* consumer) { return consumer->Opcode() == IrOpcode::IEqual32 && idiomOf(idioms, consumer) == FoldedIntoIdiom; })) idioms[exponent->Id()] = FoldedIntoIdiom;
+    }
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    if (flush) {
+        state.flushF32DenormalFunction = state.module.AllocateId();
+        state.module.AddName(state.flushF32DenormalFunction, "flush_f32_denormal");
+        state.module.AddFunction(spv::OpFunction, u32, state.flushF32DenormalFunction, spv::FunctionControlInlineMask, state.module.Type(spv::OpTypeFunction, u32, u32));
+        const auto bits = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionParameter, u32, bits);
+        EmitLabel(state, state.module.AllocateId());
+        const auto exponent = EmitBitwiseAnd32(state, bits, ConstantU32(state, 0x7f800000u));
+        const auto denormal = EmitIEqual32(state, exponent, ConstantU32(state, 0u));
+        const auto sign = EmitBitwiseAnd32(state, bits, ConstantU32(state, 0x80000000u));
+        state.module.AddFunction(spv::OpReturnValue, EmitSelectU32(state, denormal, sign, bits));
+        state.module.AddFunction(spv::OpFunctionEnd);
+    }
+    if (nan) {
+        state.isNanF32Function = state.module.AllocateId();
+        state.module.AddName(state.isNanF32Function, "is_nan_f32_bits");
+        state.module.AddFunction(spv::OpFunction, boolean, state.isNanF32Function, spv::FunctionControlInlineMask, state.module.Type(spv::OpTypeFunction, boolean, u32));
+        const auto bits = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionParameter, u32, bits);
+        EmitLabel(state, state.module.AllocateId());
+        const auto magnitude = EmitBitwiseAnd32(state, bits, ConstantU32(state, 0x7fffffffu));
+        state.module.AddFunction(spv::OpReturnValue, EmitUGreaterThan32(state, magnitude, ConstantU32(state, 0x7f800000u)));
+        state.module.AddFunction(spv::OpFunctionEnd);
+    }
 }
 
 void EmitControlFlow(SpirvModule& module, const IrProgram& program) {

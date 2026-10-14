@@ -1030,6 +1030,7 @@ void EmitProgram(SpirvEmitterState& state) {
     }
     DefineGetBdaPointer(state);
     DefineDot2F32F16Function(state);
+    DefineFloatIdiomFunctions(state);
     for (const IrBlock* block : program.BlockOrder()) {
         const bool needsScratch = std::any_of(block->Instructions().begin(), block->Instructions().end(), [](const IrValue* inst) {
             return inst->Opcode() == IrOpcode::SwizzleU32;
