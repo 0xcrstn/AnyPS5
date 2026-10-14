@@ -731,8 +731,9 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     auto plan = std::make_unique<RegisteredPreparation>();
     plan->codeOffset = codeOffset;
+    ShaderRecompiler::RdnaProgram decoded;
     try {
-        plan->decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+        decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
     } catch (const ShaderRecompiler::UnsupportedInstructionError& error) {
         if (deferred == nullptr) throw;
         return defer(error.what());
@@ -782,12 +783,13 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     }
     plan->swappc = {vertex.has_value(), firstUser, userCount};
     if (deferred != nullptr) {
-        if (const auto counter = ShaderRecompiler::UnresolvableSwappcTarget(plan->decoded, &plan->swappc)) {
+        if (const auto counter = ShaderRecompiler::UnresolvableSwappcTarget(decoded, &plan->swappc)) {
             char reason[96];
             std::snprintf(reason, sizeof(reason), "its s_swappc_b64 at program counter 0x%x calls a computed target", *counter);
-            if (stage != Stage::Compute || CalleePreparationDisabled() || ShaderRecompiler::FindUserDataCalls(plan->decoded, plan->swappc).empty()) return defer(reason);
+            if (stage != Stage::Compute || CalleePreparationDisabled() || ShaderRecompiler::FindUserDataCalls(decoded, plan->swappc).empty()) return defer(reason);
             static_cast<void>(defer(reason));
             plan->awaitsCallees = true;
+            plan->decoded = std::move(decoded);
         }
     }
     plan->memory = {{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
