@@ -1,5 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
@@ -69,6 +72,46 @@ void Driver::traceLabel(std::span<const std::uint32_t> packet, std::uint32_t que
     std::fprintf(stderr, "[label] %lld ms queue 0x%x %s 0x%llx:", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), queue, kind, static_cast<unsigned long long>(target));
     for (std::size_t i = 1; i < packet.size() && i < 9; ++i) std::fprintf(stderr, " %08x", packet[i]);
     std::fprintf(stderr, "\n");
+}
+
+std::string Driver::describeWait(std::span<const std::uint32_t> packet) {
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    const bool wide = opcode == 0x93;
+    if ((opcode != 0x3c && !wide) || packet.size() < (wide ? 8u : 7u) || ((packet[1] >> 4u) & 3u) != 1u) return {};
+    const auto target = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+    const std::uint64_t reference = wide ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : packet[4];
+    const std::uint64_t mask = wide ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : packet[5];
+    constexpr std::array<const char*, 8> functions{"always", "<", "<=", "==", "!=", ">=", ">", "never"};
+    char text[256];
+    std::snprintf(text, sizeof(text), "; waits for (0x%llx & 0x%llx) %s 0x%llx", static_cast<unsigned long long>(target), static_cast<unsigned long long>(mask), functions[packet[1] & 7u], static_cast<unsigned long long>(reference));
+    std::string description = text;
+    if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(target)), wide ? 8u : 4u)) {
+        const std::uint64_t value = wide ? *reinterpret_cast<const volatile std::uint64_t*>(target) : *reinterpret_cast<const volatile std::uint32_t*>(target);
+        std::snprintf(text, sizeof(text), ", value now 0x%llx", static_cast<unsigned long long>(value));
+        description += text;
+    }
+    {
+        std::lock_guard lock(labelStoresMutex);
+        if (const auto found = labelStores.find(target); found != labelStores.end()) {
+            description += ", last label stores";
+            for (const auto& store : found->second) {
+                if (store.stamp == 0) continue;
+                std::snprintf(text, sizeof(text), " 0x%x by queue %u (stamp %llu)", store.value, store.queue, static_cast<unsigned long long>(store.stamp));
+                description += text;
+            }
+        } else {
+            description += ", no label store recorded";
+        }
+    }
+    const auto& history = writeHistory();
+    const auto newest = writeCursor();
+    for (std::size_t back = 1; back <= history.size() && back <= newest; ++back) {
+        const auto record = history[(newest - back) % history.size()];
+        if (target < record.target || target >= record.target + std::max<std::uint64_t>(record.length, 4u)) continue;
+        std::snprintf(text, sizeof(text), ", last GPU write by queue %u opcode 0x%02x %zu writes ago", record.queue, record.opcode, back);
+        return description + text;
+    }
+    return description + ", no GPU write among the last 16384";
 }
 
 std::array<WriteRecord, 16384>& Driver::writeHistory() {
