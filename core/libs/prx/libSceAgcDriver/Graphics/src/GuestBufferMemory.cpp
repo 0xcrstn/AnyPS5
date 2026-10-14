@@ -816,9 +816,16 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 }
 
 const HostImport* importJoined(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
-    if (const auto* low = findImport(state, begin, begin + 1); low != nullptr && low->joined) begin = low->base;
-    if (const auto* high = findImport(state, end - 1, end); high != nullptr && high->joined) end = high->base + high->bytes;
-    auto run = joinedRun(lease, begin, end);
+    auto from = begin;
+    auto to = end;
+    if (const auto* low = findImport(state, begin, begin + 1); low != nullptr) from = low->base;
+    if (const auto* high = findImport(state, end - 1, end); high != nullptr) to = high->base + high->bytes;
+    auto run = joinedRun(lease, from, to);
+    if (run.ranges.empty() && (from != begin || to != end)) run = joinedRun(lease, begin, end);
+    else {
+        begin = from;
+        end = to;
+    }
     if (run.ranges.empty()) return nullptr;
     if (const auto failed = state.failedJoins.find(run.base); failed != state.failedJoins.end() && sameRun(failed->second, run)) return nullptr;
     return importRunAt(context, state, std::move(run), true, begin, lease, end, true);
