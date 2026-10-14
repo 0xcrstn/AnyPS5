@@ -22,6 +22,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
@@ -759,6 +760,142 @@ void verifyGuardedDescriptorSources() {
     require(storePlan->info.images.size() == 2u && storePlan->descriptorSources.size() == 1u, "guarded images: the two stores were not planned as two images of one T#");
     static_cast<void>(compileStore(1u));
     expectFailure([&] { static_cast<void>(compileStore(0u)); }, "incompatible with the static runtime image interface", "guarded images: a store of the wrong dimension behind a taken branch was accepted");
+}
+
+void verifyCaptureMemo() {
+    using namespace ShaderRecompiler;
+    const bool memo = std::getenv("APS5_NO_CAPTURE_MEMO") == nullptr;
+    constexpr std::uint32_t Format8888UNorm = 56;
+    constexpr std::uint32_t Type2D = 9;
+    struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
+    static Texture firstTexture;
+    static Texture secondTexture;
+    const auto imageAt = [&](const Texture& texture) {
+        const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
+        return std::array<std::uint32_t, 8>{static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+    };
+    const auto first = imageAt(firstTexture);
+    const auto second = imageAt(secondTexture);
+    static std::array<std::uint32_t, 4> output{};
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    const std::array<std::uint32_t, 4> outputV{static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 16u, 0xfacu};
+    struct alignas(4096) Tables {
+        std::array<std::uint32_t, 32> first{};
+        std::array<std::uint32_t, 32> second{};
+    };
+    static Tables tables;
+    const auto fill = [&](std::array<std::uint32_t, 32>& srt, const std::array<std::uint32_t, 8>& image, std::uint32_t mode) {
+        srt.fill(0u);
+        std::copy(image.begin(), image.end(), srt.begin());
+        std::copy(outputV.begin(), outputV.end(), srt.begin() + 16);
+        srt[20] = mode;
+    };
+    const auto pointerTo = [](const std::array<std::uint32_t, 32>& srt) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data())); };
+    std::array<std::uint32_t, 3> userData{static_cast<std::uint32_t>(pointerTo(tables.first)), static_cast<std::uint32_t>(pointerTo(tables.first) >> 32u), 7u};
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    const std::vector<std::uint32_t> code{0xf4000400u, 0xfa000050u, 0xf4080500u, 0xfa000020u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xbf068010u, 0xbf850006u, 0xf40c0200u, 0xfa000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x24000u, code, 0, {}};
+    request.context.waveSize = 32;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    fill(tables.first, first, 1u);
+    fill(tables.second, first, 1u);
+    const auto handle = PrepareShader(request);
+    const auto invocation = PreparedShaderInvocation::TryCreate(request, handle);
+    require(invocation.has_value(), "capture memo: the prepared shader does not match its request");
+    const auto sameCapture = [](const ResourceCapture& left, const ResourceCapture& right) {
+        const auto& a = left.snapshot;
+        const auto& b = right.snapshot;
+        return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers && a.flattenedSrt == b.flattenedSrt && a.userData == b.userData && a.uniformFill == b.uniformFill && a.srtPoison == b.srtPoison && a.nullRootReads == b.nullRootReads && left.readTrace.leaves == right.readTrace.leaves && left.readTrace.otherReads == right.readTrace.otherReads && left.userDataUse.asBase == right.userDataUse.asBase && left.userDataUse.asValue == right.userDataUse.asValue && left.userDataUse.reads == right.userDataUse.reads && left.bufferBaseWords.size() == right.bufferBaseWords.size();
+    };
+    const auto sameRegions = [](const std::vector<MemoryRegion>& left, const std::vector<MemoryRegion>& right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            if (left[i].guestAddress != right[i].guestAddress || left[i].bytes.size() != right[i].bytes.size() || std::memcmp(left[i].bytes.data(), right[i].bytes.data(), left[i].bytes.size()) != 0) return false;
+        }
+        return true;
+    };
+    struct Captured {
+        std::shared_ptr<const ResourceCapture> capture;
+        std::vector<std::uint32_t> words;
+        std::vector<std::uint64_t> addresses;
+        bool memoized = false;
+    };
+    const auto capture = [&]() {
+        const auto before = AgcDriver::ShaderMemory::MemoizedCaptures();
+        AgcDriver::ShaderMemory memory({});
+        auto prepared = PreparedShaderInvocation::TryCreate(request, handle);
+        require(prepared.has_value(), "capture memo: the prepared shader stopped matching its request");
+        Captured result{memory.Capture(*prepared)};
+        result.memoized = AgcDriver::ShaderMemory::MemoizedCaptures() == before + 1;
+        AgcDriver::ShaderMemory reference({});
+        const auto expected = reference.Capture(request);
+        require(sameCapture(*result.capture, *expected), "capture memo: the capture differs from a fresh walk of the same memory");
+        require(sameRegions(memory.Regions(), reference.Regions()), "capture memo: the captured regions differ from a fresh walk's");
+        return result;
+    };
+
+    const auto initial = capture();
+    require(!initial.memoized, "capture memo: the first capture was served from the memo");
+    const auto repeated = capture();
+    require(repeated.memoized == memo && (repeated.capture == initial.capture) == memo, "capture memo: an unchanged capture was not served as configured");
+
+    fill(tables.first, second, 1u);
+    const auto moved = capture();
+    require(!moved.memoized && moved.capture->snapshot.images.at(0).dwords[0] == second[0], "capture memo: a changed T# in guest memory was served from the memo");
+    require(capture().memoized == memo, "capture memo: the changed T# was not memoized");
+
+    fill(tables.first, second, 0u);
+    const auto skipped = capture();
+    require(!skipped.memoized && std::ranges::all_of(skipped.capture->snapshot.images.at(0).dwords, [](std::uint32_t word) { return word == 0u; }), "capture memo: a changed branch condition in guest memory was served from the memo");
+
+    fill(tables.first, first, 1u);
+    userData[0] = static_cast<std::uint32_t>(pointerTo(tables.second));
+    userData[1] = static_cast<std::uint32_t>(pointerTo(tables.second) >> 32u);
+    const auto relocated = capture();
+    require(!relocated.memoized && relocated.capture->userDataUse.reads.front().first >= pointerTo(tables.second), "capture memo: a moved SRT pointer was served from the memo");
+
+    userData[2] = 9u;
+    const auto patched = capture();
+    require(patched.memoized == memo && patched.capture->snapshot.userData.at(2) == 9u, "capture memo: an unread user word did not patch the memoized snapshot");
+    require(capture().memoized == memo, "capture memo: the patched capture was not memoized");
+
+    fill(tables.second, first, 0u);
+    const auto changedSecond = capture();
+    require(!changedSecond.memoized, "capture memo: a changed branch condition behind a moved pointer was served from the memo");
+
+    constexpr int Iterations = 20000;
+    const auto time = [&](const PreparedShaderInvocation& prepared, auto&& prepare) {
+        const auto started = std::chrono::steady_clock::now();
+        for (int i = 0; i < Iterations; ++i) {
+            prepare(i);
+            AgcDriver::ShaderMemory memory({});
+            static_cast<void>(memory.Capture(prepared));
+        }
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / Iterations;
+    };
+    fill(tables.second, first, 1u);
+    const auto stable = PreparedShaderInvocation::TryCreate(request, handle);
+    require(stable.has_value(), "capture memo: the prepared shader stopped matching its request");
+    const auto hitsBefore = AgcDriver::ShaderMemory::MemoizedCaptures();
+    const auto unchangedUs = time(*stable, [](int) {});
+    const auto served = AgcDriver::ShaderMemory::MemoizedCaptures() - hitsBefore;
+    require(memo ? served >= Iterations - 1 : served == 0, "capture memo: repeated captures were not served as configured");
+    const auto changedBefore = AgcDriver::ShaderMemory::MemoizedCaptures();
+    const auto changedUs = time(*stable, [&](int i) { fill(tables.second, i % 2 == 0 ? first : second, 1u); });
+    require(AgcDriver::ShaderMemory::MemoizedCaptures() - changedBefore <= 1u, "capture memo: captures over changed guest words were served from the memo");
+    std::cout << "Capture memo " << (memo ? "on" : "off") << ": " << unchangedUs << " us per capture over unchanged guest words, " << changedUs << " us per capture over changed guest words\n";
 }
 
 // A compute program sampling a T# loaded from a table buffer at a runtime key (a bindless image
@@ -3657,6 +3794,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--bindless") {
             verifyBindlessTable();
             std::cout << "Bindless mapping, indexing capabilities and strict validation passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--capture-memo") {
+            verifyCaptureMemo();
+            std::cout << "Capture memo serves only captures whose read user words and guest words are unchanged\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--srt-read-patching") {

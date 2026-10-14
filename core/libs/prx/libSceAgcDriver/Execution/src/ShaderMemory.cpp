@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -11,7 +12,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace AgcDriver {
@@ -52,6 +55,134 @@ struct CaptureProfile {
     std::atomic<std::uint64_t> handleHits{0};
     std::atomic<std::uint64_t> handleMisses{0};
 };
+
+struct MemoProfile {
+    std::atomic<std::uint64_t> total{0};
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> patched{0};
+    std::atomic<std::uint64_t> absent{0};
+    std::atomic<std::uint64_t> valueWords{0};
+    std::atomic<std::uint64_t> pointerWords{0};
+    std::atomic<std::uint64_t> memory{0};
+    std::atomic<std::uint64_t> replayed{0};
+    std::atomic<std::uint64_t> hitNanoseconds{0};
+    std::atomic<std::uint64_t> missNanoseconds{0};
+    std::atomic<std::uint64_t> evaluationNanoseconds{0};
+    std::atomic<std::uint64_t> pageSetupNanoseconds{0};
+    std::atomic<std::uint64_t> pageReadNanoseconds{0};
+    std::atomic<std::uint64_t> missReads{0};
+    std::atomic<std::uint64_t> missPages{0};
+    std::atomic<std::uint64_t> values{0};
+    std::atomic<std::uint64_t> laneEvaluators{0};
+    std::atomic<std::uint64_t> phis{0};
+    std::mutex reportMutex;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+MemoProfile& MemoTotals() {
+    static MemoProfile profile;
+    return profile;
+}
+
+std::atomic<std::uint64_t> memoizedCaptures{0};
+
+bool CaptureMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_CAPTURE_MEMO") == nullptr;
+    return enabled;
+}
+
+constexpr std::size_t MemoWays = 4;
+constexpr std::size_t MemoShaders = 1024;
+
+struct MemoEntry {
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    std::uint64_t shaderBase = 0;
+    std::vector<std::uint32_t> userData;
+    std::vector<ShaderMemory::RecordedAccess> accesses;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+};
+
+struct MemoShader {
+    std::array<MemoEntry, MemoWays> ways;
+    std::size_t next = 0;
+};
+
+struct MemoTable {
+    std::unordered_map<const ShaderRecompiler::SourceHandle*, MemoShader> shaders;
+    std::uint32_t depth = 0;
+};
+
+struct MemoDepth {
+    explicit MemoDepth(MemoTable& table) : table(table) { ++table.depth; }
+    ~MemoDepth() { --table.depth; }
+    MemoTable& table;
+};
+
+MemoTable& ThreadMemo() {
+    struct MemoTableStorage {};
+    return HostThreadLocal<MemoTable, MemoTableStorage>();
+}
+
+bool AllWordsRead(const ShaderRecompiler::SrtUserDataUse& use) {
+    return use.asValue == ~std::uint64_t{0};
+}
+
+bool WordRead(const ShaderRecompiler::SrtUserDataUse& use, std::size_t word) {
+    return AllWordsRead(use) || (word < ShaderRecompiler::SrtUserDataUse::TrackedWords && (((use.asBase | use.asValue) >> word) & 1u) != 0u);
+}
+
+enum class MemoMatch { Other, Exact, UnreadWords, PointerWords, ValueWords };
+
+MemoMatch MatchUserData(const MemoEntry& entry, std::uint64_t shaderBase, std::span<const std::uint32_t> userData) {
+    if (entry.capture == nullptr || entry.shaderBase != shaderBase || entry.userData.size() != userData.size()) return MemoMatch::Other;
+    const auto& use = entry.capture->userDataUse;
+    bool exact = true;
+    bool pointers = false;
+    for (std::size_t word = 0; word < userData.size(); ++word) {
+        if (entry.userData[word] == userData[word]) continue;
+        exact = false;
+        if (!WordRead(use, word)) continue;
+        if (AllWordsRead(use) || ((use.asValue >> word) & 1u) != 0u) return MemoMatch::ValueWords;
+        pointers = true;
+    }
+    if (exact) return MemoMatch::Exact;
+    return pointers ? MemoMatch::PointerWords : MemoMatch::UnreadWords;
+}
+
+double Per(std::uint64_t value, std::uint64_t count) {
+    return count != 0 ? static_cast<double>(value) / static_cast<double>(count) : 0.0;
+}
+
+void ReportMemo() {
+    auto& memo = MemoTotals();
+    std::unique_lock lock(memo.reportMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - memo.lastReport < std::chrono::seconds(10)) return;
+    memo.lastReport = now;
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+    const auto total = take(memo.total);
+    const auto hits = take(memo.hits);
+    const auto patched = take(memo.patched);
+    const auto absent = take(memo.absent);
+    const auto valueWords = take(memo.valueWords);
+    const auto pointerWords = take(memo.pointerWords);
+    const auto memory = take(memo.memory);
+    const auto replayed = take(memo.replayed);
+    const auto hitNs = take(memo.hitNanoseconds);
+    const auto missNs = take(memo.missNanoseconds);
+    const auto evaluationNs = take(memo.evaluationNanoseconds);
+    const auto setupNs = take(memo.pageSetupNanoseconds);
+    const auto pageNs = take(memo.pageReadNanoseconds);
+    const auto reads = take(memo.missReads);
+    const auto pages = take(memo.missPages);
+    const auto values = take(memo.values);
+    const auto laneEvaluators = take(memo.laneEvaluators);
+    const auto phis = take(memo.phis);
+    const auto served = hits + patched;
+    const auto misses = total > served ? total - served : 0;
+    AgcDriver::ProfilePrint_nid_no_patch("[capture-memo] (10 s) %llu prepared captures: %llu served from the memo (%llu with unread user words patched; %.1f words replayed each, %.1f us each); %llu walked (%.1f us each: SRT evaluation %.1f with page setup %.1f and page reads %.1f inside; %.1f word reads, %.2f new pages, %.1f values evaluated, %.2f lane evaluators, %.1f phis each), because: no entry %llu, read user words differ %llu (only pointer words %llu), guest words differ %llu\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(served), static_cast<unsigned long long>(patched), Per(replayed, served), Per(hitNs, served) / 1e3, static_cast<unsigned long long>(misses), Per(missNs, misses) / 1e3, Per(evaluationNs, misses) / 1e3, Per(setupNs, misses) / 1e3, Per(pageNs, misses) / 1e3, Per(reads, misses), Per(pages, misses), Per(values, misses), Per(laneEvaluators, misses), Per(phis, misses), static_cast<unsigned long long>(absent), static_cast<unsigned long long>(valueWords + pointerWords), static_cast<unsigned long long>(pointerWords), static_cast<unsigned long long>(memory));
+}
 
 constexpr std::uint64_t WordWaitNanoseconds = 50000;
 
@@ -99,18 +230,28 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
     if (found != pages.end()) return found->second;
     auto& page = pages[base];
     ++CaptureTotals().pages;
+    const bool profile = CaptureProfiled();
+    const auto setupStarted = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // A page is either mapped whole or read word by word where the guest mapped less than a page,
     // or where recorded GPU work writes into it (a whole-page read would wait for that work).
     if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
         if (WordwisePages() && pendingWrite != nullptr && pendingWrite(base, PageBytes, {}) != PendingWrite::None) {
             page.wordwise = true;
             ++CaptureTotals().pagesWordwise;
+            if (profile) pageSetupNanoseconds += NanosecondsSince(setupStarted);
             return page;
         }
-        const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (profile) pageSetupNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(started - setupStarted).count());
         GuestMemory::Read(base, std::as_writable_bytes(std::span(page.words)), sizeof(std::uint32_t));
-        if (CaptureProfiled()) CaptureTotals().pageReadNanoseconds += NanosecondsSince(started);
+        if (profile) {
+            const auto nanoseconds = NanosecondsSince(started);
+            CaptureTotals().pageReadNanoseconds += nanoseconds;
+            pageReadNanoseconds += nanoseconds;
+        }
         page.valid.set();
+    } else if (profile) {
+        pageSetupNanoseconds += NanosecondsSince(setupStarted);
     }
     return page;
 }
@@ -129,6 +270,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             if (offset < previous->second.size()) {
                 if (previous->second.size() - offset < sizeof(*value)) throw std::runtime_error("AGC driver: shader memory read crosses a snapshot boundary");
                 std::memcpy(value, previous->second.data() + offset, sizeof(*value));
+                if (self.recording != nullptr) self.recording->push_back({address, 0, *value});
                 return true;
             }
         }
@@ -198,11 +340,19 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     page.read.set(index);
     page.recent.set(index);
     *value = page.words[index];
+    if (self.recording != nullptr) self.recording->push_back({address, 0, *value});
     return true;
 }
 
 bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_t bytes) {
     auto& self = *static_cast<ShaderMemory*>(context);
+    const bool result = self.probe(address, bytes);
+    if (self.recording != nullptr) self.recording->push_back({address, bytes == 0 ? ~std::uint64_t{0} : bytes, result ? 1u : 0u});
+    return result;
+}
+
+bool ShaderMemory::probe(std::uint64_t address, std::uint64_t bytes) {
+    auto& self = *this;
     if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes) return false;
     const auto end = address + bytes;
     while (address < end) {
@@ -228,6 +378,23 @@ ShaderMemory::KnownValueCounts ShaderMemory::KnownValues() {
     return {totals.wordsKnown.load(std::memory_order_relaxed), totals.wordsKnownVerified.load(std::memory_order_relaxed), totals.wordsKnownMismatches.load(std::memory_order_relaxed)};
 }
 
+std::uint64_t ShaderMemory::MemoizedCaptures() {
+    return memoizedCaptures.load(std::memory_order_relaxed);
+}
+
+bool ShaderMemory::replay(std::span<const RecordedAccess> accesses) {
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
+    for (const auto& access : accesses) {
+        if (access.bytes == 0) {
+            std::uint32_t word = 0;
+            if (!read(this, access.address, &word) || word != access.value) return false;
+            continue;
+        }
+        if (probe(access.address, access.bytes == ~std::uint64_t{0} ? 0 : access.bytes) != (access.value != 0u)) return false;
+    }
+    return true;
+}
+
 void ShaderMemory::CountHandleMemo(bool hit) {
     if (!CaptureProfiled()) return;
     (hit ? CaptureTotals().handleHits : CaptureTotals().handleMisses).fetch_add(1, std::memory_order_relaxed);
@@ -238,7 +405,95 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
 }
 
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(const ShaderRecompiler::PreparedShaderInvocation& invocation) {
-    return capture(invocation.Request(), nullptr, &invocation);
+    auto& table = ThreadMemo();
+    if (!CaptureMemoEnabled() || invocation.Handle() == nullptr || table.depth != 0) return capture(invocation.Request(), nullptr, &invocation);
+    const MemoDepth depth(table);
+    const auto& request = invocation.Request();
+    const auto& handle = invocation.Handle();
+    const auto userData = request.context.userData;
+    const auto shaderBase = request.shader.codeAddress;
+    const bool profile = CaptureProfiled();
+    auto& memo = MemoTotals();
+    const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto found = table.shaders.find(handle.get());
+    if (found == table.shaders.end()) {
+        if (table.shaders.size() >= MemoShaders) table.shaders.clear();
+        found = table.shaders.emplace(handle.get(), MemoShader{}).first;
+    }
+    auto& shader = found->second;
+    MemoEntry* slot = nullptr;
+    auto reason = MemoMatch::Other;
+    for (auto& entry : shader.ways) {
+        if (entry.handle != handle) continue;
+        const auto match = MatchUserData(entry, shaderBase, userData);
+        if (match == MemoMatch::Exact || match == MemoMatch::UnreadWords) {
+            const auto readsBefore = profile ? entry.accesses.size() : 0;
+            if (!replay(entry.accesses)) {
+                slot = &entry;
+                reason = MemoMatch::Other;
+                if (profile) ++memo.memory;
+                break;
+            }
+            if (match == MemoMatch::UnreadWords) {
+                auto patched = std::make_shared<ShaderRecompiler::ResourceCapture>(*entry.capture);
+                std::copy_n(userData.begin(), patched->snapshot.userData.size(), patched->snapshot.userData.begin());
+                entry.capture = std::move(patched);
+                entry.userData.assign(userData.begin(), userData.end());
+            }
+            memoizedCaptures.fetch_add(1, std::memory_order_relaxed);
+            if (profile) {
+                ++memo.total;
+                ++(match == MemoMatch::Exact ? memo.hits : memo.patched);
+                memo.replayed += readsBefore;
+                memo.hitNanoseconds += NanosecondsSince(started);
+                ReportMemo();
+            }
+            return entry.capture;
+        }
+        if (match == MemoMatch::PointerWords || (match == MemoMatch::ValueWords && reason != MemoMatch::PointerWords)) reason = match;
+    }
+    if (profile && slot == nullptr) {
+        if (reason == MemoMatch::PointerWords) ++memo.pointerWords;
+        else if (reason == MemoMatch::ValueWords) ++memo.valueWords;
+        else ++memo.absent;
+    }
+    if (slot == nullptr) slot = &shader.ways[shader.next++ % MemoWays];
+    slot->capture = nullptr;
+    slot->accesses.clear();
+    const auto pagesBefore = profile ? pages.size() : 0;
+    const auto setupBefore = pageSetupNanoseconds;
+    const auto pageReadBefore = pageReadNanoseconds;
+    const auto evaluationBefore = profile ? ShaderRecompiler::ResourceMaterializer::ThreadEvaluationNanoseconds() : 0;
+    const auto countsBefore = profile ? ShaderRecompiler::ThreadSrtEvaluationCounts() : ShaderRecompiler::SrtEvaluationCounts{};
+    recording = &slot->accesses;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> result;
+    try {
+        result = capture(request, nullptr, &invocation);
+    } catch (...) {
+        recording = nullptr;
+        *slot = MemoEntry{};
+        throw;
+    }
+    recording = nullptr;
+    if (slot->handle != handle) slot->handle = handle;
+    slot->shaderBase = shaderBase;
+    slot->userData.assign(userData.begin(), userData.end());
+    slot->capture = result;
+    if (profile) {
+        ++memo.total;
+        memo.missReads += static_cast<std::uint64_t>(std::count_if(slot->accesses.begin(), slot->accesses.end(), [](const RecordedAccess& access) { return access.bytes == 0; }));
+        memo.missPages += pages.size() - pagesBefore;
+        memo.pageSetupNanoseconds += pageSetupNanoseconds - setupBefore;
+        memo.pageReadNanoseconds += pageReadNanoseconds - pageReadBefore;
+        memo.evaluationNanoseconds += ShaderRecompiler::ResourceMaterializer::ThreadEvaluationNanoseconds() - evaluationBefore;
+        const auto counts = ShaderRecompiler::ThreadSrtEvaluationCounts();
+        memo.values += counts.values - countsBefore.values;
+        memo.laneEvaluators += counts.laneEvaluators - countsBefore.laneEvaluators;
+        memo.phis += counts.phis - countsBefore.phis;
+        memo.missNanoseconds += NanosecondsSince(started);
+        ReportMemo();
+    }
+    return result;
 }
 
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation) {

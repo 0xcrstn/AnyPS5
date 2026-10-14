@@ -1,4 +1,5 @@
 #include "Optimization/ResourceMaterializer.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
@@ -33,6 +34,11 @@ std::atomic<std::uint64_t> specializationNanoseconds{0};
 bool MaterializeProfiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
+}
+
+std::uint64_t& threadEvaluationNanoseconds() {
+    struct EvaluationStorage {};
+    return HostThreadLocal<std::uint64_t, EvaluationStorage>();
 }
 
 struct DecodedImage {
@@ -1073,12 +1079,14 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
     SrtWalker walker;
     ResourceSnapshot nextSnapshot;
     std::vector<TableResolution> tables;
+    const auto evaluationStarted = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     try {
         materializeSnapshot(plan, runtime, walker, nextSnapshot, tables);
     } catch (...) {
         reportBindless();
         throw;
     }
+    if (MaterializeProfiled()) threadEvaluationNanoseconds() += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - evaluationStarted).count());
     const auto started = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     materializeTables(plan, nextSnapshot, tables);
     materializeSrtGuards(plan, nextSnapshot);
@@ -1089,6 +1097,10 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
 
 std::uint64_t ResourceMaterializer::SpecializationNanoseconds() {
     return specializationNanoseconds.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ResourceMaterializer::ThreadEvaluationNanoseconds() {
+    return threadEvaluationNanoseconds();
 }
 
 std::uint32_t ResourceMaterializer::BindlessSlots() {

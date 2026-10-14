@@ -66,6 +66,7 @@ bool Evaluator::EvaluateWide(IrValue* raw, std::uint64_t& result) {
         return false;
     }
     _cache.Insert(inst, out);
+    ++_counts.values;
     result = out;
     return true;
 }
@@ -77,6 +78,7 @@ std::uint64_t Evaluator::Float32Bits(float value) { return std::bit_cast<std::ui
 bool Evaluator::Arg(IrValue& inst, std::size_t index, std::uint64_t& result) { return EvaluateWide(inst.Argument(index), result); }
 
 bool Evaluator::EvaluatePhi(IrValue& inst, std::uint64_t& result) {
+    ++_counts.phis;
     IrValue* value = ResolveInvariantPhi(_program, &inst);
     return value != nullptr && EvaluateWide(value, result);
 }
@@ -368,7 +370,11 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
             active._nested = _nested;
             active.ReportInaccessibleReads(_inaccessible);
             active.ReportNullRootReads(_nullRoots);
-            return active.EvaluateWide(inst.Argument(0), result);
+            const bool evaluated = active.EvaluateWide(inst.Argument(0), result);
+            _counts.values += active._counts.values;
+            _counts.phis += active._counts.phis;
+            _counts.laneEvaluators += active._counts.laneEvaluators + 1u;
+            return evaluated;
         }
         case IrOpcode::BitCastU32F32:
         case IrOpcode::BitCastF32U32: return Arg(inst, 0, result);

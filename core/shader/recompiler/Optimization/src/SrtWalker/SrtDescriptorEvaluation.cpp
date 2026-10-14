@@ -37,6 +37,19 @@ bool Fail(std::string reason) {
     return false;
 }
 
+struct CountsFlush {
+    const Evaluator& first;
+    const Evaluator& second;
+    ~CountsFlush() {
+        auto& counts = ThreadEvaluationCounts();
+        for (const auto* evaluator : {&first, &second}) {
+            counts.values += evaluator->Counts().values;
+            counts.laneEvaluators += evaluator->Counts().laneEvaluators;
+            counts.phis += evaluator->Counts().phis;
+        }
+    }
+};
+
 const DescriptorSource* Source(const IrResourcePlan& program, std::uint32_t source) {
     if (source >= program.descriptorSources.size()) {
         return nullptr;
@@ -62,6 +75,7 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
     cleanRuntime.readMemory = runtime.readSpecializationMemory;
     Evaluator cleanEvaluator(program, cleanRuntime);
     Evaluator evaluator(program, runtime, cleanFlatSlots, &cleanEvaluator);
+    const CountsFlush flush{evaluator, cleanEvaluator};
     std::vector<std::uint8_t> active;
     if (evaluateFlat) {
         active.assign(program.descriptorSources.size() + program.info.images.size(), 1u);
@@ -212,6 +226,19 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
 
 const std::string& RuntimeSourceFailureReason() {
     return failureReason();
+}
+
+SrtEvaluationCounts& ThreadEvaluationCounts() {
+    struct EvaluationCountsStorage {};
+    return HostThreadLocal<SrtEvaluationCounts, EvaluationCountsStorage>();
+}
+
+}
+
+namespace ShaderRecompiler {
+
+SrtEvaluationCounts ThreadSrtEvaluationCounts() {
+    return Detail::ThreadEvaluationCounts();
 }
 
 }
