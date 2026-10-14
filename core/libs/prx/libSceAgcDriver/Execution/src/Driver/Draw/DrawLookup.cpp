@@ -75,8 +75,13 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::lock_guard cacheLock(drawCacheMutex);
             ++drawEntryCounters.lookups;
             const auto found = drawCache.find(drawKey);
-            if (found != drawCache.end()) entry = found->second;
-            else ++drawEntryCounters.absent;
+            if (found != drawCache.end()) {
+                drawSizing.Hit();
+                entry = found->second;
+            } else {
+                drawSizing.Miss(drawKey, drawCache.size(), drawCacheVariantBytes);
+                ++drawEntryCounters.absent;
+            }
         }
         if (entry != nullptr) {
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;

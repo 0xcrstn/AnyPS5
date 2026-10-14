@@ -34,15 +34,25 @@ bool Driver::insertCompare() {
     return compare;
 }
 
-std::size_t Driver::dispatchCacheEntries() {
-    static const std::size_t entries = [] {
-        const char* text = std::getenv("APS5_DISPATCH_CACHE_ENTRIES");
-        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
-        if (parsed != 0) return static_cast<std::size_t>(parsed);
-        if (stampValidate()) return std::size_t{4096};
-        return dispatchVariants() > 2 ? std::size_t{8192} : std::size_t{16384};
+Graphics::CacheSizing::Limits Driver::dispatchCacheLimits() {
+    static const Graphics::CacheSizing::Limits limits = [] {
+        const std::size_t initial = stampValidate() ? 4096 : dispatchVariants() > 2 ? 8192 : 16384;
+        return Graphics::CacheSizing::FromEnvironment("APS5_DISPATCH_CACHE", {initial, 65536, std::uint64_t{128} << 20u, true});
     }();
-    return entries;
+    return limits;
+}
+
+std::size_t Driver::dispatchCacheEntries() {
+    return dispatchCacheLimits().initialEntries;
+}
+
+void Driver::evictDispatchEntries() {
+    while (dispatchSizing.OverLimit(dispatchCache.size(), dispatchCacheVariantBytes)) {
+        const auto key = dispatchOrder.back();
+        eraseDispatchEntry(dispatchCache.find(key));
+        dispatchSizing.Evicted(key);
+        ++dispatchCacheEvictions;
+    }
 }
 
 std::uint64_t Driver::variantBytes(const DispatchVariant& variant) {

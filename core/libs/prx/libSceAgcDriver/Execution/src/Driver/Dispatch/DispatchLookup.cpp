@@ -12,7 +12,12 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
         ++entryCounters.lookups;
         const auto found = dispatchCache.find(key);
         std::shared_ptr<DispatchEntry> entry = found != dispatchCache.end() ? found->second : nullptr;
-        if (entry == nullptr) ++entryCounters.absent;
+        if (entry == nullptr) {
+            ++entryCounters.absent;
+            dispatchSizing.Miss(key, dispatchCache.size(), dispatchCacheVariantBytes);
+        } else {
+            dispatchSizing.Hit();
+        }
         if (validateUnlocked) cacheLock.unlock();
         phaseTiming.Phase(PhaseLookup);
         if (entry != nullptr) {

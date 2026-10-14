@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CacheSizing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
@@ -99,6 +100,10 @@ private:
     static std::size_t dispatchVariants();
     static bool insertCompare();
     static std::size_t dispatchCacheEntries();
+    static Graphics::CacheSizing::Limits dispatchCacheLimits();
+    static Graphics::CacheSizing::Limits drawCacheLimits();
+    void evictDispatchEntries();
+    void evictDrawEntries();
     static std::uint64_t variantBytes(const DispatchVariant& variant);
     void accountVariant(const DispatchVariant& variant, bool added);
     void eraseDispatchEntry(std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>>::iterator it);
@@ -311,6 +316,7 @@ private:
 
     std::uint64_t dispatchCacheVariants = 0;
     std::uint64_t dispatchCacheVariantBytes = 0;
+    Graphics::CacheSizing dispatchSizing{dispatchCacheLimits()};
 
     EntryCounters entryCounters;
 
@@ -331,6 +337,7 @@ private:
     std::mutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     std::optional<DrawKeySightings> drawKeySightings;
+    Graphics::CacheSizing drawSizing{drawCacheLimits()};
 
     DrawEntryCounters drawEntryCounters;
 
