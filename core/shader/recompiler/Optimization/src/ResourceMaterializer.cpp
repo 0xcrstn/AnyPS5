@@ -493,7 +493,11 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
             descriptor.dwordCount = 8u;
         }
         if (!validImageDescriptor(descriptor, image.r128) && !nullImageDescriptor(descriptor)) {
-            throw std::runtime_error("runtime image descriptor is invalid");
+            if (!image.optionalDescriptor) {
+                throw std::runtime_error("runtime image descriptor is invalid");
+            }
+            descriptor = DescriptorValue{};
+            descriptor.dwordCount = 8u;
         }
         snapshot.images[i] = descriptor;
     }

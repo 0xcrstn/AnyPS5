@@ -51,6 +51,7 @@ struct MemoryInfo {
     bool coherent = false;
     bool gpuDescriptor = false;
     bool flushDenormals = false;
+    bool descriptorWebArm = false;
 
     bool operator==(const MemoryInfo& other) const = default;
 };

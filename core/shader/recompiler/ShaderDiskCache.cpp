@@ -572,6 +572,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(image.flatVolumeCompatible);
         out.Value(image.flatLineCompatible);
         out.Value(image.foldTexelOffsetsOnly);
+        out.Value(image.optionalDescriptor);
         out.Value(image.byElements);
         out.Value(image.byComponents);
         out.Value(image.packedFormat);
@@ -672,6 +673,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(image.flatVolumeCompatible);
         in.Value(image.flatLineCompatible);
         in.Value(image.foldTexelOffsetsOnly);
+        in.Value(image.optionalDescriptor);
         in.Value(image.byElements);
         in.Value(image.byComponents);
         in.Value(image.packedFormat);
