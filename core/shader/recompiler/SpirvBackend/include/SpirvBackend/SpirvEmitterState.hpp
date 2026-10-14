@@ -126,6 +126,10 @@ struct SpirvEmitterState {
     bool nativeF16ModesEmitted = false;
     bool f16DenormPreserveEmitted = false;
     std::uint32_t dot2F32F16Function = 0;
+    std::vector<std::uint8_t> floatIdioms;
+    std::uint32_t flushF32DenormalFunction = 0;
+    std::uint32_t isNanF32Function = 0;
+    std::map<std::vector<std::uint64_t>, std::uint32_t> outlinedFunctions;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};
     std::unordered_map<const IrValue*, std::pair<std::uint32_t, std::uint32_t>> bdaGroupedLoads;
