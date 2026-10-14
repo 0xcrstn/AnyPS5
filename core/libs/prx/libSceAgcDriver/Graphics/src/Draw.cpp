@@ -494,7 +494,7 @@ void reportRecordParts(const DrawProfile& profile) {
     const auto& bindings = profile.bindings;
     double totalUs = 0;
     for (const auto us : profile.recordUs) totalUs += us;
-    char line[1024];
+    char line[1536];
     int n = std::snprintf(line, sizeof(line), "[draw-record] %llu recorded draws (10 s), us per draw: total %.1f,", static_cast<unsigned long long>(profile.recordDraws), totalUs / draws);
     for (std::size_t i = 0; i < RecordPartCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.1f", RecordPartNames[i], profile.recordUs[i] / draws);
@@ -502,7 +502,7 @@ void reportRecordParts(const DrawProfile& profile) {
     }
     if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) {
         const auto snapshotDraws = profile.bindingDraws != 0 ? static_cast<double>(profile.bindingDraws) : 1.0;
-        std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw), %llu skipped, %llu descriptor writes; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
+        std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw; %llu copies limited to the read ranges, %.1f KiB left uncopied per such draw), %llu skipped, %llu descriptor writes; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.limited), static_cast<double>(bindings.uncopiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
     }
     std::fprintf(stderr, "%s\n", line);
 }
@@ -549,6 +549,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         profile.bindings.skipped += bindings.skipped;
         profile.bindings.copiedBytes += bindings.copiedBytes;
         profile.bindings.descriptorWrites += bindings.descriptorWrites;
+        profile.bindings.limited += bindings.limited;
+        profile.bindings.uncopiedBytes += bindings.uncopiedBytes;
         profile.bindings.checkUs += bindings.checkUs;
         profile.bindings.collectUs += bindings.collectUs;
         profile.bindings.lookupUs += bindings.lookupUs;

@@ -1,6 +1,7 @@
 #ifndef CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
+#include "BufferReadRanges.hpp"
 #include "RuntimeAbi.hpp"
 #include "PipelineSpecialization.hpp"
 #include <array>
@@ -390,6 +391,7 @@ struct DescriptorBinding {
     std::vector<bool> imageUnnormalizedBaseLevel;
     std::vector<std::uint32_t> imageSamplers;
     std::vector<bool> bufferRead;
+    std::vector<BufferReadRanges> bufferReadRanges;
 };
 
 struct VertexAttribute {

@@ -77,13 +77,13 @@ namespace ShaderRecompiler::ShaderDiskCache {
 static_assert(sizeof(CompiledShaderArtifact) == 200, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 112, "ShaderInvocation changed: update the invocation encoder");
 static_assert(sizeof(RecompileResult) == 320, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 568, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 592, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
 static_assert(sizeof(CompiledShaderInfo) == 344, "CompiledShaderInfo changed: update the info encoder");
 static_assert(sizeof(ShaderInfo) == 232, "ShaderInfo changed: update the info encoder");
-static_assert(sizeof(BufferResource) == 32, "BufferResource changed: update the info encoder");
+static_assert(sizeof(BufferResource) == 64, "BufferResource changed: update the info encoder");
 static_assert(sizeof(ImageResource) == 120, "ImageResource changed: update the info encoder");
 static_assert(sizeof(SamplerResource) == 20, "SamplerResource changed: update the info encoder");
 static_assert(sizeof(SampledResourcePair) == 12, "SampledResourcePair changed: update the info encoder");
@@ -247,6 +247,26 @@ private:
     bool ok = true;
 };
 
+void encodeReadRanges(Writer& writer, const BufferReadRanges& ranges) {
+    writer.Value(ranges.bounded);
+    writer.List(ranges.ranges, [](Writer& out, const BufferReadRange& range) {
+        out.Value(range.firstIndex);
+        out.Value(range.lastIndex);
+        out.Value(range.begin);
+        out.Value(range.end);
+    });
+}
+
+void decodeReadRanges(Reader& reader, BufferReadRanges& ranges) {
+    reader.Value(ranges.bounded);
+    reader.List(ranges.ranges, 24, [](Reader& in, BufferReadRange& range) {
+        in.Value(range.firstIndex);
+        in.Value(range.lastIndex);
+        in.Value(range.begin);
+        in.Value(range.end);
+    });
+}
+
 void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Value(binding.kind);
     writer.Value(binding.role);
@@ -270,6 +290,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.samplerIntegerBorder);
     writer.Values(std::span<const std::uint32_t>(binding.imageSamplers));
     writer.Flags(binding.bufferRead);
+    writer.List(binding.bufferReadRanges, [](Writer& out, const BufferReadRanges& ranges) { encodeReadRanges(out, ranges); });
 }
 
 void decodeBinding(Reader& reader, DescriptorBinding& binding) {
@@ -296,6 +317,7 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.samplerIntegerBorder);
     reader.Values(binding.imageSamplers);
     reader.Flags(binding.bufferRead);
+    reader.List(binding.bufferReadRanges, 9, [](Reader& in, BufferReadRanges& ranges) { decodeReadRanges(in, ranges); });
 }
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
@@ -476,6 +498,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(buffer.formattedReadMask);
         out.Value(buffer.scalar);
         out.Value(buffer.typedAlignment);
+        encodeReadRanges(out, buffer.readRanges);
     });
     writer.List(info.images, [](Writer& out, const ImageResource& image) {
         out.Value(image.source);
@@ -572,7 +595,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
     auto& info = compiled.info;
     reader.Value(info.scratchDwords);
     reader.Value(info.sharedMemoryBytes);
-    reader.List(info.buffers, 27, [](Reader& in, BufferResource& buffer) {
+    reader.List(info.buffers, 36, [](Reader& in, BufferResource& buffer) {
         in.Value(buffer.source);
         in.Value(buffer.firstUsePc);
         in.Value(buffer.maxByteExtent);
@@ -585,6 +608,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(buffer.formattedReadMask);
         in.Value(buffer.scalar);
         in.Value(buffer.typedAlignment);
+        decodeReadRanges(in, buffer.readRanges);
     });
     reader.List(info.images, 75, [](Reader& in, ImageResource& image) {
         in.Value(image.source);

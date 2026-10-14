@@ -1,4 +1,5 @@
 #include "Optimization/ResourceTracker.hpp"
+#include "Optimization/BufferReadAnalysis.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
@@ -1185,6 +1186,7 @@ private:
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
             if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");
+            m_reads.Note(m_info.buffers[resource].readRanges, inst, memory);
             AddMemoryPatch(memoryIndex, resource, 0u, false);
             memory.gpuDescriptor = false;
             m_info.usesFaultBuffer = m_info.usesFaultBuffer || access == BufferAccess::Atomic;
@@ -1476,6 +1478,7 @@ private:
                 }
                 if (alias) {
                     buffer.imageAlias = image;
+                    buffer.readRanges.Unbound();
                     break;
                 }
             }
@@ -1485,6 +1488,7 @@ private:
     IrProgram& m_program;
     ShaderInfo m_info;
     IrBuilder m_builder;
+    BufferReadAnalysis m_reads;
     std::vector<DescriptorSource> m_sources;
     std::vector<std::vector<std::uint32_t>> m_blockSources;
     std::vector<std::vector<std::uint32_t>> m_blockImages;
