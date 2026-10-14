@@ -1174,6 +1174,10 @@ public:
         enqueue({std::move(key), nullptr, std::move(plan), {}});
     }
 
+    void StoreFile(std::filesystem::path path, std::vector<std::byte> file) {
+        enqueue({{}, nullptr, nullptr, {}, std::move(path), std::move(file)});
+    }
+
     void Flush() {
         std::unique_lock lock(mutex);
         idle.wait(lock, [&] { return jobs.empty() && !writing; });
@@ -1203,6 +1207,8 @@ private:
         std::shared_ptr<const CompiledVariant> variant;
         std::shared_ptr<const IrResourcePlan> plan;
         std::function<void()> stored;
+        std::filesystem::path path;
+        std::vector<std::byte> file;
     };
 
     template<typename TDecode>
@@ -1270,6 +1276,17 @@ private:
     }
 
     void write(const Job& job) {
+        if (!job.path.empty()) {
+            std::error_code error;
+            std::filesystem::create_directories(job.path.parent_path(), error);
+            if (!job.file.empty() && WriteFileAtomically(job.path, job.file)) {
+                bytesWritten.fetch_add(job.file.size(), std::memory_order_relaxed);
+                return;
+            }
+            const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
+            if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", job.path.string().c_str());
+            return;
+        }
         const auto file = job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : EncodeEntry(job.key, *job.variant);
         if (!file.empty() && WriteFileAtomically(directory / EntryName(job.key), file)) {
             (job.plan != nullptr ? planWrites : writes).fetch_add(1, std::memory_order_relaxed);
@@ -1509,6 +1526,97 @@ void Flush() {
 
 Counters Totals() {
     return store().Totals();
+}
+
+namespace {
+
+constexpr std::uint32_t UserDataCalleeEntryKind = 0x4c4c4143u;
+constexpr std::size_t UserDataCalleeWordLimit = 16384u;
+constexpr std::size_t UserDataCalleeFileLimit = 4096u;
+
+std::vector<std::byte> userDataCalleeKey(const UserDataCallee& callee) {
+    std::vector<std::byte> key;
+    Writer writer(key);
+    writer.Value(FileMagic);
+    writer.Value(FormatVersion);
+    writer.Value(SourceVersion());
+    writer.Value(UserDataCalleeEntryKind);
+    writer.Value(callee.userDataRegister);
+    writer.Value(callee.linkRegister);
+    writer.Values(std::span<const std::uint32_t>(callee.code));
+    return key;
+}
+
+}
+
+std::vector<std::byte> EncodeUserDataCallee(const UserDataCallee& callee) {
+    if (callee.code.empty() || callee.code.size() > UserDataCalleeWordLimit) return {};
+    return wrapEntry(userDataCalleeKey(callee), {});
+}
+
+std::optional<UserDataCallee> DecodeUserDataCallee(std::span<const std::byte> file) {
+    if (file.size() < sizeof(FileHeader)) return std::nullopt;
+    FileHeader header;
+    std::memcpy(&header, file.data(), sizeof(header));
+    if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != SourceVersion()) return std::nullopt;
+    const auto key = file.subspan(sizeof(header));
+    if (header.keyBytes != key.size() || header.payloadBytes != 0u || header.keyHash != HashBytes(key) || header.payloadHash != HashBytes(std::span<const std::byte>{})) return std::nullopt;
+    Reader reader(key);
+    if (reader.Get<std::uint32_t>() != FileMagic || reader.Get<std::uint32_t>() != FormatVersion || reader.Get<std::uint64_t>() != SourceVersion() || reader.Get<std::uint32_t>() != UserDataCalleeEntryKind) return std::nullopt;
+    UserDataCallee callee;
+    reader.Value(callee.userDataRegister);
+    reader.Value(callee.linkRegister);
+    reader.Values(callee.code);
+    if (!reader.Done() || callee.code.empty() || callee.code.size() > UserDataCalleeWordLimit) return std::nullopt;
+    return callee;
+}
+
+std::string UserDataCalleeName(const UserDataCallee& callee) {
+    return EntryName(userDataCalleeKey(callee));
+}
+
+std::filesystem::path UserDataCalleeDirectory() {
+    auto& instance = store();
+    return instance.Enabled() ? instance.Directory() / "user-data-callees" : std::filesystem::path{};
+}
+
+void StoreUserDataCallee(const UserDataCallee& callee) {
+    auto& instance = store();
+    if (!instance.Enabled()) return;
+    auto file = EncodeUserDataCallee(callee);
+    if (file.empty()) return;
+    instance.StoreFile(UserDataCalleeDirectory() / UserDataCalleeName(callee), std::move(file));
+}
+
+std::vector<UserDataCallee> LoadUserDataCallees() {
+    const auto directory = UserDataCalleeDirectory();
+    if (directory.empty()) return {};
+    struct Found {
+        std::filesystem::file_time_type written;
+        std::string name;
+        UserDataCallee callee;
+    };
+    std::vector<Found> found;
+    std::vector<std::byte> bytes;
+    std::error_code error;
+    std::size_t files = 0;
+    for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end && files < UserDataCalleeFileLimit; it.increment(error)) {
+        if (it->path().extension() != ".bin") continue;
+        ++files;
+        if (!ReadWholeFile(it->path(), bytes)) continue;
+        auto callee = DecodeUserDataCallee(bytes);
+        auto name = it->path().filename().string();
+        if (!callee.has_value() || UserDataCalleeName(*callee) != name) continue;
+        std::error_code timeError;
+        const auto written = std::filesystem::last_write_time(it->path(), timeError);
+        if (timeError) continue;
+        found.push_back({written, std::move(name), std::move(*callee)});
+    }
+    std::ranges::sort(found, [](const Found& left, const Found& right) { return left.written != right.written ? left.written < right.written : left.name < right.name; });
+    std::vector<UserDataCallee> callees;
+    callees.reserve(found.size());
+    for (auto& entry : found) callees.push_back(std::move(entry.callee));
+    return callees;
 }
 
 }

@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "CompiledVariant.hpp"
+#include "ShaderDiskCache.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
@@ -510,6 +511,9 @@ std::vector<std::uint32_t> ReadUserDataCallee(std::uint64_t address, std::uint32
 
 void NoteUserDataCallees(std::uint64_t caller, std::span<const ShaderRecompiler::UserDataCall> calls, std::span<const std::vector<std::uint32_t>> callees);
 
+std::atomic<std::uint64_t> calleePreparationsAhead{0};
+std::atomic<std::uint64_t> calleePreparationsAtUse{0};
+
 bool CalleePreparationDisabled() {
     static const bool disabled = std::getenv("APS5_NO_CALLEE_PREPARE") != nullptr;
     return disabled;
@@ -567,6 +571,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         if (auto invocation = find()) return std::move(*invocation);
     }
     ReportPreparedAtUse(snapshot, source);
+    if (!linked.empty()) calleePreparationsAtUse.fetch_add(1, std::memory_order_relaxed);
     auto handle = PrepareShaderWithDiagnostics(source);
     invocationRequest = source;
     invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
@@ -1098,18 +1103,42 @@ struct CalleeWaiter {
     std::vector<std::vector<std::uint32_t>> linked;
 };
 
+struct KnownCallee {
+    std::vector<std::uint32_t> code;
+    bool linkedThisRun = false;
+};
+
 struct UserDataCallees {
     std::mutex mutex;
-    std::map<std::pair<std::uint32_t, std::uint32_t>, std::vector<std::vector<std::uint32_t>>> known;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::vector<KnownCallee>> known;
     std::vector<CalleeWaiter> waiters;
 };
 
-UserDataCallees& KnownUserDataCallees() {
-    static auto* callees = new UserDataCallees();
-    return *callees;
+constexpr std::size_t MaxCalleesPerRegisters = 4;
+
+bool PersistedCallee(const ShaderRecompiler::ShaderDiskCache::UserDataCallee& callee) {
+    try {
+        return ShaderRecompiler::UserDataCalleeLength(callee.code, callee.linkRegister) == callee.code.size();
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
-constexpr std::size_t MaxCalleesPerRegisters = 4;
+UserDataCallees& KnownUserDataCallees() {
+    static auto* callees = [] {
+        auto* created = new UserDataCallees();
+        if (CalleePreparationDisabled()) return created;
+        for (auto& callee : ShaderRecompiler::ShaderDiskCache::LoadUserDataCallees()) {
+            if (!PersistedCallee(callee)) continue;
+            auto& known = created->known[{callee.userDataRegister, callee.linkRegister}];
+            if (std::ranges::any_of(known, [&](const KnownCallee& entry) { return entry.code == callee.code; })) continue;
+            if (known.size() == MaxCalleesPerRegisters) known.erase(known.begin());
+            known.push_back({std::move(callee.code), false});
+        }
+        return created;
+    }();
+    return *callees;
+}
 
 void PrepareWithKnownCallees(UserDataCallees& state, CalleeWaiter& waiter, std::uint64_t caller) {
     const auto snapshot = waiter.snapshot.lock();
@@ -1117,8 +1146,8 @@ void PrepareWithKnownCallees(UserDataCallees& state, CalleeWaiter& waiter, std::
     std::vector<std::vector<std::uint32_t>> callees;
     for (const auto& call : waiter.calls) {
         const auto found = state.known.find({call.userDataRegister, call.linkRegister});
-        if (found == state.known.end()) return;
-        callees.push_back(found->second.back());
+        if (found == state.known.end() || found->second.empty()) return;
+        callees.push_back(found->second.back().code);
     }
     auto linked = ShaderRecompiler::LinkUserDataCalls(waiter.plan->decoded, waiter.calls, callees);
     if (std::ranges::find(waiter.linked, linked) != waiter.linked.end()) return;
@@ -1139,6 +1168,7 @@ void PrepareWithKnownCallees(UserDataCallees& state, CalleeWaiter& waiter, std::
             linkedPlan.request->shader.code = *code;
             linkedPlan.prebuildDevice = nullptr;
             entries = PrepareRegistered(linkedPlan);
+            calleePreparationsAhead.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception& error) {
             APS5_LOG_ERR("Shader 0x%llx could not be prepared with a callee another dispatch linked: %s", static_cast<unsigned long long>(snapshot->codeAddress), error.what());
         }
@@ -1167,8 +1197,20 @@ void NoteUserDataCallees(std::uint64_t caller, std::span<const ShaderRecompiler:
     bool added = false;
     for (std::size_t index = 0; index < calls.size() && index < callees.size(); ++index) {
         auto& known = state.known[{calls[index].userDataRegister, calls[index].linkRegister}];
-        if (std::ranges::find(known, callees[index]) != known.end() || known.size() == MaxCalleesPerRegisters) continue;
-        known.push_back(callees[index]);
+        const auto found = std::ranges::find_if(known, [&](const KnownCallee& entry) { return entry.code == callees[index]; });
+        if (found != known.end()) {
+            if (found->linkedThisRun) continue;
+            found->linkedThisRun = true;
+            std::rotate(found, std::next(found), known.end());
+        } else {
+            if (known.size() == MaxCalleesPerRegisters) {
+                const auto stale = std::ranges::find_if(known, [](const KnownCallee& entry) { return !entry.linkedThisRun; });
+                if (stale == known.end()) continue;
+                known.erase(stale);
+            }
+            known.push_back({callees[index], true});
+        }
+        ShaderRecompiler::ShaderDiskCache::StoreUserDataCallee({calls[index].userDataRegister, calls[index].linkRegister, callees[index]});
         added = true;
     }
     if (!added) return;
@@ -1180,6 +1222,10 @@ void NoteUserDataCallees(std::uint64_t caller, std::span<const ShaderRecompiler:
 
 void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared, bool behind) {
     RegistrationPreparePool::Instance().Submit(std::move(task), prepared, behind);
+}
+
+UserDataCalleePreparations CountUserDataCalleePreparations() {
+    return {calleePreparationsAhead.load(std::memory_order_relaxed), calleePreparationsAtUse.load(std::memory_order_relaxed)};
 }
 
 void PrioritizeRegistrationPreparation(PreparedShaders& prepared) {

@@ -245,6 +245,8 @@ function(add_shader_recompiler target runtimeTarget)
             RuntimeAbi::HeapCapacity
             SetDebugProbeActive
             ShaderCacheDirectory
+            ShaderDiskCache::LoadUserDataCallees
+            ShaderDiskCache::StoreUserDataCallee
             SrgbDecodeBit
             SrgbUnormFormat
             ThreadOwned
