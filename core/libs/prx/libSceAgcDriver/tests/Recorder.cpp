@@ -5869,6 +5869,109 @@ void atomicViewTests(const Device& device, Recorder& recorder) {
     }
 }
 
+bool drawInputTwinTests(const Device& device, Recorder& recorder) {
+    if (!device.Graphics()) return false;
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 3;
+    void* watched = AllocateWatched(bytes, unit);
+    std::vector<std::byte> fallback(watched == nullptr ? bytes + unit : 0);
+    auto* block = watched != nullptr ? static_cast<std::byte*>(watched) : reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(fallback.data()) + unit - 1) & ~(unit - 1));
+    struct Release {
+        void* watched;
+        ~Release() { if (watched != nullptr) ReleaseWatched(watched, bytes); }
+    } release{watched};
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+    } cleanup{context, recorder, block};
+    const auto shader = [](auto& words, std::uint64_t variant) {
+        ShaderRecompiler::RecompileResult program;
+        program.spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
+        program.variantId = variant;
+        return program;
+    };
+    auto vertex = shader(VERTEXRANGE_VERT_SPV, 203);
+    auto pixel = shader(COVER_FRAG_SPV, 204);
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.color = {address, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {64, 64};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, 64, 64, -64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    const auto vertices = address + unit;
+    const auto indices = address + 2 * unit;
+    const std::array<float, 4> offset{0.5f, 0.0f, 0.0f, 0.0f};
+    for (std::size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex) AgcDriver::GuestMemory::Write(vertices + vertexIndex * 16, std::as_bytes(std::span(offset)));
+    const std::array<std::uint16_t, 3> indexWords{0, 1, 2};
+    AgcDriver::GuestMemory::Write(indices, std::as_bytes(std::span(indexWords)));
+    vertex.vertexAttributes = {ShaderRecompiler::VertexAttribute{0, 4, {{static_cast<std::uint32_t>(vertices), static_cast<std::uint32_t>(vertices >> 32u) | (16u << 16u), 3u, 77u << 12u}}, 0}};
+    const auto check = [&](const char* what) {
+        std::vector<std::byte> texels(64 * 64 * 4);
+        ReadColorTarget(state.color, texels);
+        for (std::size_t y = 0; y < 64; ++y) {
+            for (std::size_t x = 0; x < 64; ++x) {
+                const auto expected = x < 16 ? std::byte{0} : std::byte{255};
+                Require(texels[(y * 64 + x) * 4] == expected, what);
+            }
+        }
+    };
+    const auto clear = [&] {
+        std::vector<std::byte> cleared(unit);
+        AgcDriver::GuestMemory::Write(address, cleared);
+    };
+    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
+    auto indexed = triangle;
+    indexed.indexed = true;
+    indexed.indexSize = 2;
+    indexed.indexAddress = indices;
+    const auto before = Recorder::TwinCounters();
+    for (int round = 0; round < 3; ++round) {
+        clear();
+        Draw(context, state, triangle, shaders);
+        WaitForOptimizedPipelines(context.device);
+        check("a draw reusing a copied vertex range read other bytes");
+        clear();
+        Draw(context, state, indexed, shaders);
+        WaitForOptimizedPipelines(context.device);
+        check("an indexed draw reusing copied vertex and index ranges read other bytes");
+    }
+    const auto after = Recorder::TwinCounters();
+    std::cout << "draw input twins: " << (after.bound - before.bound) << " bindings, " << (after.made - before.made) << " made" << (std::getenv("APS5_SYNC_DRAWS") == nullptr ? "" : " (synchronous draws)") << '\n';
+    Require(std::getenv("APS5_SYNC_DRAWS") != nullptr || !Recorder::SnapshotTwinsEnabled() || after.bound > before.bound, "recorded draws reusing copied inputs bound no twin");
+    Require(std::getenv("APS5_SYNC_DRAWS") == nullptr || after.bound == before.bound, "a synchronous draw bound a twin its own command buffer does not fill");
+    return true;
+}
+
 bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool imported) {
     if (!device.Graphics() || (imported && device.GetContext().hostImportAlignment == 0)) return false;
     constexpr std::size_t unit = 65536;
@@ -6712,6 +6815,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--parked-import-unmap-only") {
             gpu.unlock();
             parkedImportUnmapTests(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-input-twins-only") {
+            if (!drawInputTwinTests(device, recorder)) return 77;
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--snapshot-twins-only") {
