@@ -151,7 +151,42 @@ void DrawIndices() {
     auto& divided = fixture.builder.Emit(IrOpcode::UDiv32, IrType::U32, {&vertex, &fixture.builder.Constant(3u)});
     BufferReadRanges halved;
     analysis.Note(halved, fixture.Load(IrOpcode::LoadBufferU32, divided, fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 1u));
-    Require(halved.bounded && halved.ranges.size() == 1u && halved.ranges[0].lastIndex == BufferReadRanges::AnyIndex && halved.ranges[0].indexSource == BufferIndexSource::None && halved.ranges[0].indexOrigin == BufferIndexOrigin::VertexIndex, "a load at index vertex / 3, which is not affine, was not marked as an unbounded index from the vertex id");
+    Require(halved.bounded && halved.ranges.size() == 1u && halved.ranges[0].indexSource == BufferIndexSource::Expression && halved.ranges[0].indexExpression == std::vector<BufferIndexNode>{{BufferIndexOp::VertexIndex, 0u, 0u, 0u, 0u}, {BufferIndexOp::Divide, 0u, 0u, 3u, 0u}}, "a load at index vertex / 3 was not recorded as that expression");
+    BufferIndexInputs inputs{300u, 599u, 0u, 0u};
+    const auto third = EvaluateBufferIndex(halved.ranges[0].indexExpression, inputs);
+    Require(third && third->first == 100u && third->second == 199u, "vertex / 3 over vertices 300 to 599 does not give records 100 to 199");
+    auto& reciprocal = fixture.builder.Emit(IrOpcode::UMulHi, IrType::U32, {&vertex, &fixture.builder.Constant(0xaaaaaaabu)});
+    auto& magic = fixture.builder.ShiftRightLogical(reciprocal, fixture.builder.Constant(1u));
+    BufferReadRanges multiplied;
+    analysis.Note(multiplied, fixture.Load(IrOpcode::LoadBufferU32, magic, fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 1u));
+    Require(multiplied.bounded && multiplied.ranges.size() == 1u && multiplied.ranges[0].indexSource == BufferIndexSource::Expression, "a load at index mulhi(vertex, 0xaaaaaaab) >> 1 was not recorded as an expression");
+    const auto magicThird = EvaluateBufferIndex(multiplied.ranges[0].indexExpression, inputs);
+    Require(magicThird && magicThird->first == 100u && magicThird->second == 199u, "mulhi(vertex, 0xaaaaaaab) >> 1 over vertices 300 to 599 does not give records 100 to 199");
+    auto& fold = fixture.builder.ISub(vertex, fixture.builder.GetUserData(static_cast<ScalarReg>(12)));
+    auto& clamped = fixture.builder.Emit(IrOpcode::UMin32, IrType::U32, {&fold, &fixture.builder.Constant(1000u)});
+    BufferReadRanges folded;
+    analysis.Note(folded, fixture.Load(IrOpcode::LoadBufferU32, clamped, fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 1u));
+    Require(folded.bounded && folded.ranges.size() == 1u && folded.ranges[0].indexSource == BufferIndexSource::Expression, "a load at index min(vertex - user word, 1000) was not recorded as an expression");
+    BufferIndexInputs foldedInputs{5000u, 5100u, 0u, 0u, 12, 4990u, -1, 0u};
+    const auto foldedRange = EvaluateBufferIndex(folded.ranges[0].indexExpression, foldedInputs);
+    Require(foldedRange && foldedRange->first == 10u && foldedRange->second == 110u, "min(vertex - folded base vertex, 1000) over vertices 5000 to 5100 with base 4990 does not give records 10 to 110");
+    foldedInputs.vertexFoldSgpr = 13;
+    Require(!EvaluateBufferIndex(folded.ranges[0].indexExpression, foldedInputs), "a user word other than the folded vertex offset was taken as known at the draw");
+    auto& extracted = fixture.builder.Emit(IrOpcode::BitFieldUExtract, IrType::U32, {&vertex, &fixture.builder.Constant(2u), &fixture.builder.Constant(4u)});
+    BufferReadRanges field;
+    analysis.Note(field, fixture.Load(IrOpcode::LoadBufferU32, extracted, fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 1u));
+    const auto fieldRange = EvaluateBufferIndex(field.ranges.front().indexExpression, BufferIndexInputs{16u, 23u, 0u, 0u});
+    Require(fieldRange && fieldRange->first == 4u && fieldRange->second == 5u, "bits 2 to 5 of vertices 16 to 23 do not give records 4 to 5");
+    const auto wrappedField = EvaluateBufferIndex(field.ranges.front().indexExpression, BufferIndexInputs{60u, 70u, 0u, 0u});
+    Require(wrappedField && wrappedField->first == 0u && wrappedField->second == 15u, "bits 2 to 5 of vertices crossing a 64 boundary do not give the whole field");
+    auto& remainder = fixture.builder.ISub(vertex, fixture.builder.IMul(fixture.builder.Emit(IrOpcode::UDiv32, IrType::U32, {&vertex, &fixture.builder.Constant(3u)}), fixture.builder.Constant(3u)));
+    BufferReadRanges modulo;
+    analysis.Note(modulo, fixture.Load(IrOpcode::LoadBufferU32, remainder, fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 1u));
+    Require(modulo.ranges.front().indexSource == BufferIndexSource::Expression && !EvaluateBufferIndex(modulo.ranges.front().indexExpression, inputs), "vertex - (vertex / 3) * 3, which interval arithmetic cannot bound below, was given a range");
+    auto& mixed = fixture.builder.BitwiseXor(vertex, fixture.builder.Constant(5u));
+    BufferReadRanges blocked;
+    analysis.Note(blocked, fixture.Load(IrOpcode::LoadBufferU32, mixed, fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 1u));
+    Require(blocked.ranges.front().lastIndex == BufferReadRanges::AnyIndex && blocked.ranges.front().indexOrigin == BufferIndexOrigin::VertexIndex && blocked.ranges.front().blockingOpcode == static_cast<std::uint16_t>(IrOpcode::BitwiseXor32), "an index stopped by an exclusive or did not name that step");
 }
 
 void Collapse() {

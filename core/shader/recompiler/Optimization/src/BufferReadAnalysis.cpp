@@ -159,6 +159,117 @@ std::optional<BufferReadAnalysis::Affine> BufferReadAnalysis::AffineOf(const IrV
     }
 }
 
+std::optional<std::uint8_t> BufferReadAnalysis::BuildIndex(const IrValue* value, std::vector<BufferIndexNode>& nodes, std::uint16_t& blocking, std::uint32_t depth) {
+    if (value == nullptr) return std::nullopt;
+    value = value->Resolve();
+    if (value == nullptr) return std::nullopt;
+    const auto push = [&](BufferIndexNode node) -> std::optional<std::uint8_t> {
+        if (nodes.size() >= MaxIndexNodes) return std::nullopt;
+        nodes.push_back(node);
+        return static_cast<std::uint8_t>(nodes.size() - 1u);
+    };
+    const auto plain = Of(value);
+    if (plain && (plain->low == plain->high || (OriginOf(value) != BufferIndexOrigin::VertexIndex && OriginOf(value) != BufferIndexOrigin::InstanceIndex))) return push({BufferIndexOp::Range, 0u, 0u, static_cast<std::uint32_t>(plain->low), static_cast<std::uint32_t>(plain->high)});
+    const auto op = value->Opcode();
+    const auto block = [&]() -> std::optional<std::uint8_t> {
+        if (blocking == 0) blocking = static_cast<std::uint16_t>(op);
+        return std::nullopt;
+    };
+    if (depth >= MaxAffineDepth) {
+        if (plain) return push({BufferIndexOp::Range, 0u, 0u, static_cast<std::uint32_t>(plain->low), static_cast<std::uint32_t>(plain->high)});
+        return block();
+    }
+    const auto child = [&](std::size_t index) { return index < value->ArgumentCount() ? BuildIndex(value->Argument(index), nodes, blocking, depth + 1u) : std::nullopt; };
+    const auto constantOf = [&](std::size_t index) -> std::optional<std::uint32_t> {
+        const auto interval = index < value->ArgumentCount() ? Of(value->Argument(index)) : std::nullopt;
+        if (!interval || interval->low != interval->high) return std::nullopt;
+        return static_cast<std::uint32_t>(interval->low);
+    };
+    const auto binary = [&](BufferIndexOp kind) -> std::optional<std::uint8_t> {
+        const auto left = child(0);
+        if (!left) return std::nullopt;
+        const auto right = child(1);
+        if (!right) return std::nullopt;
+        return push({kind, *left, *right, 0u, 0u});
+    };
+    const auto shifted = [&](BufferIndexOp kind) -> std::optional<std::uint8_t> {
+        const auto amount = constantOf(1);
+        if (!amount || *amount >= 32u) return block();
+        const auto left = child(0);
+        if (!left) return std::nullopt;
+        return push({kind, *left, 0u, *amount, 0u});
+    };
+    const auto saved = nodes.size();
+    const auto structured = [&]() -> std::optional<std::uint8_t> {
+        switch (op) {
+        case IrOpcode::GetBuiltin: {
+            if (value->ArgumentCount() != 2u) return block();
+            const auto* kind = value->Argument(0)->Resolve();
+            const auto* component = value->Argument(1)->Resolve();
+            if (!kind->HasImmediate() || !component->HasImmediate() || component->ImmediateU32() != 0u) return block();
+            if (kind->ImmediateU32() == static_cast<std::uint32_t>(StageInputKind::VertexIndex)) return push({BufferIndexOp::VertexIndex, 0u, 0u, 0u, 0u});
+            if (kind->ImmediateU32() == static_cast<std::uint32_t>(StageInputKind::InstanceIndex)) return push({BufferIndexOp::InstanceIndex, 0u, 0u, 0u, 0u});
+            return block();
+        }
+        case IrOpcode::GetUserData:
+            if (value->ArgumentCount() != 1u) return block();
+            return push({BufferIndexOp::UserData, 0u, 0u, value->Argument(0)->Register().index, 0u});
+        case IrOpcode::IAdd32: return binary(BufferIndexOp::Add);
+        case IrOpcode::ISub32: return binary(BufferIndexOp::Sub);
+        case IrOpcode::IMul32: return binary(BufferIndexOp::Mul);
+        case IrOpcode::UMulHi: return binary(BufferIndexOp::MulHigh);
+        case IrOpcode::BitwiseAnd32:
+        case IrOpcode::IAnd32: return binary(BufferIndexOp::And);
+        case IrOpcode::BitwiseOr32:
+        case IrOpcode::IOr32: return binary(BufferIndexOp::Or);
+        case IrOpcode::UMin32: return binary(BufferIndexOp::Min);
+        case IrOpcode::UMax32: return binary(BufferIndexOp::Max);
+        case IrOpcode::ShiftLeftLogical32:
+        case IrOpcode::IShiftLeft32: return shifted(BufferIndexOp::ShiftLeft);
+        case IrOpcode::ShiftRightLogical32:
+        case IrOpcode::IShiftRightLogical32: return shifted(BufferIndexOp::ShiftRight);
+        case IrOpcode::UDiv32: {
+            const auto divisor = constantOf(1);
+            if (!divisor || *divisor == 0u) return block();
+            const auto left = child(0);
+            if (!left) return std::nullopt;
+            return push({BufferIndexOp::Divide, *left, 0u, *divisor, 0u});
+        }
+        case IrOpcode::BitFieldUExtract: {
+            const auto offset = constantOf(1);
+            const auto width = constantOf(2);
+            if (!offset || !width || *offset >= 32u || *width == 0u || *width >= 32u) return block();
+            const auto left = child(0);
+            if (!left) return std::nullopt;
+            return push({BufferIndexOp::Extract, *left, 0u, *offset, *width});
+        }
+        case IrOpcode::SelectU32: {
+            const auto left = child(1);
+            if (!left) return std::nullopt;
+            const auto right = child(2);
+            if (!right) return std::nullopt;
+            return push({BufferIndexOp::Select, *left, *right, 0u, 0u});
+        }
+        case IrOpcode::Phi: {
+            if (value->ArgumentCount() == 0u) return block();
+            auto result = child(0);
+            for (std::size_t index = 1; result && index < value->ArgumentCount(); ++index) {
+                const auto incoming = child(index);
+                if (!incoming) return std::nullopt;
+                result = push({BufferIndexOp::Select, *result, *incoming, 0u, 0u});
+            }
+            return result;
+        }
+        default:
+            return block();
+        }
+    };
+    if (const auto built = structured()) return built;
+    nodes.resize(saved);
+    if (plain) return push({BufferIndexOp::Range, 0u, 0u, static_cast<std::uint32_t>(plain->low), static_cast<std::uint32_t>(plain->high)});
+    return std::nullopt;
+}
+
 BufferIndexOrigin BufferReadAnalysis::OriginOf(const IrValue* value) {
     std::vector<const IrValue*> pending{value};
     std::unordered_set<const IrValue*> seen;
@@ -220,14 +331,27 @@ void BufferReadAnalysis::Note(BufferReadRanges& ranges, const IrValue& inst, con
         return;
     }
     BufferReadRange range{0u, BufferReadRanges::AnyIndex, offset->low + memory.offset + soffset->low, offset->high + memory.offset + soffset->high + extent};
-    if (affine) {
+    const auto origin = OriginOf(inst.Argument(1));
+    const bool drawDerived = origin == BufferIndexOrigin::VertexIndex || origin == BufferIndexOrigin::InstanceIndex;
+    if (affine && (affine->source != BufferIndexSource::None || affine->low == affine->high || !drawDerived)) {
         range.firstIndex = static_cast<std::uint32_t>(affine->low);
         range.lastIndex = static_cast<std::uint32_t>(affine->high);
         range.indexSource = affine->source;
         range.indexScale = static_cast<std::uint32_t>(affine->scale);
-        if (affine->source == BufferIndexSource::None && affine->high == BufferReadRanges::AnyIndex) range.indexOrigin = OriginOf(inst.Argument(1));
+        if (affine->source == BufferIndexSource::None && affine->high == BufferReadRanges::AnyIndex) range.indexOrigin = origin;
     } else {
-        range.indexOrigin = OriginOf(inst.Argument(1));
+        range.indexOrigin = origin;
+        if (drawDerived) {
+            std::vector<BufferIndexNode> nodes;
+            std::uint16_t blocking = 0;
+            if (BuildIndex(inst.Argument(1), nodes, blocking)) {
+                range.indexSource = BufferIndexSource::Expression;
+                range.indexExpression = std::move(nodes);
+                range.lastIndex = 0u;
+            } else {
+                range.blockingOpcode = blocking;
+            }
+        }
     }
     ranges.Add(range);
 }

@@ -17,8 +17,12 @@ void Driver::FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, co
         const auto offset = drawUserWord(program, result.vertexOffsetSgpr);
         require(offset <= std::numeric_limits<std::uint32_t>::max() - parameters.firstVertex, "draw vertex offset overflow");
         parameters.firstVertex += offset;
+        parameters.vertexFold = offset;
     }
-    if (result.instanceOffsetSgpr >= 0) parameters.firstInstance = drawUserWord(program, result.instanceOffsetSgpr);
+    if (result.instanceOffsetSgpr >= 0) {
+        parameters.firstInstance = drawUserWord(program, result.instanceOffsetSgpr);
+        parameters.instanceFold = parameters.firstInstance;
+    }
 }
 
 std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect) {

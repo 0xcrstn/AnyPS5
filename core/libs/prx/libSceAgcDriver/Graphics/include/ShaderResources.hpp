@@ -149,19 +149,15 @@ public:
         std::vector<Snapshot> snapshots;
         ~DrawBindings();
     };
-    enum class WholeCopy : std::uint8_t { NotAnalysed, IndexVertex, IndexInstance, IndexMemory, IndexUserData, IndexOther, NoDrawRange, Offset, Soffset, ScalarOffset, Wrap, Opcode, Alias, Swizzled, AddTid, BeyondFourGiB, OverHalf, Disabled, Count };
+    enum class WholeCopy : std::uint8_t { NotAnalysed, IndexVertex, IndexInstance, IndexMemory, IndexUserData, IndexOther, NoDrawRange, IndexAtDraw, Offset, Soffset, ScalarOffset, Wrap, Opcode, Alias, Swizzled, AddTid, BeyondFourGiB, OverHalf, Disabled, Count };
     static const char* WholeCopyName(WholeCopy reason);
     using ByteRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
     struct ReadAnalysis {
         std::array<std::uint32_t, 4> words{};
         ShaderRecompiler::BufferReadRanges ranges;
     };
-    struct DrawIndexRanges {
-        std::uint32_t firstVertex = 0;
-        std::uint32_t lastVertex = 0;
-        std::uint32_t firstInstance = 0;
-        std::uint32_t lastInstance = 0;
-    };
+    using DrawIndexRanges = ShaderRecompiler::BufferIndexInputs;
+    static std::array<std::pair<std::uint16_t, std::uint64_t>, 6> TakeBlockingOpcodes();
     struct MovedBuffer {
         std::size_t allocation;
         std::uint64_t address;
