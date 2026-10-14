@@ -3876,6 +3876,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
+    if (programAddress != 0 && Graphics::Recorder::GpuTimingEnabled()) Graphics::Recorder::NoteProgramWords(programAddress, shader.spirv.size());
     const SlowReport slowPipeline([&] {
         char text[160];
         std::snprintf(text, sizeof(text), "compute pipeline creation for program 0x%llx (%zu SPIR-V words)", static_cast<unsigned long long>(programAddress), shader.spirv.size());

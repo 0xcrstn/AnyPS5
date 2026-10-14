@@ -1726,7 +1726,7 @@ void Recorder::FlushStores() {
 
 namespace {
 
-constexpr std::uint32_t MaxTimedRanges = 512;
+constexpr std::uint32_t MaxTimedRanges = 2048;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
 constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
@@ -1750,7 +1750,8 @@ std::atomic<std::uint64_t> timingDropped{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
 std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
-double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
+double timingProgramMs = 0, timingDrawProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
+std::map<std::uint64_t, std::size_t> timingProgramWords;
 std::uint64_t timingBatches = 0;
 
 bool DrawOrGpuProfiled() {
@@ -1932,6 +1933,36 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
     return index;
+}
+
+std::uint32_t Recorder::BeginDrawProgramTiming(std::uint64_t key) {
+    if (!GpuTimingEnabled() || key == 0 || open == nullptr || open->queries == VK_NULL_HANDLE) return NoTiming;
+    return beginTiming(key);
+}
+
+void Recorder::NoteProgramWords(std::uint64_t key, std::size_t words) {
+    if (!GpuTimingEnabled()) return;
+    std::lock_guard lock(timingMutex);
+    timingProgramWords[key] = words;
+}
+
+std::string Recorder::FormatGpuPrograms(std::vector<GpuProgramTotals> programs, bool draws, std::size_t limit) {
+    std::sort(programs.begin(), programs.end(), [](const GpuProgramTotals& a, const GpuProgramTotals& b) { return a.ms > b.ms; });
+    std::string text;
+    for (std::size_t i = 0; i < programs.size() && i < limit; ++i) {
+        const auto& program = programs[i];
+        const auto perRun = program.count != 0 ? program.ms * 1000.0 / static_cast<double>(program.count) : 0.0;
+        char entry[160];
+        if (draws) {
+            std::snprintf(entry, sizeof(entry), " %s 0x%llx x%llu %.0fms %.0fus", (program.key & VertexOnlyFlag) != 0 ? "vs" : "ps", static_cast<unsigned long long>(program.key & ~(DrawProgramFlag | VertexOnlyFlag)), static_cast<unsigned long long>(program.count), program.ms, perRun);
+        } else if (program.words != 0) {
+            std::snprintf(entry, sizeof(entry), " 0x%llx x%llu %.0fms %.0fus %zuw", static_cast<unsigned long long>(program.key), static_cast<unsigned long long>(program.count), program.ms, perRun, program.words);
+        } else {
+            std::snprintf(entry, sizeof(entry), " 0x%llx x%llu %.0fms %.0fus", static_cast<unsigned long long>(program.key), static_cast<unsigned long long>(program.count), program.ms, perRun);
+        }
+        text += entry;
+    }
+    return text;
 }
 
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
@@ -2393,7 +2424,7 @@ void Recorder::readGpuTiming(Batch& batch) {
         ++totals.count;
         totals.ms += ns / 1e6;
         totals.bytes += batch.timedBytes[i];
-        (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
+        (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : (key & DrawProgramFlag) != 0 ? timingDrawProgramMs : timingProgramMs) += ns / 1e6;
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
     }
     std::sort(intervals.begin(), intervals.end());
@@ -2410,7 +2441,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     lastReport = now;
     const auto presents = timingPresents.exchange(0, std::memory_order_relaxed);
     const double perPresent = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
-    std::vector<std::pair<std::uint64_t, TimingTotals>> hot;
+    std::vector<GpuProgramTotals> dispatchPrograms, drawPrograms;
     std::string classes;
     for (const auto& [key, totals] : timingByKey) {
         if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) {
@@ -2418,16 +2449,16 @@ void Recorder::readGpuTiming(Batch& batch) {
             std::snprintf(text, sizeof(text), " %s x%llu %.1fms %.1fMiB (per present x%.1f %.2fms %.2fMiB)", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<unsigned long long>(totals.count), totals.ms, totals.bytes / 1048576.0, static_cast<double>(totals.count) * perPresent, totals.ms * perPresent, totals.bytes / 1048576.0 * perPresent);
             classes += text;
         } else {
-            hot.emplace_back(key, totals);
+            const auto words = timingProgramWords.find(key);
+            ((key & DrawProgramFlag) != 0 ? drawPrograms : dispatchPrograms).push_back({key, totals.count, totals.ms, words != timingProgramWords.end() ? words->second : 0});
         }
     }
-    std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
-    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
+    AgcDriver::ProfilePrint_nid_no_patch("%s; by draw program (%.0f ms in %zu programs):%s", FormatGpuPrograms(std::move(dispatchPrograms), false, 12).c_str(), timingDrawProgramMs, drawPrograms.size(), FormatGpuPrograms(std::move(drawPrograms), true, 16).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();
-    timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
+    timingProgramMs = timingDrawProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
     lock.unlock();
     reportBarriers();
