@@ -94,9 +94,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
         const auto found = drawCache.find(drawKey);
         if (found != drawCache.end()) {
+            drawSizing.Hit();
             entry = found->second;
             decode = entry->decode;
         } else {
+            drawSizing.Miss(drawKey, drawCache.size(), drawCacheVariantBytes);
             ++drawEntryCounters.absent;
             if (relocation != nullptr && !aliasFirst) {
                 cacheLock.unlock();

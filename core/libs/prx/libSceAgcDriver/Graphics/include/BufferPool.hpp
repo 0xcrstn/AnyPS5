@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BUFFERPOOL_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BUFFERPOOL_HPP
 
+#include "prx/libSceAgcDriver/Graphics/include/CacheSizing.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <cstdint>
 #include <deque>
@@ -111,7 +112,11 @@ private:
         std::uint64_t hits = 0;
         std::uint64_t misses = 0;
         std::uint64_t evictions = 0;
+        std::uint64_t missesEvicted = 0;
+        EvictionHistory evictedKeys{evictedHistoryKeys};
     };
+    static std::uint64_t SlotHash(const SlotKey& key);
+    static VkDeviceSize LargeBudget();
     // The tier a buffer of `capacity` and `properties` is retained in (the large one for everything
     // when shared; the device tier for device-local memory while it has a budget).
     Tier& tierFor(std::size_t capacity, VkMemoryPropertyFlags properties);
@@ -143,6 +148,7 @@ private:
     std::unordered_map<std::uint64_t, Slab> slabs;
     std::unordered_map<VkDeviceMemory, std::unique_ptr<SlabBlock>> slabBlocks;
     static constexpr VkDeviceSize budget = 512ull * 1024 * 1024;
+    static constexpr std::size_t evictedHistoryKeys = 4096;
     // The small tier's own budget (slots of at most half a MiB each): pinned host memory the large
     // tier's budget does not count.
     static constexpr VkDeviceSize smallBudget = 64ull * 1024 * 1024;

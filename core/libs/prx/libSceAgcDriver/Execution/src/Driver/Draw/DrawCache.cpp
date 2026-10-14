@@ -38,13 +38,27 @@ bool Driver::verifyDrawRecipe() {
     return verify;
 }
 
+Graphics::CacheSizing::Limits Driver::drawCacheLimits() {
+    static const auto limits = Graphics::CacheSizing::FromEnvironment("APS5_DRAW_CACHE", {4096, 32768, std::uint64_t{128} << 20u, true});
+    return limits;
+}
+
 std::size_t Driver::drawCacheEntries() {
-    static const std::size_t entries = [] {
-        const char* text = std::getenv("APS5_DRAW_CACHE_ENTRIES");
-        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
-        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{4096};
-    }();
-    return entries;
+    return drawCacheLimits().initialEntries;
+}
+
+void Driver::evictDrawEntries() {
+    while (drawSizing.OverLimit(drawCache.size(), drawCacheVariantBytes)) {
+        const auto key = drawOrder.back();
+        const auto last = drawCache.find(key);
+        for (const auto& variants : last->second->stages) {
+            for (const auto& variant : variants) accountDrawVariant(*variant, false);
+        }
+        drawOrder.erase(last->second->order);
+        drawCache.erase(last);
+        drawSizing.Evicted(key);
+        ++drawCacheEvictions;
+    }
 }
 
 void Driver::accountDrawVariant(const DispatchVariant& variant, bool added) {
@@ -83,7 +97,7 @@ bool DrawKeySightings::SeenBefore(std::uint64_t key) {
 bool Driver::admitDrawKey(std::uint64_t key) {
     std::lock_guard cacheLock(drawCacheMutex);
     if (drawCache.contains(key)) return true;
-    if (!drawKeySightings) drawKeySightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
+    if (!drawKeySightings) drawKeySightings.emplace(drawCacheLimits().maxEntries * DrawKeySightings::Ways);
     bool seen = drawKeySightings->SeenBefore(key);
     const auto& pending = drawRelocationPending;
     if (pending.key != key || pending.identity == 0) return seen;
@@ -140,15 +154,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         drawOrder.splice(drawOrder.begin(), drawOrder, replacement->order);
         found->second = std::move(replacement);
     }
-    while (drawCache.size() > drawCacheEntries()) {
-        const auto last = drawCache.find(drawOrder.back());
-        for (const auto& variants : last->second->stages) {
-            for (const auto& variant : variants) accountDrawVariant(*variant, false);
-        }
-        drawOrder.erase(last->second->order);
-        drawCache.erase(last);
-        ++drawCacheEvictions;
-    }
+    evictDrawEntries();
 }
 
 void Driver::eraseDrawEntry(std::uint64_t key, const std::shared_ptr<DrawEntry>& expected) {

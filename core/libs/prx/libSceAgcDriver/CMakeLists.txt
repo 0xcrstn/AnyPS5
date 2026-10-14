@@ -224,6 +224,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureDetiler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/CacheSizing.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
@@ -709,6 +710,20 @@ if(BUILD_TESTING)
     add_test(NAME agc_dcc_key_sharing COMMAND agc_dcc_key_sharing_tests)
     if(WIN32)
         set_tests_properties(agc_dcc_key_sharing PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_cache_sizing_tests EXCLUDE_FROM_ALL tests/CacheSizing.cpp Graphics/src/CacheSizing.cpp)
+target_include_directories(agc_cache_sizing_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_cache_sizing_tests PRIVATE libc)
+set_target_properties(agc_cache_sizing_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_cache_sizing_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_cache_sizing_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_cache_sizing COMMAND agc_cache_sizing_tests)
+    if(WIN32)
+        set_tests_properties(agc_cache_sizing PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

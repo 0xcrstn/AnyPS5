@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include <algorithm>
+#include <type_traits>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -2598,16 +2599,26 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
 
 }
 
+CacheSizing::Limits ResourceCache::DefaultLimits() {
+    return CacheSizing::FromEnvironment("APS5_RESOURCE_CACHE", {1024, 8192, std::uint64_t{256} << 20u, true});
+}
+
+ResourceCache::ResourceCache() : ResourceCache(DefaultLimits()) {}
+
+ResourceCache::ResourceCache(CacheSizing::Limits limits) : sizing(limits) {}
+
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(mutex);
     const auto found = index.find(key);
     if (found == index.end()) {
+        sizing.Miss(CacheSizing::KeyHash(key.data(), key.size()), entries.size(), bytes);
         noteMiss(key);
         return nullptr;
     }
+    sizing.Hit();
     entries.splice(entries.begin(), entries, found->second);
-    return found->second->second;
+    return found->second->resources;
 }
 
 void ResourceCache::noteMiss(const Key& key) {
@@ -2686,20 +2697,25 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     std::lock_guard lock(mutex);
     if (!resources->HasCachedStorageImages()) return;
     if (const auto found = index.find(key); found != index.end()) {
-        if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
+        if (evicted != nullptr) evicted->push_back(std::move(found->second->resources));
+        bytes -= found->second->bytes;
         entries.erase(found->second);
         index.erase(found);
     }
-    entries.emplace_front(key, std::move(resources));
+    const auto retained = resources->RetainedBytes();
+    entries.push_front({key, std::move(resources), retained});
+    bytes += retained;
     index.emplace(key, entries.begin());
-    static const std::size_t capacity = [] {
-        const char* value = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
-        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 1024ull;
-        return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
-    }();
-    while (entries.size() > capacity) {
-        if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
-        index.erase(entries.back().first);
+    evictOverLimit(evicted);
+}
+
+void ResourceCache::evictOverLimit(std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    while (sizing.OverLimit(entries.size(), bytes)) {
+        auto& last = entries.back();
+        sizing.Evicted(CacheSizing::KeyHash(last.key.data(), last.key.size()));
+        if (evicted != nullptr) evicted->push_back(std::move(last.resources));
+        bytes -= last.bytes;
+        index.erase(last.key);
         entries.pop_back();
     }
 }
@@ -2708,7 +2724,7 @@ void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
     std::lock_guard lock(mutex);
     if (object != nullptr) {
         const auto found = index.find(key);
-        if (found == index.end() || found->second->second.get() != object) return;
+        if (found == index.end() || found->second->resources.get() != object) return;
     }
     erase(key);
 }
@@ -2716,12 +2732,13 @@ void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
 void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
     for (auto it = entries.begin(); it != entries.end();) {
-        if (!it->second->ReadsImage(image)) {
+        if (!it->resources->ReadsImage(image)) {
             ++it;
             continue;
         }
-        if (evicted != nullptr) evicted->push_back(std::move(it->second));
-        index.erase(it->first);
+        if (evicted != nullptr) evicted->push_back(std::move(it->resources));
+        bytes -= it->bytes;
+        index.erase(it->key);
         it = entries.erase(it);
     }
 }
@@ -2747,6 +2764,7 @@ void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
     index.clear();
     entries.clear();
+    bytes = 0;
 }
 
 std::size_t ResourceCache::Size() const {
@@ -2754,9 +2772,53 @@ std::size_t ResourceCache::Size() const {
     return entries.size();
 }
 
+std::uint64_t ResourceCache::Bytes() const {
+    std::lock_guard lock(mutex);
+    return bytes;
+}
+
+std::size_t ResourceCache::Capacity() const {
+    std::lock_guard lock(mutex);
+    return sizing.Capacity();
+}
+
+std::string ResourceCache::Report() {
+    std::lock_guard lock(mutex);
+    std::unordered_map<const Texture*, std::pair<long, VkDeviceSize>> references;
+    for (const auto& entry : entries) {
+        for (const auto& texture : entry.resources->SampledTextures()) {
+            if (texture == nullptr) continue;
+            auto& counted = references[texture.get()];
+            if (counted.first == 0) counted.second = texture->AllocationBytes();
+            ++counted.first;
+        }
+    }
+    std::size_t pinned = 0;
+    VkDeviceSize pinnedBytes = 0;
+    VkDeviceSize referencedBytes = 0;
+    for (const auto& entry : entries) {
+        for (const auto& texture : entry.resources->SampledTextures()) {
+            if (texture == nullptr) continue;
+            auto& counted = references[texture.get()];
+            if (counted.first <= 0) continue;
+            referencedBytes += counted.second;
+            if (texture.use_count() == counted.first) {
+                ++pinned;
+                pinnedBytes += counted.second;
+            }
+            counted.first = 0;
+        }
+    }
+    auto line = sizing.Describe("resource cache (dispatch + draw)", entries.size(), bytes);
+    char tail[256];
+    std::snprintf(tail, sizeof(tail), "[cache-sizing] resource cache textures: %zu distinct sampled textures referenced (%.1f MiB), %zu held only by the cache (%.1f MiB)\n", references.size(), static_cast<double>(referencedBytes) / 1048576.0, pinned, static_cast<double>(pinnedBytes) / 1048576.0);
+    return line + tail;
+}
+
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
+    bytes -= found->second->bytes;
     entries.erase(found->second);
     index.erase(found);
 }
@@ -3802,6 +3864,26 @@ std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
         if (texture != nullptr && texture->StorageSource() != nullptr) images.emplace_back(texture->StorageSource()->Image(), false);
     }
     return images;
+}
+
+std::uint64_t ShaderResources::RetainedBytes() const {
+    constexpr std::uint64_t descriptorBytes = 64;
+    const auto vectorBytes = [](const auto& items) { return static_cast<std::uint64_t>(items.capacity()) * sizeof(typename std::remove_cvref_t<decltype(items)>::value_type); };
+    std::uint64_t total = sizeof(ShaderResources);
+    total += vectorBytes(layoutKey) + vectorBytes(fragmentLayoutKey) + vectorBytes(allocations) + vectorBytes(descriptorBuffers) + vectorBytes(descriptorImages) + vectorBytes(descriptorWrites);
+    total += vectorBytes(textures) + vectorBytes(storageTextures) + vectorBytes(storageMips) + vectorBytes(storageKeys) + vectorBytes(samplers) + vectorBytes(samplerSources);
+    total += vectorBytes(directRegions) + vectorBytes(validatedTextures) + vectorBytes(pushPatches) + vectorBytes(dataPatches) + vectorBytes(bindings) + vectorBytes(refreshResourceKey) + vectorBytes(movedWordBuffers);
+    for (const auto& allocation : allocations) {
+        total += vectorBytes(allocation.dataWords);
+        if (allocation.buffer != nullptr) total += sizeof(Buffer) + allocation.buffer->AllocationBytes();
+    }
+    for (const auto& binding : bindings) total += vectorBytes(binding.allocations) + vectorBytes(binding.imageAllocations);
+    for (const auto& moved : movedWordBuffers) {
+        total += vectorBytes(moved.words);
+        if (moved.buffer != nullptr) total += sizeof(Buffer) + moved.buffer->AllocationBytes();
+    }
+    total += (descriptorBuffers.size() + descriptorImages.size()) * descriptorBytes;
+    return total;
 }
 
 bool ShaderResources::HasCachedStorageImages() const {

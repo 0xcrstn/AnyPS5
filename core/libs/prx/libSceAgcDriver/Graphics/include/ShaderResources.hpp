@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CacheSizing.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "Recompiler.hpp"
@@ -222,6 +223,7 @@ public:
     bool Reusable() const { return reusable; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
+    std::uint64_t RetainedBytes() const;
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults() const;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
@@ -563,7 +565,7 @@ private:
 // objects (nothing to complete, every buffer read in place) are kept, and an entry serves a later
 // use only after ShaderResources::Revalidate brought it up to date. Entries hold their object alive;
 // the recorder keeps it as well while its batch runs. One LRU bound covers dispatch and draw entries
-// together (APS5_RESOURCE_CACHE_ENTRIES, default 1024); the map has its own mutex and locks itself:
+// together (APS5_RESOURCE_CACHE_ENTRIES, default 1024; see CacheSizing for the adaptive bound); the map has its own mutex and locks itself:
 // VulkanDevice::PrepareDispatch probes it without GuestMemory::GpuMutex (a hit there is revalidated
 // under the lock by the dispatch; inserts and Revalidate stay under it). Compute keys start with the
 // stage, draw keys with a marker word, so the two never meet, and both name the device handle: the driver replaces
@@ -575,6 +577,9 @@ private:
 class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
+    static CacheSizing::Limits DefaultLimits();
+    ResourceCache();
+    explicit ResourceCache(CacheSizing::Limits limits);
     std::shared_ptr<ShaderResources> Find(const Key& key);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
@@ -592,9 +597,13 @@ public:
     static std::uint64_t Touches();
     void Clear();
     std::size_t Size() const;
+    std::uint64_t Bytes() const;
+    std::size_t Capacity() const;
+    std::string Report();
 
 private:
     void erase(const Key& key);
+    void evictOverLimit(std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteMiss(const Key& key);
     struct KeyHash {
         std::size_t operator()(const Key& key) const noexcept {
@@ -603,9 +612,16 @@ private:
             return static_cast<std::size_t>(hash);
         }
     };
+    struct Entry {
+        Key key;
+        std::shared_ptr<ShaderResources> resources;
+        std::uint64_t bytes = 0;
+    };
     mutable std::mutex mutex;
-    std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
-    std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    std::list<Entry> entries;
+    std::unordered_map<Key, std::list<Entry>::iterator, KeyHash> index;
+    std::uint64_t bytes = 0;
+    CacheSizing sizing;
 };
 
 // The process-wide cache the device and the draw path share (keys name the device; a device clears
