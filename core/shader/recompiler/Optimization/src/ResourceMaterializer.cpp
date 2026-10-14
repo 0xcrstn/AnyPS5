@@ -130,7 +130,34 @@ std::uint32_t storageMipCount(const ImageResource& base, const DescriptorValue& 
     return mipBase <= mipLast ? mipLast - mipBase + 1u : 0u;
 }
 
-DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const ImageResource& base, std::uint32_t srgbDecodeFormats) {
+std::string describeImageDescriptor(const DescriptorValue& descriptor, const ImageResource& base) {
+    const char* use = base.resourceClass == ImageResourceClass::Storage ? "storage" : base.depthCompare ? "depth compare" : "sampled";
+    char text[192];
+    std::snprintf(text, sizeof(text), " (%s image of source %u first used at 0x%x; descriptor format %u, type %u, dwords %08x %08x %08x %08x)", use, base.source, base.firstUsePc, static_cast<std::uint32_t>(rawImageFormat(descriptor)), static_cast<std::uint32_t>(rawImageType(descriptor)), descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3]);
+    return text;
+}
+
+bool StrictImageFormats() {
+    static const bool strict = std::getenv("APS5_STRICT_IMAGE_FORMATS") != nullptr;
+    return strict;
+}
+
+bool unreadableSampledImage(const DescriptorValue& descriptor, const ImageResource& base) {
+    if (base.resourceClass == ImageResourceClass::Storage || base.atomic || nullImageDescriptor(descriptor) || !validImageDescriptor(descriptor, base.r128)) return false;
+    return SampledTextureNumericClass(rawImageFormat(descriptor)) == IrTextureNumericClass::Unsupported;
+}
+
+bool nullsUnreadableSampledImage(const DescriptorValue& descriptor, const ImageResource& base) {
+    if (StrictImageFormats() || !unreadableSampledImage(descriptor, base)) return false;
+    static std::array<std::atomic<bool>, 1024> reported{};
+    const auto format = static_cast<std::uint32_t>(rawImageFormat(descriptor));
+    if (!reported[(format & 0x1ffu) | (base.depthCompare ? 0x200u : 0u)].exchange(true)) {
+        std::fprintf(stderr, "[gpu] sampled image descriptor uses unsupported format %u; it is bound as a null image (APS5_STRICT_IMAGE_FORMATS refuses it)%s\n", format, describeImageDescriptor(descriptor, base).c_str());
+    }
+    return true;
+}
+
+DecodedImage decodeImageDescriptorFields(const DescriptorValue& descriptor, const ImageResource& base, std::uint32_t srgbDecodeFormats) {
     DecodedImage decoded;
     decoded.mipCount = storageMipCount(base, descriptor);
     if (decoded.mipCount == 0u) {
@@ -224,6 +251,14 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
         throw std::runtime_error("sampled image descriptor uses an unsupported format");
     }
     return decoded;
+}
+
+DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const ImageResource& base, std::uint32_t srgbDecodeFormats) {
+    try {
+        return decodeImageDescriptorFields(descriptor, base, srgbDecodeFormats);
+    } catch (const std::runtime_error& error) {
+        throw std::runtime_error(error.what() + describeImageDescriptor(descriptor, base));
+    }
 }
 
 constexpr std::uint32_t TableEntryBytes = 32;
@@ -399,6 +434,12 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
             continue;
         }
         if (!validImageDescriptor(candidate, image.r128)) throw std::runtime_error("bindless image table contains an invalid descriptor");
+        if (nullsUnreadableSampledImage(candidate, image)) {
+            candidate = DescriptorValue{};
+            candidate.dwordCount = 8u;
+            ++paddedNull;
+            continue;
+        }
         const auto decoded = decodeImageDescriptor(candidate, image, plan.srgbDecodeFormats);
         if (decoded.fmask) throw std::runtime_error("bindless FMASK images are unsupported");
         static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, candidate, plan.info.runtimeImageModes.at(imageIndex)));
@@ -496,6 +537,10 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
             if (!image.optionalDescriptor) {
                 throw std::runtime_error("runtime image descriptor is invalid");
             }
+            descriptor = DescriptorValue{};
+            descriptor.dwordCount = 8u;
+        }
+        if (nullsUnreadableSampledImage(descriptor, image)) {
             descriptor = DescriptorValue{};
             descriptor.dwordCount = 8u;
         }
