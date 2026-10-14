@@ -4,6 +4,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <span>
+#include <string>
 #include <cstdio>
 #include <condition_variable>
 #include <cstdlib>
@@ -43,6 +45,7 @@ struct BuiltLibrary {
     Key part;
     Key layout;
     Key rendering;
+    std::vector<std::uint64_t> fields;
 };
 
 struct DeviceLibraries {
@@ -56,19 +59,32 @@ struct DeviceLibraries {
     PipelineLibraryCounters counters;
 };
 
-void countLibrary(DeviceLibraries& device, std::size_t part, const Key& shaders, const Key& state, const Key& layout, const Key& rendering) {
+void countLibrary(DeviceLibraries& device, std::size_t part, const Key& shaders, const Key& state, const Key& layout, const Key& rendering, std::span<const std::uint64_t> fields, std::span<std::uint64_t> rebuiltFor) {
     if (shaders.empty()) return;
     auto& seen = device.shaders[part];
     const auto found = seen.find(shaders);
     if (found == seen.end()) {
-        seen.emplace(shaders, BuiltLibrary{state, layout, rendering});
+        seen.emplace(shaders, BuiltLibrary{state, layout, rendering, {fields.begin(), fields.end()}});
         ++device.counters.shaders[part];
         return;
     }
     if (found->second.part != state) ++device.counters.rebuiltForState[part];
     if (found->second.layout != layout) ++device.counters.rebuiltForLayout[part];
     if (found->second.rendering != rendering) ++device.counters.rebuiltForRendering[part];
-    found->second = {state, layout, rendering};
+    for (std::size_t field = 0; field < fields.size() && field < found->second.fields.size(); ++field) {
+        if (found->second.fields[field] != fields[field]) ++rebuiltFor[field];
+    }
+    found->second = {state, layout, rendering, {fields.begin(), fields.end()}};
+}
+
+template<std::size_t Count>
+std::string describeFields(const std::array<std::uint64_t, Count>& counts, const std::array<const char*, Count>& names) {
+    std::string text;
+    for (std::size_t field = 0; field < Count; ++field) {
+        if (counts[field] == 0) continue;
+        text += (text.empty() ? "" : ", ") + std::string(names[field]) + " " + std::to_string(counts[field]);
+    }
+    return text.empty() ? "none" : text;
 }
 
 void reportLibraries(const DeviceLibraries& device) {
@@ -79,10 +95,10 @@ void reportLibraries(const DeviceLibraries& device) {
     if (now - last < std::chrono::seconds(10)) return;
     last = now;
     const auto& counters = device.counters;
-    std::fprintf(stderr, "[pipeline-libraries] pre-rasterization %llu libraries for %llu shaders, fragment %llu for %llu; built again for a shader by what differed: fixed state %llu/%llu, layout %llu/%llu, rendering formats %llu/%llu; linked %llu\n",
+    std::fprintf(stderr, "[pipeline-libraries] pre-rasterization %llu libraries for %llu shaders, fragment %llu for %llu; built again for a shader by what differed: fixed state %llu/%llu, layout %llu/%llu, rendering formats %llu/%llu; fixed state by field: pre-rasterization %s; fragment %s; linked %llu\n",
         static_cast<unsigned long long>(counters.built[1]), static_cast<unsigned long long>(counters.shaders[1]), static_cast<unsigned long long>(counters.built[2]), static_cast<unsigned long long>(counters.shaders[2]),
         static_cast<unsigned long long>(counters.rebuiltForState[1]), static_cast<unsigned long long>(counters.rebuiltForState[2]), static_cast<unsigned long long>(counters.rebuiltForLayout[1]), static_cast<unsigned long long>(counters.rebuiltForLayout[2]),
-        static_cast<unsigned long long>(counters.rebuiltForRendering[1]), static_cast<unsigned long long>(counters.rebuiltForRendering[2]), static_cast<unsigned long long>(counters.linked));
+        static_cast<unsigned long long>(counters.rebuiltForRendering[1]), static_cast<unsigned long long>(counters.rebuiltForRendering[2]), describeFields(counters.preRasterizationRebuiltFor, PreRasterizationLibraryFields).c_str(), describeFields(counters.fragmentRebuiltFor, FragmentLibraryFields).c_str(), static_cast<unsigned long long>(counters.linked));
 }
 
 struct LibraryStore {
@@ -258,8 +274,8 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             continue;
         }
         cache.emplace(key, handle);
-        if (part == 1) countLibrary(device, part, keys.preRasterizationShaders, *partKeys[part], keys.preRasterizationLayout, attachmentKey);
-        if (part == 2) countLibrary(device, part, keys.fragmentShaders, *partKeys[part], keys.fragmentLayout, attachmentKey);
+        if (part == 1) countLibrary(device, part, keys.preRasterizationShaders, *partKeys[part], keys.preRasterizationLayout, attachmentKey, keys.preRasterizationFields, device.counters.preRasterizationRebuiltFor);
+        if (part == 2) countLibrary(device, part, keys.fragmentShaders, *partKeys[part], keys.fragmentLayout, attachmentKey, keys.fragmentFields, device.counters.fragmentRebuiltFor);
         reportLibraries(device);
         if (optimize) {
             for (std::uint32_t stage = 0; stage < create.stageCount; ++stage) {

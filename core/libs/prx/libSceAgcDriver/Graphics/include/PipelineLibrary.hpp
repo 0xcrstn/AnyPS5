@@ -23,6 +23,8 @@ struct PipelineLibraryKeys {
     std::vector<std::byte> fragmentLayout;
     std::vector<std::byte> preRasterizationShaders;
     std::vector<std::byte> fragmentShaders;
+    std::array<std::uint64_t, 6> preRasterizationFields{};
+    std::array<std::uint64_t, 3> fragmentFields{};
     std::uint32_t preRasterizationSets = 0;
     std::uint32_t fragmentSets = 0;
 };
@@ -53,7 +55,12 @@ struct PipelineLibraryCounters {
     std::array<std::uint64_t, 4> rebuiltForState{};
     std::array<std::uint64_t, 4> rebuiltForLayout{};
     std::array<std::uint64_t, 4> rebuiltForRendering{};
+    std::array<std::uint64_t, 6> preRasterizationRebuiltFor{};
+    std::array<std::uint64_t, 3> fragmentRebuiltFor{};
 };
+
+inline constexpr std::array<const char*, 6> PreRasterizationLibraryFields{"push offset", "provoking vertex", "clip range", "depth clamp", "conservative rasterization", "tessellation"};
+inline constexpr std::array<const char*, 3> FragmentLibraryFields{"push offset", "samples", "sample locations"};
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device);
 
