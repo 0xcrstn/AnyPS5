@@ -2202,7 +2202,11 @@ void PrewarmPipeline(const Context& context, const State& state, std::span<const
     const auto masked = maskedState(state, fragmentOutputs);
     const State& pipelineState = masked.has_value() ? *masked : state;
     const auto& attributes = shaders.front().program->vertexAttributes;
-    const auto vertexInput = BuildVertexInputLayout(context, attributes);
+    std::shared_ptr<const VertexInputLayout> retainedVertexInput;
+    if (context.vertexInputs != nullptr) retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+    VertexInputLayout uncachedVertexInput;
+    if (retainedVertexInput == nullptr) uncachedVertexInput = BuildVertexInputLayout(context, attributes);
+    const auto& vertexInput = retainedVertexInput != nullptr ? *retainedVertexInput : uncachedVertexInput;
     const auto described = DescribeSetLayouts(context, shaders);
     static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
     static const bool recordDraws = std::getenv("APS5_SYNC_DRAWS") == nullptr;
