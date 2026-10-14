@@ -37,6 +37,8 @@ struct OptimizedPipeline {
 
 VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys, std::shared_ptr<OptimizedPipeline>* optimized = nullptr, bool partsOnly = false, std::span<VkShaderModule> modules = {});
 
+std::array<std::uint64_t, 4>& ThreadBuiltLibraryParts();
+
 void WaitForOptimizedPipelines(VkDevice device);
 
 void ClearPipelineLibraries(VkDevice device);
