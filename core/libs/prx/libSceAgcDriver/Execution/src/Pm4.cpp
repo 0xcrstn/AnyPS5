@@ -609,10 +609,10 @@ std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, co
             return StoreWrite{destination, {}, copyDataSource(packet, bytes)};
         }
         case 0x50: {
-            if (packet.size() < 7 || dmaDestination(packet) == DmaSelectGds) return std::nullopt;
+            if (packet.size() < 7) return std::nullopt;
             if (dmaDestination(packet) == DmaSelectNowhere) return StoreWrite{address(packet[2], packet[3]), {}, {}};
             const std::size_t bytes = packet[6] & 0x3ffffffu;
-            const auto destination = address(packet[4], packet[5]);
+            const auto destination = dmaDestination(packet) == DmaSelectGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
             if (!fits(destination, bytes)) return std::nullopt;
             return StoreWrite{destination, {}, dmaSourceBytes(packet)};
         }
@@ -638,10 +638,13 @@ std::uint32_t DmaDestination(std::span<const std::uint32_t> packet) {
 
 std::optional<MemoryCopy> DecodeMemoryCopy(std::span<const std::uint32_t> packet) {
     if (packet.size() != 7 || ((packet[0] >> 8u) & 0xffu) != 0x50) return std::nullopt;
-    if (!memorySelector(dmaSource(packet)) || !memorySelector(dmaDestination(packet))) return std::nullopt;
+    const auto sourceSelect = dmaSource(packet), destinationSelect = dmaDestination(packet);
+    if ((!memorySelector(sourceSelect) && sourceSelect != DmaSelectGds) || (!memorySelector(destinationSelect) && destinationSelect != DmaSelectGds)) return std::nullopt;
     const std::size_t bytes = packet[6] & 0x3ffffffu;
-    const auto source = address(packet[2], packet[3]);
-    const auto destination = address(packet[4], packet[5]);
+    if (sourceSelect == DmaSelectGds && (packet[3] != 0 || !gdsRange(packet[2], bytes))) return std::nullopt;
+    if (destinationSelect == DmaSelectGds && (packet[5] != 0 || !gdsRange(packet[4], bytes))) return std::nullopt;
+    const auto source = sourceSelect == DmaSelectGds ? GdsAddress() + packet[2] : address(packet[2], packet[3]);
+    const auto destination = destinationSelect == DmaSelectGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
     if (bytes == 0 || (source < destination + bytes && destination < source + bytes)) return std::nullopt;
     return MemoryCopy{source, destination, bytes};
 }
