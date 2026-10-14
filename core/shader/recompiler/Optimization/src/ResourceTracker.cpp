@@ -867,27 +867,48 @@ private:
         inst.Parent()->RemoveInstruction(&inst);
     }
 
-    static bool HoldsProgramCounter(IrValue* value, std::uint32_t depth) {
+    static bool HoldsControlValue(IrValue* value, std::uint32_t depth, std::vector<const IrValue*>& seen) {
         value = value->Resolve();
-        if (value->Opcode() == IrOpcode::GetShaderBase) {
-            return true;
+        if (value->HasImmediate()) {
+            return false;
         }
-        if (value->HasImmediate() || depth == 0u || !Detail::IsRuntimeUniformOp(value->Opcode())) {
+        switch (value->Opcode()) {
+            case IrOpcode::GetShaderBase:
+            case IrOpcode::GetExec:
+            case IrOpcode::GetExecLo:
+            case IrOpcode::GetExecHi:
+            case IrOpcode::Ballot: return true;
+            default: break;
+        }
+        if (depth == 0u) {
+            return false;
+        }
+        if (value->IsPhi()) {
+            if (std::ranges::find(seen, value) != seen.end()) {
+                return false;
+            }
+            seen.push_back(value);
+        } else if (!Detail::IsRuntimeUniformOp(value->Opcode()) && value->Opcode() != IrOpcode::CompositeExtractU32x4) {
             return false;
         }
         for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
-            if (HoldsProgramCounter(value->Argument(index), depth - 1u)) {
+            if (HoldsControlValue(value->Argument(index), depth - 1u, seen)) {
                 return true;
             }
         }
         return false;
     }
 
+    static bool HoldsControlValue(IrValue* value) {
+        std::vector<const IrValue*> seen;
+        return HoldsControlValue(value, phiSearchDepth, seen);
+    }
+
     struct DescriptorWeb {
         static constexpr std::size_t maxStates = 512u;
         static constexpr std::size_t maxArms = 64u;
         std::string failure;
-        bool foldedProgramCounter = false;
+        bool foldedControlValue = false;
         std::vector<std::vector<IrValue*>> arms;
         std::map<std::vector<IrValue*>, IrValue*> selectors;
         std::vector<std::pair<IrBlock*, IrValue*>> phis;
@@ -964,11 +985,11 @@ private:
             return LaneSelector(tuple, **lane, web, position);
         }
         if (phi == tuple.end()) {
-            if (std::ranges::any_of(tuple, [](IrValue* value) { return HoldsProgramCounter(value, phiSearchDepth); })) {
+            if (std::ranges::any_of(tuple, [](IrValue* value) { return HoldsControlValue(value); })) {
                 if (StrictDescriptorWebs()) {
-                    return GiveUp(web, "a descriptor dword depends on the program counter");
+                    return GiveUp(web, "a descriptor dword depends on the program counter, EXEC or a lane mask");
                 }
-                web.foldedProgramCounter = true;
+                web.foldedControlValue = true;
                 return &m_builder.Constant(0u);
             }
             for (IrValue* value : tuple) {
@@ -1148,7 +1169,7 @@ private:
             }
         }
         if (selector == nullptr || web.arms.empty()) {
-            const std::string reason = !web.failure.empty() ? web.failure : web.foldedProgramCounter ? std::string("every path's descriptor depends on the program counter") : std::string("no descriptor was found on any path");
+            const std::string reason = !web.failure.empty() ? web.failure : web.foldedControlValue ? std::string("every path's descriptor depends on the program counter, EXEC or a lane mask") : std::string("no descriptor was found on any path");
             for (std::uint32_t slot = 0; slot < handleCount; slot++) {
                 if (split[slot]) {
                     m_splitFailures.try_emplace(handles[slot], reason);
