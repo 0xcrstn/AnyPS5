@@ -12,7 +12,6 @@
 #endif
 #include <array>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -201,10 +200,7 @@ void CheckDeferredSharedImports() {
     Require(ImportWatched(base, bytes, [] { return true; }), "fresh shared import failed");
     Require(protection(0) == PAGE_READWRITE && protection(bytes - 1) == PAGE_READWRITE, "fresh import armed shared pages");
     const auto gpu = MarkWritten(base + 4096, 4);
-    const char* faultSetting = std::getenv("APS5_SHARED_WRITE_FAULTS");
-    const bool faults = faultSetting != nullptr && *faultSetting != '\0' && std::string_view(faultSetting) != "0";
-    Require(gpu != 0 && protection(Block) == PAGE_READWRITE, "GPU write activated its neighbor block");
-    Require(protection(0) == (faults ? PAGE_READONLY : PAGE_READWRITE), faults ? "GPU write did not arm its block" : "GPU write armed a shared page without APS5_SHARED_WRITE_FAULTS");
+    Require(gpu != 0 && protection(0) == PAGE_READONLY && protection(Block) == PAGE_READWRITE, "GPU write did not activate only its block");
     CollectWritesUncached(base, Block);
     Require(!WrittenSince(base + 4096, 4, gpu) && !StoredOver(base + 4096, 4, gpu), "first collect overwrote a GPU generation");
     static_cast<volatile std::uint8_t*>(memory)[4096] = 0x44;
