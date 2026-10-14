@@ -1165,8 +1165,12 @@ public:
         enqueue({std::move(key), std::move(variant), nullptr, std::move(stored)});
     }
 
-    void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan) {
-        enqueue({std::move(key), nullptr, std::move(plan), {}});
+    void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan, std::function<void()> stored) {
+        enqueue({std::move(key), nullptr, std::move(plan), std::move(stored)});
+    }
+
+    bool ReloadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
+        return load(key, [&](std::span<const std::byte> file) { return DecodePlanEntry(file, key, plan); }, planReloads, planReloadFailures, planReloadFailures);
     }
 
     void Flush() {
@@ -1189,6 +1193,8 @@ public:
         counters.planLoadFailures = planLoadFailures.load(std::memory_order_relaxed);
         counters.reloads = reloads.load(std::memory_order_relaxed);
         counters.reloadFailures = reloadFailures.load(std::memory_order_relaxed);
+        counters.planReloads = planReloads.load(std::memory_order_relaxed);
+        counters.planReloadFailures = planReloadFailures.load(std::memory_order_relaxed);
         return counters;
     }
 
@@ -1337,7 +1343,7 @@ private:
     std::deque<Job> jobs;
     bool writing = false;
     std::atomic<std::uint64_t> hits{0}, misses{0}, writes{0}, loadFailures{0}, writeFailures{0}, bytesRead{0}, bytesWritten{0}, loadNanoseconds{0};
-    std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0}, reloads{0}, reloadFailures{0};
+    std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0}, reloads{0}, reloadFailures{0}, planReloads{0}, planReloadFailures{0};
     std::atomic<std::int64_t> lastReport{0};
     std::mutex reportMutex;
     Counters reported;
@@ -1492,9 +1498,14 @@ bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
     return instance.Enabled() && instance.LoadPlan(key, plan);
 }
 
-void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan) {
+void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan, std::function<void()> stored) {
     auto& instance = store();
-    if (instance.Enabled() && plan != nullptr) instance.StorePlan(std::move(key), std::move(plan));
+    if (instance.Enabled() && plan != nullptr) instance.StorePlan(std::move(key), std::move(plan), std::move(stored));
+}
+
+bool ReloadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
+    auto& instance = store();
+    return instance.Enabled() && instance.ReloadPlan(key, plan);
 }
 
 void Flush() {
