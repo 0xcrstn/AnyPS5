@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -15,8 +16,6 @@ struct ProcessCounters {
 };
 
 struct AddressSpaceUse {
-    std::uint64_t arenaPrivate = 0;
-    std::uint64_t arenaMapped = 0;
     std::uint64_t hostPrivate = 0;
     std::uint64_t hostMapped = 0;
     std::uint64_t image = 0;
@@ -26,16 +25,9 @@ struct AddressSpaceUse {
     std::vector<std::pair<std::uintptr_t, std::uint64_t>> largest;
 };
 
-struct HeapUse {
-    std::uint64_t heaps = 0;
-    std::uint64_t committed = 0;
-    std::uint64_t processHeapCommitted = 0;
-    std::uint64_t allocated = 0;
-};
-
 ProcessCounters ReadProcessCounters();
-AddressSpaceUse WalkAddressSpace(std::uintptr_t arenaBase, std::uint64_t arenaBytes, std::size_t largestCount = 4);
-HeapUse ReadHostHeaps();
+std::vector<std::uintptr_t> ThreadStackAllocations();
+AddressSpaceUse WalkAddressSpace(std::uintptr_t arenaBase, std::uint64_t arenaBytes, std::span<const std::uintptr_t> stacks, std::size_t largestCount = 4);
 
 }
 

@@ -41,18 +41,21 @@ std::string Describe(const std::function<std::string()>& device) {
     std::size_t arenaBytes = 0;
     if (GuestArena::GuestArenaAvailable_nid_postfix()) GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
     const auto process = ProcessMemory::ReadProcessCounters();
-    const auto space = ProcessMemory::WalkAddressSpace(arenaBase, arenaBytes);
-    const auto heaps = ProcessMemory::ReadHostHeaps();
+    static std::mutex stacksMutex;
+    static std::vector<std::uintptr_t> stacks;
+    static std::uint64_t reports = 0;
+    std::lock_guard stacksLock(stacksMutex);
+    if (reports++ % 10 == 0) stacks = ProcessMemory::ThreadStackAllocations();
+    const auto space = ProcessMemory::WalkAddressSpace(arenaBase, arenaBytes, stacks);
     GuestHeap::GuestHeapStatistics guestHeap{};
     GuestHeap::GuestHeapGetStatistics_nid_no_patch(&guestHeap);
     const auto shaders = ShaderRecompiler::GetRetainedShaderMemory();
     const auto backlog = DriverDetail::RegistrationPreparationBacklog();
     const auto walked = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-    const auto known = heaps.committed + space.stacks;
     std::string text = "[memory] process commit " + gib(process.commit) + " (peak " + gib(process.peakCommit) + "), working set " + gib(process.workingSet);
-    text += " | guest arena private " + gib(space.arenaPrivate) + ", mapped " + gib(space.arenaMapped);
+    text += " | guest arena private " + gib(process.commit > space.hostPrivate ? process.commit - space.hostPrivate : 0);
     text += "; guest heap live " + mib(guestHeap.largeLiveBytes) + " + small spans " + mib(guestHeap.smallSpanBytes) + ", freed blocks kept " + mib(guestHeap.largeCachedBytes);
-    text += " | host private " + gib(space.hostPrivate) + ": " + std::to_string(heaps.heaps) + " heaps commit " + gib(heaps.committed) + " (" + gib(heaps.allocated) + " allocated; process heap " + gib(heaps.processHeapCommitted) + "), " + std::to_string(space.threads) + " thread stacks " + mib(space.stacks) + ", other " + gib(space.hostPrivate > known ? space.hostPrivate - known : 0);
+    text += " | host private " + gib(space.hostPrivate) + ": " + std::to_string(space.threads) + " thread stacks " + mib(space.stacks) + ", heaps and other allocations " + gib(space.hostPrivate - space.stacks);
     if (!space.largest.empty()) {
         text += " (largest";
         for (const auto& [base, bytes] : space.largest) {
@@ -78,7 +81,7 @@ std::string Describe(const std::function<std::string()>& device) {
 std::uint64_t IntervalSeconds() {
     static const std::uint64_t seconds = [] {
         const char* text = std::getenv("APS5_MEMORY_REPORT");
-        if (text == nullptr || *text == '\0') return std::getenv("APS5_PROFILE_DRAW") != nullptr ? std::uint64_t{10} : std::uint64_t{0};
+        if (text == nullptr || *text == '\0') return std::getenv("APS5_PROFILE_DRAW") != nullptr ? std::uint64_t{60} : std::uint64_t{0};
         char* end = nullptr;
         const auto value = std::strtoull(text, &end, 10);
         if (end == text || *end != '\0') throw std::runtime_error("APS5_MEMORY_REPORT is not a whole number of seconds: " + std::string(text));
