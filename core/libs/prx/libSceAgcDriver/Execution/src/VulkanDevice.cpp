@@ -380,6 +380,7 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::TextureCache> textureCache;
     std::unique_ptr<Graphics::PipelineCache> pipelineCache;
     std::unique_ptr<Graphics::DescriptorCache> descriptorCache;
+    std::unique_ptr<Graphics::VertexInputCache> vertexInputs;
     std::unique_ptr<Graphics::SamplerCache> samplerCache;
     Graphics::ResourceCache& resourceCache = Graphics::SharedResourceCache();
     // Recorded dispatches that write a copied buffer (their results reach guest memory by a CPU
@@ -735,6 +736,7 @@ struct VulkanDevice::State {
             workgroupMemory.reset();
             if (workgroupMemoryLayout != VK_NULL_HANDLE) reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(deviceProc(device, "vkDestroyDescriptorSetLayout"))(device, workgroupMemoryLayout, nullptr);
             descriptorCache.reset();
+            vertexInputs.reset();
             emptyBuffer.reset();
             placeholderImages.reset();
             samplerCache.reset();
@@ -1770,6 +1772,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->textureCache = std::make_unique<Graphics::TextureCache>(graphicsContext());
     state->colorTransfer = std::make_unique<Graphics::GpuColorTransfer>(graphicsContext());
     state->descriptorCache = std::make_unique<Graphics::DescriptorCache>(graphicsContext());
+    state->vertexInputs = std::make_unique<Graphics::VertexInputCache>(graphicsContext());
     state->samplerCache = std::make_unique<Graphics::SamplerCache>();
     state->CreateWorkgroupMemoryLayout();
     if (!state->shaderProfile->NullDescriptors()) {
@@ -3449,6 +3452,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sparseQueueMutex = &state->sparseQueueMutex;
     context.recorder = state->recorder.get();
     context.descriptorCache = state->descriptorCache.get();
+    context.vertexInputs = state->vertexInputs.get();
     context.samplerCache = state->samplerCache.get();
     context.drawIndirectFirstInstance = state->drawIndirectFirstInstance;
     context.multiDrawIndirect = state->multiDrawIndirect;

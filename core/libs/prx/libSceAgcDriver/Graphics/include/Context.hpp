@@ -31,6 +31,7 @@ class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
 class PlaceholderImages;
+class VertexInputCache;
 
 class PipelineCacheSynchronization {
 public:
@@ -220,6 +221,7 @@ struct Context {
     PipelineCacheSynchronization::PipelineUseLock LockPipelineCacheForUse() const {
         return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
     }
+    VertexInputCache* vertexInputs = nullptr;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

@@ -1120,6 +1120,7 @@ struct DrawInputs {
     VkDeviceSize indexOffset = 0;
     std::uint32_t maxIndex = 0;
     VertexInputLayout vertexInput;
+    std::shared_ptr<const VertexInputLayout> retainedVertexInput;
     std::vector<std::shared_ptr<Buffer>> vertexBuffers;
     std::vector<VkBuffer> vertexHandles;
     std::vector<VkDeviceSize> vertexOffsets;
@@ -1134,6 +1135,7 @@ struct DrawInputs {
     VkPipelineStageFlags shaderStages = 0;
     std::uint32_t meshGroups = 0;
     std::vector<std::uint32_t> restartTable;
+    const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
 
 std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRecompiler::VertexAttribute& attribute) {
@@ -1275,8 +1277,12 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
-    if (recipe != nullptr) inputs.vertexInput = recipe->vertexInput;
-    else inputs.vertexInput = BuildVertexInputLayout(context, attributes);
+    if (recipe != nullptr) {
+        inputs.vertexInput = recipe->vertexInput;
+    } else if (!attributes.empty()) {
+        if (context.vertexInputs != nullptr) inputs.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+        if (inputs.retainedVertexInput == nullptr) inputs.vertexInput = BuildVertexInputLayout(context, attributes);
+    }
     inputs.vertexOffsets.assign(attributes.size(), 0);
     // An indexed draw's vertex offset moves every fetch: the copy must reach the last one.
     if (draw.indexed) {
@@ -2480,7 +2486,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const auto built = resources->SetLayouts();
         Require(described.layouts.main == built.main && described.layouts.fragment == built.fragment && described.layouts.split == built.split && std::ranges::equal(described.mainKey, built.mainKey) && std::ranges::equal(described.fragmentKey, built.fragmentKey), "set layouts described from the shaders differ from the draw's");
     }
-    auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    auto pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;
@@ -2527,7 +2533,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             for (const auto& owner : owners) recipe->targets.emplace_back(owner);
             recipe->targetViews = targetViews;
             recipe->passKey = DrawRenderPassKey(context, state, targetViews);
-            recipe->vertexInput = inputs.vertexInput;
+            recipe->vertexInput = inputs.VertexLayout();
             recipe->pushStages = PushConstantStages(shaders);
             if (recipe->pushStages != 0) {
                 recipe->pushBytes = AssemblePushConstants(shaders);
