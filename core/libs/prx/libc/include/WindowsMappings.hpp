@@ -148,6 +148,7 @@ public:
         invalidate(*view.page, written);
         protectSubpages(base, written, view.protection, "resume shared memory write");
         view.armed &= static_cast<std::uint8_t>(~written);
+        if (!faultSharedWrites()) view.page->cpuWritten |= written;
         return true;
     }
 
@@ -318,13 +319,13 @@ public:
                             untracked |= arming;
                             continue;
                         }
-                        if (!faultSharedWrites()) {
-                            digesting |= arming;
-                            continue;
-                        }
+                        const auto written = static_cast<std::uint8_t>(arming & view.page->cpuWritten);
+                        digesting |= written;
+                        const auto faulting = static_cast<std::uint8_t>(arming & ~written);
+                        if (faulting == 0) continue;
                         const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
-                        protectSubpages(alias, arming, protection, "arm shared memory write tracking");
-                        other.armed |= arming;
+                        protectSubpages(alias, faulting, protection, "arm shared memory write tracking");
+                        other.armed |= faulting;
                     }
                     digesting &= static_cast<std::uint8_t>(~untracked);
                     recordDigests(*view.page, base, static_cast<std::uint8_t>(digesting & ~view.page->digested));
@@ -400,6 +401,7 @@ private:
         std::uint32_t pins = 0;
         std::array<std::uint64_t, subpages> digest{};
         std::uint8_t digested = 0;
+        std::uint8_t cpuWritten = 0;
     };
     struct Section {
         HANDLE handle;
