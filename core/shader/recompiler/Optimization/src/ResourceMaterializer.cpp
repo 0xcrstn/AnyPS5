@@ -113,7 +113,7 @@ RdnaImageDimension descriptorDimension(const DescriptorValue& descriptor, RdnaIm
 bool validImageDescriptor(const DescriptorValue& descriptor, bool r128) {
     const auto type = rawImageType(descriptor);
     const auto format = rawImageFormat(descriptor);
-    if (type < ImageType::Color1D || format == IrBufferFormat::Invalid) {
+    if (type < ImageType::Color1D || !IsDefinedImageFormat(format)) {
         return false;
     }
     if (r128 && type != ImageType::Color1D && type != ImageType::Color2D && type != ImageType::Color2DMsaa) {
