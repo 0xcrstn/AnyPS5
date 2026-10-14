@@ -2677,6 +2677,7 @@ bool GuestBufferMemory::bindSparseMirror(Region& region, const GuestAllocations:
     if (region.mirror->sparse) region.backed = clipPieces(region.mirror->committed, region.begin, region.end);
     else region.backed = clipPieces({{region.mirror->base, region.mirror->base + region.mirror->bytes}}, region.begin, region.end);
     region.snapshot.clear();
+    accountHostCopies();
     std::lock_guard lock(Mirrors().mutex);
     ++Mirrors().sparseBinds;
     return true;
@@ -2692,6 +2693,25 @@ void GuestBufferMemory::AddReadable(std::uint64_t address, std::size_t bytes) {
     // direct-write mark, and UploadPrepare copies it without the device lock. A written descriptor
     // overlapping the range still covers it through its own Writes() entry.
     addDescriptorRegion(address, bytes, false, false);
+}
+
+namespace {
+
+std::atomic<std::uint64_t> guestBufferHostCopies{0};
+
+}
+
+std::uint64_t GuestBufferHostCopyBytes() {
+    return guestBufferHostCopies.load(std::memory_order_relaxed);
+}
+
+void GuestBufferMemory::accountHostCopies() noexcept {
+    std::uint64_t held = 0;
+    for (const auto& region : regions) held += region.snapshot.capacity() + region.uploaded.capacity();
+    for (const auto& [address, bytes] : heapReferences) held += bytes.capacity();
+    if (held >= accountedHostCopyBytes) guestBufferHostCopies.fetch_add(held - accountedHostCopyBytes, std::memory_order_relaxed);
+    else guestBufferHostCopies.fetch_sub(accountedHostCopyBytes - held, std::memory_order_relaxed);
+    accountedHostCopyBytes = held;
 }
 
 void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
@@ -2745,6 +2765,7 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
         return;
     }
     regions.push_back({snapshot.address, end, false, {snapshot.bytes.begin(), snapshot.bytes.end()}, nullptr});
+    accountHostCopies();
     regionsSorted = false;
 }
 
@@ -2932,6 +2953,18 @@ void ShutdownGuestBufferWorkers() {
 }
 
 GuestBufferMemory::~GuestBufferMemory() {
+    const auto release = [&]() noexcept {
+        for (auto& region : regions) {
+            region.snapshot = std::vector<std::byte>();
+            region.uploaded = std::vector<std::byte>();
+        }
+        heapReferences = decltype(heapReferences)();
+        accountHostCopies();
+    };
+    struct Releaser {
+        decltype(release)& run;
+        ~Releaser() { run(); }
+    } releaser{release};
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
     // A staged region whose last use recorded its copy-in but no copy-back (the use threw before
@@ -3029,6 +3062,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         }
     }
     regions = std::move(merged);
+    accountHostCopies();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
     for (auto& region : regions) {
@@ -3168,6 +3202,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             continue;
         }
         region.snapshot.clear();
+        accountHostCopies();
         std::lock_guard lock(Mirrors().mutex);
         ++Mirrors().subranges;
     }
@@ -3248,6 +3283,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (entry != nullptr && !staged && bindableInPlace(region.begin - entry->base, addressable)) {
                 region.direct = entry;
                 region.snapshot.clear();
+                accountHostCopies();
                 // A buffer UploadPrepare made for a GPU copy is not needed: the import serves the
                 // region in place (Descriptor prefers `direct`), and a kept buffer would count as copied.
                 region.buffer.reset();
@@ -3361,6 +3397,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
             GuestMemory::Read(region.begin, region.buffer->Bytes());
             readBytes += region.buffer->Bytes().size();
             if (written) region.uploaded.assign(region.buffer->Bytes().begin(), region.buffer->Bytes().end());
+            accountHostCopies();
         } else {
             // `uploaded` holds the backed pieces back to back.
             const auto target = region.buffer->Bytes().first(static_cast<std::size_t>(allocated));
@@ -3382,6 +3419,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         readBytes += region.snapshot.size();
     }
     region.snapshot.clear();
+    accountHostCopies();
     if (profile) readUs.fetch_add(microsecondsSince(readStart), std::memory_order_relaxed);
     if (profile) {
         static std::mutex reasonsMutex;
@@ -3493,6 +3531,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         // source is a live import or one retireImport already handed to this batch.
         recorder->Keep(region->buffer);
         region->snapshot.clear();
+        accountHostCopies();
         if (region->deviceLocal) traceStaged(region->begin, region->end, region->atomic);
         if (profile) {
             Copies().gpuCopies.fetch_add(1, std::memory_order_relaxed);

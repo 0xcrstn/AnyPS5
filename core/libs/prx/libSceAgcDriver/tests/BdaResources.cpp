@@ -1294,6 +1294,16 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     GuestBufferMemory overflow(context);
     const std::array<std::byte, 8> source{};
     reject([&] { overflow.AddSnapshot({std::numeric_limits<std::uint64_t>::max() - 3, source}); }, "overflow");
+    {
+        const auto before = GuestBufferHostCopyBytes();
+        {
+            GuestBufferMemory counted(context);
+            const std::array<std::byte, 4096> page{};
+            counted.AddSnapshot({0x7fff12350000ULL, page});
+            Require(GuestBufferHostCopyBytes() >= before + page.size(), "the memory report does not count a guest buffer snapshot");
+        }
+        Require(GuestBufferHostCopyBytes() == before, "the memory report keeps counting a destroyed guest buffer snapshot");
+    }
 
     const std::array<GuestMemorySnapshot, 1> snapshots{{{0x7fff12340000ULL, source}}};
     ShaderRecompiler::RecompileResult shader;

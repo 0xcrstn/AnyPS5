@@ -178,6 +178,8 @@ struct AddressCopy {
 };
 std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t limit);
 
+std::uint64_t GuestBufferHostCopyBytes();
+
 class GuestBufferMemory {
 public:
     explicit GuestBufferMemory(const Context& context);
@@ -391,6 +393,8 @@ private:
     bool regionsSorted = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
+    std::uint64_t accountedHostCopyBytes = 0;
+    void accountHostCopies() noexcept;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
     bool prepared = false;
     bool uploaded = false;
