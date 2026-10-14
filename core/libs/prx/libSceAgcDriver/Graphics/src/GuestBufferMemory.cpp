@@ -4289,6 +4289,21 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     return result;
 }
 
+VkDescriptorBufferInfo GuestBufferMemory::MirroredDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment, std::vector<std::shared_ptr<ResidentMirror>>& mirrors) const {
+    auto info = Descriptor(address, bytes, adjustment);
+    if (!BufferMirrorsEnabled() || context.recorder == nullptr) return info;
+    const auto* region = owner(address);
+    if (region == nullptr || region->direct == nullptr || info.buffer != region->direct->buffer) return info;
+    const auto begin = address - adjustment;
+    const auto end = begin + info.range;
+    if (std::any_of(writes.begin(), writes.end(), [&](const auto& write) { return write.first < end && begin < write.second; })) return info;
+    auto mirror = MirrorOfImport(context, *region->direct);
+    if (mirror == nullptr) return info;
+    info.buffer = MirrorBuffer(*mirror);
+    if (std::find(mirrors.begin(), mirrors.end(), mirror) == mirrors.end()) mirrors.push_back(std::move(mirror));
+    return info;
+}
+
 std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::MirroredRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::vector<std::shared_ptr<ResidentMirror>>& mirrors) const {
     std::vector<ShaderRecompiler::BdaAbi::Range> result(ranges.begin(), ranges.end());
     if (!ResidentMirrorsEnabled() || context.recorder == nullptr) return result;

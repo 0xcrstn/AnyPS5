@@ -13,8 +13,10 @@ struct HostImport;
 struct ResidentMirror;
 
 bool ResidentMirrorsEnabled();
+bool BufferMirrorsEnabled();
 std::shared_ptr<ResidentMirror> MirrorOfImport(const Context& context, const HostImport& import);
 VkDeviceAddress MirrorDeviceAddress(const ResidentMirror& mirror);
+VkBuffer MirrorBuffer(const ResidentMirror& mirror);
 void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirror>> mirrors);
 void RefreshMirrorsForDirectUse(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirror>> mirrors);
 void NoteMirroredWrite(std::uint64_t begin, std::uint64_t end);

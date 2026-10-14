@@ -6307,9 +6307,9 @@ void atomicViewTests(const Device& device, Recorder& recorder) {
     }
 }
 
-bool residentMirrorTests(const Device& device, Recorder& recorder) {
-    if (!AgcDriver::Graphics::ResidentMirrorsEnabled()) {
-        std::cout << "resident mirrors are off (APS5_RESIDENT_MIRRORS): not tested\n";
+bool residentMirrorTests(const Device& device, Recorder& recorder, bool descriptors) {
+    if (!(descriptors ? AgcDriver::Graphics::BufferMirrorsEnabled() : AgcDriver::Graphics::ResidentMirrorsEnabled())) {
+        std::cout << "resident mirrors are off (APS5_RESIDENT_MIRRORS, APS5_RESIDENT_BUFFER_MIRRORS): not tested\n";
         return false;
     }
     auto context = device.GetContext();
@@ -6372,15 +6372,23 @@ bool residentMirrorTests(const Device& device, Recorder& recorder) {
         return false;
     }
     GuestBufferMemory leased(context);
-    leased.AcquireRegistered();
+    if (!descriptors) leased.AcquireRegistered();
     leased.AddReadable(address, bytes);
-    leased.Upload(true);
+    leased.Upload(!descriptors);
     std::vector<std::shared_ptr<AgcDriver::Graphics::ResidentMirror>> mirrors;
-    const auto ranges = leased.MirroredRanges(leased.AddressRanges(), mirrors);
-    const auto mapped = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= address && address + bytes <= range.end; });
-    Require(mapped != ranges.end() && mirrors.size() == 1, "the imported block got no resident mirror");
-    const auto mirrorAddress = mapped->deviceAddress + (address - mapped->begin);
-    Require(mirrorAddress != import->address + (address - import->base), "the mirrored range still points at the import");
+    std::uint64_t mirrorAddress = 0;
+    if (descriptors) {
+        std::uint32_t adjustment = 0;
+        const auto info = leased.MirroredDescriptor(address, bytes, adjustment, mirrors);
+        Require(mirrors.size() == 1 && info.buffer == AgcDriver::Graphics::MirrorBuffer(*mirrors.front()) && info.buffer != import->buffer && info.offset + adjustment == address - import->base, "a read-only V# over an import was not bound to its resident mirror");
+        mirrorAddress = AgcDriver::Graphics::MirrorDeviceAddress(*mirrors.front()) + (address - import->base);
+    } else {
+        const auto ranges = leased.MirroredRanges(leased.AddressRanges(), mirrors);
+        const auto mapped = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= address && address + bytes <= range.end; });
+        Require(mapped != ranges.end() && mirrors.size() == 1, "the imported block got no resident mirror");
+        mirrorAddress = mapped->deviceAddress + (address - mapped->begin);
+        Require(mirrorAddress != import->address + (address - import->base), "the mirrored range still points at the import");
+    }
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkShaderModule module = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
@@ -7467,8 +7475,12 @@ int main(int argc, char** argv) {
             parkedImportUnmapTests(device);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--resident-buffer-mirrors-only") {
+            if (!residentMirrorTests(device, recorder, true)) return 77;
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--resident-mirrors-only") {
-            if (!residentMirrorTests(device, recorder)) return 77;
+            if (!residentMirrorTests(device, recorder, false)) return 77;
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-input-twins-only") {

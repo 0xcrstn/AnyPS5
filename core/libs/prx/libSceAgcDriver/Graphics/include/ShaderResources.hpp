@@ -475,6 +475,7 @@ private:
     GuestBufferMemory guestMemory;
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
+    std::vector<std::shared_ptr<ResidentMirror>> bufferMirrors;
     bool usesBda = false;
     bool mirrorReads = false;
     bool usesFaultBuffer = false;
