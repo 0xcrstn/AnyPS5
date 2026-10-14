@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <span>
 
 namespace AgcDriver::DriverDetail {
 
@@ -45,6 +46,8 @@ SubmissionCosts& submissionCosts(std::uint32_t queue);
 void reportSync();
 
 void countLabelOutcome(int reason);
+
+void countDmaData(std::span<const std::uint32_t> packet, const char* outcome);
 
 }
 
