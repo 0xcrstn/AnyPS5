@@ -328,6 +328,9 @@ void encodeReadRanges(Writer& writer, const BufferReadRanges& ranges) {
         out.Value(range.lastIndex);
         out.Value(range.begin);
         out.Value(range.end);
+        out.Value(range.indexSource);
+        out.Value(range.indexOrigin);
+        out.Value(range.indexScale);
     });
 }
 
@@ -335,11 +338,20 @@ void decodeReadRanges(Reader& reader, BufferReadRanges& ranges) {
     reader.Value(ranges.bounded);
     reader.Value(ranges.unbound);
     if (static_cast<std::uint32_t>(ranges.unbound) >= static_cast<std::uint32_t>(BufferReadUnbound::Count)) ranges.unbound = BufferReadUnbound::Opcode;
-    reader.List(ranges.ranges, 24, [](Reader& in, BufferReadRange& range) {
+    reader.List(ranges.ranges, 36, [](Reader& in, BufferReadRange& range) {
         in.Value(range.firstIndex);
         in.Value(range.lastIndex);
         in.Value(range.begin);
         in.Value(range.end);
+        in.Value(range.indexSource);
+        in.Value(range.indexOrigin);
+        in.Value(range.indexScale);
+        if (static_cast<std::uint32_t>(range.indexSource) >= static_cast<std::uint32_t>(BufferIndexSource::Count) || static_cast<std::uint32_t>(range.indexOrigin) >= static_cast<std::uint32_t>(BufferIndexOrigin::Count)) {
+            range.indexSource = BufferIndexSource::None;
+            range.indexOrigin = BufferIndexOrigin::Other;
+            range.firstIndex = 0;
+            range.lastIndex = BufferReadRanges::AnyIndex;
+        }
     });
 }
 

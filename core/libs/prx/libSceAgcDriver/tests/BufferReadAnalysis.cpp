@@ -104,7 +104,10 @@ void Unbounded() {
     BufferReadAnalysis analysis;
     BufferReadRanges index;
     analysis.Note(index, fixture.Load(IrOpcode::LoadBufferU32, fixture.Unknown(), fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 1u));
-    Require(Holds(index, 0u, BufferReadRanges::AnyIndex, 0u, 4u), "a load at an unbounded index does not read bytes 0 to 4 of any record");
+    Require(index.bounded && index.ranges.size() == 1u && index.ranges[0].firstIndex == 0u && index.ranges[0].lastIndex == BufferReadRanges::AnyIndex && index.ranges[0].end == 4u && index.ranges[0].indexOrigin == BufferIndexOrigin::Other, "a load at an unbounded index does not read bytes 0 to 4 of any record of another origin");
+    BufferReadRanges loaded;
+    analysis.Note(loaded, fixture.Load(IrOpcode::LoadBufferU32, fixture.Scalar(fixture.builder.Constant(0u)), fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 1u));
+    Require(loaded.bounded && loaded.ranges.size() == 1u && loaded.ranges[0].lastIndex == BufferReadRanges::AnyIndex && loaded.ranges[0].indexOrigin == BufferIndexOrigin::Memory, "a load at an index read from memory was not marked with that origin");
     BufferReadRanges offset;
     analysis.Note(offset, fixture.Load(IrOpcode::LoadBufferU32, fixture.builder.Constant(0u), fixture.builder.IAdd(fixture.Unknown(), fixture.builder.Constant(4u)), fixture.builder.Constant(0u)), Memory(0u, 1u));
     Require(!offset.bounded && offset.unbound == BufferReadUnbound::Offset, "a load at an unbounded offset was given a range or another reason");
@@ -131,6 +134,26 @@ void Unbounded() {
     Require(written.bounded && written.ranges.empty(), "a store was counted as a read");
 }
 
+void DrawIndices() {
+    Fixture fixture;
+    BufferReadAnalysis analysis;
+    auto& vertex = fixture.builder.Emit(IrOpcode::GetBuiltin, IrOpcodeType(IrOpcode::GetBuiltin), {&fixture.builder.Constant(static_cast<std::uint32_t>(StageInputKind::VertexIndex)), &fixture.builder.Constant(0u)});
+    auto& scaled = fixture.builder.ShiftLeftLogical(vertex, fixture.builder.Constant(2u));
+    auto& index = fixture.builder.IAdd(scaled, fixture.builder.Constant(1u));
+    BufferReadRanges ranges;
+    analysis.Note(ranges, fixture.Load(IrOpcode::LoadBufferU32, index, fixture.builder.Constant(8u), fixture.builder.Constant(0u)), Memory(0u, 1u));
+    Require(ranges.bounded && ranges.ranges.size() == 1u && ranges.ranges[0] == BufferReadRange{1u, 1u, 8u, 12u, BufferIndexSource::VertexIndex, BufferIndexOrigin::Bounded, 4u}, "a load at index (vertex << 2) + 1 was not recorded as index 4 * vertex + 1");
+    auto& instance = fixture.builder.Emit(IrOpcode::GetBuiltin, IrOpcodeType(IrOpcode::GetBuiltin), {&fixture.builder.Constant(static_cast<std::uint32_t>(StageInputKind::InstanceIndex)), &fixture.builder.Constant(0u)});
+    auto& times = fixture.builder.IMul(instance, fixture.builder.Constant(6u));
+    BufferReadRanges instanced;
+    analysis.Note(instanced, fixture.Load(IrOpcode::LoadBufferU32x2, times, fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 2u));
+    Require(instanced.bounded && instanced.ranges.size() == 1u && instanced.ranges[0] == BufferReadRange{0u, 0u, 0u, 8u, BufferIndexSource::InstanceIndex, BufferIndexOrigin::Bounded, 6u}, "a load at index instance * 6 was not recorded as index 6 * instance");
+    auto& divided = fixture.builder.Emit(IrOpcode::UDiv32, IrType::U32, {&vertex, &fixture.builder.Constant(3u)});
+    BufferReadRanges halved;
+    analysis.Note(halved, fixture.Load(IrOpcode::LoadBufferU32, divided, fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 1u));
+    Require(halved.bounded && halved.ranges.size() == 1u && halved.ranges[0].lastIndex == BufferReadRanges::AnyIndex && halved.ranges[0].indexSource == BufferIndexSource::None && halved.ranges[0].indexOrigin == BufferIndexOrigin::VertexIndex, "a load at index vertex / 3, which is not affine, was not marked as an unbounded index from the vertex id");
+}
+
 void Collapse() {
     Fixture fixture;
     BufferReadAnalysis analysis;
@@ -147,6 +170,7 @@ int main() {
         ScalarLoads();
         BoundedIndex();
         Unbounded();
+        DrawIndices();
         Collapse();
         std::puts("buffer read analysis tests passed");
         return 0;

@@ -149,17 +149,27 @@ public:
         std::vector<Snapshot> snapshots;
         ~DrawBindings();
     };
-    enum class WholeCopy : std::uint8_t { NotAnalysed, Index, Offset, Soffset, ScalarOffset, Wrap, Opcode, Alias, Swizzled, AddTid, BeyondFourGiB, OverHalf, Disabled, Count };
+    enum class WholeCopy : std::uint8_t { NotAnalysed, IndexVertex, IndexInstance, IndexMemory, IndexUserData, IndexOther, NoDrawRange, Offset, Soffset, ScalarOffset, Wrap, Opcode, Alias, Swizzled, AddTid, BeyondFourGiB, OverHalf, Disabled, Count };
     static const char* WholeCopyName(WholeCopy reason);
     using ByteRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    struct ReadAnalysis {
+        std::array<std::uint32_t, 4> words{};
+        ShaderRecompiler::BufferReadRanges ranges;
+    };
+    struct DrawIndexRanges {
+        std::uint32_t firstVertex = 0;
+        std::uint32_t lastVertex = 0;
+        std::uint32_t firstInstance = 0;
+        std::uint32_t lastInstance = 0;
+    };
     struct MovedBuffer {
         std::size_t allocation;
         std::uint64_t address;
         std::size_t size;
         std::vector<std::uint32_t> words;
-        std::optional<ByteRanges> readRanges;
-        WholeCopy wholeCopy = WholeCopy::NotAnalysed;
+        std::optional<ReadAnalysis> readAnalysis;
     };
+    static std::optional<ReadAnalysis> ElementReadAnalysis(const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element);
     struct DrawBindingsStatistics {
         std::uint64_t snapshots = 0;
         std::uint64_t reused = 0;
@@ -183,10 +193,10 @@ public:
         double allocateUs = 0;
         double updateUs = 0;
     };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsStatistics* statistics = nullptr) const;
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsStatistics* statistics = nullptr, const DrawIndexRanges* drawRanges = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     static std::size_t MaxDrawSnapshotBytes();
-    static std::optional<ByteRanges> GuestReadRanges(std::span<const std::uint32_t> words, const ShaderRecompiler::BufferReadRanges* ranges, std::uint64_t size, WholeCopy* reason = nullptr);
+    static std::optional<ByteRanges> GuestReadRanges(std::span<const std::uint32_t> words, const ShaderRecompiler::BufferReadRanges* ranges, std::uint64_t size, WholeCopy* reason = nullptr, const DrawIndexRanges* drawRanges = nullptr);
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
@@ -327,8 +337,7 @@ private:
         std::int32_t pushByte = -1;
         std::int64_t dataAllocation = -1;
         std::uint32_t dataByte = 0;
-        std::optional<ByteRanges> readRanges;
-        WholeCopy wholeCopy = WholeCopy::NotAnalysed;
+        std::optional<ReadAnalysis> readAnalysis;
     };
     struct DataPatch {
         std::size_t allocation;

@@ -1403,7 +1403,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                         const bool atomic = element < binding.bufferAtomic.size() && binding.bufferAtomic[element];
                         const bool read = element < binding.bufferRead.size() && binding.bufferRead[element];
                         const auto index = addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic, read);
-                        if (!allocations[index].written && allocations[index].guest) allocations[index].readRanges = GuestReadRanges(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), element < binding.bufferReadRanges.size() ? &binding.bufferReadRanges[element] : nullptr, allocations[index].size, &allocations[index].wholeCopy);
+                        if (!allocations[index].written && allocations[index].guest) allocations[index].readAnalysis = ElementReadAnalysis(binding, element);
                         const auto& push = shader.program->pushConstants;
                         if (!push.empty()) {
                             const auto position = shader.program->memoryOffsetDword * 4u + element;
@@ -3624,7 +3624,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
                 if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
                 MovedBuffer entry{index, address, static_cast<std::size_t>(size)};
-                entry.readRanges = GuestReadRanges(std::span<const std::uint32_t>(words, 4), element < binding.bufferReadRanges.size() ? &binding.bufferReadRanges[element] : nullptr, entry.size, &entry.wholeCopy);
+                entry.readAnalysis = ElementReadAnalysis(binding, element);
                 moved.push_back(std::move(entry));
             }
         }
@@ -3646,12 +3646,20 @@ bool PartialSnapshotsDisabled() {
 }
 
 const char* ShaderResources::WholeCopyName(WholeCopy reason) {
-    static constexpr std::array<const char*, static_cast<std::size_t>(WholeCopy::Count)> names{"not analysed", "unbounded index", "unbounded offset", "unbounded soffset", "unbounded scalar offset", "offset past 32 bits", "other read", "image alias", "swizzled", "add tid", "past 4 GiB", "over half", "disabled"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(WholeCopy::Count)> names{"not analysed", "index from the vertex id", "index from the instance id", "index loaded from memory", "index from user data", "unbounded index", "no draw range", "unbounded offset", "unbounded soffset", "unbounded scalar offset", "offset past 32 bits", "other read", "image alias", "swizzled", "add tid", "past 4 GiB", "over half", "disabled"};
     const auto index = static_cast<std::size_t>(reason);
     return index < names.size() ? names[index] : "?";
 }
 
-std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std::span<const std::uint32_t> words, const ShaderRecompiler::BufferReadRanges* ranges, std::uint64_t size, WholeCopy* reason) {
+std::optional<ShaderResources::ReadAnalysis> ShaderResources::ElementReadAnalysis(const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element) {
+    if (element >= binding.bufferReadRanges.size() || binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1u) * 4u) return std::nullopt;
+    ReadAnalysis analysis;
+    std::copy_n(binding.guestDescriptor.begin() + static_cast<std::ptrdiff_t>(element) * 4, 4, analysis.words.begin());
+    analysis.ranges = binding.bufferReadRanges[element];
+    return analysis;
+}
+
+std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std::span<const std::uint32_t> words, const ShaderRecompiler::BufferReadRanges* ranges, std::uint64_t size, WholeCopy* reason, const DrawIndexRanges* drawRanges) {
     const auto whole = [&](WholeCopy why) -> std::optional<ByteRanges> {
         if (reason != nullptr) *reason = why;
         return std::nullopt;
@@ -3675,9 +3683,27 @@ std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std:
     ByteRanges result;
     for (const auto& range : ranges->ranges) {
         if (range.firstIndex > range.lastIndex || range.begin > range.end) return whole(WholeCopy::Opcode);
-        if (range.lastIndex == ShaderRecompiler::BufferReadRanges::AnyIndex && stride != 0) return whole(WholeCopy::Index);
-        const auto begin = static_cast<std::uint64_t>(range.firstIndex) * stride + range.begin;
-        const auto end = static_cast<std::uint64_t>(range.lastIndex) * stride + range.end;
+        std::uint64_t firstIndex = range.firstIndex;
+        std::uint64_t lastIndex = range.lastIndex;
+        using Source = ShaderRecompiler::BufferIndexSource;
+        if (range.indexSource != Source::None && stride != 0) {
+            if (drawRanges == nullptr) return whole(WholeCopy::NoDrawRange);
+            const bool vertex = range.indexSource == Source::VertexIndex;
+            firstIndex += static_cast<std::uint64_t>(range.indexScale) * (vertex ? drawRanges->firstVertex : drawRanges->firstInstance);
+            lastIndex += static_cast<std::uint64_t>(range.indexScale) * (vertex ? drawRanges->lastVertex : drawRanges->lastInstance);
+            if (lastIndex > ShaderRecompiler::BufferReadRanges::AnyIndex) return whole(WholeCopy::BeyondFourGiB);
+        } else if (range.indexSource == Source::None && range.lastIndex == ShaderRecompiler::BufferReadRanges::AnyIndex && stride != 0) {
+            using Origin = ShaderRecompiler::BufferIndexOrigin;
+            switch (range.indexOrigin) {
+            case Origin::VertexIndex: return whole(WholeCopy::IndexVertex);
+            case Origin::InstanceIndex: return whole(WholeCopy::IndexInstance);
+            case Origin::Memory: return whole(WholeCopy::IndexMemory);
+            case Origin::UserData: return whole(WholeCopy::IndexUserData);
+            default: return whole(WholeCopy::IndexOther);
+            }
+        }
+        const auto begin = firstIndex * stride + range.begin;
+        const auto end = lastIndex * stride + range.end;
         if (end > std::uint64_t{0xffffffff}) return whole(WholeCopy::BeyondFourGiB);
         if (begin >= size) continue;
         result.emplace_back(begin, std::min(end, size));
@@ -3691,7 +3717,7 @@ std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std:
     return merged;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindingsStatistics* statistics) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindingsStatistics* statistics, const DrawIndexRanges* drawRanges) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     auto lapStart = statistics != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto lap = [&](double DrawBindingsStatistics::*bucket) {
@@ -3803,8 +3829,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, BufferExtent::SizeClass);
                 lap(&DrawBindingsStatistics::bufferUs);
                 std::uint64_t covered = 0;
-                const auto& readRanges = override != moved.end() ? override->readRanges : item.readRanges;
-                auto wholeCopy = override != moved.end() ? override->wholeCopy : item.wholeCopy;
+                const auto& readAnalysis = override != moved.end() ? override->readAnalysis : item.readAnalysis;
+                auto wholeCopy = WholeCopy::NotAnalysed;
+                const auto readRanges = readAnalysis.has_value() && !PartialSnapshotsDisabled() ? GuestReadRanges(readAnalysis->words, &readAnalysis->ranges, size, &wholeCopy, drawRanges) : std::nullopt;
                 if (PartialSnapshotsDisabled()) wholeCopy = WholeCopy::Disabled;
                 else if (readRanges.has_value()) {
                     for (const auto& [from, to] : *readRanges) covered += to - from;

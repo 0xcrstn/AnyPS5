@@ -1988,7 +1988,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     parts.lap(RecordStores);
-    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.profile ? &outcome.bindings : nullptr);
+    std::optional<ShaderResources::DrawIndexRanges> drawRanges;
+    if (args == nullptr && !state.stages.mesh && !state.stages.tessellation && state.stages.path == ShaderPath::Vertex && draw.instanceCount != 0 && static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount - 1u <= std::numeric_limits<std::uint32_t>::max() && draw.firstVertex <= inputs.maxIndex) drawRanges = ShaderResources::DrawIndexRanges{draw.firstVertex, inputs.maxIndex, draw.firstInstance, draw.firstInstance + draw.instanceCount - 1u};
+    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.profile ? &outcome.bindings : nullptr, drawRanges ? &*drawRanges : nullptr);
     parts.lap(RecordBindings);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
