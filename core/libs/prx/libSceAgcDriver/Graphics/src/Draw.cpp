@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -1664,6 +1665,14 @@ bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, R
         // Read in place from the import when the batch runs (a synchronous draw waits for its own).
         recorder->NotePendingRead(args->arguments, static_cast<std::size_t>(args->RangeBytes()), Recorder::ReadKind::Indirect);
         if (args->countIndirect) recorder->NotePendingRead(args->countAddress, 4, Recorder::ReadKind::Indirect);
+    }
+    if (recorder != nullptr && AnyDeviceResident()) {
+        std::uint64_t published = PublishDeviceResident(*recorder, args->arguments, static_cast<std::size_t>(args->RangeBytes()), ResidentSite::Indirect);
+        if (args->countIndirect) published += PublishDeviceResident(*recorder, args->countAddress, 4, ResidentSite::Indirect);
+        if (!recorded && published != 0) {
+            recorder->Submit();
+            recorder->Sync();
+        }
     }
     argumentBuffer = indirect.argumentImport->buffer;
     argumentOffset = args->arguments - indirect.argumentImport->base;

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -1031,6 +1032,18 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             recorder->SyncThrough(address, bytes, true);
         }
     }
+    if (AnyDeviceResidentOverlaps(address, bytes)) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        Require(completionDepth == 0, "a completion action reached unpublished device-resident buffer results");
+        auto* recorder = Recorder::Active();
+        Require(recorder != nullptr, "reading device-resident buffer results needs an active recorder");
+        if (PublishDeviceResident(*recorder, address, bytes, GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Scanout ? ResidentSite::Scanout : ResidentSite::Hook) != 0) {
+            Recorder::CountSync(1);
+            recorder->Submit();
+            recorder->SyncThrough(address, bytes, true);
+        }
+    }
     // A reader takes every shadowed unit of the range; a store only the units it covers partly
     // (its own stamp makes the others stale). Inside a completion action a store has no publish
     // recorded: the batch is not waited for, and the copy would land over the store later.
@@ -1118,6 +1131,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
 
 Recorder::~Recorder() {
     try {
+        if (AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Retire);
         Sync();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
@@ -2897,6 +2911,11 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
 }
 
 void Recorder::OnComplete(std::function<void()> action) {
+    OnCompleteWithoutGuestAccess(std::move(action));
+    open->guestCompletions = true;
+}
+
+void Recorder::OnCompleteWithoutGuestAccess(std::function<void()> action) {
     ensureOpen();
     open->completions.push_back(std::move(action));
     ++open->writeBackCompletionCount;
@@ -3177,6 +3196,14 @@ bool Recorder::HasCompletions() const {
     return false;
 }
 
+bool Recorder::HasGuestCompletions() const {
+    if (open != nullptr && open->guestCompletions) return true;
+    for (const auto& batch : inFlight) {
+        if (batch->guestCompletions) return true;
+    }
+    return false;
+}
+
 void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion) {
     // One entry per dword; a label overlapping older entries (a 4-byte store inside an 8-byte one or
     // the reverse) replaces exactly the dwords it stores, so a lookup composes what memory will hold.
@@ -3313,6 +3340,7 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
 }
 
 void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu) {
+    if (AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Completion);
     Require(open != nullptr || !inFlight.empty(), "no batch to append a completion label to");
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     std::vector<std::byte> copy(bytes.begin(), bytes.end());
@@ -3333,6 +3361,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         GuestMemory::CheckRange(reinterpret_cast<const void*>(address), copy.size(), 4, true);
         GuestMemory::StoreOwnBytes(address, copy);
     });
+    batch.guestCompletions = true;
     // Counted per batch and counted down when the batch finishes, on every exit path of finish()
     // (a label whose range became unmapped is reported there, and a lost device throws before the
     // completions run): a label that will never land must not leave the workers reaping forever.
@@ -3355,9 +3384,11 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
 }
 
 bool Recorder::AfterRecordedWork(std::function<void()> action) {
+    if (AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Completion);
     if (Idle()) return false;
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     batch.completions.push_back(std::move(action));
+    batch.guestCompletions = true;
     ++batch.completionLabelCount;
     completionLabels.fetch_add(1, std::memory_order_acq_rel);
     if (&batch == open.get() && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
@@ -3417,6 +3448,7 @@ void Recorder::Submit() {
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
+    if (open->guestCompletions && AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Completion);
     const bool segments = segmentMode();
     if (!segments) {
         endSamples(*open);

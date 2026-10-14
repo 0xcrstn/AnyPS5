@@ -343,6 +343,7 @@ private:
         bool unstaged = false;
         std::shared_ptr<StagingShadow> shadow {};
         mutable bool shadowBegun = false;
+        mutable bool lazyResident = false;
     };
 
     // How [begin, end) lies against the space's base regions.

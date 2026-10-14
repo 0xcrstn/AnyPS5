@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SlowReport.hpp"
 #include "BdaAbi.hpp"
@@ -1878,6 +1879,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // Debug aid: APS5_LABEL_REAP_ALL_QUEUES=1 reaps on every queue as before.
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
+    if (Graphics::AnyDeviceResident()) Graphics::PublishAllDeviceResident(recorder, Graphics::ResidentSite::Label);
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
@@ -2221,6 +2223,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
         if (Graphics::StorageTexture::AnyPendingOverlaps(ranges)) return CopyOutcome::Image;
         // Results retiled into a unit shadow are not in the import's bytes: the GPU path publishes them.
         if (Graphics::AnyShadowedOverlaps(ranges)) return CopyOutcome::Shadow;
+        if (Graphics::AnyDeviceResidentOverlaps(source, bytes) || Graphics::AnyDeviceResidentOverlaps(destination, bytes)) return CopyOutcome::Shadow;
         if (recorder.PendingWriteOverlaps(source, bytes)) {
             if (!recorder.PendingWriteSettled(source, bytes)) return CopyOutcome::SourcePending;
             if (completionStoreOverlaps(source) || recorder.PendingLabelIn(source, bytes)) return CopyOutcome::SourceUnsettled;
@@ -2318,6 +2321,10 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     // the retile and notes it as a pending write, which is why it comes after the CPU decision).
     Graphics::StorageTexture::FlushPending(source, bytes, nullptr, "buffer copy source", Graphics::PublishScope::Whole);
     Graphics::StorageTexture::FlushPending(destination, bytes, nullptr, "buffer copy destination", Graphics::PublishScope::PartialUnits);
+    if (Graphics::AnyDeviceResident()) {
+        Graphics::PublishDeviceResident(recorder, source, bytes, Graphics::ResidentSite::Copy);
+        Graphics::PublishDeviceResident(recorder, destination, bytes, Graphics::ResidentSite::Copy);
+    }
     // Looked up after the sync (its completions' write-backs can refresh the import table and
     // retire an import) and the flushes (which may import memory themselves).
     const Graphics::HostImport* destinationImport = Graphics::HostImportFor(context, destination, bytes);
@@ -2365,7 +2372,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     // with the generation this store gets, and goes in ahead of the note.
     const auto generation = GuestMemory::MarkWritten(destination, bytes);
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> sourceRange{{{source, source + bytes}}};
-    const bool sourceCurrent = bytes <= knownMax && generation != 0 && !recorder.PendingWriteOverlaps(source, bytes) && !recorder.PendingLabelIn(source, bytes) && !completionStoreOverlaps(source) && !Graphics::StorageTexture::AnyPendingOverlaps(sourceRange) && !Graphics::AnyShadowedOverlaps(sourceRange);
+    const bool sourceCurrent = bytes <= knownMax && generation != 0 && !recorder.PendingWriteOverlaps(source, bytes) && !recorder.PendingLabelIn(source, bytes) && !completionStoreOverlaps(source) && !Graphics::StorageTexture::AnyPendingOverlaps(sourceRange) && !Graphics::AnyShadowedOverlaps(sourceRange) && !Graphics::AnyDeviceResidentOverlaps(source, bytes);
     noteWriter(sourceCurrent ? std::span(reinterpret_cast<const std::byte*>(source), bytes) : std::span<const std::byte>{}, sourceCurrent ? generation : 0);
     recorder.NotePendingWrite(destination, bytes);
     outcome.path = 1;
@@ -4166,6 +4173,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.NoteAccess(CommandClass::DispatchLeading, Graphics::Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, resources.HoldsLease()});
     }
     resources.UseMirrors(recorder);
+    if (argumentImport != nullptr && Graphics::AnyDeviceResident()) Graphics::PublishDeviceResident(recorder, arguments, 12, Graphics::ResidentSite::Indirect);
     if (argumentImport != nullptr) {
         // The group counts were stored by earlier recorded work (a dispatch in place, a fill) or the
         // host; the indirect read follows all of it.
