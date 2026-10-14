@@ -6,6 +6,7 @@
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DriverHeapTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
@@ -1642,6 +1643,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
+    if (DriverHeapTrace::Enabled()) APS5_LOG_OUT("APS5_TRACE_DRIVER_HEAP: traced the heap of %zu driver modules", DriverHeapTrace::HookModules("\\DriverStore\\"));
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = family;
@@ -3046,6 +3048,26 @@ std::string VulkanDevice::DescribeMemoryHeaps() const {
     for (const auto count : libraries.built) built += count;
     std::snprintf(part, sizeof(part), "; pipelines created: compute %llu, graphics libraries %llu, linked %llu, optimized %llu", static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(built), static_cast<unsigned long long>(libraries.linked), static_cast<unsigned long long>(libraries.optimized));
     text += part;
+    if (DriverHeapTrace::Enabled()) {
+        static_cast<void>(DriverHeapTrace::HookModules("\\DriverStore\\"));
+        auto uses = DriverHeapTrace::Read();
+        std::sort(uses.begin(), uses.end(), [](const auto& left, const auto& right) { return left.heapBytes + left.virtualBytes > right.heapBytes + right.virtualBytes; });
+        std::uint64_t heap = 0;
+        std::uint64_t blocks = 0;
+        std::uint64_t virtualBytes = 0;
+        for (const auto& use : uses) {
+            heap += use.heapBytes;
+            blocks += use.heapBlocks;
+            virtualBytes += use.virtualBytes;
+        }
+        std::snprintf(part, sizeof(part), "; driver modules hold %.0f MiB of heap in %llu blocks and %.0f MiB committed directly", static_cast<double>(heap) / 1048576.0, static_cast<unsigned long long>(blocks), static_cast<double>(virtualBytes) / 1048576.0);
+        text += part;
+        for (std::size_t index = 0; index < std::min<std::size_t>(uses.size(), 4); ++index) {
+            std::snprintf(part, sizeof(part), "%s %s %.0f+%.0f MiB", index == 0 ? " (" : ",", uses[index].name.c_str(), static_cast<double>(uses[index].heapBytes) / 1048576.0, static_cast<double>(uses[index].virtualBytes) / 1048576.0);
+            text += part;
+        }
+        if (!uses.empty()) text += ")";
+    }
     const auto modules = Graphics::CreatedShaderModules();
     std::snprintf(part, sizeof(part), "; shader modules handed to the driver %llu (%.0f MiB SPIR-V)", static_cast<unsigned long long>(modules.modules), static_cast<double>(modules.spirvBytes) / 1048576.0);
     text += part;

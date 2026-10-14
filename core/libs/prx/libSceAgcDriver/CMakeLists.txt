@@ -185,6 +185,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/MemoryReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ProcessMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DriverHeapTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -312,6 +313,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_profile_output PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_profile_output PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_driver_heap_trace_tests tests/DriverHeapTrace.cpp Execution/src/DriverHeapTrace.cpp)
+    target_include_directories(agc_driver_heap_trace_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_driver_heap_trace_tests PRIVATE libc)
+    configure_windows_unwind(agc_driver_heap_trace_tests)
+    add_test(NAME agc_driver_heap_trace COMMAND agc_driver_heap_trace_tests)
+    set_tests_properties(agc_driver_heap_trace PROPERTIES TIMEOUT 20 ENVIRONMENT "APS5_TRACE_DRIVER_HEAP=1")
+    if(WIN32)
+        set_tests_properties(agc_driver_heap_trace PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
