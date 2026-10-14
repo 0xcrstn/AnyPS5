@@ -4027,8 +4027,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (override != moved.end() && !override->words.empty()) {
             constexpr std::size_t MovedWordBufferSlots = 8;
             const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
+            const bool reusedWords = held != movedWordBuffers.end();
             std::shared_ptr<Buffer> buffer;
-            if (held != movedWordBuffers.end()) {
+            if (reusedWords) {
                 buffer = held->buffer;
             } else {
                 buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -4044,7 +4045,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto wordHandle = buffer->Handle();
             const auto wordBytes = buffer->Bytes();
             result->snapshots.push_back({0, std::move(buffer), {}, wordHandle, 0, wordBytes});
-            if (statistics != nullptr && held != movedWordBuffers.end()) {
+            if (statistics != nullptr && reusedWords) {
                 ++statistics->reused;
             } else if (statistics != nullptr) {
                 ++statistics->copied;
@@ -4073,13 +4074,45 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         lap(&DrawBindingsStatistics::checkUs);
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        std::optional<ByteRanges> readRanges;
+        std::size_t covered = 0;
+        bool analysed = false;
+        bool limitedCopy = false;
+        auto wholeCopy = WholeCopy::NotAnalysed;
+        const auto prepareRanges = [&]() -> std::optional<DrawSnapshotArena::CopyRanges> {
+            if (!analysed) {
+                const auto& readAnalysis = override != moved.end() ? override->readAnalysis : item.readAnalysis;
+                if (PartialSnapshotsDisabled()) wholeCopy = WholeCopy::Disabled;
+                else if (readAnalysis.has_value()) readRanges = GuestReadRanges(readAnalysis->words, &readAnalysis->ranges, size, &wholeCopy, drawRanges);
+                if (readRanges.has_value()) {
+                    for (const auto& [from, to] : *readRanges) covered += static_cast<std::size_t>(to - from);
+                    limitedCopy = covered * 2 <= bytes;
+                    wholeCopy = WholeCopy::OverHalf;
+                }
+                analysed = true;
+            }
+            if (!limitedCopy) return std::nullopt;
+            DrawSnapshotArena::CopyRanges adjusted = *readRanges;
+            for (auto& [from, to] : adjusted) {
+                from += item.adjustment;
+                to += item.adjustment;
+            }
+            return adjusted;
+        };
         if (DrawSnapshotArena::Enabled()) {
-            if (const auto view = recorder.SnapshotArena().Take(recorder, begin, bytes, registryGeneration)) {
+            if (const auto view = recorder.SnapshotArena().Take(recorder, begin, bytes, registryGeneration, prepareRanges)) {
                 lap(view->copied ? &DrawBindingsStatistics::copyUs : &DrawBindingsStatistics::lookupUs);
                 if (statistics != nullptr && view->copied) {
                     ++statistics->copied;
                     ++statistics->arenaCopies;
-                    statistics->copiedBytes += bytes;
+                    statistics->copiedBytes += view->copiedBytes;
+                    if (view->limited) {
+                        ++statistics->limited;
+                        statistics->uncopiedBytes += bytes - view->copiedBytes;
+                    } else {
+                        ++statistics->wholeCopies[static_cast<std::size_t>(wholeCopy)];
+                        statistics->wholeBytes[static_cast<std::size_t>(wholeCopy)] += view->copiedBytes;
+                    }
                 } else if (statistics != nullptr) {
                     ++statistics->reused;
                     ++statistics->arenaHits;
@@ -4116,16 +4149,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (buffer == nullptr) {
                 buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, BufferExtent::SizeClass);
                 lap(&DrawBindingsStatistics::bufferUs);
-                std::uint64_t covered = 0;
-                const auto& readAnalysis = override != moved.end() ? override->readAnalysis : item.readAnalysis;
-                auto wholeCopy = WholeCopy::NotAnalysed;
-                const auto readRanges = readAnalysis.has_value() && !PartialSnapshotsDisabled() ? GuestReadRanges(readAnalysis->words, &readAnalysis->ranges, size, &wholeCopy, drawRanges) : std::nullopt;
-                if (PartialSnapshotsDisabled()) wholeCopy = WholeCopy::Disabled;
-                else if (readRanges.has_value()) {
-                    for (const auto& [from, to] : *readRanges) covered += to - from;
-                    partial = covered * 2 <= bytes;
-                    wholeCopy = WholeCopy::OverHalf;
-                }
+                static_cast<void>(prepareRanges());
+                partial = limitedCopy;
                 if (partial) {
                     const auto bytesOut = buffer->Bytes();
                     for (const auto& [from, to] : *readRanges) std::memcpy(bytesOut.data() + item.adjustment + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));

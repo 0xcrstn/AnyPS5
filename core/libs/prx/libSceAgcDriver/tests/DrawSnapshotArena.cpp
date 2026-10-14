@@ -25,6 +25,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -93,7 +94,7 @@ private:
 
 class Fixture {
 public:
-    Fixture(const Context& base, std::size_t bytes) : context(base), bytes(bytes) {
+    Fixture(const Context& base, std::size_t bytes, std::size_t ownOffset = 0) : context(base), bytes(bytes) {
         if (context.hostImportAlignment == 0) return;
         block = AllocateWatchedBlock(bytes, 65536);
         if (block == nullptr) return;
@@ -123,7 +124,7 @@ public:
         context.descriptorCache = cache.get();
         recorder = std::make_unique<Recorder>(context);
         recorder->Activate();
-        const auto element = OwnAddress();
+        const auto element = OwnAddress() + ownOffset;
         ShaderRecompiler::DescriptorBinding binding;
         binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
         binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
@@ -133,6 +134,7 @@ public:
         binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, 1024, 0x31000000u};
         binding.bufferWritten = {false};
         program.bindings.push_back(binding);
+        if (ownOffset != 0) program.pushConstants.resize(4);
         compute = std::make_unique<CompiledShader>(CompiledShader{ShaderRecompiler::ShaderStage::Compute, &program, 0});
         resources = std::make_unique<ShaderResources>(context, *compute);
     }
@@ -170,9 +172,10 @@ public:
     Recorder& GetRecorder() { return *recorder; }
     const Context& GetContext() const { return context; }
 
-    Snapshot Take(std::uint64_t offset, std::size_t size, Statistics* statistics = nullptr) {
-        const std::vector<ShaderResources::MovedBuffer> moved{{0, Address() + offset, size, {}}};
-        auto bindings = resources->PrepareDrawBindings(*recorder, moved, statistics);
+    Snapshot Take(std::uint64_t offset, std::size_t size, Statistics* statistics = nullptr, const ShaderResources::ReadAnalysis* analysis = nullptr) {
+        ShaderResources::MovedBuffer moved{0, Address() + offset, size, {}};
+        if (analysis != nullptr) moved.readAnalysis = *analysis;
+        auto bindings = resources->PrepareDrawBindings(*recorder, std::span(&moved, 1), statistics);
         Require(bindings != nullptr && bindings->snapshots.size() == 1, "a moved read-only draw input was not snapshotted");
         held.push_back(bindings);
         return bindings->snapshots.front();
@@ -209,6 +212,132 @@ bool Holds(const Snapshot& snapshot, std::byte value) {
 
 bool SameBytes(const Snapshot& snapshot, const std::byte* guest) {
     return std::memcmp(snapshot.bytes.data(), guest, snapshot.bytes.size()) == 0;
+}
+
+void PartialTests(Fixture& fixture) {
+    DrawSnapshotArena::SetEnabled(true);
+    DrawSnapshotArena::SetDeviceTwins(false);
+    DrawSnapshotArena::SetVerify(true);
+    DrawSnapshotArena::SetExtendBytes(65536);
+    constexpr std::uint64_t offset = 131073;
+    constexpr std::size_t bytes = 16384;
+    constexpr std::size_t viewBytes = bytes + 4;
+    auto* data = fixture.Bytes(0);
+    for (std::size_t index = 0; index < (std::size_t{1} << 20u); ++index) data[index] = static_cast<std::byte>(index * 7u + 3u);
+    const auto analysis = [&](std::uint64_t at, std::size_t size, ShaderRecompiler::BufferReadRanges ranges) {
+        const auto address = fixture.Address() + at;
+        return ShaderResources::ReadAnalysis{{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, static_cast<std::uint32_t>(size), 0x31000000u}, std::move(ranges)};
+    };
+    ShaderRecompiler::BufferReadRanges ranges;
+    ranges.ranges = {{0u, 0u, 63u, 127u}, {0u, 0u, 8999u, 9011u}};
+    const auto limited = analysis(offset, bytes, ranges);
+    auto& recorder = fixture.GetRecorder();
+    auto& arena = recorder.SnapshotArena();
+    arena.TakeCounters();
+    GuestMemory::BumpCollectEpoch();
+    Statistics first;
+    const auto original = fixture.Take(offset, bytes, &first, &limited);
+    Require(original.buffer == nullptr && original.address == fixture.Address() + offset - 1 && original.bytes.size() == viewBytes, "an adjusted partial arena snapshot lost its logical extent");
+    Require(original.offset % fixture.GetContext().limits.minStorageBufferOffsetAlignment == 0, "a partial arena snapshot has an unaligned descriptor offset");
+    Require(first.arenaCopies == 1 && first.limited == 1 && first.copiedBytes == 76 && first.uncopiedBytes == viewBytes - 76, "the arena widened a proved 76-byte read into a full copy");
+    Require(std::memcmp(original.bytes.data() + 64, fixture.Bytes(offset - 1 + 64), 64) == 0 && std::memcmp(original.bytes.data() + 9000, fixture.Bytes(offset - 1 + 9000), 12) == 0, "a partial arena snapshot applied its descriptor adjustment twice or not at all");
+    auto counters = arena.TakeCounters();
+    Require(counters.partialCopies == 1 && counters.copiedBytes == 76 && counters.uncopiedBytes == viewBytes - 76, "the arena did not report its actual partial copy bytes");
+    ShaderRecompiler::BufferReadRanges subsetRanges;
+    subsetRanges.ranges = {{0u, 0u, 8743u, 8755u}};
+    const auto subsetAnalysis = analysis(offset + 256, 12288, subsetRanges);
+    Statistics subsetStatistics;
+    const auto subset = fixture.Take(offset + 256, 12288, &subsetStatistics, &subsetAnalysis);
+    Require(subsetStatistics.arenaHits == 1 && subsetStatistics.copied == 0 && subset.handle == original.handle && subset.offset == original.offset + 256, "a shifted subset of a partial snapshot was recopied or bound at the wrong offset");
+    ranges.ranges.insert(ranges.ranges.begin() + 1, {0u, 0u, 255u, 263u});
+    const auto changedAnalysis = analysis(offset, bytes, ranges);
+    Statistics changedStatistics;
+    const auto changed = fixture.Take(offset, bytes, &changedStatistics, &changedAnalysis);
+    Require(changedStatistics.arenaCopies == 1 && changedStatistics.limited == 1 && changedStatistics.copiedBytes == 84 && (changed.handle != original.handle || changed.offset != original.offset), "a wider read shape reused bytes absent from a partial snapshot");
+    *fixture.Bytes(offset - 1 + 64) = std::byte{0xee};
+    GuestMemory::BumpCollectEpoch();
+    Statistics writtenStatistics;
+    const auto written = fixture.Take(offset, bytes, &writtenStatistics, &changedAnalysis);
+    Require(writtenStatistics.arenaCopies == 1 && written.bytes[64] == std::byte{0xee}, "a CPU store did not invalidate a partial arena snapshot");
+    Require(original.bytes[64] != std::byte{0xee} && changed.bytes[64] != std::byte{0xee}, "a later partial copy overwrote an in-flight snapshot");
+    auto downloaded = std::make_shared<Buffer>(fixture.GetContext(), 80, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(fixture.GetContext(), commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(fixture.GetContext(), commands, original.handle, original.offset + 64, downloaded->Handle(), 0, 64);
+    CopyBuffer(fixture.GetContext(), commands, subset.handle, subset.offset + 8744, downloaded->Handle(), 64, 12);
+    CopyBuffer(fixture.GetContext(), commands, written.handle, written.offset + 64, downloaded->Handle(), 76, 4);
+    RecordMemoryBarrier(fixture.GetContext(), commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    ShaderRecompiler::BufferReadRanges dynamicRanges;
+    dynamicRanges.ranges = {{0u, ShaderRecompiler::BufferReadRanges::AnyIndex, 0u, 4u}};
+    dynamicRanges.ranges.front().indexOrigin = ShaderRecompiler::BufferIndexOrigin::Memory;
+    auto dynamicAnalysis = analysis(offset, bytes, dynamicRanges);
+    dynamicAnalysis.words[1] |= 4u << 16u;
+    dynamicAnalysis.words[2] = bytes / 4u;
+    Statistics fullStatistics;
+    const auto full = fixture.Take(offset, bytes, &fullStatistics, &dynamicAnalysis);
+    Require(fullStatistics.arenaCopies == 1 && fullStatistics.limited == 0 && fullStatistics.wholeCopies[static_cast<std::size_t>(ShaderResources::WholeCopy::IndexMemory)] == 1 && SameBytes(full, fixture.Bytes(offset - 1)), "an unbounded read reused incomplete partial bytes");
+    bool analysed = false;
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto fullHit = arena.Take(recorder, fixture.Address() + offset - 1, viewBytes, registry, [&]() -> std::optional<DrawSnapshotArena::CopyRanges> { analysed = true; return DrawSnapshotArena::CopyRanges{{64, 128}}; });
+    Require(fullHit.has_value() && !fullHit->copied && !analysed, "a complete arena hit evaluated read-range analysis");
+    const auto noReads = analysis(786433, bytes, {});
+    Statistics emptyStatistics;
+    fixture.Take(786433, bytes, &emptyStatistics, &noReads);
+    Require(emptyStatistics.limited == 1 && emptyStatistics.copiedBytes == 0 && emptyStatistics.uncopiedBytes == viewBytes, "an empty proved read set copied guest data");
+    Statistics emptyThenFullStatistics;
+    const auto emptyThenFull = fixture.Take(786433, bytes, &emptyThenFullStatistics);
+    Require(emptyThenFullStatistics.arenaCopies == 1 && emptyThenFullStatistics.limited == 0 && SameBytes(emptyThenFull, fixture.Bytes(786432)), "an empty partial entry exposed uncopied bytes to an unanalysed draw");
+    DrawSnapshotArena::SetDeviceTwins(true);
+    const auto mixed = arena.Take(recorder, fixture.Address() + offset - 1, viewBytes, registry);
+    Require(mixed.has_value() && mixed->buffer == full.handle, "a chunk containing partial snapshots was copied into a device twin");
+    const auto twinAnalysis = analysis(524289, bytes, limited.ranges);
+    Statistics twinStatistics;
+    const auto withoutTwin = fixture.Take(524289, bytes, &twinStatistics, &twinAnalysis);
+    Require(withoutTwin.buffer != nullptr && withoutTwin.twin == nullptr && withoutTwin.offset == 0 && twinStatistics.limited == 1 && twinStatistics.copiedBytes == 76, "a partial snapshot with arena twins enabled exposed uncopied bytes through a twin");
+    recorder.Sync();
+    const auto output = downloaded->Bytes();
+    for (std::size_t index = 0; index < 64; ++index) Require(output[index] == static_cast<std::byte>((offset - 1 + 64 + index) * 7u + 3u), "the GPU lost the original partial snapshot's adjusted bytes");
+    for (std::size_t index = 0; index < 12; ++index) Require(output[64 + index] == static_cast<std::byte>((offset - 1 + 9000 + index) * 7u + 3u), "the GPU read a shifted partial subset at the wrong arena offset");
+    Require(output[76] == std::byte{0xee}, "the GPU did not read the later CPU-written partial snapshot");
+    counters = arena.TakeCounters();
+    Require(counters.verified != 0 && counters.verifyDiffering == 0 && counters.twinCopies == 0, "partial arena verification or device-twin exclusion failed");
+    DrawSnapshotArena::SetDeviceTwins(false);
+    DrawSnapshotArena::SetVerify(false);
+    fixture.Release();
+}
+
+void MovedWordTests(Fixture& fixture) {
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::ShaderData;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {0u, 0u, 0u, 0u};
+    program.shaderDataDwords = static_cast<std::uint32_t>(binding.guestDescriptor.size());
+    program.bindings.push_back(std::move(binding));
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    ShaderResources resources(fixture.GetContext(), compute);
+    std::vector<std::shared_ptr<ShaderResources::DrawBindings>> held;
+    const auto take = [&](std::uint32_t value, bool reused) {
+        ShaderResources::MovedBuffer moved{0, 0, 16, {value, value + 1u, value + 2u, value + 3u}};
+        Statistics statistics;
+        const auto bindings = resources.PrepareDrawBindings(fixture.GetRecorder(), std::span(&moved, 1), &statistics);
+        Require(bindings != nullptr && bindings->snapshots.size() == 1, "moved words were not snapshotted");
+        Require(statistics.reused == (reused ? 1u : 0u) && statistics.copied == (reused ? 0u : 1u) && statistics.copiedBytes == (reused ? 0u : 16u), "moved-word copy accounting used an invalidated cache iterator");
+        Require(std::memcmp(bindings->snapshots.front().bytes.data(), moved.words.data(), 16) == 0, "moved-word cache rollover served another value");
+        held.push_back(bindings);
+        return bindings->snapshots.front();
+    };
+    const auto original = take(1, false);
+    for (std::uint32_t value = 2; value <= 8; ++value) take(value, false);
+    for (std::uint32_t value = 1; value <= 8; ++value) take(value, true);
+    for (std::uint32_t value = 9; value <= 16; ++value) take(value, false);
+    for (std::uint32_t value = 9; value <= 16; ++value) take(value, true);
+    const auto replaced = take(1, false);
+    const std::array<std::uint32_t, 4> originalWords{1u, 2u, 3u, 4u};
+    Require(original.handle != replaced.handle && std::memcmp(original.bytes.data(), originalWords.data(), sizeof(originalWords)) == 0, "moved-word eviction overwrote a snapshot an earlier draw owns");
 }
 
 void ContentTests(Fixture& fixture) {
@@ -696,6 +825,7 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
             return false;
         }
         ContentTests(fixture);
+        MovedWordTests(fixture);
         PendingWriteTests(fixture);
         GpuReadTests(fixture);
         DeviceTwinTests(fixture);
@@ -704,6 +834,11 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
     }
     EpochDirtyOwnedRangeTests(context);
     EpochDirtyReferenceTests(context);
+    {
+        Fixture fixture(context, std::size_t{1} << 20u, 1);
+        Require(fixture.Ready(), "the partial arena fixture lost its host import");
+        PartialTests(fixture);
+    }
     {
         DrawSnapshotArena::SetChunkBytes(65536);
         DrawSnapshotArena::SetBudgetBytes(2 * 65536);
