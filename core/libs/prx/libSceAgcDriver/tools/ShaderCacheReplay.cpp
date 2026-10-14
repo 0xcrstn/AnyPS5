@@ -30,6 +30,12 @@ double Milliseconds(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
+template<typename TSpirv>
+std::vector<std::uint32_t> PreparedWords(const TSpirv& spirv) {
+    if constexpr (requires { spirv.Resolved(); }) return spirv.Resolved().Words();
+    else return spirv.Words();
+}
+
 void Replay(const char* path, bool frontEnd) {
     const auto bytes = ReadFile(path);
     const auto entry = AgcDriver::Tools::ReadComputeCacheEntry(bytes);
@@ -47,7 +53,7 @@ void Replay(const char* path, bool frontEnd) {
     const auto handle = ShaderRecompiler::PrepareShader(entry->request);
     const auto wallMs = Milliseconds(started);
     const auto cpuMs = 1000.0 * static_cast<double>(std::clock() - cpuStarted) / CLOCKS_PER_SEC;
-    const auto& spirv = ShaderRecompiler::GetPreparedArtifact(*handle).spirv.Words();
+    const auto spirv = PreparedWords(ShaderRecompiler::GetPreparedArtifact(*handle).spirv);
     std::uint64_t spirvHash = 0xcbf29ce484222325ull;
     for (const auto word : spirv) spirvHash = Hash(spirvHash, word);
     std::vector<std::byte> plan;
