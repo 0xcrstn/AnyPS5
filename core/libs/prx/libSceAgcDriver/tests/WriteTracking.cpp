@@ -202,7 +202,7 @@ void CheckDeferredSharedImports() {
     Require(protection(0) == PAGE_READWRITE && protection(bytes - 1) == PAGE_READWRITE, "fresh import armed shared pages");
     const char* faultSetting = std::getenv("APS5_SHARED_WRITE_FAULTS");
     const bool faults = faultSetting != nullptr && *faultSetting != '\0' && std::string_view(faultSetting) != "0";
-    const auto gpu = MarkWritten(base + 4096, 4);
+    const auto gpu = MarkWritten(base + 4096, 128);
     Require(gpu != 0 && protection(4096) == PAGE_READONLY && protection(Block) == PAGE_READWRITE, "GPU write did not activate only its block");
     Require(protection(0) == (faults ? PAGE_READONLY : PAGE_READWRITE), faults ? "GPU write did not arm its whole block" : "a shared subpage the GPU did not write was armed for write faults");
     CollectWritesUncached(base, Block);
@@ -218,6 +218,16 @@ void CheckDeferredSharedImports() {
     const auto digested = CollectWritesUncached(base, Block);
     static_cast<volatile std::uint8_t*>(memory)[8] = 0x46;
     Require(!UnchangedSinceCollected(base, 16, digested), "a store to a shared subpage the GPU did not write was missed");
+    if (!faults) {
+        const auto label = base + 2 * 4096 + 64;
+        Require(MarkWritten(label, 8) != 0, "a small GPU write was not stamped");
+        Require(protection(2 * 4096) == PAGE_READWRITE, "a small GPU write armed its subpage for write faults");
+        const auto beforeLabel = CollectWritesUncached(base, Block);
+        static_cast<volatile std::uint64_t*>(reinterpret_cast<void*>(label))[0] = 0x123456789abcdefull;
+        Require(UnchangedSinceCollected(label, 8, beforeLabel), "bytes a small GPU write covers were taken for a guest write");
+        static_cast<volatile std::uint8_t*>(memory)[2 * 4096 + 256] = 0x47;
+        Require(!UnchangedSinceCollected(base + 2 * 4096 + 256, 16, beforeLabel), "a guest store next to a small GPU write was missed");
+    }
 
     const auto second = base + Block;
     const auto before = CollectWritesUncached(second, 4096);
