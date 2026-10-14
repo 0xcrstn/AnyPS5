@@ -1110,6 +1110,7 @@ struct DrawInputs {
     std::vector<VkBuffer> vertexHandles;
     std::vector<VkDeviceSize> vertexOffsets;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
+    std::vector<std::shared_ptr<Buffer>> reusedCopies;
     std::set<std::uint32_t> fragmentOutputs;
     VkPipelineStageFlags shaderStages = 0;
     std::uint32_t meshGroups = 0;
@@ -1247,8 +1248,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.indexOffset = draw.indexAddress - import->base;
             inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
         } else {
-            auto twin = copy.reused && context.recorder != nullptr ? context.recorder->SnapshotTwin(copy.buffer) : std::shared_ptr<Buffer>{};
-            inputs.indices = twin != nullptr ? std::move(twin) : std::move(copy.buffer);
+            if (copy.reused) inputs.reusedCopies.push_back(copy.buffer);
+            inputs.indices = std::move(copy.buffer);
             inputs.indexHandle = inputs.indices->Handle();
         }
     }
@@ -1315,7 +1316,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
-        if (auto twin = copy.reused && context.recorder != nullptr ? context.recorder->SnapshotTwin(copy.buffer) : std::shared_ptr<Buffer>{}) copy.buffer = std::move(twin);
+        if (copy.reused) inputs.reusedCopies.push_back(copy.buffer);
         rangeHandles.push_back(copy.buffer->Handle());
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
@@ -1576,6 +1577,20 @@ struct IndirectRecord {
 
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
+void bindInputTwins(Recorder& recorder, DrawInputs& inputs) {
+    for (const auto& copy : inputs.reusedCopies) {
+        auto twin = recorder.SnapshotTwin(copy);
+        if (twin == nullptr) continue;
+        const auto handle = copy->Handle();
+        if (inputs.indices == copy && inputs.indexHandle == handle) inputs.indexHandle = twin->Handle();
+        for (auto& vertexHandle : inputs.vertexHandles) {
+            if (vertexHandle == handle) vertexHandle = twin->Handle();
+        }
+        inputs.vertexBuffers.push_back(std::move(twin));
+    }
+    inputs.reusedCopies.clear();
+}
+
 void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset) {
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
     const auto* args = indirect != nullptr ? indirect->args : nullptr;
@@ -2060,6 +2075,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    bindInputTwins(*recorder, inputs);
     const auto programTiming = Recorder::GpuTimingEnabled() ? recorder->BeginDrawProgramTiming(drawProgramTimingKey(shaders)) : Recorder::NoTiming;
     if (programTiming != Recorder::NoTiming) Recorder::NoteProgramPlacement(drawProgramTimingKey(shaders), drawPlacement(resources, drawBindings.get(), inputs));
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
@@ -2594,6 +2610,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    if (recorded) bindInputTwins(*recorder, inputs);
     const auto programTiming = recorded && Recorder::GpuTimingEnabled() ? recorder->BeginDrawProgramTiming(drawProgramTimingKey(shaders)) : Recorder::NoTiming;
     if (programTiming != Recorder::NoTiming) Recorder::NoteProgramPlacement(drawProgramTimingKey(shaders), drawPlacement(*resources, nullptr, inputs));
     recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
