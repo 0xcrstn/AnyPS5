@@ -70,7 +70,7 @@ enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiff
 
 struct DrawEntryCounters {
     std::uint64_t lookups = 0, absent = 0, hits = 0, stageValidations = 0, stageEqual = 0, variantsCompared = 0, inserts = 0, variantsInserted = 0, variantsEvicted = 0, present = 0, unstable = 0, touches = 0, verifyHits = 0, verifyMismatches = 0;
-    std::uint64_t partialStages = 0, dataPatchedStages = 0, stashed = 0, nestedMoved = 0, nestedRefused = 0;
+    std::uint64_t partialStages = 0, dataPatchedStages = 0, stashed = 0, nestedMoved = 0, nestedRefused = 0, recipesSkipped = 0;
     double learnUs = 0, relocateUs = 0, stageValidateUs = 0, patchUs = 0, insertUs = 0, syncUs = 0, overlapUs = 0, labelUs = 0, compareUs = 0;
     std::uint64_t validatedRuns = 0, validatedWords = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrawMiss::Count)> misses{};
@@ -116,6 +116,7 @@ struct StageCapture {
     std::vector<std::uint64_t> otherReads;
     std::vector<std::uint32_t> inputExports;
     std::vector<std::pair<std::uint32_t, std::uint64_t>> baseSlots;
+    std::vector<std::uint8_t> readUses;
 };
 
 struct RelocatableUserWord {
@@ -243,6 +244,10 @@ struct DrawMissDiagnosis {
     std::array<std::uint64_t, static_cast<std::size_t>(DrawStageMiss::Count)> validationRoles{};
     std::uint64_t validationDataWords = 0, validationFlatWords = 0, validationOtherWords = 0, validationOnlyData = 0;
     std::uint64_t stagesTagged = 0, leavesOffered = 0, leavesTagged = 0, leavesUnmapped = 0, leavesMismatched = 0, leavesAliased = 0, baseSlotsOffered = 0, nestedTagged = 0, nestedRuns = 0;
+    static constexpr std::size_t ReadUses = 8;
+    std::array<std::uint64_t, ReadUses> differingByUse{};
+    std::array<std::uint64_t, ReadUses> capturedByUse{};
+    std::uint64_t dumped = 0;
     RecentTable<bool> evictedDonors{Samples * 16};
     std::unordered_map<std::uint64_t, DrawStructureParts> learned;
     RecentTable<DrawStageSample> samples{Samples};

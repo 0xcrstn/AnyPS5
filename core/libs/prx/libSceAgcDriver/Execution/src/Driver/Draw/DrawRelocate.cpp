@@ -160,6 +160,24 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
     }
 }
 
+void Driver::tagWordUses(DispatchVariant& variant, const ShaderRecompiler::SrtUserDataUse& use, std::span<const std::uint8_t> readUses) {
+    variant.wordUses.assign(variant.words.size(), 0u);
+    if (readUses.size() != use.reads.size()) return;
+    std::vector<std::pair<std::uint64_t, std::uint8_t>> byAddress;
+    byAddress.reserve(use.reads.size());
+    for (std::size_t read = 0; read < use.reads.size(); ++read) byAddress.emplace_back(use.reads[read].first, readUses[read]);
+    std::sort(byAddress.begin(), byAddress.end());
+    std::size_t position = 0;
+    for (const auto& [begin, end] : variant.runs) {
+        for (auto address = begin; address < end && position < variant.wordUses.size(); address += sizeof(std::uint32_t), ++position) {
+            auto found = std::lower_bound(byAddress.begin(), byAddress.end(), std::make_pair(address, std::uint8_t {0}));
+            std::uint8_t highest = 0;
+            for (; found != byAddress.end() && found->first == address; ++found) highest = std::max(highest, found->second);
+            variant.wordUses[position] = highest;
+        }
+    }
+}
+
 std::shared_ptr<DispatchVariant> Driver::followNestedBases(const DispatchVariant& variant, bool& refused) {
     refused = false;
     if (variant.nestedBases.empty() || variant.runNested.size() != variant.runs.size()) return nullptr;
@@ -525,6 +543,7 @@ std::shared_ptr<DispatchVariant> Driver::cloneVariant(const DispatchVariant& var
     copy->inputExports = variant.inputExports;
     copy->runNested = variant.runNested;
     copy->nestedBases = variant.nestedBases;
+    copy->wordUses = variant.wordUses;
     return copy;
 }
 
