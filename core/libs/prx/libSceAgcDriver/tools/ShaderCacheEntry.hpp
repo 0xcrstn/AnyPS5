@@ -31,6 +31,7 @@ struct CacheEntryRequest {
     ShaderRecompiler::RecompileRequest request{};
     std::uint32_t hostSubgroupSize = 0;
     std::size_t storedWords = 0;
+    std::uint64_t storedHash = 0xcbf29ce484222325ull;
 };
 
 namespace CacheEntryDetail {
@@ -89,7 +90,7 @@ inline constexpr std::size_t HeaderBytes = 48;
 
 }
 
-inline std::unique_ptr<CacheEntryRequest> ReadComputeCacheEntry(std::span<const std::byte> file) {
+inline std::unique_ptr<CacheEntryRequest> ReadCacheEntry(std::span<const std::byte> file, bool graphics) {
     using namespace CacheEntryDetail;
     Bytes bytes(file);
     if (bytes.Read<std::uint32_t>() != FileMagic) throw std::runtime_error("not a shader cache entry");
@@ -114,27 +115,69 @@ inline std::unique_ptr<CacheEntryRequest> ReadComputeCacheEntry(std::span<const 
     bytes.Seek(HeaderBytes + keyBytes);
     bytes.Read<std::uint32_t>();
     entry->storedWords = bytes.Read<std::uint64_t>();
+    for (std::size_t index = 0; index < entry->storedWords; ++index) entry->storedHash = (entry->storedHash ^ bytes.Read<std::uint32_t>()) * 0x100000001b3ull;
 
     Words key(entry->key);
     if (key.Next32() != ShaderRecompiler::RuntimeAbi::Version) throw std::runtime_error("shader cache entry has another runtime ABI version");
     const auto stage = static_cast<ShaderRecompiler::ShaderStage>(key.Next());
-    if (stage != ShaderRecompiler::ShaderStage::Compute) return nullptr;
+    if (stage != ShaderRecompiler::ShaderStage::Compute && (!graphics || (stage != ShaderRecompiler::ShaderStage::Fragment && stage != ShaderRecompiler::ShaderStage::Vertex))) return nullptr;
     if (key.Next() != entry->code.size()) throw std::runtime_error("shader cache key holds code words; it was written with APS5_NO_CODE_HASH_KEY");
     key.Next();
     request.context.waveSize = key.Next32();
     request.context.userDataBaseRegister = key.Next32();
     entry->userData.assign(key.Next(), 0u);
-    if (!key.NextBool()) throw std::runtime_error("compute shader cache key has no compute stage information");
-    ShaderRecompiler::ShaderComputeStageInfo compute{};
-    for (auto& value : compute.numThreads) value = key.Next32();
-    compute.ldsSizeDwords = key.Next32();
-    for (auto& value : compute.groupIdEnable) value = key.NextBool();
-    compute.tgSizeEnable = key.NextBool();
-    compute.threadIdComponentCount = key.Next32();
-    if (key.NextBool()) compute.partialThreads = {1u, 1u, 1u};
-    compute.scratchDwords = key.Next32();
-    request.context.compute = compute;
-    if (key.NextBool() || key.NextBool()) throw std::runtime_error("compute shader cache key has pixel or vertex stage information");
+    if (stage == ShaderRecompiler::ShaderStage::Compute) {
+        if (!key.NextBool()) throw std::runtime_error("compute shader cache key has no compute stage information");
+        ShaderRecompiler::ShaderComputeStageInfo compute{};
+        for (auto& value : compute.numThreads) value = key.Next32();
+        compute.ldsSizeDwords = key.Next32();
+        for (auto& value : compute.groupIdEnable) value = key.NextBool();
+        compute.tgSizeEnable = key.NextBool();
+        compute.threadIdComponentCount = key.Next32();
+        if (key.NextBool()) compute.partialThreads = {1u, 1u, 1u};
+        compute.scratchDwords = key.Next32();
+        request.context.compute = compute;
+        if (key.NextBool() || key.NextBool()) throw std::runtime_error("compute shader cache key has pixel or vertex stage information");
+    } else if (stage == ShaderRecompiler::ShaderStage::Vertex) {
+        if (key.NextBool() || key.NextBool() || !key.NextBool()) throw std::runtime_error("vertex shader cache key has no vertex stage information");
+        ShaderRecompiler::ShaderVertexStageInfo info{};
+        info.fetchAttribReg = key.Next32();
+        info.fetchBufferReg = key.Next32();
+        info.fetchEmbedded = key.NextBool();
+        info.paClVsOutCntl = key.Next32();
+        info.resourcesNum = key.Next32();
+        if (info.resourcesNum > info.resources.size()) throw std::runtime_error("vertex shader cache key has too many vertex resources");
+        for (std::uint32_t index = 0; index < info.resourcesNum; ++index) {
+            if (!info.fetchEmbedded) {
+                const auto numericClass = static_cast<ShaderRecompiler::IrTextureNumericClass>(key.Next());
+                const auto format = numericClass == ShaderRecompiler::IrTextureNumericClass::Uint ? ShaderRecompiler::IrBufferFormat::Format32UInt : numericClass == ShaderRecompiler::IrTextureNumericClass::Sint ? ShaderRecompiler::IrBufferFormat::Format32SInt : ShaderRecompiler::IrBufferFormat::Format32Float;
+                info.resources[index].fields[3] = static_cast<std::uint32_t>(format) << 12u;
+            }
+            auto& destination = info.resourcesDst[index];
+            destination.registerStart = static_cast<std::int32_t>(key.Next());
+            destination.registersNum = static_cast<std::int32_t>(key.Next());
+            destination.attrId = static_cast<std::int32_t>(key.Next());
+            destination.fetchIndex = key.Next32();
+        }
+        request.context.vertex = info;
+    } else {
+        if (key.NextBool() || !key.NextBool()) throw std::runtime_error("pixel shader cache key has no pixel stage information");
+        ShaderRecompiler::ShaderPixelStageInfo info{};
+        info.interpolatorCount = key.Next32();
+        if (info.interpolatorCount > info.interpolatorSettings.size()) throw std::runtime_error("pixel shader cache key has too many interpolators");
+        for (std::uint32_t index = 0; index < info.interpolatorCount; ++index) info.interpolatorSettings[index] = key.Next32();
+        info.wave32 = key.NextBool();
+        info.inputAddr = key.Next32();
+        for (bool* flag : {&info.hasPerspectiveCenterVgpr, &info.perspectiveCentroid, &info.posX, &info.posY, &info.posZ, &info.posW, &info.frontFace, &info.ancillary, &info.sampleShading, &info.noPerspective, &info.linearCentroid, &info.pixelKillEnable, &info.depthExportEnable, &info.sampleMaskExportEnable, &info.earlyZ, &info.executeOnNoop}) *flag = key.NextBool();
+        info.conservativeZExport = static_cast<ShaderRecompiler::ConservativeZExport>(key.Next());
+        info.orderedPixelShader = key.NextBool();
+        info.alphaToCoverage = key.NextBool();
+        info.stencilRefExportEnable = key.NextBool();
+        for (auto& mode : info.targetOutputMode) mode = static_cast<std::uint8_t>(key.Next());
+        for (std::uint8_t target = 0; target < info.targetExportMapping.size(); ++target) info.targetExportMapping[target] = target;
+        request.context.pixel = info;
+        if (key.NextBool()) throw std::runtime_error("pixel shader cache key has vertex stage information");
+    }
     if (key.NextBool()) {
         ShaderRecompiler::ShaderFloatMode floatMode{};
         floatMode.floatMode = key.Next32();
@@ -206,6 +249,10 @@ inline std::unique_ptr<CacheEntryRequest> ReadComputeCacheEntry(std::span<const 
     ShaderRecompiler::RecompileCacheKey::Build(request, rebuilt);
     if (rebuilt != entry->key) throw std::runtime_error("shader cache key does not match the request this build rebuilds from it");
     return entry;
+}
+
+inline std::unique_ptr<CacheEntryRequest> ReadComputeCacheEntry(std::span<const std::byte> file) {
+    return ReadCacheEntry(file, false);
 }
 
 }

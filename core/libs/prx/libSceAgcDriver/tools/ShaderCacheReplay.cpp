@@ -36,11 +36,11 @@ std::vector<std::uint32_t> PreparedWords(const TSpirv& spirv) {
     else return spirv.Words();
 }
 
-void Replay(const char* path, bool frontEnd) {
+void Replay(const char* path, bool frontEnd, bool graphics) {
     const auto bytes = ReadFile(path);
-    const auto entry = AgcDriver::Tools::ReadComputeCacheEntry(bytes);
+    const auto entry = AgcDriver::Tools::ReadCacheEntry(bytes, graphics);
     if (entry == nullptr) {
-        std::printf("%s: skipped, not a compute shader variant\n", path);
+        std::printf("%s: skipped, not a compute%s shader variant\n", path, graphics ? ", pixel or vertex" : "");
         return;
     }
     if (frontEnd) {
@@ -60,28 +60,33 @@ void Replay(const char* path, bool frontEnd) {
     if (!ShaderRecompiler::ShaderDiskCache::EncodePlan(*ShaderRecompiler::GetResourcePlan(entry->request), plan)) throw std::runtime_error("the resource plan cannot be encoded");
     std::uint64_t planHash = 0xcbf29ce484222325ull;
     for (const auto byte : plan) planHash = Hash(planHash, static_cast<std::uint8_t>(byte));
-    const auto& compute = *entry->request.context.compute;
-    std::printf("%s: %zu code dwords, wave%u, %ux%ux%u threads%s, %zu SPIR-V words (%zu stored), prepared in %.1f ms (%.1f ms CPU), SPIR-V hash %016llx, plan hash %016llx\n",
+    const auto compute = entry->request.context.compute.value_or(ShaderRecompiler::ShaderComputeStageInfo{{0u, 0u, 0u}, 0u, {false, false, false}, false, 0u, {}, 0u});
+    std::printf("%s: %zu code dwords, wave%u, %ux%ux%u threads%s, %zu SPIR-V words (%zu stored), prepared in %.1f ms (%.1f ms CPU), SPIR-V hash %016llx, plan hash %016llx, stored hash %016llx\n",
         path, entry->code.size(), entry->request.context.waveSize, compute.numThreads[0], compute.numThreads[1], compute.numThreads[2], compute.PartialGroups() ? " with partial groups" : "",
-        spirv.size(), entry->storedWords, wallMs, cpuMs, static_cast<unsigned long long>(spirvHash), static_cast<unsigned long long>(planHash));
+        spirv.size(), entry->storedWords, wallMs, cpuMs, static_cast<unsigned long long>(spirvHash), static_cast<unsigned long long>(planHash), static_cast<unsigned long long>(entry->storedHash));
 }
 
 }
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_cache_replay [--front-end] <shader cache entry>...\n");
+        std::fprintf(stderr, "usage: agc_shader_cache_replay [--front-end] [--graphics] <shader cache entry>...\n");
         return 2;
     }
     bool frontEnd = false;
+    bool graphics = false;
     int failures = 0;
     for (int index = 1; index < argc; ++index) {
         if (std::string(argv[index]) == "--front-end") {
             frontEnd = true;
             continue;
         }
+        if (std::string(argv[index]) == "--graphics") {
+            graphics = true;
+            continue;
+        }
         try {
-            Replay(argv[index], frontEnd);
+            Replay(argv[index], frontEnd, graphics);
         } catch (const std::exception& error) {
             std::printf("%s: failed: %.2000s\n", argv[index], error.what());
             ++failures;
