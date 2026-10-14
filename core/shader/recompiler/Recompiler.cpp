@@ -1412,14 +1412,23 @@ void noteBufferBaseWords(ResourceCapture& capture) {
     }
 }
 
-std::shared_ptr<const std::vector<std::uint8_t>> baseOnlySlots(const std::shared_ptr<const IrResourcePlan>& plan) {
+std::shared_ptr<const std::vector<std::pair<const void*, std::uint32_t>>> baseOnlyReads(const std::shared_ptr<const IrResourcePlan>& plan) {
     static std::mutex mutex;
-    static std::unordered_map<const IrResourcePlan*, std::pair<std::weak_ptr<const IrResourcePlan>, std::shared_ptr<const std::vector<std::uint8_t>>>> memo;
+    static std::unordered_map<const IrResourcePlan*, std::pair<std::weak_ptr<const IrResourcePlan>, std::shared_ptr<const std::vector<std::pair<const void*, std::uint32_t>>>>> memo;
     {
         std::lock_guard lock(mutex);
         if (const auto found = memo.find(plan.get()); found != memo.end() && found->second.first.lock() == plan) return found->second.second;
     }
-    auto computed = std::make_shared<const std::vector<std::uint8_t>>(Detail::ComputeBaseOnlyFlatSlots(*plan));
+    std::unordered_map<const IrValue*, std::uint32_t> slots;
+    for (const auto& read : plan->srtReads) {
+        if (read.value != nullptr) slots.emplace(read.value->Resolve(), read.flatOffset);
+    }
+    std::vector<std::pair<const void*, std::uint32_t>> reads;
+    for (const auto* raw : Detail::ComputeBaseOnlyReads(*plan)) {
+        const auto slot = slots.find(raw);
+        reads.emplace_back(raw, slot != slots.end() ? slot->second : NoBaseSlot);
+    }
+    auto computed = std::make_shared<const std::vector<std::pair<const void*, std::uint32_t>>>(std::move(reads));
     std::lock_guard lock(mutex);
     if (memo.size() >= 65536) {
         for (auto it = memo.begin(); it != memo.end();) it = it->second.first.expired() ? memo.erase(it) : std::next(it);
@@ -1430,13 +1439,9 @@ std::shared_ptr<const std::vector<std::uint8_t>> baseOnlySlots(const std::shared
 
 void noteBaseSlots(ResourceCapture& capture) {
     if (capture.plan == nullptr) return;
-    const auto& plan = *capture.plan;
-    if (plan.srtReads.empty()) return;
-    const auto base = baseOnlySlots(capture.plan);
+    const auto reads = baseOnlyReads(capture.plan);
     const auto& use = capture.userDataUse;
-    for (std::uint32_t slot = 0; slot < base->size() && slot < plan.srtReads.size(); ++slot) {
-        if ((*base)[slot] == 0u || plan.srtReads[slot].value == nullptr) continue;
-        const void* inst = plan.srtReads[slot].value->Resolve();
+    for (const auto& [inst, slot] : *reads) {
         std::optional<std::uint64_t> address;
         bool single = true;
         for (std::size_t read = 0; read < use.readInstructions.size() && read < use.reads.size(); ++read) {
@@ -1444,7 +1449,7 @@ void noteBaseSlots(ResourceCapture& capture) {
             if (address && *address != use.reads[read].first) single = false;
             address = use.reads[read].first;
         }
-        if (address && single) capture.baseSlots.emplace_back(plan.srtReads[slot].flatOffset, *address);
+        if (address && single) capture.baseSlots.emplace_back(slot, *address);
     }
 }
 

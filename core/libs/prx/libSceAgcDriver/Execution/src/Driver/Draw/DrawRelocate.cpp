@@ -99,7 +99,6 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
             bool usable = true, any = false;
             std::vector<std::uint64_t> addresses;
             for (std::size_t i = 0; usable && i < use.reads.size(); ++i) {
-                if (use.reads[i].first == pointer && use.readBases[i] != 0) usable = false;
                 if (use.readBases[i] != pointer) continue;
                 any = true;
                 const auto address = use.reads[i].first;
@@ -110,8 +109,7 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
                 addresses.push_back(address);
             }
             if (!usable || !any) continue;
-            if (std::any_of(dependents.begin(), dependents.end(), [&](const std::pair<std::uint64_t, std::int16_t>& dependent) { return dependent.first == pointer || std::find(addresses.begin(), addresses.end(), dependent.first) != addresses.end(); })) continue;
-            if (std::any_of(nested.begin(), nested.end(), [&](const std::pair<std::uint64_t, std::uint32_t>& base) { return std::find(addresses.begin(), addresses.end(), base.first) != addresses.end(); })) continue;
+            if (std::any_of(dependents.begin(), dependents.end(), [&](const std::pair<std::uint64_t, std::int16_t>& dependent) { return std::find(addresses.begin(), addresses.end(), dependent.first) != addresses.end(); })) continue;
             const auto index = static_cast<std::int16_t>(nested.size());
             nested.emplace_back(pointer, slot);
             for (const auto address : addresses) dependents.emplace_back(address, index);
@@ -167,44 +165,57 @@ std::shared_ptr<DispatchVariant> Driver::followNestedBases(const DispatchVariant
     if (variant.nestedBases.empty() || variant.runNested.size() != variant.runs.size()) return nullptr;
     std::shared_ptr<DispatchVariant> copy;
     std::shared_ptr<ShaderRecompiler::RecompileResult> rebased;
-    for (std::size_t base = 0; base < variant.nestedBases.size(); ++base) {
-        const auto [position, slot] = variant.nestedBases[base];
-        std::uint64_t address = 0;
-        std::uint32_t first = 0;
-        bool located = false;
-        for (const auto& [begin, end] : variant.runs) {
-            const auto count = static_cast<std::uint32_t>((end - begin) / sizeof(std::uint32_t));
-            if (position >= first && position < first + count) {
-                address = begin + static_cast<std::uint64_t>(position - first) * sizeof(std::uint32_t);
-                located = true;
-                break;
+    const auto& runs = [&]() -> const std::vector<std::pair<std::uint64_t, std::uint64_t>>& { return copy != nullptr ? copy->runs : variant.runs; };
+    std::vector<bool> done(variant.nestedBases.size(), false);
+    for (std::size_t pass = 0; pass < variant.nestedBases.size(); ++pass) {
+        bool progressed = false;
+        for (std::size_t base = 0; base < variant.nestedBases.size(); ++base) {
+            if (done[base]) continue;
+            const auto [position, slot] = variant.nestedBases[base];
+            std::uint64_t address = 0;
+            std::uint32_t first = 0;
+            std::int16_t parent = -1;
+            bool located = false;
+            const auto& current = runs();
+            for (std::size_t run = 0; run < current.size(); ++run) {
+                const auto count = static_cast<std::uint32_t>((current[run].second - current[run].first) / sizeof(std::uint32_t));
+                if (position >= first && position < first + count) {
+                    address = current[run].first + static_cast<std::uint64_t>(position - first) * sizeof(std::uint32_t);
+                    parent = variant.runNested[run];
+                    located = true;
+                    break;
+                }
+                first += count;
             }
-            first += count;
-        }
-        if (!located || position >= variant.words.size()) continue;
-        std::uint32_t live = 0;
-        if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(&live, 1))) != GuestMemory::Compare::Equal) continue;
-        const auto stored = variant.words[position];
-        if (live == stored) continue;
-        if (copy == nullptr) {
-            copy = cloneVariant(variant);
-            rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
-        }
-        const auto delta = static_cast<std::int64_t>(live & ~3u) - static_cast<std::int64_t>(stored & ~3u);
-        for (std::size_t run = 0; run < copy->runs.size(); ++run) {
-            if (copy->runNested[run] != static_cast<std::int16_t>(base)) continue;
-            copy->runs[run].first = static_cast<std::uint64_t>(static_cast<std::int64_t>(copy->runs[run].first) + delta);
-            copy->runs[run].second = static_cast<std::uint64_t>(static_cast<std::int64_t>(copy->runs[run].second) + delta);
-        }
-        copy->words[position] = live;
-        for (auto& binding : rebased->bindings) {
-            if (binding.role != ShaderRecompiler::DescriptorRole::FlattenedSrt || slot >= binding.guestDescriptor.size()) continue;
-            if (binding.guestDescriptor[slot] != stored) {
-                refused = true;
-                return nullptr;
+            if (located && parent >= 0 && static_cast<std::size_t>(parent) < done.size() && !done[static_cast<std::size_t>(parent)]) continue;
+            done[base] = true;
+            progressed = true;
+            if (!located || position >= variant.words.size()) continue;
+            std::uint32_t live = 0;
+            if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(&live, 1))) != GuestMemory::Compare::Equal) continue;
+            const auto stored = variant.words[position];
+            if (live == stored) continue;
+            if (copy == nullptr) {
+                copy = cloneVariant(variant);
+                rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
             }
-            binding.guestDescriptor[slot] = live;
+            const auto delta = static_cast<std::int64_t>(live & ~3u) - static_cast<std::int64_t>(stored & ~3u);
+            for (std::size_t run = 0; run < copy->runs.size(); ++run) {
+                if (copy->runNested[run] != static_cast<std::int16_t>(base)) continue;
+                copy->runs[run].first = static_cast<std::uint64_t>(static_cast<std::int64_t>(copy->runs[run].first) + delta);
+                copy->runs[run].second = static_cast<std::uint64_t>(static_cast<std::int64_t>(copy->runs[run].second) + delta);
+            }
+            copy->words[position] = live;
+            for (auto& binding : rebased->bindings) {
+                if (binding.role != ShaderRecompiler::DescriptorRole::FlattenedSrt || slot >= binding.guestDescriptor.size()) continue;
+                if (binding.guestDescriptor[slot] != stored) {
+                    refused = true;
+                    return nullptr;
+                }
+                binding.guestDescriptor[slot] = live;
+            }
         }
+        if (!progressed) break;
     }
     if (copy == nullptr) return nullptr;
     copy->compiled = std::move(rebased);
