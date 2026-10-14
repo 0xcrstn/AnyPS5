@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/SlowReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
@@ -122,6 +123,11 @@ void Driver::execute(const Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        const SlowReport slowPacket([&] {
+            char text[128];
+            std::snprintf(text, sizeof(text), "queue %u packet opcode 0x%02x (%zu dwords) at dword %zu of submission %llu", submission.queue, static_cast<unsigned>(opcode), static_cast<std::size_t>(count), cursor, static_cast<unsigned long long>(submission.serial));
+            return std::string(text);
+        });
         auto nextCursor = cursor + count;
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
