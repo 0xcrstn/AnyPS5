@@ -181,6 +181,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostThread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/MemoryReport.cpp
@@ -334,6 +335,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_stack_walk PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_stack_walk PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_host_thread_tests tests/HostThread.cpp Execution/src/HostThread.cpp)
+    target_include_directories(agc_host_thread_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_host_thread_tests PRIVATE libc)
+    configure_windows_unwind(agc_host_thread_tests)
+    add_test(NAME agc_host_thread COMMAND agc_host_thread_tests)
+    set_tests_properties(agc_host_thread PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_host_thread PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

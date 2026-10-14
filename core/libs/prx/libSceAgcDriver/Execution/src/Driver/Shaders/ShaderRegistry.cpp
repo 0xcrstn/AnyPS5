@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostThread.hpp"
 #include "CacheKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
@@ -938,17 +939,9 @@ public:
 
 private:
     explicit RegistrationPreparePool(unsigned count) {
-        pthread_attr_t attributes;
-        pthread_attr_init(&attributes);
-        pthread_attr_setstacksize(&attributes, 64u << 20u);
         for (unsigned index = 0; index < count; ++index) {
-            pthread_t thread;
-            if (pthread_create(&thread, &attributes, &RegistrationPreparePool::Main, this) == 0) {
-                pthread_detach(thread);
-                ++threads;
-            }
+            if (StartDetachedHostThread(&RegistrationPreparePool::Main, this, 64u << 20u)) ++threads;
         }
-        pthread_attr_destroy(&attributes);
     }
 
     static void* Main(void* argument) {
