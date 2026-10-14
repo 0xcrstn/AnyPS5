@@ -576,6 +576,9 @@ struct RetainedShaderMemory {
     std::uint64_t plans = 0;
     std::uint64_t planValues = 0;
     std::uint64_t planBytes = 0;
+    std::uint64_t spilledPlans = 0;
+    std::uint64_t spilledPlanBytes = 0;
+    std::uint64_t planReloads = 0;
     std::uint64_t programs = 0;
     std::uint64_t variants = 0;
     std::uint64_t variantSpirvBytes = 0;

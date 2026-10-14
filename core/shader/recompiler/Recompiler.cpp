@@ -314,12 +314,20 @@ struct SourceEntry {
     // The result memo, most recently used first, at most ResultMemoEntries (under mutex).
     std::list<ResultMemoEntry> memo;
     std::unordered_map<std::uint64_t, std::list<ResultMemoEntry>::iterator> memoIndex;
+    std::vector<std::byte> planKey;
+    std::weak_ptr<const IrResourcePlan> spilledPlan;
+    std::uint64_t planCodeAddress = 0;
+    std::uint64_t planBytes = 0;
+    bool planStored = false;
+    bool planSpilled = false;
+    bool planUsed = false;
+    bool planSpillRequested = false;
 };
 
 namespace {
 
 struct RetainedCounters {
-    std::atomic<std::uint64_t> sources{0}, plans{0}, planValues{0}, planBytes{0}, programs{0}, variants{0}, variantSpirvBytes{0}, spilledVariants{0}, spilledSpirvBytes{0}, spirvReloads{0}, spirvReloadBytes{0}, bindingPlans{0}, specializedModules{0}, specializedSpirvBytes{0}, registrationModules{0};
+    std::atomic<std::uint64_t> sources{0}, plans{0}, planValues{0}, planBytes{0}, spilledPlans{0}, spilledPlanBytes{0}, planReloads{0}, programs{0}, variants{0}, variantSpirvBytes{0}, spilledVariants{0}, spilledSpirvBytes{0}, spirvReloads{0}, spirvReloadBytes{0}, bindingPlans{0}, specializedModules{0}, specializedSpirvBytes{0}, registrationModules{0};
 };
 
 bool SpillPreparedSpirv() {
@@ -332,13 +340,46 @@ RetainedCounters& retainedCounters() {
     return counters;
 }
 
-void countPlan(const IrResourcePlan& plan) {
+std::uint64_t countPlan(const IrResourcePlan& plan) {
     std::uint64_t values = 0;
     const auto bytes = EstimatePlanBytes(plan, &values);
     auto& counters = retainedCounters();
     counters.plans.fetch_add(1, std::memory_order_relaxed);
     counters.planValues.fetch_add(values, std::memory_order_relaxed);
     counters.planBytes.fetch_add(bytes, std::memory_order_relaxed);
+    return bytes;
+}
+
+bool SpillResourcePlans() {
+    static const bool spill = std::getenv("APS5_NO_PLAN_SPILL") == nullptr;
+    return spill;
+}
+
+void spillPlanLocked(SourceEntry& source) {
+    if (source.plan == nullptr || source.planUsed || !source.planStored || !source.planSpillRequested) return;
+    source.spilledPlan = source.plan;
+    source.plan.reset();
+    source.planSpilled = true;
+    retainedCounters().spilledPlans.fetch_add(1, std::memory_order_relaxed);
+    retainedCounters().spilledPlanBytes.fetch_add(source.planBytes, std::memory_order_relaxed);
+}
+
+std::shared_ptr<const IrResourcePlan> usePlan(SourceEntry& source) {
+    std::lock_guard lock(source.mutex);
+    source.planUsed = true;
+    if (source.plan != nullptr || !source.planSpilled) return source.plan;
+    source.plan = source.spilledPlan.lock();
+    if (source.plan == nullptr) {
+        IrResourcePlan loaded;
+        if (!ShaderDiskCache::ReloadPlan(source.planKey, loaded)) throw std::runtime_error("ShaderRecompiler: a resource plan kept in the shader disk cache could not be read back from it");
+        loaded.shaderHash = source.planCodeAddress;
+        source.plan = std::make_shared<const IrResourcePlan>(std::move(loaded));
+        retainedCounters().planReloads.fetch_add(1, std::memory_order_relaxed);
+    }
+    source.planSpilled = false;
+    retainedCounters().spilledPlans.fetch_sub(1, std::memory_order_relaxed);
+    retainedCounters().spilledPlanBytes.fetch_sub(source.planBytes, std::memory_order_relaxed);
+    return source.plan;
 }
 
 void countProgram(bool retained) {
@@ -444,7 +485,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
     }
     {
         std::lock_guard lock(source->mutex);
-        if (source->plan == nullptr) {
+        if (source->plan == nullptr && !source->planSpilled) {
             if (FailureMemo() && source->planFailure) std::rethrow_exception(source->planFailure);
             const bool disk = diskPlans();
             std::vector<std::byte> planKey;
@@ -454,7 +495,8 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                 if (ShaderDiskCache::LoadPlan(planKey, loaded)) {
                     loaded.shaderHash = request.shader.codeAddress;
                     source->plan = std::make_shared<const IrResourcePlan>(std::move(loaded));
-                    countPlan(*source->plan);
+                    source->planBytes = countPlan(*source->plan);
+                    source->planStored = true;
                 } else if (std::string refused; FailureMemo() && ShaderDiskCache::LoadPlanFailure(planKey, refused)) {
                     source->planFailure = std::make_exception_ptr(std::runtime_error(refused));
                     std::rethrow_exception(source->planFailure);
@@ -465,7 +507,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                     ResourceProgram resource(request, preparation, reclaim);
                     source->plan = std::move(resource.plan);
                     source->program = std::move(resource.program);
-                    countPlan(*source->plan);
+                    source->planBytes = countPlan(*source->plan);
                     if (source->program != nullptr) countProgram(true);
                 } catch (const std::runtime_error& error) {
                     if (FailureMemo()) source->planFailure = std::current_exception();
@@ -475,7 +517,19 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                     if (FailureMemo()) source->planFailure = std::current_exception();
                     throw;
                 }
-                if (disk) ShaderDiskCache::StorePlan(std::move(planKey), source->plan);
+                if (disk) {
+                    ShaderDiskCache::StorePlan(planKey, source->plan, [weak = std::weak_ptr<SourceEntry>(source)] {
+                        const auto stored = weak.lock();
+                        if (stored == nullptr) return;
+                        std::lock_guard storedLock(stored->mutex);
+                        stored->planStored = true;
+                        spillPlanLocked(*stored);
+                    });
+                }
+            }
+            if (disk) {
+                source->planKey = std::move(planKey);
+                source->planCodeAddress = request.shader.codeAddress;
             }
         }
     }
@@ -1069,7 +1123,7 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
         return materializeResult(variant, request, snapshot);
     }
     const auto source = getSource(request);
-    materializer.Materialize(*source->plan, runtime, snapshot);
+    materializer.Materialize(*usePlan(*source), runtime, snapshot);
     return materializeVariant(*source, request, snapshot);
 }
 
@@ -1363,12 +1417,12 @@ std::uint64_t EstimatePlanBytes(const IrResourcePlan& plan, std::uint64_t* value
 RetainedShaderMemory GetRetainedShaderMemory() {
     const auto& counters = retainedCounters();
     const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
-    return {load(counters.sources), load(counters.plans), load(counters.planValues), load(counters.planBytes), load(counters.programs), load(counters.variants), load(counters.variantSpirvBytes), load(counters.spilledVariants), load(counters.spilledSpirvBytes), load(counters.spirvReloads), load(counters.spirvReloadBytes), load(resultMemoCounters().memoResults), load(resultMemoCounters().memoBytes), load(counters.bindingPlans), load(counters.specializedModules), load(counters.specializedSpirvBytes), load(counters.registrationModules)};
+    return {load(counters.sources), load(counters.plans), load(counters.planValues), load(counters.planBytes), load(counters.spilledPlans), load(counters.spilledPlanBytes), load(counters.planReloads), load(counters.programs), load(counters.variants), load(counters.variantSpirvBytes), load(counters.spilledVariants), load(counters.spilledSpirvBytes), load(counters.spirvReloads), load(counters.spirvReloadBytes), load(resultMemoCounters().memoResults), load(resultMemoCounters().memoBytes), load(counters.bindingPlans), load(counters.specializedModules), load(counters.specializedSpirvBytes), load(counters.registrationModules)};
 }
 
 std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request) {
     static_cast<void>(RequestInputInfo(request));
-    if (request.useCache) return getSource(request)->plan;
+    if (request.useCache) return usePlan(*getSource(request));
     return makeResourcePlan(request);
 }
 
@@ -1437,7 +1491,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     auto capture = std::make_shared<ResourceCapture>();
     if (request.useCache) {
         capture->source = getSource(request);
-        capture->plan = capture->source->plan;
+        capture->plan = usePlan(*capture->source);
     } else {
         capture->plan = makeResourcePlan(request);
     }
@@ -1466,6 +1520,10 @@ std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& reques
         bool cacheHit = false;
         std::lock_guard lock(handle->source->mutex);
         handle->artifact = findOrCompileVariant(*handle->source, request, cacheHit, preparation);
+        if (SpillResourcePlans()) {
+            handle->source->planSpillRequested = true;
+            spillPlanLocked(*handle->source);
+        }
         return handle;
     });
 }
@@ -1518,13 +1576,13 @@ std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(cons
 std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const SrtRuntime& runtime) const {
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle->source;
-    capture->plan = handle->source->plan;
+    capture->plan = usePlan(*handle->source);
     materializeCapture(*capture, runtime);
     return capture;
 }
 
 std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture) const {
-    if (capture.source != handle->source || capture.plan != handle->source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    if (capture.source != handle->source || capture.plan != usePlan(*handle->source)) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
     result->cacheHit = true;
@@ -1552,7 +1610,7 @@ std::shared_ptr<const RecompileResult> RegistrationResult(const RecompileRequest
 
 std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest& request, const ResourceCapture& capture, const SourceHandle& handle) {
     if (!MatchesPreparedShader(request, handle)) throw std::runtime_error("ShaderRecompiler: prepared artifact does not match the static ABI");
-    if (capture.source != handle.source || capture.plan != handle.source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    if (capture.source != handle.source || capture.plan != usePlan(*handle.source)) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle.source, handle.artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle.artifact, request, capture.snapshot));
     result->cacheHit = true;
@@ -1568,7 +1626,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) static_cast<void>(RequestInputInfo(request));
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle.source;
-    capture->plan = handle.source->plan;
+    capture->plan = usePlan(*handle.source);
     if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
     materializeCapture(*capture, runtime);
     return capture;

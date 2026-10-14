@@ -681,6 +681,28 @@ void verifySpilledSpirv() {
     throw std::runtime_error("spilled SPIR-V was read without being resolved");
 }
 
+void verifySpilledPlan() {
+    ComputeRequest request(true);
+    request.code[1] = 0x80000004u;
+    request.request.shader.code = request.code;
+    const auto before = GetRetainedShaderMemory();
+    const auto handle = PrepareShader(request.request);
+    ShaderDiskCache::Flush();
+    const auto spilled = GetRetainedShaderMemory();
+    require(spilled.plans == before.plans + 1 && spilled.spilledPlans == before.spilledPlans + 1 && spilled.spilledPlanBytes > before.spilledPlanBytes, "a prepared shader's resource plan stored in the disk cache stays in memory");
+    RequestMemoryView view(request.request.context.memory);
+    const auto capture = CaptureResources(request.request, view.MakeRuntime(request.request.context.userData, request.request.shader.codeAddress), *handle);
+    const auto reloaded = GetRetainedShaderMemory();
+    require(capture->plan != nullptr && reloaded.planReloads == spilled.planReloads + 1 && reloaded.spilledPlans == before.spilledPlans, "the spilled resource plan was not read back at its first capture");
+    const auto result = MaterializeShader(request.request, *capture, *handle);
+    ComputeRequest fresh(false);
+    fresh.code[1] = 0x80000004u;
+    fresh.request.shader.code = fresh.code;
+    requireSameResult(Recompile(fresh.request), *result, "a capture over a read-back resource plan against a fresh compile");
+    static_cast<void>(CaptureResources(request.request, view.MakeRuntime(request.request.context.userData, request.request.shader.codeAddress), *handle));
+    require(GetRetainedShaderMemory().planReloads == reloaded.planReloads, "a captured shader's resource plan was spilled again");
+}
+
 struct ClockRequest {
     std::vector<std::uint32_t> code{0xf4900100u, 0x00000000u, 0xbf8cc07fu, 0x7e020204u, 0xe0700000u, 0x80000100u, 0xf800180fu, 0x01010101u, 0xbf810000u};
     std::array<std::uint32_t, 4> userData{0x10000000u, 0x00000000u, 0x40u, 0x00027facu};
@@ -1950,6 +1972,7 @@ int main(int argc, char** argv) {
         verifyStore();
         verifyAcrossProcesses(argv[0]);
         verifySpilledSpirv();
+        verifySpilledPlan();
         verifyPlanAcrossProcesses(argv[0]);
         verifyEmissionFailureMemo();
         verifyFailureMemoSwitch(argv[0]);

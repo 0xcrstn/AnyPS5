@@ -40,6 +40,8 @@ struct Counters {
     std::uint64_t reloadFailures = 0;
     std::uint64_t planFailureHits = 0;
     std::uint64_t planFailureWrites = 0;
+    std::uint64_t planReloads = 0;
+    std::uint64_t planReloadFailures = 0;
 };
 
 [[nodiscard]] std::uint64_t SourceVersion();
@@ -70,7 +72,8 @@ void BuildPlanFailureKey(std::span<const std::byte> planKey, std::vector<std::by
 [[nodiscard]] bool Reload(std::span<const std::byte> key, CompiledVariant& variant);
 void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant, std::function<void()> stored = {});
 [[nodiscard]] bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan);
-void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan);
+void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan, std::function<void()> stored = {});
+[[nodiscard]] bool ReloadPlan(std::span<const std::byte> key, IrResourcePlan& plan);
 [[nodiscard]] bool LoadPlanFailure(std::span<const std::byte> planKey, std::string& message);
 void StorePlanFailure(std::span<const std::byte> planKey, std::string message);
 void Flush();
