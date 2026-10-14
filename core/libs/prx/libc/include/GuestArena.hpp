@@ -50,6 +50,7 @@ bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t byt
 #endif
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
+void GuestArenaNoteDeviceWrite_nid_postfix(std::uintptr_t address, std::size_t bytes);
 
 }
 
