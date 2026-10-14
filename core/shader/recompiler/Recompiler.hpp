@@ -582,6 +582,7 @@ struct RetainedShaderMemory {
     std::uint64_t programs = 0;
     std::uint64_t variants = 0;
     std::uint64_t variantSpirvBytes = 0;
+    std::uint64_t variantMetadataBytes = 0;
     std::uint64_t spilledVariants = 0;
     std::uint64_t spilledSpirvBytes = 0;
     std::uint64_t spirvReloads = 0;
@@ -592,6 +593,9 @@ struct RetainedShaderMemory {
     std::uint64_t specializedModules = 0;
     std::uint64_t specializedSpirvBytes = 0;
     std::uint64_t registrationModules = 0;
+    std::uint64_t irPrograms = 0;
+    std::uint64_t irBytes = 0;
+    std::uint64_t irPeakBytes = 0;
 };
 
 [[nodiscard]] RetainedShaderMemory GetRetainedShaderMemory();

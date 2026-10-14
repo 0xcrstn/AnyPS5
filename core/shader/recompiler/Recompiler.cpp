@@ -327,7 +327,7 @@ struct SourceEntry {
 namespace {
 
 struct RetainedCounters {
-    std::atomic<std::uint64_t> sources{0}, plans{0}, planValues{0}, planBytes{0}, spilledPlans{0}, spilledPlanBytes{0}, planReloads{0}, programs{0}, variants{0}, variantSpirvBytes{0}, spilledVariants{0}, spilledSpirvBytes{0}, spirvReloads{0}, spirvReloadBytes{0}, bindingPlans{0}, specializedModules{0}, specializedSpirvBytes{0}, registrationModules{0};
+    std::atomic<std::uint64_t> sources{0}, plans{0}, planValues{0}, planBytes{0}, spilledPlans{0}, spilledPlanBytes{0}, planReloads{0}, programs{0}, variants{0}, variantSpirvBytes{0}, variantMetadataBytes{0}, irPrograms{0}, irBytes{0}, irPeakBytes{0}, spilledVariants{0}, spilledSpirvBytes{0}, spirvReloads{0}, spirvReloadBytes{0}, bindingPlans{0}, specializedModules{0}, specializedSpirvBytes{0}, registrationModules{0};
 };
 
 bool SpillPreparedSpirv() {
@@ -382,6 +382,67 @@ std::shared_ptr<const IrResourcePlan> usePlan(SourceEntry& source) {
     return source.plan;
 }
 
+std::uint64_t estimateValueBytes(const IrValue& value) {
+    return sizeof(IrValue) + (value.ArgumentCount() + value.UseCount() + value.PhiBlockCount()) * sizeof(void*) + value.OperandUses().size() * sizeof(IrUse);
+}
+
+std::uint64_t estimateProgramBytes(const IrProgram& program) {
+    std::uint64_t bytes = sizeof(IrProgram);
+    for (const auto& block : program.Blocks()) {
+        if (block == nullptr) continue;
+        bytes += sizeof(IrBlock) + (block->Predecessors().size() + block->Successors().size()) * sizeof(void*);
+        for (const auto* value : block->Instructions()) bytes += estimateValueBytes(*value) + 3u * sizeof(void*);
+    }
+    return bytes;
+}
+
+template<typename TElement>
+std::uint64_t vectorBytes(const std::vector<TElement>& values) {
+    return values.size() * sizeof(TElement);
+}
+
+template<typename TElement, std::size_t Count>
+std::uint64_t vectorBytes(const std::array<TElement, Count>&) {
+    return 0;
+}
+
+std::uint64_t estimateVariantMetadataBytes(const CompiledVariant& variant) {
+    const auto& info = variant.info.info;
+    std::uint64_t bytes = sizeof(CompiledVariant) + vectorBytes(info.buffers) + vectorBytes(info.images) + vectorBytes(info.runtimeImageModes) + vectorBytes(info.samplers) + vectorBytes(info.sampledPairs) + vectorBytes(info.inputs) + vectorBytes(info.outputs);
+    for (const auto& modes : info.runtimeImageModes) bytes += vectorBytes(modes);
+    const auto& artifact = variant.artifact;
+    bytes += vectorBytes(artifact.runtimeImageResources) + vectorBytes(artifact.vertexInputs) + vectorBytes(artifact.vertexInputPatches) + vectorBytes(artifact.parameterExports) + vectorBytes(artifact.fragmentParameters);
+    for (const auto& patch : artifact.vertexInputPatches) bytes += vectorBytes(patch.values);
+    return bytes;
+}
+
+class InFlightIr {
+public:
+    explicit InFlightIr(std::uint64_t bytes) : bytes(bytes) {
+        auto& counters = retainedCounters();
+        counters.irPrograms.fetch_add(1, std::memory_order_relaxed);
+        const auto total = counters.irBytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+        auto peak = counters.irPeakBytes.load(std::memory_order_relaxed);
+        while (total > peak && !counters.irPeakBytes.compare_exchange_weak(peak, total, std::memory_order_relaxed)) {}
+    }
+    InFlightIr(const InFlightIr&) = delete;
+    InFlightIr& operator=(const InFlightIr&) = delete;
+    ~InFlightIr() {
+        Release();
+    }
+
+    void Release() {
+        if (released) return;
+        released = true;
+        retainedCounters().irPrograms.fetch_sub(1, std::memory_order_relaxed);
+        retainedCounters().irBytes.fetch_sub(bytes, std::memory_order_relaxed);
+    }
+
+private:
+    std::uint64_t bytes;
+    bool released = false;
+};
+
 void countProgram(bool retained) {
     if (retained) retainedCounters().programs.fetch_add(1, std::memory_order_relaxed);
     else retainedCounters().programs.fetch_sub(1, std::memory_order_relaxed);
@@ -408,6 +469,7 @@ struct ResourceProgram {
         clearRegisterState(program->Blocks());
         clearRegisterState(program->Resources().blockStorage);
         if (reclaim) program->ReclaimUnusedValues();
+        const InFlightIr inFlight(estimateProgramBytes(*program));
         plan = std::make_shared<const IrResourcePlan>(ResourceMaterializer{}.ExtractPlan(*program));
     }
 
@@ -546,6 +608,7 @@ std::uint64_t nextVariantId() {
 }
 
 CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, std::exception_ptr* emissionFailure = nullptr) try {
+    InFlightIr inFlight(estimateProgramBytes(program));
     const auto inputInfo = RequestInputInfo(request);
     constexpr DeadCodeEliminator deadCodeEliminator;
     constexpr ResourceMaterializer resourceMaterializer;
@@ -629,6 +692,11 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
         }
     }
 
+    auto compiledInfo = std::move(program).TakeCompiledInfo();
+    {
+        const IrProgram released = std::move(program);
+    }
+    inFlight.Release();
     const bool embedded = !result.vertexInputs.empty() && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded;
     if (embedded) PrepareVertexInputSpecialization(result);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
@@ -643,7 +711,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     }
 #endif
 
-    return {request.layout, std::move(program).TakeCompiledInfo(), std::move(static_cast<CompiledBindingLayout&>(bindings)), std::move(result)};
+    return {request.layout, std::move(compiledInfo), std::move(static_cast<CompiledBindingLayout&>(bindings)), std::move(result)};
 } catch (const std::bad_alloc&) {
     throw;
 } catch (...) {
@@ -1087,6 +1155,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     }
     source.variants.push_back(variant);
     retainedCounters().variants.fetch_add(1, std::memory_order_relaxed);
+    retainedCounters().variantMetadataBytes.fetch_add(estimateVariantMetadataBytes(*variant), std::memory_order_relaxed);
     const auto spirvBytes = variant->artifact.spirv.WordCount() * sizeof(std::uint32_t);
     if (variant->artifact.spirv.Spilled()) {
         retainedCounters().spilledVariants.fetch_add(1, std::memory_order_relaxed);
@@ -1401,9 +1470,8 @@ std::uint64_t EstimatePlanBytes(const IrResourcePlan& plan, std::uint64_t* value
     std::uint64_t count = 0;
     std::uint64_t bytes = sizeof(IrResourcePlan);
     for (const auto& stored : plan.valueStorage) {
-        const auto& value = storedValue(stored);
         ++count;
-        bytes += sizeof(IrValue) + (value.ArgumentCount() + value.UseCount() + value.PhiBlockCount()) * sizeof(void*) + value.OperandUses().size() * sizeof(IrUse);
+        bytes += estimateValueBytes(storedValue(stored));
     }
     for (const auto& block : plan.blockStorage) {
         if (block != nullptr) bytes += sizeof(IrBlock) + (block->Predecessors().size() + block->Successors().size()) * sizeof(void*);
@@ -1417,7 +1485,7 @@ std::uint64_t EstimatePlanBytes(const IrResourcePlan& plan, std::uint64_t* value
 RetainedShaderMemory GetRetainedShaderMemory() {
     const auto& counters = retainedCounters();
     const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
-    return {load(counters.sources), load(counters.plans), load(counters.planValues), load(counters.planBytes), load(counters.spilledPlans), load(counters.spilledPlanBytes), load(counters.planReloads), load(counters.programs), load(counters.variants), load(counters.variantSpirvBytes), load(counters.spilledVariants), load(counters.spilledSpirvBytes), load(counters.spirvReloads), load(counters.spirvReloadBytes), load(resultMemoCounters().memoResults), load(resultMemoCounters().memoBytes), load(counters.bindingPlans), load(counters.specializedModules), load(counters.specializedSpirvBytes), load(counters.registrationModules)};
+    return {load(counters.sources), load(counters.plans), load(counters.planValues), load(counters.planBytes), load(counters.spilledPlans), load(counters.spilledPlanBytes), load(counters.planReloads), load(counters.programs), load(counters.variants), load(counters.variantSpirvBytes), load(counters.variantMetadataBytes), load(counters.spilledVariants), load(counters.spilledSpirvBytes), load(counters.spirvReloads), load(counters.spirvReloadBytes), load(resultMemoCounters().memoResults), load(resultMemoCounters().memoBytes), load(counters.bindingPlans), load(counters.specializedModules), load(counters.specializedSpirvBytes), load(counters.registrationModules), load(counters.irPrograms), load(counters.irBytes), load(counters.irPeakBytes)};
 }
 
 std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request) {
