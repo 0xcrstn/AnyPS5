@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProcessMemory.hpp"
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -84,6 +85,7 @@ AddressSpaceUse WalkAddressSpace(std::uintptr_t arenaBase, std::uint64_t arenaBy
     AddressSpaceUse use;
 #ifdef _WIN32
     std::unordered_map<std::uintptr_t, std::uint64_t> allocations;
+    std::unordered_set<std::uintptr_t> gpuMapped;
     SYSTEM_INFO system{};
     GetSystemInfo(&system);
     auto cursor = reinterpret_cast<std::uintptr_t>(system.lpMinimumApplicationAddress);
@@ -106,8 +108,15 @@ AddressSpaceUse WalkAddressSpace(std::uintptr_t arenaBase, std::uint64_t arenaBy
             } else {
                 use.hostPrivate += bytes;
                 const auto allocation = reinterpret_cast<std::uintptr_t>(memory.AllocationBase);
-                if (std::ranges::binary_search(stacks, allocation)) use.stacks += bytes;
-                else allocations[allocation] += bytes;
+                if (std::ranges::binary_search(stacks, allocation)) {
+                    use.stacks += bytes;
+                } else {
+                    allocations[allocation] += bytes;
+                    if ((memory.Protect & PAGE_WRITECOMBINE) != 0) {
+                        use.gpuMapped += bytes;
+                        gpuMapped.insert(allocation);
+                    }
+                }
             }
         }
         if (base + bytes <= cursor) break;
@@ -118,6 +127,11 @@ AddressSpaceUse WalkAddressSpace(std::uintptr_t arenaBase, std::uint64_t arenaBy
     const auto count = std::min(largestCount, use.largest.size());
     std::partial_sort(use.largest.begin(), use.largest.begin() + static_cast<std::ptrdiff_t>(count), use.largest.end(), [](const auto& left, const auto& right) { return left.second > right.second; });
     use.largest.resize(count);
+    use.allocations.assign(allocations.begin(), allocations.end());
+    std::sort(use.allocations.begin(), use.allocations.end());
+    use.gpuMappedBases.assign(gpuMapped.begin(), gpuMapped.end());
+    std::sort(use.gpuMappedBases.begin(), use.gpuMappedBases.end());
+    use.gpuMappedCount = use.gpuMappedBases.size();
 #else
     static_cast<void>(arenaBase);
     static_cast<void>(arenaBytes);
@@ -125,6 +139,49 @@ AddressSpaceUse WalkAddressSpace(std::uintptr_t arenaBase, std::uint64_t arenaBy
     static_cast<void>(largestCount);
 #endif
     return use;
+}
+
+std::size_t AllocationSizeClass(std::uint64_t bytes) {
+    std::size_t sizeClass = 0;
+    while (sizeClass < AllocationSizeClasses.size() && bytes >= AllocationSizeClasses[sizeClass]) ++sizeClass;
+    return sizeClass;
+}
+
+AddressSpaceDelta DiffAllocations(std::span<const std::pair<std::uintptr_t, std::uint64_t>> before, std::span<const std::pair<std::uintptr_t, std::uint64_t>> after, std::size_t largestCount) {
+    AddressSpaceDelta delta;
+    std::vector<AllocationChange> changes;
+    std::size_t old = 0;
+    for (const auto& [base, bytes] : after) {
+        while (old < before.size() && before[old].first < base) {
+            delta.vanishedBytes += before[old].second;
+            ++delta.vanishedCount;
+            ++old;
+        }
+        if (old < before.size() && before[old].first == base) {
+            const auto previous = before[old].second;
+            ++old;
+            if (bytes > previous) {
+                delta.grownBytes += bytes - previous;
+                changes.push_back({base, previous, bytes});
+            } else if (bytes < previous) {
+                delta.shrunkBytes += previous - bytes;
+            }
+            continue;
+        }
+        const auto sizeClass = AllocationSizeClass(bytes);
+        ++delta.newCount[sizeClass];
+        delta.newBytes[sizeClass] += bytes;
+        changes.push_back({base, 0, bytes});
+    }
+    for (; old < before.size(); ++old) {
+        delta.vanishedBytes += before[old].second;
+        ++delta.vanishedCount;
+    }
+    const auto count = std::min(largestCount, changes.size());
+    std::partial_sort(changes.begin(), changes.begin() + static_cast<std::ptrdiff_t>(count), changes.end(), [](const AllocationChange& left, const AllocationChange& right) { return left.after - left.before > right.after - right.before; });
+    changes.resize(count);
+    delta.largest = std::move(changes);
+    return delta;
 }
 
 }
