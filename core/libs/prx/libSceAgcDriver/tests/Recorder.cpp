@@ -1716,6 +1716,66 @@ void readWrittenStagingTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+void snapshotTwinTests(const Device& device, Recorder& recorder) {
+    using AgcDriver::Graphics::Buffer;
+    const auto& context = device.GetContext();
+    if (!Recorder::SnapshotTwinsEnabled()) {
+        std::cout << "snapshot twins are off: not tested\n";
+        return;
+    }
+    recorder.Sync();
+    constexpr std::size_t bytes = 64 * 1024;
+    const auto fill = [](Buffer& buffer, std::uint32_t seed) {
+        auto* words = reinterpret_cast<std::uint32_t*>(buffer.Bytes().data());
+        for (std::size_t i = 0; i < bytes / 4; ++i) words[i] = seed * 0x9e3779b9u + static_cast<std::uint32_t>(i);
+    };
+    const auto readBack = [&](const std::shared_ptr<Buffer>& twin, std::uint32_t seed) {
+        auto target = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::memset(target->Bytes().data(), 0, bytes);
+        const auto commands = recorder.Commands();
+        AgcDriver::Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        AgcDriver::Graphics::CopyBuffer(context, commands, twin->Handle(), 0, target->Handle(), 0, bytes);
+        AgcDriver::Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(target);
+        recorder.Keep(twin);
+        recorder.Submit();
+        recorder.Sync();
+        const auto* words = reinterpret_cast<const std::uint32_t*>(target->Bytes().data());
+        for (std::size_t i = 0; i < bytes / 4; ++i) {
+            if (words[i] != seed * 0x9e3779b9u + static_cast<std::uint32_t>(i)) return false;
+        }
+        return true;
+    };
+    const auto before = Recorder::TwinCounters();
+    auto snapshot = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    fill(*snapshot, 1);
+    const auto first = recorder.SnapshotTwin(snapshot);
+    Require(first != nullptr && first.get() != snapshot.get() && !first->Mapped(), "a reused snapshot got no device-local twin");
+    const auto again = recorder.SnapshotTwin(snapshot);
+    Require(again == first, "a second use of the same snapshot made another twin");
+    auto counters = Recorder::TwinCounters();
+    Require(counters.made - before.made == 1 && counters.madeBytes - before.madeBytes == bytes && counters.bound - before.bound == 2, "twin counters do not count one copy and two bindings");
+    Require(readBack(first, 1), "the twin does not hold the snapshot's bytes before the batch's own commands");
+    const auto later = recorder.SnapshotTwin(snapshot);
+    Require(later == first && Recorder::TwinCounters().made == counters.made, "a twin made by an earlier batch was copied again");
+    Require(readBack(later, 1), "a twin read by a later batch lost the snapshot's bytes");
+    constexpr std::uint64_t address = 0x7a0000;
+    recorder.KeepDrawSnapshot(address, bytes, 1, 0, snapshot);
+    auto replacement = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    recorder.KeepDrawSnapshot(address, bytes, 1, 0, replacement);
+    Require(Recorder::TwinCounters().dropped - counters.dropped == 1, "an erased draw snapshot kept its twin");
+    fill(*snapshot, 2);
+    const auto refreshed = recorder.SnapshotTwin(snapshot);
+    Require(refreshed != nullptr && refreshed != first && Recorder::TwinCounters().made - counters.made == 1, "a snapshot whose twin was dropped did not get a new one");
+    Require(readBack(refreshed, 2), "a new twin does not hold the snapshot's current bytes");
+    auto deviceOnly = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    Require(recorder.SnapshotTwin(deviceOnly) == nullptr && recorder.SnapshotTwin(nullptr) == nullptr, "a buffer without host bytes got a twin");
+    recorder.KeepDrawSnapshot(address, bytes, 1, 0, std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    recorder.Submit();
+    recorder.Sync();
+    std::cout << "snapshot twin tests passed\n";
+}
+
 void stagingReuseTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -6798,6 +6858,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--parked-import-unmap-only") {
             gpu.unlock();
             parkedImportUnmapTests(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--snapshot-twins-only") {
+            snapshotTwinTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--staging-reuse-only") {

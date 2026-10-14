@@ -494,7 +494,7 @@ void reportRecordParts(const DrawProfile& profile) {
     const auto& bindings = profile.bindings;
     double totalUs = 0;
     for (const auto us : profile.recordUs) totalUs += us;
-    char line[1024];
+    char line[1536];
     int n = std::snprintf(line, sizeof(line), "[draw-record] %llu recorded draws (10 s), us per draw: total %.1f,", static_cast<unsigned long long>(profile.recordDraws), totalUs / draws);
     for (std::size_t i = 0; i < RecordPartCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.1f", RecordPartNames[i], profile.recordUs[i] / draws);
@@ -502,7 +502,13 @@ void reportRecordParts(const DrawProfile& profile) {
     }
     if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) {
         const auto snapshotDraws = profile.bindingDraws != 0 ? static_cast<double>(profile.bindingDraws) : 1.0;
-        std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw), %llu skipped, %llu descriptor writes; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
+        const auto twins = Recorder::TwinCounters();
+        static Recorder::SnapshotTwinCounters reportedTwins{};
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw), %llu skipped, %llu descriptor writes; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
+        if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) {
+            std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; device twins%s: %llu snapshot reads bound to one (%.1f MiB), %llu made (%.1f MiB copied in batch prologues), %llu dropped", Recorder::SnapshotTwinsEnabled() ? "" : " (off)", static_cast<unsigned long long>(twins.bound - reportedTwins.bound), static_cast<double>(twins.boundBytes - reportedTwins.boundBytes) / 1048576.0, static_cast<unsigned long long>(twins.made - reportedTwins.made), static_cast<double>(twins.madeBytes - reportedTwins.madeBytes) / 1048576.0, static_cast<unsigned long long>(twins.dropped - reportedTwins.dropped));
+        }
+        reportedTwins = twins;
     }
     std::fprintf(stderr, "%s\n", line);
 }
@@ -1175,7 +1181,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.indexOffset = draw.indexAddress - import->base;
             inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
         } else {
-            inputs.indices = std::move(copy.buffer);
+            auto twin = copy.reused && context.recorder != nullptr ? context.recorder->SnapshotTwin(copy.buffer) : std::shared_ptr<Buffer>{};
+            inputs.indices = twin != nullptr ? std::move(twin) : std::move(copy.buffer);
             inputs.indexHandle = inputs.indices->Handle();
         }
     }
@@ -1242,6 +1249,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
+        if (auto twin = copy.reused && context.recorder != nullptr ? context.recorder->SnapshotTwin(copy.buffer) : std::shared_ptr<Buffer>{}) copy.buffer = std::move(twin);
         rangeHandles.push_back(copy.buffer->Handle());
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
