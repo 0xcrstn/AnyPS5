@@ -763,6 +763,74 @@ void verifyGuardedDescriptorSources() {
     expectFailure([&] { static_cast<void>(compileStore(0u)); }, "incompatible with the static runtime image interface", "guarded images: a store of the wrong dimension behind a taken branch was accepted");
 }
 
+void verifyCaptureMemoDataWords() {
+    using namespace ShaderRecompiler;
+    const bool memo = std::getenv("APS5_NO_CAPTURE_MEMO") == nullptr;
+    const std::array<std::uint32_t, 8> code{0xf4040004u, 0xfa000000u, 0xf4000080u, 0xfa000000u, 0x7e000202u, 0xf80008cfu, 0u, 0xbf810000u};
+    struct alignas(4096) GuestTables {
+        std::uint32_t payload = 0;
+        std::uint32_t other = 0;
+        std::uint64_t table = 0;
+    };
+    static GuestTables guest;
+    guest.payload = 0x3f800000u;
+    guest.other = 0x40000000u;
+    guest.table = reinterpret_cast<std::uintptr_t>(&guest.payload);
+    const auto address = reinterpret_cast<std::uintptr_t>(&guest.table);
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Vertex, 0x26000u, code, 0, {}};
+    request.target = BufferTarget();
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 8;
+    request.context.userData = userData;
+    request.context.vertex = ShaderVertexStageInfo{};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    const auto handle = PrepareShader(request);
+    const auto capture = [&] {
+        const auto before = AgcDriver::ShaderMemory::MemoizedCaptures();
+        AgcDriver::ShaderMemory memory({});
+        const auto prepared = PreparedShaderInvocation::TryCreate(request, handle);
+        require(prepared.has_value(), "capture memo data words: the prepared shader does not match its request");
+        const auto result = memory.Capture(*prepared);
+        AgcDriver::ShaderMemory reference({});
+        const auto expected = reference.Capture(request);
+        const auto& a = result->snapshot;
+        const auto& b = expected->snapshot;
+        require(a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers && a.flattenedSrt == b.flattenedSrt && a.userData == b.userData && a.srtPoison == b.srtPoison && result->readTrace.leaves == expected->readTrace.leaves && result->readTrace.otherReads == expected->readTrace.otherReads && result->userDataUse.reads == expected->userDataUse.reads, "capture memo data words: the capture differs from a fresh walk of the same memory");
+        const auto regions = memory.Regions();
+        const auto fresh = reference.Regions();
+        require(regions.size() == fresh.size(), "capture memo data words: the captured regions differ from a fresh walk's");
+        for (std::size_t i = 0; i < regions.size(); ++i) require(regions[i].guestAddress == fresh[i].guestAddress && regions[i].bytes.size() == fresh[i].bytes.size() && std::memcmp(regions[i].bytes.data(), fresh[i].bytes.data(), regions[i].bytes.size()) == 0, "capture memo data words: the captured regions differ from a fresh walk's");
+        return std::pair(result, AgcDriver::ShaderMemory::MemoizedCaptures() == before + 1);
+    };
+    const auto [initial, initialServed] = capture();
+    require(!initialServed && std::count(initial->plan->pureFlatSlots.begin(), initial->plan->pureFlatSlots.end(), std::uint8_t{1}) == 1, "capture memo data words: the payload is not a pure SRT slot");
+    guest.payload = 0x40400000u;
+    const auto [changed, changedServed] = capture();
+    require(changedServed == memo && std::find(changed->snapshot.flattenedSrt.begin(), changed->snapshot.flattenedSrt.end(), 0x40400000u) != changed->snapshot.flattenedSrt.end(), "capture memo data words: a changed pure SRT data word was not patched into the memoized capture");
+    guest.table = reinterpret_cast<std::uintptr_t>(&guest.other);
+    const auto [moved, movedServed] = capture();
+    require(!movedServed && std::find(moved->snapshot.flattenedSrt.begin(), moved->snapshot.flattenedSrt.end(), 0x40000000u) != moved->snapshot.flattenedSrt.end(), "capture memo data words: a changed pointer in guest memory was served from the memo");
+    constexpr int Iterations = 20000;
+    const auto prepared = PreparedShaderInvocation::TryCreate(request, handle);
+    const auto started = std::chrono::steady_clock::now();
+    const auto before = AgcDriver::ShaderMemory::MemoizedCaptures();
+    for (int i = 0; i < Iterations; ++i) {
+        guest.other = static_cast<std::uint32_t>(i);
+        AgcDriver::ShaderMemory memory({});
+        static_cast<void>(memory.Capture(*prepared));
+    }
+    const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / Iterations;
+    const auto served = AgcDriver::ShaderMemory::MemoizedCaptures() - before;
+    require(memo ? served >= Iterations - 1 : served == 0, "capture memo data words: captures over changed pure SRT data words were not served as configured");
+    std::cout << "Capture memo " << (memo ? "on" : "off") << ": " << us << " us per capture over a changed pure SRT data word\n";
+}
+
 void verifyCaptureMemo() {
     using namespace ShaderRecompiler;
     const bool memo = std::getenv("APS5_NO_CAPTURE_MEMO") == nullptr;
@@ -3942,6 +4010,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--capture-memo") {
             verifyCaptureMemo();
+            verifyCaptureMemoDataWords();
             std::cout << "Capture memo serves only captures whose read user words and guest words are unchanged\n";
             return 0;
         }
