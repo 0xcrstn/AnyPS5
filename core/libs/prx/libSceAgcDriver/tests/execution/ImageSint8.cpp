@@ -23,6 +23,7 @@ constexpr std::uint32_t Height = 128;
 constexpr std::uint32_t Texels = Width * Height;
 constexpr std::uint32_t Sint8 = 6;
 constexpr std::uint32_t Unorm8 = 1;
+constexpr std::uint32_t Uscaled8 = 3;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t SwizzleX111 = 0x24cu;
 constexpr std::uint32_t IdentitySwizzle = 0xfacu;
@@ -232,6 +233,11 @@ int main() {
         CheckSamples(*device);
         CheckTable(*device);
         RequireRefused(*device, StoreX, Sint8, PointSampler, "storage image descriptor uses an unsupported format", "8_SINT image_store");
+        Fill();
+        Run(*device, SampleLz, Uscaled8, PointSampler, 1);
+        for (std::uint32_t lane = 0; lane < Threads; ++lane) {
+            Expect(lane, {0u, 0u, 0u, 0u}, "image_sample_lz of an 8_USCALED image, which is bound as a null image");
+        }
         std::puts("image 8_SINT tests passed");
         return 0;
     } catch (const std::exception& error) {
