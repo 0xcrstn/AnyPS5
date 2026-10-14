@@ -28,5 +28,13 @@ int main() {
             ++failures;
         }
     }
+    if (AgcDriver::PipelineLibraryCreateFlags(false) != VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) {
+        std::fprintf(stderr, "a library that is never optimized at link time retains link-time optimization information\n");
+        ++failures;
+    }
+    if (AgcDriver::PipelineLibraryCreateFlags(true) != (VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT)) {
+        std::fprintf(stderr, "a library linked with link-time optimization does not retain its information\n");
+        ++failures;
+    }
     return failures == 0 ? 0 : 1;
 }
