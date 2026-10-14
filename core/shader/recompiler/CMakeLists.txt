@@ -247,6 +247,8 @@ function(add_shader_recompiler target runtimeTarget)
             ShaderCacheDirectory
             ShaderDiskCache::LoadUserDataCallees
             ShaderDiskCache::StoreUserDataCallee
+            ShaderDiskCache::EarlierShaderUses
+            ShaderDiskCache::StoreShaderUse
             SrgbDecodeBit
             SrgbUnormFormat
             ThreadOwned
