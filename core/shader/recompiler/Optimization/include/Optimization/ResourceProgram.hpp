@@ -63,6 +63,8 @@ public:
     const std::shared_ptr<const SourceHandle>& Handle() const { return handle; }
     std::shared_ptr<const ResourceCapture> Capture(const SrtRuntime& runtime) const;
     std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture) const;
+    std::shared_ptr<const ResourceCapture> CaptureValues(const SrtRuntime& runtime) const;
+    std::shared_ptr<const RecompileResult> MaterializeValues(const ResourceCapture& capture) const;
 
 private:
     PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);

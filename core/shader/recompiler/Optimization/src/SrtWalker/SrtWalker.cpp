@@ -3,10 +3,24 @@
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtPlanBuilder.hpp"
 #include "Optimization/SrtWalker/SrtRuntimeValidator.hpp"
+#include "Optimization/SrtWalker/SrtTape.hpp"
+
+#include <algorithm>
+#include <atomic>
 
 #include <stdexcept>
 
 namespace ShaderRecompiler {
+
+namespace {
+std::atomic<std::uint64_t> compiledWalkRuns{0};
+std::atomic<std::uint64_t> compiledWalkFallbacks{0};
+std::atomic<std::uint64_t> compiledWalkUncompiled{0};
+}
+
+SrtCompiledWalkCounts CompiledWalkCounts() {
+    return {compiledWalkRuns.load(std::memory_order_relaxed), compiledWalkFallbacks.load(std::memory_order_relaxed), compiledWalkUncompiled.load(std::memory_order_relaxed)};
+}
 
 void SrtWalker::BuildPlan(IrProgram& program) const {
     if (program.Resources().resourceTrackingComplete) {
@@ -50,6 +64,18 @@ void SrtWalker::EvaluateDescriptorSources(const IrResourcePlan& program, std::sp
 }
 
 void SrtWalker::EvaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads) const {
+    if (runtime.compiledWalk && Detail::CompiledWalkEnabled() && poison != nullptr && nullRootReads != nullptr && runtime.userDataUse == nullptr && runtime.readTrace == nullptr && sources.data() == program.materializationSources.data() && sources.size() == program.materializationSources.size() && std::ranges::none_of(cleanFlatSlots, [](std::uint8_t clean) { return clean != 0u; })) {
+        if (const auto tape = Detail::SrtTape::For(program)) {
+            if (tape->Run(runtime, results, flat, activeSources, *nullRootReads)) {
+                poison->clear();
+                compiledWalkRuns.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            compiledWalkFallbacks.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            compiledWalkUncompiled.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (!Detail::EvaluateRuntimeSourcesImpl(program, sources, runtime, results, flat, true, cleanFlatSlots, activeSources, poison, nullRootReads)) {
         throw std::runtime_error("SrtWalker::EvaluateRuntimeSources failed to evaluate runtime sources: " + Detail::RuntimeSourceFailureReason());
     }

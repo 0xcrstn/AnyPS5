@@ -15,6 +15,10 @@
 #include <utility>
 #include <vector>
 
+namespace ShaderRecompiler {
+struct ResourceSnapshot;
+}
+
 namespace AgcDriver::DriverDetail {
 
 struct DrawProgram {
@@ -101,6 +105,14 @@ struct DrawValidateSplit {
 };
 
 DrawValidateSplit& ThreadDrawValidateSplit();
+
+struct BindingPlanCounters {
+    std::uint64_t draws = 0, decodeHits = 0, decodeMisses = 0, stages = 0, verifiedStages = 0, stageMismatches = 0, verifiedDecodes = 0, decodeMismatches = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+bool SameStageResult(const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b);
+bool SameSnapshot(const ShaderRecompiler::ResourceSnapshot& a, const ShaderRecompiler::ResourceSnapshot& b);
 
 enum class DrawVerdict { Drawn, Nothing, Rejected };
 

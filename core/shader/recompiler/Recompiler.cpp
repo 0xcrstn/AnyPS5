@@ -1698,6 +1698,25 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(con
     return result;
 }
 
+std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::CaptureValues(const SrtRuntime& runtime) const {
+    auto capture = std::make_shared<ResourceCapture>();
+    capture->source = handle->source;
+    capture->plan = usePlan(*handle->source);
+    SrtRuntime values = runtime;
+    values.userDataUse = nullptr;
+    values.readTrace = nullptr;
+    values.compiledWalk = true;
+    ResourceMaterializer{}.Materialize(*capture->plan, values, capture->snapshot);
+    return capture;
+}
+
+std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeValues(const ResourceCapture& capture) const {
+    if (capture.source != handle->source || capture.plan != usePlan(*handle->source)) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
+    result->cacheHit = true;
+    return result;
+}
+
 const CompiledShaderArtifact& GetPreparedArtifact(const SourceHandle& handle) {
     if (handle.artifact == nullptr) throw std::runtime_error("ShaderRecompiler: prepared artifact is missing");
     return handle.artifact->artifact;
