@@ -3818,13 +3818,29 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         lap(&DrawBindingsStatistics::checkUs);
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto& readAnalysis = override != moved.end() ? override->readAnalysis : item.readAnalysis;
+        auto wholeCopy = WholeCopy::NotAnalysed;
+        const auto readRanges = readAnalysis.has_value() && !PartialSnapshotsDisabled() ? GuestReadRanges(readAnalysis->words, &readAnalysis->ranges, size, &wholeCopy, drawRanges) : std::nullopt;
+        if (PartialSnapshotsDisabled()) wholeCopy = WholeCopy::Disabled;
         if (DrawSnapshotArena::Enabled()) {
-            if (const auto view = recorder.SnapshotArena().Take(recorder, begin, bytes, registryGeneration)) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> arenaRanges;
+            if (readRanges.has_value()) {
+                for (const auto& [from, to] : *readRanges) arenaRanges.emplace_back(item.adjustment + from, std::min<std::uint64_t>(item.adjustment + to, bytes));
+                if (arenaRanges.empty()) arenaRanges.emplace_back(0u, 0u);
+            }
+            if (const auto view = recorder.SnapshotArena().Take(recorder, begin, bytes, registryGeneration, arenaRanges)) {
                 lap(view->copied ? &DrawBindingsStatistics::copyUs : &DrawBindingsStatistics::lookupUs);
                 if (statistics != nullptr && view->copied) {
                     ++statistics->copied;
                     ++statistics->arenaCopies;
-                    statistics->copiedBytes += bytes;
+                    statistics->copiedBytes += view->copiedBytes;
+                    if (readRanges.has_value()) {
+                        ++statistics->limited;
+                        statistics->uncopiedBytes += bytes - std::min(bytes, view->copiedBytes);
+                    } else {
+                        ++statistics->wholeCopies[static_cast<std::size_t>(wholeCopy)];
+                        statistics->wholeBytes[static_cast<std::size_t>(wholeCopy)] += view->copiedBytes;
+                    }
                 } else if (statistics != nullptr) {
                     ++statistics->reused;
                     ++statistics->arenaHits;
@@ -3862,11 +3878,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, BufferExtent::SizeClass);
                 lap(&DrawBindingsStatistics::bufferUs);
                 std::uint64_t covered = 0;
-                const auto& readAnalysis = override != moved.end() ? override->readAnalysis : item.readAnalysis;
-                auto wholeCopy = WholeCopy::NotAnalysed;
-                const auto readRanges = readAnalysis.has_value() && !PartialSnapshotsDisabled() ? GuestReadRanges(readAnalysis->words, &readAnalysis->ranges, size, &wholeCopy, drawRanges) : std::nullopt;
-                if (PartialSnapshotsDisabled()) wholeCopy = WholeCopy::Disabled;
-                else if (readRanges.has_value()) {
+                if (readRanges.has_value()) {
                     for (const auto& [from, to] : *readRanges) covered += to - from;
                     partial = covered * 2 <= bytes;
                     wholeCopy = WholeCopy::OverHalf;

@@ -170,6 +170,19 @@ public:
         return bindings->snapshots.front();
     }
 
+    Snapshot TakeRanges(std::uint64_t offset, std::size_t size, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, Statistics* statistics = nullptr) {
+        ShaderResources::MovedBuffer moved{0, Address() + offset, size, {}};
+        const auto element = Address() + offset;
+        ShaderResources::ReadAnalysis analysis;
+        analysis.words = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(size), 0x31000000u};
+        for (const auto& [from, to] : ranges) analysis.ranges.ranges.push_back({0u, 0u, from, to});
+        moved.readAnalysis = std::move(analysis);
+        auto bindings = resources->PrepareDrawBindings(*recorder, std::span(&moved, 1), statistics);
+        Require(bindings != nullptr && bindings->snapshots.size() == 1, "a range-limited draw input was not snapshotted");
+        held.push_back(bindings);
+        return bindings->snapshots.front();
+    }
+
     std::shared_ptr<ShaderResources::DrawBindings> TakeOwn() {
         auto bindings = resources->PrepareDrawBindings(*recorder);
         if (bindings != nullptr) held.push_back(bindings);
@@ -254,6 +267,51 @@ void ContentTests(Fixture& fixture) {
     Statistics tenth{};
     const auto j = fixture.Take(8192, 64, &tenth);
     Require(Holds(j, std::byte{0x44}) && j.offset % fixture.GetContext().limits.minStorageBufferOffsetAlignment == 0, "a range off the segment's alignment phase was bound misaligned");
+    fixture.Release();
+    fixture.GetRecorder().Sync();
+}
+
+bool SameRange(const Snapshot& snapshot, const Fixture& fixture, std::uint64_t from, std::size_t bytes) {
+    return std::memcmp(snapshot.bytes.data() + from, fixture.Bytes(from), bytes) == 0;
+}
+
+void RangeTests(Fixture& fixture) {
+    DrawSnapshotArena::SetEnabled(true);
+    DrawSnapshotArena::SetExtendBytes(0);
+    auto& arena = fixture.GetRecorder().SnapshotArena();
+    static_cast<void>(arena.TakeCounters());
+    constexpr std::size_t request = 131072;
+    constexpr std::uint64_t secondBlock = 65536 + 4096;
+    for (std::size_t page = 0; page < request / 4096; ++page) std::memset(fixture.Bytes(page * 4096), 0x50 + static_cast<int>(page), 4096);
+    GuestMemory::BumpCollectEpoch();
+    Statistics first{};
+    const auto a = fixture.TakeRanges(0, request, {{100, 200}, {40000, 40100}}, &first);
+    Require(first.arenaCopies == 1 && first.limited == 1 && first.copiedBytes == 8192 && first.uncopiedBytes == request - 8192, "a range-limited arena copy did not copy the two pages of its read ranges only");
+    Require(a.bytes.size() == request && SameRange(a, fixture, 0, 4096) && SameRange(a, fixture, 36864, 4096), "a range-limited arena snapshot does not hold the guest bytes of its read ranges");
+    Statistics second{};
+    const auto b = fixture.TakeRanges(0, request, {{150, 160}}, &second);
+    Require(second.arenaHits == 1 && second.copied == 0 && b.handle == a.handle && b.offset == a.offset, "a read range inside a copied page was copied again");
+    Statistics third{};
+    const auto c = fixture.TakeRanges(0, request, {{8200, 8210}}, &third);
+    Require(third.arenaCopies == 1 && third.copiedBytes == 4096 && c.handle == a.handle && c.offset == a.offset && SameRange(c, fixture, 8192, 4096), "a read range outside the copied pages of a held segment was not filled into it");
+    Require(SameRange(a, fixture, 0, 4096) && SameRange(a, fixture, 36864, 4096), "a fill overwrote the pages an earlier draw binds");
+    const auto counters = arena.TakeCounters();
+    Require(counters.copies == 2 && counters.fills == 1 && counters.rangeLimited == 1 && counters.hits == 1 && counters.copiedBytes == 12288, "the arena counters do not account the limited copy, the hit and the fill");
+    Statistics fourth{};
+    const auto d = fixture.Take(0, request, &fourth);
+    Require(fourth.arenaCopies == 1 && fourth.copiedBytes == request - 3 * 4096 && d.offset == a.offset && SameBytes(d, fixture.Bytes(0)), "a whole request of a partly copied segment did not fill the remaining pages");
+    std::memset(fixture.Bytes(secondBlock), 0x66, 4096);
+    GuestMemory::BumpCollectEpoch();
+    Statistics fifth{};
+    const auto e = fixture.TakeRanges(0, request, {{100, 200}}, &fifth);
+    Require(fifth.arenaHits == 1 && e.offset == a.offset, "a CPU store in another write-tracking block than a draw's read ranges made the segment stale for it");
+    Statistics sixth{};
+    const auto f = fixture.TakeRanges(0, request, {{secondBlock + 10, secondBlock + 20}}, &sixth);
+    Require(sixth.arenaCopies == 1 && sixth.limited == 1 && sixth.copiedBytes == 4096 && f.offset != a.offset && SameRange(f, fixture, secondBlock, 4096), "a CPU store inside a draw's read range did not make a new limited copy");
+    Require(std::all_of(a.bytes.begin() + secondBlock, a.bytes.begin() + secondBlock + 4096, [](std::byte value) { return value == std::byte{0x61}; }), "a new segment's copy overwrote the page an earlier draw binds");
+    Statistics seventh{};
+    const auto g = fixture.Take(0, request, &seventh);
+    Require(seventh.arenaCopies == 1 && seventh.copiedBytes == request - 4096 && g.offset == f.offset && SameBytes(g, fixture.Bytes(0)), "a whole request after a limited copy did not fill the new segment's remaining pages");
     fixture.Release();
     fixture.GetRecorder().Sync();
 }
@@ -404,6 +462,7 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
             return false;
         }
         ContentTests(fixture);
+        RangeTests(fixture);
         PendingWriteTests(fixture);
         GpuReadTests(fixture);
         DisabledTests(fixture);

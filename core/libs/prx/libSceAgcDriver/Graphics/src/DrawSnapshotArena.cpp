@@ -51,6 +51,59 @@ VkDeviceSize AlignUp(VkDeviceSize value, VkDeviceSize alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
+void AddRange(DrawSnapshotArena::GuestRanges& ranges, std::uint64_t begin, std::uint64_t end) {
+    if (begin >= end) return;
+    auto first = std::lower_bound(ranges.begin(), ranges.end(), begin, [](const auto& range, std::uint64_t value) { return range.second < value; });
+    auto last = first;
+    while (last != ranges.end() && last->first <= end) {
+        begin = std::min(begin, last->first);
+        end = std::max(end, last->second);
+        ++last;
+    }
+    if (first == last) {
+        ranges.insert(first, {begin, end});
+        return;
+    }
+    *first = {begin, end};
+    ranges.erase(first + 1, last);
+}
+
+DrawSnapshotArena::GuestRanges Missing(const DrawSnapshotArena::GuestRanges& valid, std::uint64_t begin, std::uint64_t end) {
+    DrawSnapshotArena::GuestRanges missing;
+    auto cursor = begin;
+    for (const auto& [from, to] : valid) {
+        if (to <= cursor) continue;
+        if (from >= end) break;
+        if (from > cursor) missing.emplace_back(cursor, from);
+        cursor = std::max(cursor, to);
+    }
+    if (cursor < end) missing.emplace_back(cursor, end);
+    return missing;
+}
+
+DrawSnapshotArena::GuestRanges Requested(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    DrawSnapshotArena::GuestRanges requested;
+    if (ranges.empty()) {
+        requested.emplace_back(address, address + bytes);
+        return requested;
+    }
+    for (const auto& [from, to] : ranges) {
+        if (from >= to || from >= bytes) continue;
+        AddRange(requested, address + from, address + std::min<std::uint64_t>(to, bytes));
+    }
+    return requested;
+}
+
+DrawSnapshotArena::GuestRanges Paged(const DrawSnapshotArena::GuestRanges& ranges, std::uint64_t first, std::uint64_t last) {
+    DrawSnapshotArena::GuestRanges paged;
+    for (const auto& [from, to] : ranges) {
+        const auto begin = std::max(first, from - from % DrawSnapshotArena::SegmentGranule);
+        const auto end = std::min(last, AlignUp(to, DrawSnapshotArena::SegmentGranule));
+        AddRange(paged, begin, end);
+    }
+    return paged;
+}
+
 }
 
 bool DrawSnapshotArena::Enabled() {
@@ -114,7 +167,7 @@ void DrawSnapshotArena::ReportActive() {
         heldBytes += chunk->buffer->Bytes().size();
         if (chunk.use_count() > 1) ++busy;
     }
-    std::fprintf(stderr, "[draw-arena] (10 s) %llu takes (%.1f MiB requested): %llu hits (%.1f%%), %llu stale, %llu copies (%.1f MiB copied, %llu exact, %llu unindexed); refused: size %llu, budget %llu; chunks %zu (%zu in flight, %.0f MiB, %llu created, %llu recycled), %zu entries; verify %llu checked, %llu differing\n", static_cast<unsigned long long>(taken.takes), static_cast<double>(taken.requestedBytes) / 1048576.0, static_cast<unsigned long long>(taken.hits), 100.0 * static_cast<double>(taken.hits) / takes, static_cast<unsigned long long>(taken.stale), static_cast<unsigned long long>(taken.copies), static_cast<double>(taken.copiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.exactSegments), static_cast<unsigned long long>(taken.unindexed), static_cast<unsigned long long>(taken.refusedSize), static_cast<unsigned long long>(taken.refusedBudget), arena->chunks.size(), busy, static_cast<double>(heldBytes) / 1048576.0, static_cast<unsigned long long>(taken.chunksCreated), static_cast<unsigned long long>(taken.chunksRecycled), arena->entries.size(), static_cast<unsigned long long>(taken.verified), static_cast<unsigned long long>(taken.verifyDiffering));
+    std::fprintf(stderr, "[draw-arena] (10 s) %llu takes (%.1f MiB requested): %llu hits (%.1f%%), %llu stale, %llu copies (%.1f MiB copied, %llu exact, %llu unindexed, %llu limited to read ranges, %llu fills of held segments); refused: size %llu, budget %llu; chunks %zu (%zu in flight, %.0f MiB, %llu created, %llu recycled), %zu entries; verify %llu checked, %llu differing\n", static_cast<unsigned long long>(taken.takes), static_cast<double>(taken.requestedBytes) / 1048576.0, static_cast<unsigned long long>(taken.hits), 100.0 * static_cast<double>(taken.hits) / takes, static_cast<unsigned long long>(taken.stale), static_cast<unsigned long long>(taken.copies), static_cast<double>(taken.copiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.exactSegments), static_cast<unsigned long long>(taken.unindexed), static_cast<unsigned long long>(taken.rangeLimited), static_cast<unsigned long long>(taken.fills), static_cast<unsigned long long>(taken.refusedSize), static_cast<unsigned long long>(taken.refusedBudget), arena->chunks.size(), busy, static_cast<double>(heldBytes) / 1048576.0, static_cast<unsigned long long>(taken.chunksCreated), static_cast<unsigned long long>(taken.chunksRecycled), arena->entries.size(), static_cast<unsigned long long>(taken.verified), static_cast<unsigned long long>(taken.verifyDiffering));
 }
 
 DrawSnapshotArena::Counters DrawSnapshotArena::TakeCounters() {
@@ -171,7 +224,19 @@ DrawSnapshotArena::View DrawSnapshotArena::view(Recorder& recorder, std::size_t 
     return View{held->buffer->Handle(), offset, std::span<const std::byte>(all.data() + offset, bytes), copied};
 }
 
-std::optional<DrawSnapshotArena::View> DrawSnapshotArena::lookup(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration) {
+std::size_t DrawSnapshotArena::copyPieces(std::size_t chunk, VkDeviceSize offset, std::uint64_t first, std::uint64_t last, const GuestRanges& pieces, GuestRanges& valid) {
+    std::size_t copied = 0;
+    auto& held = *chunks[chunk];
+    for (const auto& [from, to] : pieces) {
+        if (from < first || to > last || from >= to) continue;
+        std::memcpy(held.buffer->Bytes().data() + offset + (from - first), reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from));
+        copied += static_cast<std::size_t>(to - from);
+        AddRange(valid, from, to);
+    }
+    return copied;
+}
+
+std::optional<DrawSnapshotArena::View> DrawSnapshotArena::lookup(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const GuestRanges& requested) {
     auto found = entries.upper_bound(address);
     for (std::size_t depth = 0; depth < LookupDepth && found != entries.begin(); ++depth) {
         --found;
@@ -182,29 +247,42 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::lookup(Recorder& recor
             found = entries.erase(found);
             continue;
         }
-        if (GuestMemory::CollectWrites(begin, static_cast<std::size_t>(entry.end - begin)) == 0 || !GuestMemory::UnchangedSince(address, bytes, entry.generation)) {
+        if (GuestMemory::CollectWrites(begin, static_cast<std::size_t>(entry.end - begin)) == 0 || std::any_of(requested.begin(), requested.end(), [&](const auto& range) { return !GuestMemory::UnchangedSince(range.first, static_cast<std::size_t>(range.second - range.first), entry.generation); })) {
             ++counters.stale;
             continue;
         }
-        auto result = view(recorder, entry.chunk, entry.offset + (address - begin), bytes, false, 0);
-        ++counters.hits;
+        GuestRanges missing;
+        for (const auto& [from, to] : requested) {
+            for (const auto& piece : Missing(entry.valid, from, to)) AddRange(missing, piece.first, piece.second);
+        }
+        const auto filled = copyPieces(entry.chunk, entry.offset, begin, entry.end, Paged(missing, begin, entry.end), found->second.valid);
+        auto result = view(recorder, entry.chunk, entry.offset + (address - begin), bytes, filled != 0, 0);
+        result.copiedBytes = filled;
+        if (filled != 0) {
+            ++counters.fills;
+            ++counters.copies;
+            counters.copiedBytes += filled;
+        } else {
+            ++counters.hits;
+        }
         if (Verify()) {
             ++counters.verified;
-            if (std::memcmp(result.bytes.data(), reinterpret_cast<const void*>(address), bytes) != 0) ++counters.verifyDiffering;
+            if (std::any_of(requested.begin(), requested.end(), [&](const auto& range) { return std::memcmp(result.bytes.data() + (range.first - address), reinterpret_cast<const void*>(range.first), static_cast<std::size_t>(range.second - range.first)) != 0; })) ++counters.verifyDiffering;
         }
         return result;
     }
     return std::nullopt;
 }
 
-std::optional<DrawSnapshotArena::View> DrawSnapshotArena::Take(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration) {
+std::optional<DrawSnapshotArena::View> DrawSnapshotArena::Take(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     ++counters.takes;
     counters.requestedBytes += bytes;
     if (bytes == 0 || bytes > ChunkBytes()) {
         ++counters.refusedSize;
         return std::nullopt;
     }
-    if (auto hit = lookup(recorder, address, bytes, registryGeneration)) return hit;
+    const auto requested = Requested(address, bytes, ranges);
+    if (auto hit = lookup(recorder, address, bytes, registryGeneration, requested)) return hit;
     auto first = address;
     auto last = address + bytes;
     std::uint64_t segmentGeneration = 0;
@@ -227,16 +305,20 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::Take(Recorder& recorde
         return std::nullopt;
     }
     auto& chunk = *chunks[placement->chunk];
-    std::memcpy(chunk.buffer->Bytes().data() + placement->offset, reinterpret_cast<const void*>(first), segmentBytes);
+    GuestRanges valid;
+    const auto copied = copyPieces(placement->chunk, placement->offset, first, last, ranges.empty() ? GuestRanges{{first, last}} : Paged(requested, first, last), valid);
     ++counters.copies;
-    counters.copiedBytes += segmentBytes;
+    counters.copiedBytes += copied;
+    if (!ranges.empty() && copied < segmentBytes) ++counters.rangeLimited;
     if (segmentGeneration != 0) {
         if (entries.size() >= MaxEntries) entries.clear();
-        entries[first] = Entry{last, segmentGeneration, registryGeneration, placement->chunk, chunk.serial, placement->offset};
+        entries[first] = Entry{last, segmentGeneration, registryGeneration, placement->chunk, chunk.serial, placement->offset, std::move(valid)};
     } else {
         ++counters.unindexed;
     }
-    return view(recorder, placement->chunk, placement->offset + (address - first), bytes, true, segmentBytes);
+    auto result = view(recorder, placement->chunk, placement->offset + (address - first), bytes, true, segmentBytes);
+    result.copiedBytes = copied;
+    return result;
 }
 
 }

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -311,7 +312,10 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         ReadRangeTests(*device, target, input);
-        std::puts("draw input read range tests passed");
+        AgcDriver::Graphics::DrawSnapshotArena::SetEnabled(true);
+        ReadRangeTests(*device, target, input);
+        AgcDriver::Graphics::DrawSnapshotArena::SetEnabled(false);
+        std::puts("draw input read range tests passed with per-draw buffers and the snapshot arena");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << std::endl;
