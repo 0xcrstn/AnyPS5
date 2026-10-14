@@ -135,7 +135,7 @@ private:
     static bool bindingPlan();
     static bool verifyBindingPlan();
     void planDrawDecode(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial, std::shared_ptr<const DrawDecode>& decode, bool profile);
-    void notePlannedStage(bool verified, bool mismatch);
+    void notePlannedStage(bool verified, bool mismatch, SnapshotPart part = SnapshotPart::None);
     void reportBindingPlan();
     static bool verifyDrawEntries();
     static bool registerKeyEnabled();

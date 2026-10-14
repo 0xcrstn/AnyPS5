@@ -55,6 +55,12 @@ public:
     // by the driver: the [capture] line charges the waits made inside a capture to it.
     using WaitedMsProvider = double (*)();
     static void SetWaitedMsProvider(WaitedMsProvider provider);
+    using PendingGenerationProvider = std::uint64_t (*)();
+    static void SetPendingGenerationProvider(PendingGenerationProvider provider);
+    struct DirectReadCounts {
+        std::uint64_t captures, words, hookedWords, pageStateLookups, pageStateMisses;
+    };
+    static DirectReadCounts DirectReads();
     explicit ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> initial, PendingWriteQuery pendingWrite = nullptr, PendingWriteObserver observe = nullptr, HookWaitCounter hookWaits = nullptr);
     ShaderMemory(const ShaderMemory&) = delete;
     ShaderMemory& operator=(const ShaderMemory&) = delete;
@@ -97,6 +103,15 @@ private:
     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
     static bool accessible(void* context, std::uint64_t address, std::uint64_t bytes);
     Page& page(std::uint64_t base);
+    std::uint32_t fetchWord(std::uint64_t address, bool wordwise);
+    bool readDirect(std::uint64_t address, std::uint32_t* value);
+    bool probeDirect(std::uint64_t address, std::uint64_t end);
+    std::uint8_t directPageKind(std::uint64_t base);
+    std::vector<ShaderRecompiler::MemoryRegion> directRegions(std::span<const std::uint32_t> indices, bool withInitial) const;
+    struct DirectRead {
+        std::uint64_t address;
+        std::uint32_t word;
+    };
     bool replay(std::span<const RecordedAccess> accesses, std::span<const std::pair<std::uint64_t, std::uint32_t>> dataLeaves = {}, std::vector<std::pair<std::size_t, std::uint32_t>>* changed = nullptr, std::uint64_t* mismatch = nullptr);
     bool probe(std::uint64_t address, std::uint64_t bytes);
 
@@ -116,6 +131,16 @@ private:
     std::uint64_t initialHigh = 0;
     std::uint64_t lastBase = ~std::uint64_t{0};
     Page* lastPage = nullptr;
+    bool direct = false;
+    std::uint64_t instanceSerial = 0;
+    std::vector<DirectRead> directReads;
+    std::vector<std::uint32_t> directIndex;
+    std::vector<std::uint32_t> recentReads;
+    mutable std::vector<std::unique_ptr<std::uint32_t[]>> regionStorage;
+    std::uint64_t directWords = 0;
+    std::uint64_t directHooked = 0;
+    std::uint64_t directLookups = 0;
+    std::uint64_t directMisses = 0;
 };
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a

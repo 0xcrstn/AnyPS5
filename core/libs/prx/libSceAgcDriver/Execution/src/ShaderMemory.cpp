@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
@@ -352,6 +353,49 @@ CaptureProfile& CaptureTotals() {
 }
 
 std::atomic<ShaderMemory::WaitedMsProvider> waitedMsProvider{nullptr};
+std::atomic<ShaderMemory::PendingGenerationProvider> pendingGenerationProvider{nullptr};
+
+struct DirectProfile {
+    std::atomic<std::uint64_t> captures{0};
+    std::atomic<std::uint64_t> words{0};
+    std::atomic<std::uint64_t> hookedWords{0};
+    std::atomic<std::uint64_t> pageStateLookups{0};
+    std::atomic<std::uint64_t> pageStateMisses{0};
+};
+
+DirectProfile& DirectTotals() {
+    static DirectProfile profile;
+    return profile;
+}
+
+bool DirectReadsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DIRECT_CAPTURE_READS") == nullptr;
+    return enabled;
+}
+
+constexpr std::uint8_t PageWhole = 1;
+constexpr std::uint8_t PageWordwise = 2;
+constexpr std::uint8_t PageInaccessible = 3;
+constexpr std::size_t PageStateSlots = 1024;
+
+struct PageState {
+    std::uint64_t base = ~std::uint64_t{0};
+    std::uint64_t allocation = 0;
+    std::uint64_t pending = 0;
+    ShaderMemory::PendingWriteQuery query = nullptr;
+    ShaderMemory::PendingGenerationProvider provider = nullptr;
+    std::uint8_t kind = 0;
+};
+
+struct PageStateCache {
+    std::array<PageState, PageStateSlots> entries{};
+    std::uint64_t serials = 0;
+};
+
+PageStateCache& ThreadPageStates() {
+    struct PageStateCacheStorage {};
+    return HostThreadLocal<PageStateCache, PageStateCacheStorage>();
+}
 
 double WaitedMs() {
     const auto provider = waitedMsProvider.load(std::memory_order_acquire);
@@ -362,6 +406,123 @@ double WaitedMs() {
 
 void ShaderMemory::SetWaitedMsProvider(WaitedMsProvider provider) {
     waitedMsProvider.store(provider, std::memory_order_release);
+}
+
+void ShaderMemory::SetPendingGenerationProvider(PendingGenerationProvider provider) {
+    pendingGenerationProvider.store(provider, std::memory_order_release);
+}
+
+ShaderMemory::DirectReadCounts ShaderMemory::DirectReads() {
+    auto& totals = DirectTotals();
+    return {totals.captures.load(std::memory_order_relaxed), totals.words.load(std::memory_order_relaxed), totals.hookedWords.load(std::memory_order_relaxed), totals.pageStateLookups.load(std::memory_order_relaxed), totals.pageStateMisses.load(std::memory_order_relaxed)};
+}
+
+std::uint8_t ShaderMemory::directPageKind(std::uint64_t base) {
+    auto& cache = ThreadPageStates();
+    auto& entry = cache.entries[static_cast<std::size_t>(base / PageBytes) % PageStateSlots];
+    const auto allocation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto provider = pendingGenerationProvider.load(std::memory_order_acquire);
+    const auto pending = provider != nullptr ? provider() : instanceSerial;
+    ++directLookups;
+    if (entry.base == base && entry.allocation == allocation && entry.pending == pending && entry.query == pendingWrite && entry.provider == provider) return entry.kind;
+    ++directMisses;
+    std::uint8_t kind = PageInaccessible;
+    if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
+        kind = pendingWrite == nullptr || pendingWrite(base, PageBytes, {}) != PendingWrite::None ? PageWordwise : PageWhole;
+    }
+    entry = {base, allocation, pending, pendingWrite, provider, kind};
+    return kind;
+}
+
+bool ShaderMemory::readDirect(std::uint64_t address, std::uint32_t* value) {
+    if (!directIndex.empty()) {
+        const auto mask = directIndex.size() - 1;
+        for (auto slot = static_cast<std::size_t>((address >> 2u) * 0x9e3779b97f4a7c15ull >> 40u) & mask;; slot = (slot + 1) & mask) {
+            const auto held = directIndex[slot];
+            if (held == 0) break;
+            if (directReads[held - 1].address == address) {
+                *value = directReads[held - 1].word;
+                recentReads.push_back(held - 1);
+                if (recording != nullptr) recording->push_back({address, 0, *value});
+                return true;
+            }
+        }
+    }
+    const auto allocationBefore = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto provider = pendingGenerationProvider.load(std::memory_order_acquire);
+    const auto pendingBefore = provider != nullptr ? provider() : 0;
+    const auto kind = directPageKind(address & ~static_cast<std::uint64_t>(PageBytes - 1));
+    std::uint32_t word = 0;
+    if (kind == PageWhole) {
+        GuestMemory::CheckReadGuard(address, sizeof(word));
+        std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+        if (allocationBefore != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || provider != pendingGenerationProvider.load(std::memory_order_acquire) || (provider != nullptr && pendingBefore != provider())) {
+            word = fetchWord(address, pendingWrite != nullptr);
+            ++directHooked;
+        } else {
+            ++directWords;
+        }
+    } else {
+        word = fetchWord(address, kind == PageWordwise && pendingWrite != nullptr);
+        ++directHooked;
+    }
+    if ((directReads.size() + 1) * 2 > directIndex.size()) {
+        directIndex.assign(directIndex.empty() ? 256 : directIndex.size() * 2, 0u);
+        const auto mask = directIndex.size() - 1;
+        for (std::size_t index = 0; index < directReads.size(); ++index) {
+            auto slot = static_cast<std::size_t>((directReads[index].address >> 2u) * 0x9e3779b97f4a7c15ull >> 40u) & mask;
+            while (directIndex[slot] != 0) slot = (slot + 1) & mask;
+            directIndex[slot] = static_cast<std::uint32_t>(index + 1);
+        }
+    }
+    directReads.push_back({address, word});
+    const auto mask = directIndex.size() - 1;
+    auto slot = static_cast<std::size_t>((address >> 2u) * 0x9e3779b97f4a7c15ull >> 40u) & mask;
+    while (directIndex[slot] != 0) slot = (slot + 1) & mask;
+    directIndex[slot] = static_cast<std::uint32_t>(directReads.size());
+    recentReads.push_back(static_cast<std::uint32_t>(directReads.size() - 1));
+    if (recording != nullptr) recording->push_back({address, 0, word});
+    *value = word;
+    return true;
+}
+
+bool ShaderMemory::probeDirect(std::uint64_t address, std::uint64_t end) {
+    while (address < end) {
+        const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
+        const auto pageEnd = std::min<std::uint64_t>(base + PageBytes, end);
+        if (directPageKind(base) == PageInaccessible && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(pageEnd - address))) return false;
+        address = pageEnd;
+    }
+    return true;
+}
+
+std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::directRegions(std::span<const std::uint32_t> indices, bool withInitial) const {
+    std::vector<DirectRead> reads;
+    reads.reserve(indices.size());
+    for (const auto index : indices) reads.push_back(directReads[index]);
+    std::sort(reads.begin(), reads.end(), [](const DirectRead& a, const DirectRead& b) { return a.address < b.address; });
+    reads.erase(std::unique(reads.begin(), reads.end(), [](const DirectRead& a, const DirectRead& b) { return a.address == b.address; }), reads.end());
+    std::vector<ShaderRecompiler::MemoryRegion> result;
+    result.reserve(reads.size() + (withInitial ? initial.size() : 0));
+    std::unique_ptr<std::uint32_t[]> storage(reads.empty() ? nullptr : new std::uint32_t[reads.size()]);
+    auto next = withInitial ? initial.begin() : initial.end();
+    for (std::size_t index = 0; index < reads.size();) {
+        const auto first = index;
+        storage[index] = reads[index].word;
+        ++index;
+        while (index < reads.size() && reads[index].address / PageBytes == reads[first].address / PageBytes && reads[index].address == reads[index - 1].address + sizeof(std::uint32_t)) {
+            storage[index] = reads[index].word;
+            ++index;
+        }
+        while (next != initial.end() && next->first < reads[first].address) {
+            result.push_back({next->first, next->second});
+            ++next;
+        }
+        result.push_back({reads[first].address, std::as_bytes(std::span(storage.get() + first, index - first))});
+    }
+    for (; next != initial.end(); ++next) result.push_back({next->first, next->second});
+    if (storage != nullptr) regionStorage.push_back(std::move(storage));
+    return result;
 }
 
 ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits) : pendingWrite(pendingWrite), observe(observe), hookWaits(hookWaits) {
@@ -376,6 +537,70 @@ ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regio
 ShaderMemory::~ShaderMemory() {
     if (readCount != 0) CaptureTotals().reads.fetch_add(readCount, std::memory_order_relaxed);
     if (pageCount != 0) CaptureTotals().pages.fetch_add(pageCount, std::memory_order_relaxed);
+    if (direct) {
+        auto& totals = DirectTotals();
+        totals.words.fetch_add(directWords, std::memory_order_relaxed);
+        totals.hookedWords.fetch_add(directHooked, std::memory_order_relaxed);
+        totals.pageStateLookups.fetch_add(directLookups, std::memory_order_relaxed);
+        totals.pageStateMisses.fetch_add(directMisses, std::memory_order_relaxed);
+    }
+}
+
+std::uint32_t ShaderMemory::fetchWord(std::uint64_t address, bool wordwise) {
+    auto& self = *this;
+    std::uint32_t word = 0;
+    auto policy = PendingWrite::Sync;
+    if (wordwise) {
+        policy = self.pendingWrite(address, sizeof(word), std::as_writable_bytes(std::span(&word, 1)));
+        if (policy != PendingWrite::None && policy != PendingWrite::Sync && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) policy = PendingWrite::Sync;
+    }
+    const auto hookWaits = [&] { return self.hookWaits != nullptr ? self.hookWaits() : 0; };
+    const auto report = [&](std::uint64_t waitsBefore, bool unchanged) {
+        if (self.hookWaits == nullptr || self.hookWaits() != waitsBefore) self.observe(address, unchanged);
+        else ++CaptureTotals().observationsSkipped;
+    };
+    const auto fetchStarted = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (policy == PendingWrite::KnownValue || policy == PendingWrite::VerifyKnownValue) {
+        ++CaptureTotals().wordsKnown;
+        if (policy == PendingWrite::VerifyKnownValue) {
+            std::uint32_t waited = 0;
+            const auto waitsBefore = hookWaits();
+            GuestMemory::Read(address, std::as_writable_bytes(std::span(&waited, 1)), alignof(std::uint32_t));
+            ++CaptureTotals().wordsKnownVerified;
+            if (waited != word) ++CaptureTotals().wordsKnownMismatches;
+            if (self.observe != nullptr) report(waitsBefore, waited == word);
+            word = waited;
+        }
+    } else if (policy == PendingWrite::Raw || policy == PendingWrite::VerifyRaw) {
+        std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+        ++CaptureTotals().wordsRaw;
+        if (policy == PendingWrite::VerifyRaw) {
+            std::uint32_t waited = 0;
+            const auto waitsBefore = hookWaits();
+            GuestMemory::Read(address, std::as_writable_bytes(std::span(&waited, 1)), alignof(std::uint32_t));
+            ++CaptureTotals().wordsVerified;
+            if (waited != word) ++CaptureTotals().wordMismatches;
+            if (self.observe != nullptr) report(waitsBefore, waited == word);
+            word = waited;
+        }
+    } else {
+        const bool observed = wordwise && policy == PendingWrite::Sync && self.observe != nullptr && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word));
+        std::uint32_t before = 0;
+        if (observed) std::memcpy(&before, reinterpret_cast<const void*>(address), sizeof(before));
+        const auto waitsBefore = observed ? hookWaits() : 0;
+        const auto started = wordwise ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        GuestMemory::Read(address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
+        if (wordwise) {
+            const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+            if (nanoseconds >= WordWaitNanoseconds) {
+                ++CaptureTotals().wordWaits;
+                CaptureTotals().wordWaitNanoseconds += nanoseconds;
+            }
+        }
+        if (observed) report(waitsBefore, before == word);
+    }
+    if (CaptureProfiled()) CaptureTotals().wordReadNanoseconds += NanosecondsSince(fetchStarted);
+    return word;
 }
 
 ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
@@ -436,65 +661,11 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         }
         if (next != self.initial.end() && next->first - address < sizeof(*value)) throw std::runtime_error("AGC driver: shader memory read overlaps a snapshot boundary");
     }
+    if (self.direct) return self.readDirect(address, value);
     auto& page = self.page(address & ~static_cast<std::uint64_t>(PageBytes - 1));
     const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(*value));
     if (!page.valid.test(index)) {
-        std::uint32_t word = 0;
-        auto policy = PendingWrite::Sync;
-        if (page.wordwise) {
-            policy = self.pendingWrite(address, sizeof(word), std::as_writable_bytes(std::span(&word, 1)));
-            if (policy != PendingWrite::None && policy != PendingWrite::Sync && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) policy = PendingWrite::Sync;
-        }
-        // A read is evidence only when the hook waited for unfinished GPU work across it.
-        const auto hookWaits = [&] { return self.hookWaits != nullptr ? self.hookWaits() : 0; };
-        const auto report = [&](std::uint64_t waitsBefore, bool unchanged) {
-            if (self.hookWaits == nullptr || self.hookWaits() != waitsBefore) self.observe(address, unchanged);
-            else ++CaptureTotals().observationsSkipped;
-        };
-        const auto fetchStarted = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (policy == PendingWrite::KnownValue || policy == PendingWrite::VerifyKnownValue) {
-            // The query stored the known dword in `word`.
-            ++CaptureTotals().wordsKnown;
-            if (policy == PendingWrite::VerifyKnownValue) {
-                std::uint32_t waited = 0;
-                const auto waitsBefore = hookWaits();
-                GuestMemory::Read(address, std::as_writable_bytes(std::span(&waited, 1)), alignof(std::uint32_t));
-                ++CaptureTotals().wordsKnownVerified;
-                if (waited != word) ++CaptureTotals().wordsKnownMismatches;
-                if (self.observe != nullptr) report(waitsBefore, waited == word);
-                word = waited;
-            }
-        } else if (policy == PendingWrite::Raw || policy == PendingWrite::VerifyRaw) {
-            std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
-            ++CaptureTotals().wordsRaw;
-            if (policy == PendingWrite::VerifyRaw) {
-                std::uint32_t waited = 0;
-                const auto waitsBefore = hookWaits();
-                GuestMemory::Read(address, std::as_writable_bytes(std::span(&waited, 1)), alignof(std::uint32_t));
-                ++CaptureTotals().wordsVerified;
-                if (waited != word) ++CaptureTotals().wordMismatches;
-                if (self.observe != nullptr) report(waitsBefore, waited == word);
-                word = waited;
-            }
-        } else {
-            // On a word-wise page the bytes before the hook's wait are kept for the observer.
-            const bool observed = page.wordwise && policy == PendingWrite::Sync && self.observe != nullptr && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word));
-            std::uint32_t before = 0;
-            if (observed) std::memcpy(&before, reinterpret_cast<const void*>(address), sizeof(before));
-            const auto waitsBefore = observed ? hookWaits() : 0;
-            const auto started = page.wordwise ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            GuestMemory::Read(address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
-            if (page.wordwise) {
-                const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
-                if (nanoseconds >= WordWaitNanoseconds) {
-                    ++CaptureTotals().wordWaits;
-                    CaptureTotals().wordWaitNanoseconds += nanoseconds;
-                }
-            }
-            if (observed) report(waitsBefore, before == word);
-        }
-        if (CaptureProfiled()) CaptureTotals().wordReadNanoseconds += NanosecondsSince(fetchStarted);
-        page.words[index] = word;
+        page.words[index] = self.fetchWord(address, page.wordwise);
         page.valid.set(index);
     }
     page.read.set(index);
@@ -526,6 +697,11 @@ bool ShaderMemory::probe(std::uint64_t address, std::uint64_t bytes) {
         }
         const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
         const auto pageEnd = std::min<std::uint64_t>(base + PageBytes, end);
+        if (self.direct) {
+            if (!self.probeDirect(address, pageEnd)) return false;
+            address = pageEnd;
+            continue;
+        }
         const auto& page = self.page(base);
         if (!page.wordwise && !page.valid.all() && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(pageEnd - address))) return false;
         address = pageEnd;
@@ -729,6 +905,12 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
 }
 
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation) {
+    if (!direct && DirectReadsEnabled() && WordwisePages() && pages.empty()) {
+        direct = true;
+        auto& cache = ThreadPageStates();
+        instanceSerial = ++cache.serials;
+        DirectTotals().captures.fetch_add(1, std::memory_order_relaxed);
+    }
     return capture(invocation.Request(), nullptr, &invocation, true);
 }
 
@@ -770,6 +952,11 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
 }
 
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
+    if (direct) {
+        std::vector<std::uint32_t> all(directReads.size());
+        for (std::size_t index = 0; index < all.size(); ++index) all[index] = static_cast<std::uint32_t>(index);
+        return directRegions(all, true);
+    }
     std::vector<ShaderRecompiler::MemoryRegion> result;
     result.reserve(initial.size() + pages.size());
     auto next = initial.begin();
@@ -794,6 +981,11 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
 }
 
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::TakeRecentRegions() {
+    if (direct) {
+        auto result = directRegions(recentReads, false);
+        recentReads.clear();
+        return result;
+    }
     std::vector<ShaderRecompiler::MemoryRegion> result;
     for (auto& [base, page] : pages) {
         if (page.recent.none()) continue;

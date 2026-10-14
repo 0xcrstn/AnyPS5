@@ -222,6 +222,10 @@ function(add_shader_recompiler target runtimeTarget)
             BuildPreparedShaderKey
             BuildRectListShaders
             CaptureResources
+            CompiledWalkCounts
+            SrtCompiledWalkCounts
+            SrtCompiledWalkRefusals
+            SrtCompiledWalkRefusalNames
             DebugProbeActive
             DepthBitsTextureWidth
             HashBytes
