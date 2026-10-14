@@ -330,6 +330,14 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(guest_memory_pool_stats PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSsl>")
+
+        add_test_executable(guest_access_guard_tests tests/GuestAccessGuards.cpp)
+        target_include_directories(guest_access_guard_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(guest_access_guard_tests PRIVATE libc)
+        configure_windows_unwind(guest_access_guard_tests)
+        add_test(NAME guest_access_guards COMMAND guest_access_guard_tests)
+        set_tests_properties(guest_access_guards PROPERTIES TIMEOUT 10 ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
     add_test_executable(guest_system_gesture_tests tests/GuestSystemGesture.cpp)

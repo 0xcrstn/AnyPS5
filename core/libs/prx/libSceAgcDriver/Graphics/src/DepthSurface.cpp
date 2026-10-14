@@ -10,6 +10,7 @@
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -24,6 +25,7 @@ namespace AgcDriver::Graphics {
 namespace {
 
 std::uint64_t depthWrites = 0;
+std::atomic<std::uint64_t> depthSurfaceSerial{0};
 
 Recorder* RecorderFor(const Context& context) {
     auto* recorder = Recorder::Active();
@@ -140,6 +142,7 @@ public:
         const auto viewType = resource.dimension == TextureDimension::k2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
         auto texture = std::make_shared<Texture>(context, image, hostFormat, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components, viewType);
         textures.emplace(key, texture);
+        depthSurfaceSerial.fetch_add(1, std::memory_order_relaxed);
         return texture;
     }
 
@@ -258,6 +261,7 @@ private:
         depthPlane = {};
         stencilPlane = {};
         textures.clear();
+        depthSurfaceSerial.fetch_add(1, std::memory_order_relaxed);
         if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
@@ -437,6 +441,7 @@ private:
 
     void release() noexcept {
         textures.clear();
+        depthSurfaceSerial.fetch_add(1, std::memory_order_relaxed);
         staging.reset();
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
@@ -607,6 +612,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         return surface->view;
     }
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
+    depthSurfaceSerial.fetch_add(1, std::memory_order_relaxed);
     surfaces().back()->clearDepth = target.clearDepth;
     surfaces().back()->clearStencil = target.clearStencil;
     drawnDepth = surfaces().back().get();
@@ -655,6 +661,10 @@ void NoteHtileDepthClear(std::uint64_t htileAddress) {
         existing = true;
     }
     if (!existing) clearedHtiles().insert(htileAddress);
+}
+
+std::uint64_t DepthSurfaceSerial() {
+    return depthSurfaceSerial.load(std::memory_order_relaxed);
 }
 
 void ClearDepthSurfaces(VkDevice device) {

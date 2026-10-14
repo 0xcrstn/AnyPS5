@@ -222,6 +222,12 @@ public:
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
     // RecordCopyBacks copies it back again. Nothing to do without staged regions.
     void RecordStagingCopies(Recorder& recorder);
+    bool HasStagedRegions() const {
+        for (const auto& region : regions) {
+            if (region.gpuCopy && region.deviceLocal) return true;
+        }
+        return false;
+    }
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -343,6 +349,7 @@ private:
         bool unstaged = false;
         std::shared_ptr<StagingShadow> shadow {};
         mutable bool shadowBegun = false;
+        mutable bool lazyResident = false;
     };
 
     // How [begin, end) lies against the space's base regions.

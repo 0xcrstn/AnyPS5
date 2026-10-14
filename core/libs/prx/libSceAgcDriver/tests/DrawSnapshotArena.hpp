@@ -5,5 +5,6 @@
 
 bool RunDrawSnapshotArenaTests(const AgcDriver::Graphics::Context& context);
 bool RunDrawSnapshotArenaBenchmark(const AgcDriver::Graphics::Context& context);
+bool RunEpochDirtySetBenchmark(const AgcDriver::Graphics::Context& context);
 
 #endif

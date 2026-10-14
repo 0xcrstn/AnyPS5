@@ -21,6 +21,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -94,6 +95,81 @@ std::atomic<std::uint64_t> collectDirty{0};
 #ifndef _WIN32
 std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
+
+struct DirtyEntry {
+    std::atomic<std::uint64_t> version{0};
+    std::atomic<std::uint64_t> begin{0};
+    std::atomic<std::uint64_t> end{0};
+};
+constexpr std::size_t DirtyLogEntries = 4096;
+
+std::array<DirtyEntry, DirtyLogEntries>& dirtyLog() {
+    static auto& log = *new std::array<DirtyEntry, DirtyLogEntries>();
+    return log;
+}
+
+std::atomic<std::uint64_t> dirtySerial{0};
+std::atomic_flag dirtyLogLock = ATOMIC_FLAG_INIT;
+
+struct DirtySetCounters {
+    std::atomic<std::uint64_t> checks{0};
+    std::atomic<std::uint64_t> serialHits{0};
+    std::atomic<std::uint64_t> logClean{0};
+    std::atomic<std::uint64_t> logOverlaps{0};
+    std::atomic<std::uint64_t> logOverflows{0};
+    std::atomic<std::uint64_t> widenedWalks{0};
+    std::atomic<std::uint64_t> widenFallbacks{0};
+    std::atomic<std::uint64_t> verifyChecks{0};
+    std::atomic<std::uint64_t> verifyDisagreements{0};
+};
+
+DirtySetCounters& dirtySetCounters() {
+    static DirtySetCounters counters;
+    return counters;
+}
+
+std::atomic<bool>& epochDirtySetFlag() {
+    static std::atomic<bool> flag{std::getenv("APS5_EPOCH_DIRTY_SET") != nullptr && std::strcmp(std::getenv("APS5_EPOCH_DIRTY_SET"), "0") != 0};
+    return flag;
+}
+
+void publishDirty(std::uint64_t begin, std::uint64_t end) {
+    if (end <= begin) return;
+    while (dirtyLogLock.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
+    const auto serial = dirtySerial.load(std::memory_order_relaxed);
+    auto& entry = dirtyLog()[serial % DirtyLogEntries];
+    entry.version.store(2 * serial + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    entry.begin.store(begin, std::memory_order_relaxed);
+    entry.end.store(end, std::memory_order_relaxed);
+    entry.version.store(2 * (serial + 1), std::memory_order_release);
+    dirtySerial.store(serial + 1, std::memory_order_release);
+    dirtyLogLock.clear(std::memory_order_release);
+}
+
+void noteDirty(std::uint64_t begin, std::uint64_t end) {
+    if (epochDirtySetFlag().load(std::memory_order_acquire)) publishDirty(begin, end);
+}
+
+std::atomic<bool>& epochDirtySetVerifyFlag() {
+    static std::atomic<bool> flag{std::getenv("APS5_VERIFY_EPOCH_DIRTY_SET") != nullptr && std::strcmp(std::getenv("APS5_VERIFY_EPOCH_DIRTY_SET"), "0") != 0};
+    return flag;
+}
+
+std::size_t roundWidenBytes(std::size_t bytes) {
+    if (bytes == 0) return 0;
+    std::size_t rounded = 4096;
+    while (rounded < bytes && rounded < (std::size_t{1} << 30)) rounded <<= 1;
+    return rounded;
+}
+
+std::atomic<std::size_t>& epochDirtySetWiden() {
+    static std::atomic<std::size_t> bytes{[] {
+        const char* text = std::getenv("APS5_EPOCH_DIRTY_SET_WIDEN_KIB");
+        return roundWidenBytes(text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) << 10 : std::size_t{256} << 10);
+    }()};
+    return bytes;
+}
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 std::uintptr_t PagesBase();
@@ -334,6 +410,10 @@ public:
         auto& refusals = collectRefusals();
         AgcDriver::ProfilePrint_nid_no_patch(" collect refused: unwatched %llu, outside the watched coverage %llu (last 0x%llx), walk failed %llu (last 0x%llx);", static_cast<unsigned long long>(refusals.unwatched.load()), static_cast<unsigned long long>(refusals.uncovered.load()), static_cast<unsigned long long>(refusals.lastUncovered.load()), static_cast<unsigned long long>(refusals.walk.load()), static_cast<unsigned long long>(refusals.lastWalk.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
+        {
+            const auto dirty = DirtySetStatistics();
+            AgcDriver::ProfilePrint_nid_no_patch(" | dirty-set%s: serial %llu, checks %llu (serial hits %llu, log clean %llu, overlaps %llu, overflows %llu), widened walks %llu (%llu fell back), verify %llu checked / %llu disagree", EpochDirtySetEnabled() ? " on" : " off", static_cast<unsigned long long>(dirty.serial), static_cast<unsigned long long>(dirty.checks), static_cast<unsigned long long>(dirty.serialHits), static_cast<unsigned long long>(dirty.logClean), static_cast<unsigned long long>(dirty.logOverlaps), static_cast<unsigned long long>(dirty.logOverflows), static_cast<unsigned long long>(dirty.widenedWalks), static_cast<unsigned long long>(dirty.widenFallbacks), static_cast<unsigned long long>(dirty.verifyChecks), static_cast<unsigned long long>(dirty.verifyDisagreements));
+        }
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
             std::lock_guard lock(state.callersMutex);
@@ -522,6 +602,7 @@ std::size_t ImagePagesSize() {
 void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetCalls.fetch_add(1, std::memory_order_relaxed);
     forgetBytes.fetch_add(bytes, std::memory_order_relaxed);
+    noteDirty(address, address + bytes);
     forgetSerial.fetch_add(1, std::memory_order_release);
     Pages().forget(address, bytes);
     forgetSerial.fetch_add(1, std::memory_order_release);
@@ -1109,6 +1190,7 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
         tracker.driverPieces.erase(block);
         tracker.stamp(block, tracker.generation, StampKind::Cpu);
     }
+    noteDirty(address, address + bytes);
     unwatchSerial.fetch_add(1, std::memory_order_release);
 }
 #endif
@@ -1201,14 +1283,15 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     ++tracker.generation;
     StampRuns runs{tracker, kind, 0, window};
 #ifdef _WIN32
-    return collectWindowsWrites(runs, first, stop, armedOnly);
+    const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
 #else
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
     const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
     const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
     if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
-    return complete;
 #endif
+    if (!complete) noteDirty(first, stop);
+    return complete;
 }
 
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
@@ -1260,16 +1343,43 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
-#ifndef _WIN32
-    if (useMemo && threadCollectEpoch != 0 && bytes <= WriteBlockBytes) {
-        const auto begin = first & ~(WriteBlockBytes - 1);
-        const auto end = (stop + WriteBlockBytes - 1) & ~(WriteBlockBytes - 1);
-        if (end > begin && tracker.covers(begin, end - begin)) {
-            first = begin;
-            stop = end;
+    const auto remember = [&](std::uint64_t begin, std::uint64_t end) {
+        if (!collectMemoEnabled()) return;
+        const auto serial = unwatchSerial.load(std::memory_order_relaxed);
+        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {begin, end, epoch, serial};
+        else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {begin, end, epoch, serial};
+    };
+    if (useMemo && threadCollectEpoch != 0) {
+        if (EpochDirtySetEnabled()) {
+            const auto widen = EpochDirtySetWidenBytes();
+            if (widen != 0 && stop - first <= widen) {
+                const auto begin = first & ~(std::uint64_t{widen} - 1);
+                auto end = begin + widen;
+                if (end < stop) end = (stop + widen - 1) & ~(std::uint64_t{widen} - 1);
+                if ((begin != first || end != stop) && tracker.covers(begin, static_cast<std::size_t>(end - begin))) {
+                    const auto dirtyBefore = collectDirty.load(std::memory_order_relaxed);
+                    if (walkWrites(tracker, begin, end, StampKind::Cpu)) {
+                        if (collectDirty.load(std::memory_order_relaxed) != dirtyBefore) noteDirty(begin, end);
+                        dirtySetCounters().widenedWalks.fetch_add(1, std::memory_order_relaxed);
+                        remember(begin, end);
+                        return tracker.generation;
+                    }
+                    dirtySetCounters().widenFallbacks.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         }
-    }
+#ifndef _WIN32
+        else if (bytes <= WriteBlockBytes) {
+            const auto begin = first & ~(WriteBlockBytes - 1);
+            const auto end = (stop + WriteBlockBytes - 1) & ~(WriteBlockBytes - 1);
+            if (end > begin && tracker.covers(begin, end - begin)) {
+                first = begin;
+                stop = end;
+            }
+        }
 #endif
+    }
+    const auto dirtyBefore = collectDirty.load(std::memory_order_relaxed);
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
         if (MemoryProfiled()) {
             collectRefusals().walk.fetch_add(1, std::memory_order_relaxed);
@@ -1277,12 +1387,9 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
         return 0;
     }
+    if (collectDirty.load(std::memory_order_relaxed) != dirtyBefore) noteDirty(first, stop);
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
-    if (collectMemoEnabled()) {
-        const auto serial = unwatchSerial.load(std::memory_order_relaxed);
-        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
-        else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
-    }
+    remember(first, stop);
     return tracker.generation;
 }
 
@@ -1294,6 +1401,94 @@ std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, false);
+}
+
+bool EpochDirtySetEnabled() {
+    return epochDirtySetFlag().load(std::memory_order_acquire);
+}
+
+void SetEpochDirtySet(bool enabled) {
+    auto& flag = epochDirtySetFlag();
+    if (enabled && !flag.load(std::memory_order_acquire)) publishDirty(0, std::numeric_limits<std::uint64_t>::max());
+    flag.store(enabled, std::memory_order_release);
+}
+
+bool EpochDirtySetVerify() {
+    return epochDirtySetVerifyFlag().load(std::memory_order_relaxed);
+}
+
+void SetEpochDirtySetVerify(bool verify) {
+    epochDirtySetVerifyFlag().store(verify, std::memory_order_relaxed);
+}
+
+std::size_t EpochDirtySetWidenBytes() {
+    return epochDirtySetWiden().load(std::memory_order_relaxed);
+}
+
+void SetEpochDirtySetWidenBytes(std::size_t bytes) {
+    epochDirtySetWiden().store(roundWidenBytes(bytes), std::memory_order_relaxed);
+}
+
+std::uint64_t DirtySerial() {
+    return dirtySerial.load(std::memory_order_acquire);
+}
+
+bool UnchangedSinceDirtySerial(std::span<const DirtyRange> ranges, std::uint64_t serial, std::uint64_t* checkedThrough) {
+    if (!EpochDirtySetEnabled()) return false;
+    auto& counters = dirtySetCounters();
+    counters.checks.fetch_add(1, std::memory_order_relaxed);
+    const auto current = dirtySerial.load(std::memory_order_acquire);
+    if (checkedThrough != nullptr) *checkedThrough = current;
+    if (current == serial) {
+        counters.serialHits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    if (current < serial || current - serial > DirtyLogEntries) {
+        counters.logOverflows.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    auto& log = dirtyLog();
+    for (auto index = serial; index < current; ++index) {
+        const auto& entry = log[index % DirtyLogEntries];
+        const auto version = entry.version.load(std::memory_order_acquire);
+        if (version != 2 * (index + 1)) {
+            counters.logOverflows.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        const auto begin = entry.begin.load(std::memory_order_relaxed);
+        const auto end = entry.end.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (entry.version.load(std::memory_order_relaxed) != version) {
+            counters.logOverflows.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        for (const auto& [first, last] : ranges) {
+            if (begin < last && first < end) {
+                counters.logOverlaps.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        }
+    }
+    counters.logClean.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool UnchangedSinceDirtySerial(std::uint64_t address, std::size_t bytes, std::uint64_t serial, std::uint64_t* checkedThrough) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    const DirtyRange range{address, address + bytes};
+    return UnchangedSinceDirtySerial(std::span<const DirtyRange>(&range, 1), serial, checkedThrough);
+}
+
+void NoteDirtySetVerify(bool agreed) {
+    auto& counters = dirtySetCounters();
+    counters.verifyChecks.fetch_add(1, std::memory_order_relaxed);
+    if (!agreed) counters.verifyDisagreements.fetch_add(1, std::memory_order_relaxed);
+}
+
+DirtySetCounts DirtySetStatistics() {
+    const auto& counters = dirtySetCounters();
+    const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    return {DirtySerial(), load(counters.checks), load(counters.serialHits), load(counters.logClean), load(counters.logOverlaps), load(counters.logOverflows), load(counters.widenedWalks), load(counters.widenFallbacks), load(counters.verifyChecks), load(counters.verifyDisagreements)};
 }
 
 void BumpCollectEpoch() {
@@ -1321,10 +1516,13 @@ void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t byt
     if (!tracker.watched) return;
 #ifdef _WIN32
     tracker.startHints(address, bytes);
-    if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) unwatchSerial.fetch_add(1, std::memory_order_release);
+    const bool excluded = tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix());
 #else
-    if (GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(address), bytes)) unwatchSerial.fetch_add(1, std::memory_order_release);
+    const bool excluded = GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(address), bytes);
 #endif
+    if (!excluded) return;
+    noteDirty(address, address + bytes);
+    unwatchSerial.fetch_add(1, std::memory_order_release);
 }
 
 }
@@ -1368,12 +1566,16 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     }
     const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
     bool imported = false;
-    {
+    try {
 #ifdef __APPLE__
         const GuestArena::HostWrite open(reinterpret_cast<void*>(first), static_cast<std::size_t>(stop - first));
 #endif
         imported = import();
+    } catch (...) {
+        if (covered) noteDirty(first, stop);
+        throw;
     }
+    if (covered) noteDirty(first, stop);
     if (!imported) return false;
     if (!staysWatched) {
         if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
@@ -1453,6 +1655,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     if (bytes == 0) return 0;
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
+        noteDirty(stored.first, stored.second);
         ++tracker.generation;
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) {
             tracker.noteUnstampedStore(stored.first, stored.second);
@@ -1471,9 +1674,14 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     constexpr std::uint64_t page = 4096;
     const auto first = address & ~(page - 1);
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return stampStored(tracker, store());
+    const auto dirtyBefore = collectDirty.load(std::memory_order_relaxed);
+    const bool walked = walkWrites(tracker, first, stop, StampKind::Cpu);
+    if (collectDirty.load(std::memory_order_relaxed) != dirtyBefore) noteDirty(first, stop);
+    if (!walked) return stampStored(tracker, store());
     const auto stored = store();
+    const auto dirtyBeforeStore = collectDirty.load(std::memory_order_relaxed);
     walkWrites(tracker, first, stop, StampKind::Driver);
+    if (collectDirty.load(std::memory_order_relaxed) != dirtyBeforeStore) noteDirty(first, stop);
     return stampStored(tracker, stored);
 }
 
@@ -1498,6 +1706,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (bytes == 0) return 0;
+    noteDirty(address, address + bytes);
     ++tracker.generation;
     if (!tracker.watched || !tracker.covers(address, bytes)) {
         tracker.noteUnstampedStore(address, address + bytes);
@@ -1512,6 +1721,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
 #else
         const bool complete = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
 #endif
+        if (runs.stamped != 0) noteDirty(blockFirst, blockStop);
         if (!complete) {
             unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             tracker.noteUnstampedStore(address, address + bytes);
@@ -1581,7 +1791,9 @@ MarkedWrites MarkWrittenUnlessStored(std::span<const std::pair<std::uint64_t, st
     ++tracker.generation;
     const auto unstamped = [&] {
         for (const auto& [begin, end] : ranges) {
-            if (begin < end) tracker.noteUnstampedStore(begin, end);
+            if (begin >= end) continue;
+            noteDirty(begin, end);
+            tracker.noteUnstampedStore(begin, end);
         }
         return MarkedWrites{0, true};
     };
@@ -1592,6 +1804,7 @@ MarkedWrites MarkWrittenUnlessStored(std::span<const std::pair<std::uint64_t, st
         if (!tracker.watched || !tracker.covers(begin, static_cast<std::size_t>(end - begin))) return unstamped();
     }
     if (!any) return result;
+    for (const auto& [begin, end] : ranges) noteDirty(begin, end);
     std::size_t stamped = 0;
     for (const auto& [begin, end] : ranges) {
         if (end <= begin) continue;
@@ -1603,6 +1816,7 @@ MarkedWrites MarkWrittenUnlessStored(std::span<const std::pair<std::uint64_t, st
 #else
         const bool complete = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
 #endif
+        if (runs.stamped != 0) noteDirty(blockFirst, blockStop);
         if (!complete) {
             unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             return unstamped();

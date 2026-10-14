@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -1031,6 +1032,18 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             recorder->SyncThrough(address, bytes, true);
         }
     }
+    if (AnyDeviceResidentOverlaps(address, bytes)) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        Require(completionDepth == 0, "a completion action reached unpublished device-resident buffer results");
+        auto* recorder = Recorder::Active();
+        Require(recorder != nullptr, "reading device-resident buffer results needs an active recorder");
+        if (PublishDeviceResident(*recorder, address, bytes, GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Scanout ? ResidentSite::Scanout : ResidentSite::Hook) != 0) {
+            Recorder::CountSync(1);
+            recorder->Submit();
+            recorder->SyncThrough(address, bytes, true);
+        }
+    }
     // A reader takes every shadowed unit of the range; a store only the units it covers partly
     // (its own stamp makes the others stale). Inside a completion action a store has no publish
     // recorded: the batch is not waited for, and the copy would land over the store later.
@@ -1118,6 +1131,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
 
 Recorder::~Recorder() {
     try {
+        if (AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Retire);
         Sync();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
@@ -1378,6 +1392,10 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
 
 void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
+}
+
+std::uint64_t Recorder::KeyStoreSerial() {
+    return keyStoreCount.load(std::memory_order_relaxed);
 }
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
@@ -2607,11 +2625,23 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
 
 std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp) {
     const auto found = unwrittenSnapshots.find(address);
-    if (found == unwrittenSnapshots.end() || found->second.bytes != bytes || found->second.stamp != stamp) return {};
-    return found->second.buffer;
+    if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return {};
+    auto& entry = found->second;
+    if (entry.dirtySet != GuestMemory::EpochDirtySetEnabled()) return {};
+    if (entry.stamp == stamp) return entry.buffer;
+    if (!GuestMemory::EpochDirtySetEnabled() || entry.stamp[1] != stamp[1] || entry.stamp[2] != stamp[2]) return {};
+    std::uint64_t through = 0;
+    if (!GuestMemory::UnchangedSinceDirtySerial(address, bytes, entry.stamp[0], &through)) return {};
+    if (GuestMemory::EpochDirtySetVerify()) {
+        const bool slow = entry.generation != 0 && GuestMemory::UnchangedSince(address, bytes, entry.generation);
+        GuestMemory::NoteDirtySetVerify(slow);
+        if (!slow) return {};
+    }
+    entry.stamp[0] = through;
+    return entry.buffer;
 }
 
-void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer) {
+void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::uint64_t generation, std::shared_ptr<Buffer> buffer) {
     constexpr std::size_t Limit = 4096;
     if (unwrittenSnapshots.size() >= Limit) {
         retireSnapshot(std::make_shared<std::unordered_map<std::uint64_t, UnwrittenSnapshot>>(std::move(unwrittenSnapshots)));
@@ -2619,19 +2649,32 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
     }
     auto& entry = unwrittenSnapshots[address];
     retireSnapshot(std::move(entry.buffer));
-    entry = {bytes, stamp, std::move(buffer)};
+    entry = {bytes, stamp, std::move(buffer), generation, GuestMemory::EpochDirtySetEnabled()};
 }
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+    bool unchanged = false;
+    if (sameRegistry && found->second.dirtySerial != 0 && GuestMemory::EpochDirtySetEnabled()) {
+        std::uint64_t through = 0;
+        const auto ownedBytes = std::get<2>(found->first);
+        unchanged = GuestMemory::UnchangedSinceDirtySerial(address, ownedBytes, found->second.dirtySerial, &through);
+        if (unchanged && GuestMemory::EpochDirtySetVerify()) {
+            const bool slow = GuestMemory::UnchangedSince(address, ownedBytes, found->second.generation);
+            GuestMemory::NoteDirtySetVerify(slow);
+            unchanged = slow;
+        }
+        if (unchanged) found->second.dirtySerial = through;
+    }
+    if (!sameRegistry || (!unchanged && !GuestMemory::UnchangedSince(address, bytes, found->second.generation))) {
         if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes)) {
             eraseDrawSnapshot(found);
             return {};
         }
         found->second.generation = generation;
+        found->second.dirtySerial = 0;
     }
     auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
     recency.splice(recency.end(), recency, found->second.recent);
@@ -2839,7 +2882,7 @@ std::shared_ptr<Buffer> Recorder::SnapshotTwin(std::uint64_t address, SnapshotUs
     return found->second.twin;
 }
 
-void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
+void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived, std::uint64_t dirtySerial) {
     const bool storage = use == SnapshotUse::Storage;
     const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
     const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntries;
@@ -2854,7 +2897,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     const DrawSnapshotKey key{address, use, bytes};
     pool.recency.push_back(key);
     try {
-        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
+        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived, dirtySerial});
     } catch (...) {
         pool.recency.pop_back();
         throw;
@@ -2897,6 +2940,11 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
 }
 
 void Recorder::OnComplete(std::function<void()> action) {
+    OnCompleteWithoutGuestAccess(std::move(action));
+    open->guestCompletions = true;
+}
+
+void Recorder::OnCompleteWithoutGuestAccess(std::function<void()> action) {
     ensureOpen();
     open->completions.push_back(std::move(action));
     ++open->writeBackCompletionCount;
@@ -2982,6 +3030,8 @@ void Recorder::publishPendingWrites() const {
     if (activeRecorder != this) return;
     const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto merged = std::make_shared<WriteRanges>();
+    const auto resident = DeviceResidentRanges(context.device);
+    merged->insert(merged->end(), resident.begin(), resident.end());
     if (open != nullptr) merged->insert(merged->end(), open->writes.begin(), open->writes.end());
     for (const auto& batch : inFlight) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
     for (const auto* batch : finishing) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
@@ -2996,6 +3046,10 @@ void Recorder::publishPendingWrites() const {
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+}
+
+void Recorder::RefreshPendingWrites() {
+    publishPendingWrites();
 }
 
 bool Recorder::overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end) {
@@ -3177,6 +3231,14 @@ bool Recorder::HasCompletions() const {
     return false;
 }
 
+bool Recorder::HasGuestCompletions() const {
+    if (open != nullptr && open->guestCompletions) return true;
+    for (const auto& batch : inFlight) {
+        if (batch->guestCompletions) return true;
+    }
+    return false;
+}
+
 void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion) {
     // One entry per dword; a label overlapping older entries (a 4-byte store inside an 8-byte one or
     // the reverse) replaces exactly the dwords it stores, so a lookup composes what memory will hold.
@@ -3313,6 +3375,7 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
 }
 
 void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu) {
+    if (AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Completion);
     Require(open != nullptr || !inFlight.empty(), "no batch to append a completion label to");
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     std::vector<std::byte> copy(bytes.begin(), bytes.end());
@@ -3333,6 +3396,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         GuestMemory::CheckRange(reinterpret_cast<const void*>(address), copy.size(), 4, true);
         GuestMemory::StoreOwnBytes(address, copy);
     });
+    batch.guestCompletions = true;
     // Counted per batch and counted down when the batch finishes, on every exit path of finish()
     // (a label whose range became unmapped is reported there, and a lost device throws before the
     // completions run): a label that will never land must not leave the workers reaping forever.
@@ -3355,9 +3419,11 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
 }
 
 bool Recorder::AfterRecordedWork(std::function<void()> action) {
+    if (AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Completion);
     if (Idle()) return false;
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     batch.completions.push_back(std::move(action));
+    batch.guestCompletions = true;
     ++batch.completionLabelCount;
     completionLabels.fetch_add(1, std::memory_order_acq_rel);
     if (&batch == open.get() && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
@@ -3417,6 +3483,7 @@ void Recorder::Submit() {
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
+    if (open->guestCompletions && AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Completion);
     const bool segments = segmentMode();
     if (!segments) {
         endSamples(*open);

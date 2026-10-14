@@ -32,6 +32,7 @@
 #include "BufferUpdate_spv.h"
 #include "AddressCopy_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include "SampleArray_spv.h"
 #include "Cover_vert_spv.h"
 #include "Cover_frag_spv.h"
@@ -1831,6 +1832,273 @@ void snapshotTwinTests(const Device& device, Recorder& recorder) {
     std::cout << "snapshot twin tests passed\n";
 }
 
+bool lazyStagingOutTests(const Device& device, Recorder& recorder) {
+    using AgcDriver::Graphics::ResidentSite;
+    const auto& context = device.GetContext();
+    if (!AgcDriver::Graphics::LazyStagingOut()) {
+        std::cout << "lazy staging-out is off (APS5_LAZY_STAGING_OUT): not tested\n";
+        return false;
+    }
+    if (context.hostImportAlignment == 0 || !AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "host imports or write watching unavailable: lazy staging-out not tested\n";
+        return false;
+    }
+    const bool verify = AgcDriver::Graphics::LazyStagingVerify();
+    constexpr std::size_t bytes = 4u << 20u;
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared lazy staging section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    struct Release {
+        void* block;
+        ~Release() {
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+#else
+    void* block = AllocateWatched(bytes, 65536);
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+#endif
+    std::memset(block, 0x11, bytes);
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            recorder.Sync();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, recorder, block, address};
+    if (HostImportFor(context, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "the lazy staging test block is not imported and watched: lazy staging-out not tested\n";
+        return false;
+    }
+    AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+    constexpr std::uint64_t elementBytes = 32u << 10u;
+    const auto element = address + 65536 + 4096;
+    const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+    const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto totals = [] { return AgcDriver::Graphics::DeviceResidentTotals(); };
+    const auto publishedAt = [](const AgcDriver::Graphics::ResidentCounters& counters, ResidentSite site) { return counters.published[static_cast<std::size_t>(site)]; };
+    const auto stage = [&](std::uint64_t written, std::uint32_t value, std::vector<std::uint8_t>* seen, const std::function<void()>& completion = {}) {
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddWritable(written, elementBytes);
+        memory.Upload(false);
+        Require(memory.InPlaceReads().empty(), "a written element in the staging window was bound in place");
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(written, elementBytes, adjustment);
+        const auto base = view.offset + adjustment;
+        auto readback = std::make_shared<Buffer>(context, elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy region{base, 0, elementBytes};
+        copy(commands, view.buffer, readback->Handle(), 1, &region);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (value != 0) fill(commands, view.buffer, base, elementBytes, value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(readback);
+        if (completion) recorder.OnComplete(completion);
+        memory.RecordCopyBacks(recorder);
+        recorder.NotePendingWrites(memory.Writes());
+        memory.MarkDirectWrites();
+        recorder.Submit();
+        recorder.Sync();
+        if (seen != nullptr) {
+            const auto contents = readback->Bytes();
+            seen->assign(reinterpret_cast<const std::uint8_t*>(contents.data()), reinterpret_cast<const std::uint8_t*>(contents.data()) + contents.size());
+        }
+        memory.WriteBack();
+    };
+    const auto guestAll = [&](std::uint64_t from, std::uint64_t to, std::uint8_t value) {
+        return std::all_of(guest + (from - address), guest + (to - address), [&](std::uint8_t byte) { return byte == value; });
+    };
+    const auto sync = [&] {
+        recorder.Submit();
+        recorder.Sync();
+    };
+    auto before = totals();
+    stage(element, 0xa1a1a1a1u, nullptr);
+    auto now = totals();
+    Require(now.noted - before.noted == 1 && now.live == 1 && now.liveBytes == elementBytes, "a staged element's GPU results were not noted as device-resident");
+    Require(Recorder::SnapshotWriteOverlaps(element, elementBytes), "completed device-resident results disappeared from pending coverage");
+    Require(guestAll(element, element + elementBytes, verify ? 0xa1 : 0x11), verify ? "verify mode did not copy the results back eagerly" : "a lazily staged element reached the import without a consumer");
+    std::array<std::byte, 64> read{};
+    AgcDriver::GuestMemory::Read(element + 1024, read, 1);
+    now = totals();
+    Require(publishedAt(now, ResidentSite::Hook) - publishedAt(before, ResidentSite::Hook) == 1 && now.live == 0, "a CPU read through the flush hook did not publish the resident element");
+    Require(guestAll(element, element + elementBytes, 0xa1) && std::all_of(read.begin(), read.end(), [](std::byte byte) { return byte == std::byte{0xa1}; }), "the published element does not hold the GPU results");
+    Require(guestAll(address, element, 0x11) && guestAll(element + elementBytes, address + bytes, 0x11), "the publish stored outside the element");
+    if (verify) Require(now.verified - before.verified == 1 && now.verifyDiffering == before.verifyDiffering, "verify mode did not find the eager and lazy bytes equal");
+    before = totals();
+    std::vector<std::uint8_t> reused;
+    stage(element, 0xb2b2b2b2u, &reused);
+    Require(!reused.empty() && std::all_of(reused.begin(), reused.end(), [](std::uint8_t value) { return value == 0xa1; }), "a reused staging shadow did not retain the previous GPU result");
+    {
+        GuestBufferMemory reader(context);
+        reader.AddReadable(element, elementBytes);
+        reader.Upload(false);
+        Require(!reader.InPlaceReads().empty(), "the in-place reader did not bind the import");
+        now = totals();
+        Require(publishedAt(now, ResidentSite::InPlace) - publishedAt(before, ResidentSite::InPlace) == 1 && now.live == 0, "an in-place V# over a resident element did not publish it");
+        sync();
+        reader.WriteBack();
+    }
+    Require(guestAll(element, element + elementBytes, 0xb2), "the in-place publish did not reach the import");
+    before = totals();
+    stage(element, 0xc3c3c3c3u, nullptr);
+    {
+        GuestBufferMemory leased(context);
+        leased.AcquireRegistered();
+        leased.AddReadable(element, 16);
+        leased.Upload(true);
+        now = totals();
+        Require(publishedAt(now, ResidentSite::AddressBased) - publishedAt(before, ResidentSite::AddressBased) >= 1 && now.live == 0, "an address-based build did not publish the resident element");
+        sync();
+        leased.WriteBack();
+    }
+    Require(guestAll(element, element + elementBytes, 0xc3), "the address-based publish did not reach the import");
+    before = totals();
+    stage(element, 0xd4d4d4d4u, nullptr);
+    {
+        std::vector<std::uint8_t> seen;
+        stage(element + 4096, 0, &seen);
+        now = totals();
+        Require(publishedAt(now, ResidentSite::CopyIn) - publishedAt(before, ResidentSite::CopyIn) == 1, "a staged copy-in over a resident element did not publish it first");
+        Require(!seen.empty() && seen[0] == 0xd4 && seen[elementBytes - 4096 - 1] == 0xd4, "a copy-in over a resident element missed the GPU results");
+    }
+    Require(guestAll(element, element + 4096, verify ? 0xd4 : 0xc3), "the copy-in publish changed bytes before its source range");
+    Require(AgcDriver::Graphics::PublishAllDeviceResident(recorder, ResidentSite::Copy) != 0, "overlapping staging left no results to publish");
+    sync();
+    Require(guestAll(element, element + elementBytes, 0xd4), "overlapping staging lost the first range's GPU results");
+    before = totals();
+    stage(element, 0xe5e5e5e5u, nullptr);
+    Require(AgcDriver::Graphics::PublishAllDeviceResident(recorder, ResidentSite::Label) == elementBytes, "a label publish did not take the resident element");
+    sync();
+    now = totals();
+    Require(publishedAt(now, ResidentSite::Label) - publishedAt(before, ResidentSite::Label) == 1 && now.live == 0 && guestAll(element, element + elementBytes, 0xe5), "the label publish did not reach the import");
+    before = totals();
+    stage(element, 0xf6f6f6f6u, nullptr);
+    Require(AgcDriver::Graphics::PublishDeviceResident(recorder, element + 8192, 4096, ResidentSite::Indirect) == 4096, "an indirect-argument publish did not take the resident sub-range");
+    sync();
+    now = totals();
+    Require(now.live == 2 && now.liveBytes == elementBytes - 4096 && now.liveBufferBytes == elementBytes, "a partial publish did not split the resident range while retaining its buffer");
+    Require(Recorder::SnapshotWriteOverlaps(element, 8192) && !Recorder::SnapshotWriteOverlaps(element + 8192, 4096) && Recorder::SnapshotWriteOverlaps(element + 12288, elementBytes - 12288), "pending coverage did not retain only the unpublished pieces after completion");
+    Require(guestAll(element + 8192, element + 12288, 0xf6) && guestAll(element, element + 8192, verify ? 0xf6 : 0xe5) && guestAll(element + 12288, element + elementBytes, verify ? 0xf6 : 0xe5), "a partial publish stored outside its sub-range");
+    Require(AgcDriver::Graphics::PublishDeviceResident(recorder, element, elementBytes, ResidentSite::Copy) == elementBytes - 4096, "a copy publish did not take the remaining pieces");
+    sync();
+    Require(totals().live == 0 && guestAll(element, element + elementBytes, 0xf6), "the remaining pieces did not reach the import");
+    before = totals();
+    stage(element, 0x06060606u, nullptr);
+    bool completionRead = false;
+    bool completionStore = false;
+    recorder.OnComplete([&] {
+        AgcDriver::GuestMemory::Read(element, read, 1);
+        completionRead = std::all_of(read.begin(), read.end(), [](std::byte value) { return value == std::byte{6}; });
+        const std::array<std::byte, 1> store{std::byte{0x66}};
+        AgcDriver::GuestMemory::Write(element + 200, store);
+        completionStore = guest[element - address + 200] == 0x66;
+    });
+    sync();
+    Require(completionRead && completionStore && totals().live == 0, "completion actions did not observe published GPU results before storing");
+    Require(publishedAt(totals(), ResidentSite::Completion) - publishedAt(before, ResidentSite::Completion) == 1, "a batch with completion actions did not publish resident results before submission");
+    before = totals();
+    bool eagerCompletion = false;
+    stage(element, 0x07070707u, nullptr, [&] {
+        AgcDriver::GuestMemory::Read(element, read, 1);
+        eagerCompletion = std::all_of(read.begin(), read.end(), [](std::byte value) { return value == std::byte{7}; });
+    });
+    Require(eagerCompletion && totals().noted == before.noted && totals().live == 0, "a use with pending completion actions did not retain eager copy-back");
+    before = totals();
+    stage(element, 0x08080808u, nullptr);
+    bool afterRecordedWork = false;
+    Require(recorder.AfterRecordedWork([&] {
+        AgcDriver::GuestMemory::Read(element, read, 1);
+        afterRecordedWork = std::all_of(read.begin(), read.end(), [](std::byte value) { return value == std::byte{8}; });
+    }), "an action behind resident results was not ordered after their publication");
+    sync();
+    Require(afterRecordedWork && totals().live == 0 && publishedAt(totals(), ResidentSite::Completion) - publishedAt(before, ResidentSite::Completion) == 1, "an action behind resident results did not see their GPU bytes");
+    stage(element, 0x09090909u, nullptr);
+    const std::uint32_t completedLabel = 0x12121212u;
+    recorder.AfterCompletions(address + 524288, std::as_bytes(std::span(&completedLabel, 1)), 9000, 0, false);
+    sync();
+    Require(totals().live == 0 && guestAll(element, element + elementBytes, 9) && guestAll(address + 524288, address + 524292, 0x12), "a completion label did not follow resident GPU publication");
+    before = totals();
+    stage(element, 0x17171717u, nullptr);
+    const std::array<std::byte, 1> store{std::byte{0x88}};
+    AgcDriver::GuestMemory::Write(element + 200, store);
+    now = totals();
+    Require(publishedAt(now, ResidentSite::Hook) - publishedAt(before, ResidentSite::Hook) == 1 && now.live == 0, "a CPU store through the flush hook did not publish the resident element first");
+    Require(guest[element - address] == 0x17 && guest[element - address + 200] == 0x88 && guest[element - address + 201] == 0x17, "a hooked CPU store did not land over the published results");
+    before = totals();
+    stage(element, 0x28282828u, nullptr);
+    guest[element - address + 100] = 0x77;
+    bool refused = false;
+    try {
+        AgcDriver::GuestMemory::Read(element + 1000, read, 1);
+    } catch (const std::runtime_error& error) {
+        refused = std::string_view(error.what()).find("after another writer changed the range") != std::string_view::npos;
+    }
+    now = totals();
+    Require(refused && now.refusedStoredOver - before.refusedStoredOver == 1 && now.live == 1 && now.liveBytes == elementBytes, "an ambiguous CPU store did not preserve the resident results and refuse publication");
+    Require(guest[element - address + 100] == 0x77 && guest[element - address] == (verify ? 0x28 : 0x17), "a refused publication overwrote the CPU store");
+    AgcDriver::Graphics::ClearDeviceResident(context.device);
+    before = totals();
+    stage(element, 0x38383838u, nullptr);
+    for (std::uint64_t index = 0; index < 33; ++index) {
+        const auto range = address + (index + 2) * 65536 + 4096;
+        stage(range, 0x40404040u + static_cast<std::uint32_t>(index) * 0x01010101u, nullptr);
+        AgcDriver::Graphics::PublishDeviceResident(recorder, range, elementBytes - 4, ResidentSite::Indirect);
+        sync();
+    }
+    now = totals();
+    Require(now.live + publishedAt(now, ResidentSite::Eviction) - publishedAt(before, ResidentSite::Eviction) == 34, "staging reuse eviction lost resident results");
+    if (const auto* budget = std::getenv("APS5_RESIDENT_STAGING_MIB"); budget != nullptr) Require(now.liveBufferBytes <= (std::strtoull(budget, nullptr, 10) << 20u), "partial publications bypassed the retained buffer budget");
+    Require(AgcDriver::Graphics::PublishAllDeviceResident(recorder, ResidentSite::Copy) == now.liveBytes, "staging reuse eviction lost the buffers needed for publication");
+    sync();
+    Require(guestAll(element, element + elementBytes, 0x38), "an evicted staging shadow lost its GPU results");
+    for (std::uint64_t index = 0; index < 33; ++index) Require(guestAll(address + (index + 2) * 65536 + 4096, address + (index + 2) * 65536 + 4096 + elementBytes, static_cast<std::uint8_t>(0x40 + index)), "staging reuse eviction changed a retained GPU result");
+    before = totals();
+    stage(element, 0x39393939u, nullptr);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    Require(HostImportFor(context, address, bytes) == nullptr, "the unregistered block is still imported");
+    now = totals();
+    Require(publishedAt(now, ResidentSite::Retire) - publishedAt(before, ResidentSite::Retire) == 1 && now.live == 0, "retiring the import did not publish the resident element");
+    sync();
+    Require(guestAll(element, element + elementBytes, 0x39), "the retirement publish did not reach guest memory");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    std::cout << "lazy staging-out tests passed" << (verify ? " (verify mode)" : "") << '\n';
+    return true;
+}
+
 void stagingReuseTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -2684,8 +2952,8 @@ void drawSnapshotRetireTests(const Device& device) {
         const std::array<std::uint64_t, 3> stamp{1, 2, 3};
         auto fourth = snapshot();
         unwritten = fourth;
-        cache.NoteUnwrittenDrawSnapshot(address, 16, stamp, std::move(fourth));
-        cache.NoteUnwrittenDrawSnapshot(address, 16, stamp, snapshot());
+        cache.NoteUnwrittenDrawSnapshot(address, 16, stamp, generation, std::move(fourth));
+        cache.NoteUnwrittenDrawSnapshot(address, 16, stamp, generation, snapshot());
         Require(!unwritten.expired() && cache.UnwrittenDrawSnapshot(address, 16, stamp) != unwritten.lock(), "a replaced unwritten snapshot was not retired with the open batch");
         cache.Submit();
         cache.Sync();
@@ -7444,6 +7712,9 @@ int main(int argc, char** argv) {
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-epoch-dirty-set") {
+            return RunEpochDirtySetBenchmark(device.GetContext()) ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--unchanged-cpu-stamps-only") {
             unchangedCpuStampTests(device, recorder);
             return 0;
@@ -7507,6 +7778,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--snapshot-twins-only") {
             snapshotTwinTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--lazy-staging-out-only") {
+            if (!lazyStagingOutTests(device, recorder)) return 77;
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--staging-reuse-only") {

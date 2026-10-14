@@ -5,12 +5,14 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <map>
+#include <limits>
 #include <memory>
 #include <vector>
 #include <stdexcept>
@@ -22,6 +24,107 @@ namespace GuestArena {
 class WindowsMappings {
 public:
     enum class Collection { All, Armed, Fresh };
+
+    std::uint64_t TryProtectAccess(std::uintptr_t address, std::size_t bytes, bool (*resolve)(std::uint64_t, void*), void* context, void (*releaseContext)(void*)) {
+        if (resolve == nullptr || bytes == 0 || address % subpageBytes != 0 || bytes % subpageBytes != 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address || (context != nullptr && releaseContext == nullptr)) return 0;
+        auto guard = std::make_shared<AccessGuard>();
+        guard->resolve = resolve;
+        guard->context = context;
+        std::lock_guard lock(mutex);
+        if (compare == nullptr) return 0;
+        for (auto cursor = address; cursor < address + bytes; cursor += subpageBytes) {
+            const auto base = cursor & ~(pageBytes - 1);
+            const auto found = views.find(base);
+            if (found == views.end() || found->second.resident || found->second.page->pins != 0 || !writable(found->second.protection)) return 0;
+            const auto page = found->second.page;
+            for (const auto& [otherBase, other] : views) {
+                static_cast<void>(otherBase);
+                if (other.page != page && other.offset < found->second.offset + pageBytes && found->second.offset < other.offset + pageBytes && sameSection(other.section->handle, found->second.section->handle)) return 0;
+            }
+            for (const auto alias : page->aliases) {
+                const auto& view = views.at(alias);
+                const auto protection = view.protection & 0xffu;
+                if (view.resident || view.offset != found->second.offset || !sameSection(view.section->handle, found->second.section->handle) || view.hostWrites != 0 || (view.protection & PAGE_GUARD) != 0 || (protection != PAGE_READONLY && protection != PAGE_READWRITE)) return 0;
+            }
+            const auto mask = subpagesOf(base, cursor, cursor + subpageBytes);
+            const auto existing = std::find_if(guard->pages.begin(), guard->pages.end(), [&](const ProtectedPage& held) { return held.page == page; });
+            if (existing == guard->pages.end()) guard->pages.push_back({page, mask});
+            else existing->mask |= mask;
+        }
+        if (nextAccessToken == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("guest access protection tokens exhausted");
+        const auto token = ++nextAccessToken;
+        accessGuards.emplace(token, guard);
+        for (const auto& held : guard->pages) {
+            for (std::size_t sub = 0; sub < subpages; ++sub) {
+                if ((held.mask & (1u << sub)) != 0) ++held.page->accessGuards[sub];
+            }
+        }
+        try {
+            for (const auto& held : guard->pages) {
+                for (const auto alias : held.page->aliases) protectAccess(alias, views.at(alias), held.mask);
+            }
+        } catch (...) {
+            releaseAccessLocked(token, *guard);
+            throw;
+        }
+        guard->releaseContext = releaseContext;
+        accessGuardCount.store(accessGuards.size(), std::memory_order_release);
+        return token;
+    }
+
+    void ReleaseAccess(std::uint64_t token) {
+        std::shared_ptr<AccessGuard> released;
+        {
+            std::lock_guard lock(mutex);
+            const auto found = accessGuards.find(token);
+            if (found == accessGuards.end()) return;
+            released = found->second;
+            releaseAccessLocked(token, *released);
+        }
+    }
+
+    bool ResolveAccess(std::uintptr_t address, std::size_t bytes) {
+        if (!activeAccessResolvers.empty()) throw std::runtime_error("nested guest access resolution is not implemented");
+        if (bytes == 0) return true;
+        if (bytes > std::numeric_limits<std::uintptr_t>::max() - address) return false;
+        if (accessGuardCount.load(std::memory_order_acquire) == 0) return true;
+        std::vector<ViewIdentity> identities;
+        {
+            std::lock_guard lock(mutex);
+            for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) identities.push_back({it->first, it->second.page, it->second.identity});
+        }
+        for (;;) {
+            std::vector<std::pair<std::uint64_t, std::shared_ptr<AccessGuard>>> pending;
+            {
+                std::lock_guard lock(mutex);
+                auto current = views.lower_bound(address & ~(pageBytes - 1));
+                for (const auto& [base, page, identity] : identities) {
+                    if (current == views.end() || current->first != base || current->second.page != page || current->second.identity != identity) return false;
+                    ++current;
+                    const auto mask = subpagesOf(base, address, address + bytes);
+                    for (const auto& [token, guard] : accessGuards) {
+                        if (std::any_of(guard->pages.begin(), guard->pages.end(), [&](const ProtectedPage& held) { return held.page == page && (held.mask & mask) != 0; }) && std::none_of(pending.begin(), pending.end(), [&](const auto& held) { return held.first == token; })) pending.emplace_back(token, guard);
+                    }
+                }
+                if (current != views.end() && current->first < address + bytes) return false;
+            }
+            if (pending.empty()) return true;
+            for (const auto& [token, guard] : pending) {
+                std::lock_guard resolving(guard->resolverMutex);
+                {
+                    std::lock_guard lock(mutex);
+                    if (!accessGuards.contains(token)) continue;
+                }
+                struct Resolving {
+                    explicit Resolving(std::uint64_t token) { activeAccessResolvers.push_back(token); }
+                    ~Resolving() { activeAccessResolvers.pop_back(); }
+                } resolvingScope(token);
+                if (!guard->resolve(token, guard->context)) throw std::runtime_error("guest access resolver refused publication");
+                std::lock_guard lock(mutex);
+                if (accessGuards.contains(token)) throw std::runtime_error("guest access resolver retained its protection");
+            }
+        }
+    }
 
     static WindowsMappings& Get() {
         static WindowsMappings mappings;
@@ -35,6 +138,7 @@ public:
     std::vector<std::pair<std::uintptr_t, std::size_t>> Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
         std::lock_guard lock(mutex);
+        requireAccessResolved(reinterpret_cast<std::uintptr_t>(address), bytes, true);
         collectableRanges.clear();
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
         for (auto cursor = reinterpret_cast<std::uintptr_t>(address); cursor < end;) {
@@ -78,6 +182,19 @@ public:
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection, bool watched = false, bool resident = false) {
         std::lock_guard lock(mutex);
+        if (!accessGuards.empty()) {
+            for (const auto& [token, guard] : accessGuards) {
+                static_cast<void>(token);
+                for (const auto& held : guard->pages) {
+                    const auto& view = views.at(held.page->aliases.front());
+                    if (view.offset >= offset + bytes || offset >= view.offset + pageBytes) continue;
+                    const auto existing = physical.find(std::make_pair(reinterpret_cast<std::uintptr_t>(section), view.offset));
+                    const bool sharesSlot = existing != physical.end() && existing->second.page.lock() == held.page;
+                    if (sameSection(view.section->handle, section) != sharesSlot) throw std::runtime_error("mapping protected backing with a different section identity is not implemented");
+                    if (sharesSlot && protection != PAGE_READONLY && protection != PAGE_READWRITE) throw std::runtime_error("mapping protected backing with unsupported CPU protection is not implemented");
+                }
+            }
+        }
         collectableRanges.clear();
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         reset(cursor, bytes);
@@ -115,7 +232,8 @@ public:
                         slot.saved.reset();
                     }
                     shared->aliases.push_back(base + at);
-                    views.emplace(base + at, View{shared, protection, {}, 0, owned, offset + done + at, 0, 0, true, &slot});
+                    const auto added = views.emplace(base + at, View{shared, protection, {}, 0, owned, offset + done + at, 0, 0, true, &slot}).first;
+                    added->second.identity = ++viewIdentity;
                     invalidate(*shared);
                 }
                 remember(freshRanges, base, base + runBytes);
@@ -131,10 +249,13 @@ public:
                 if (views.at(alias).resident) demote(alias);
             }
             split(base, pageBytes);
-            mapShared(base, section, offset + done, protection);
+            const auto guarded = protectedAccess(*shared);
+            mapShared(base, section, offset + done, guarded != 0 ? PAGE_NOACCESS : protection);
             slot.stored = true;
             shared->aliases.push_back(base);
-            views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0, 0, false, &slot});
+            const auto added = views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0, 0, false, &slot}).first;
+            added->second.identity = ++viewIdentity;
+            if (guarded != 0) protectAccess(base, added->second, allSubpages);
             remember(freshRanges, base, base + pageBytes);
             invalidate(*shared);
             done += pageBytes;
@@ -143,6 +264,7 @@ public:
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
         std::lock_guard lock(mutex);
+        requireAccessResolved(address, bytes, true);
         collectableRanges.clear();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
@@ -153,6 +275,7 @@ public:
 
     void Pin(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        requireAccessResolved(address, bytes, true);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& page = *it->second.page;
             ++page.pins;
@@ -176,27 +299,51 @@ public:
     }
 
     bool HandleWrite(std::uintptr_t address) {
-        std::lock_guard lock(mutex);
-        const auto base = address & ~(pageBytes - 1);
-        const auto found = views.find(base);
-        if (found == views.end() || !writable(found->second.protection)) return false;
-        auto& view = found->second;
-        if (view.resident) {
-            const auto memory = query(address);
-            return memory.State == MEM_COMMIT && writable(memory.Protect & 0xffu);
+        std::shared_ptr<SharedPage> identity;
+        std::uint64_t mappingIdentity = 0;
+        for (;;) {
+            std::unique_lock lock(mutex);
+            const auto base = address & ~(pageBytes - 1);
+            const auto found = views.find(base);
+            if (found == views.end() || (identity != nullptr && (found->second.page != identity || found->second.identity != mappingIdentity)) || !writable(found->second.protection)) return false;
+            auto& view = found->second;
+            if ((protectedAccess(*view.page) & subpagesOf(base, address, address + 1)) != 0) {
+                identity = view.page;
+                mappingIdentity = view.identity;
+                lock.unlock();
+                if (!ResolveAccess(address, 1)) return false;
+                continue;
+            }
+            if (view.resident) {
+                const auto memory = query(address);
+                return memory.State == MEM_COMMIT && writable(memory.Protect & 0xffu);
+            }
+            const auto written = subpagesOf(base, address, address + 1);
+            invalidate(*view.page, written);
+            protectSubpages(base, written, view.protection, "resume shared memory write");
+            view.armed &= static_cast<std::uint8_t>(~written);
+            return true;
         }
-        const auto written = subpagesOf(base, address, address + 1);
-        invalidate(*view.page, written);
-        protectSubpages(base, written, view.protection, "resume shared memory write");
-        view.armed &= static_cast<std::uint8_t>(~written);
-        return true;
     }
 
     bool HandleRead(std::uintptr_t address) {
-        std::lock_guard lock(mutex);
-        if (!views.contains(address & ~(pageBytes - 1))) return false;
-        const auto memory = query(address);
-        return memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+        std::shared_ptr<SharedPage> identity;
+        std::uint64_t mappingIdentity = 0;
+        for (;;) {
+            std::unique_lock lock(mutex);
+            const auto base = address & ~(pageBytes - 1);
+            const auto found = views.find(base);
+            if (found == views.end() || (identity != nullptr && (found->second.page != identity || found->second.identity != mappingIdentity))) return false;
+            if ((protectedAccess(*found->second.page) & subpagesOf(base, address, address + 1)) != 0) {
+                identity = found->second.page;
+                mappingIdentity = found->second.identity;
+                lock.unlock();
+                if (!ResolveAccess(address, 1)) return false;
+                continue;
+            }
+            const auto memory = query(address);
+            return memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+        }
     }
 
     bool ResidentSpan(std::uintptr_t address, std::size_t bytes, std::uintptr_t* start, std::uintptr_t* end) {
@@ -224,6 +371,7 @@ public:
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        requireAccessResolved(address, bytes);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
         for (auto it = first; it != views.end() && it->first < end; ++it) {
@@ -413,7 +561,7 @@ public:
                             continue;
                         }
                         const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
-                        protectSubpages(alias, arming, protection, "arm shared memory write tracking");
+                        protectSubpages(alias, static_cast<std::uint8_t>(arming & ~protectedAccess(*other.page)), protection, "arm shared memory write tracking");
                         other.armed |= arming;
                     }
                     const auto tracked = static_cast<std::uint8_t>(settled & ~untracked);
@@ -490,7 +638,66 @@ private:
         }();
         std::vector<std::uintptr_t> aliases;
         std::uint32_t pins = 0;
+        std::array<std::uint32_t, subpages> accessGuards{};
     };
+    struct ProtectedPage {
+        std::shared_ptr<SharedPage> page;
+        std::uint8_t mask;
+    };
+    struct ViewIdentity {
+        std::uintptr_t base;
+        std::shared_ptr<SharedPage> page;
+        std::uint64_t identity;
+    };
+    struct AccessGuard {
+        std::vector<ProtectedPage> pages;
+        bool (*resolve)(std::uint64_t, void*) = nullptr;
+        void* context = nullptr;
+        void (*releaseContext)(void*) = nullptr;
+        std::mutex resolverMutex;
+        ~AccessGuard() {
+            if (releaseContext != nullptr) releaseContext(context);
+        }
+    };
+    struct View;
+
+    static std::uint8_t protectedAccess(const SharedPage& page) {
+        std::uint8_t mask = 0;
+        for (std::size_t sub = 0; sub < subpages; ++sub) {
+            if (page.accessGuards[sub] != 0) mask |= static_cast<std::uint8_t>(1u << sub);
+        }
+        return mask;
+    }
+
+    static void protectAccess(std::uintptr_t base, const View& view, std::uint8_t mask) {
+        const auto guarded = static_cast<std::uint8_t>(mask & protectedAccess(*view.page));
+        protectSubpages(base, guarded, PAGE_NOACCESS, "protect pending guest access");
+        const auto watched = static_cast<std::uint8_t>(mask & ~guarded & view.armed);
+        const DWORD protection = view.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+        protectSubpages(base, watched, protection, "restore guest write tracking");
+        protectSubpages(base, static_cast<std::uint8_t>(mask & ~guarded & ~watched), view.protection, "restore resolved guest access");
+    }
+
+    void requireAccessResolved(std::uintptr_t address, std::size_t bytes, bool wholePages = false) const {
+        if (bytes > std::numeric_limits<std::uintptr_t>::max() - address) throw std::runtime_error("guest access range wraps its address");
+        if (accessGuards.empty()) return;
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
+            if ((protectedAccess(*it->second.page) & (wholePages ? allSubpages : subpagesOf(it->first, address, address + bytes))) != 0) throw std::runtime_error("guest mapping operation requires prior access resolution");
+        }
+    }
+
+    void releaseAccessLocked(std::uint64_t token, const AccessGuard& guard) {
+        for (const auto& held : guard.pages) {
+            for (std::size_t sub = 0; sub < subpages; ++sub) {
+                if ((held.mask & (1u << sub)) != 0) --held.page->accessGuards[sub];
+            }
+        }
+        accessGuards.erase(token);
+        accessGuardCount.store(accessGuards.size(), std::memory_order_release);
+        for (const auto& held : guard.pages) {
+            for (const auto alias : held.page->aliases) protectAccess(alias, views.at(alias), held.mask);
+        }
+    }
     struct Section {
         HANDLE handle;
         explicit Section(HANDLE handle) : handle(handle) {}
@@ -522,6 +729,7 @@ private:
         std::uint8_t collected = 0;
         bool resident = false;
         Physical* slot = nullptr;
+        std::uint64_t identity = 0;
     };
     struct Run {
         std::uintptr_t end;
@@ -784,6 +992,7 @@ private:
     }
 
     void reset(std::uintptr_t address, std::size_t bytes) {
+        requireAccessResolved(address, bytes, true);
         collectableRanges.clear();
         const auto end = address + bytes;
         forgetClean(address, end);
@@ -867,6 +1076,11 @@ private:
     Ranges collectableRanges;
     Ranges freshRanges;
     std::map<std::uintptr_t, View> views;
+    std::map<std::uint64_t, std::shared_ptr<AccessGuard>> accessGuards;
+    std::atomic<std::size_t> accessGuardCount{0};
+    std::uint64_t nextAccessToken = 0;
+    std::uint64_t viewIdentity = 0;
+    inline static thread_local std::vector<std::uint64_t> activeAccessResolvers;
 
     using Views = std::map<std::uintptr_t, View>;
 

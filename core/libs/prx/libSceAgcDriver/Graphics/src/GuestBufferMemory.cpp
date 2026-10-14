@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -296,6 +297,8 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.
     RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
+    if (auto* active = Recorder::Active(); active != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) PublishDeviceResidentOfImport(*active, it->second.buffer, ResidentSite::Retire);
+    else Require(!AnyDeviceResidentOverlaps(it->second.base, static_cast<std::size_t>(it->second.bytes)), "retiring device-resident buffer results needs an active locked recorder");
     forgetStagingShadows(device, it->second.base, it->second.base + it->second.bytes);
     ForgetMirrors(device, it->second.base, it->second.base + it->second.bytes);
     ++state.epoch;
@@ -2134,6 +2137,7 @@ void ClearHostImports(VkDevice device) {
     std::lock_guard lock(state.mutex);
     clearStagingShadows(device);
     ClearMirrors(device);
+    ClearDeviceResident(device);
     state.parked.erase(device);
     if (state.device != device) return;
     for (const auto& [address, entry] : state.imports) {
@@ -3566,6 +3570,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // do not read texture memory through pointers); APS5_BDA_FLUSH=1 flushes for them too.
             static const bool bdaFlush = std::getenv("APS5_BDA_FLUSH") != nullptr;
             if (!(addressable && region.hostBacked) || bdaFlush) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
+            if (auto* active = Recorder::Active(); active != nullptr && AnyDeviceResident()) PublishDeviceResident(*active, region.begin, static_cast<std::size_t>(bytes), addressable ? ResidentSite::AddressBased : ResidentSite::InPlace);
             continue;
         }
         if (copyOnGpu) {
@@ -3592,6 +3597,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         if (profile) copyUs += microsecondsSince(copyStart);
     }
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
+    if (addressable && AnyDeviceResident()) {
+        if (auto* active = Recorder::Active()) PublishAllDeviceResident(*active, ResidentSite::AddressBased);
+    }
     takeHeapReferences();
     if (!profile) return;
     const auto loopUs = microsecondsSince(loopStart);
@@ -3740,6 +3748,9 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> requested, bool
         if (profile) reportStaging();
         return;
     }
+    if (AnyDeviceResident()) {
+        for (const auto* region : copies) PublishDeviceResident(*recorder, region->begin, static_cast<std::size_t>(region->end - region->begin), ResidentSite::CopyIn);
+    }
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
@@ -3847,6 +3858,14 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     std::uint64_t copiedBytes = 0;
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
+        region.lazyResident = false;
+        if (region.deviceLocal && region.shadow != nullptr && LazyStagingOut() && !Recorder::InCompletion() && !recorder.HasGuestCompletions() && GuestMemory::Watched(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
+            region.lazyResident = true;
+            if (!LazyStagingVerify()) {
+                region.copiedBack = true;
+                continue;
+            }
+        }
         if (merged.empty() && !writes.empty()) {
             auto sorted = writes;
             std::sort(sorted.begin(), sorted.end());
@@ -4063,7 +4082,11 @@ void GuestBufferMemory::MarkDirectWrites() const {
         for (const auto& [begin, end] : writes) {
             if (begin < region->end && region->begin < end) ranges.emplace_back(begin, end);
         }
-        settleShadow(*region, GuestMemory::MarkWrittenUnlessStored(ranges, 0).generation);
+        const auto marked = GuestMemory::MarkWrittenUnlessStored(ranges, 0);
+        settleShadow(*region, marked.generation);
+        if (region->lazyResident && region->buffer != nullptr) {
+            for (const auto& [begin, end] : ranges) NoteDeviceResident(context.device, std::max(begin, region->begin), std::min(end, region->end), region->buffer, region->begin, region->copySource, region->copySourceBase, marked.generation);
+        }
     }
 }
 
@@ -4236,6 +4259,9 @@ void GuestBufferMemory::WriteBack() {
             if (!entry.retired && entry.inFlight == 0) since = entry.generation;
         }
         const auto marked = GuestMemory::MarkWrittenUnlessStored(ranges, since);
+        if (region->lazyResident && !marked.storedOver && marked.generation != 0) {
+            for (const auto& [begin, end] : ranges) RefreshDeviceResident(std::max(begin, region->begin), std::min(end, region->end), since, marked.generation);
+        }
         std::lock_guard lock(cache.mutex);
         if (since != 0 && entry.generation == since && entry.inFlight == 0) entry.generation = marked.storedOver ? 0 : marked.generation;
     }
@@ -4371,6 +4397,7 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
         if (!region.copiedBack) settleShadow(region, 0);
         region.copiedBack = false;
+        region.lazyResident = false;
         copies.push_back(&region);
     }
     if (copies.empty()) return;

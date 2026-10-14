@@ -312,6 +312,18 @@ std::invalid_argument OutsideArena(const char* operation, const void* pointer, s
 }
 
 #ifdef _WIN32
+std::uint64_t GuestArenaTryProtectAccess_nid_postfix(std::uintptr_t address, std::size_t bytes, bool (*resolve)(std::uint64_t, void*), void* context, void (*releaseContext)(void*)) {
+    return WindowsMappings::Get().TryProtectAccess(address, bytes, resolve, context, releaseContext);
+}
+
+bool GuestArenaResolveAccess_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().ResolveAccess(address, bytes);
+}
+
+void GuestArenaReleaseAccess_nid_postfix(std::uint64_t token) {
+    WindowsMappings::Get().ReleaseAccess(token);
+}
+
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
     WindowsMappings::Get().SetProtection(address, bytes, protection);
 }

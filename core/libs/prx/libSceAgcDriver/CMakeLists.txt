@@ -232,6 +232,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/CacheSizing.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidentMirrors.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidentStaging.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
         ${agcCmaskClearShaderHeader}
@@ -1076,6 +1077,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_draw_snapshot_arena PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    foreach(epochDirtyMode IN ITEMS off on verify)
+        add_test(NAME agc_driver_epoch_dirty_revalidate_${epochDirtyMode} COMMAND agc_driver_epoch_dirty_revalidate_tests ${epochDirtyMode})
+        set_tests_properties(agc_driver_epoch_dirty_revalidate_${epochDirtyMode} PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30 ENVIRONMENT "APS5_PROFILE_DRAW=1")
+        if(WIN32)
+            set_tests_properties(agc_driver_epoch_dirty_revalidate_${epochDirtyMode} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     add_test(NAME agc_unchanged_cpu_stamps COMMAND agc_driver_recorder_tests --unchanged-cpu-stamps-only)
     set_tests_properties(agc_unchanged_cpu_stamps PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
@@ -1131,6 +1140,12 @@ if(BUILD_TESTING)
     set_tests_properties(agc_resident_mirrors PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_RESIDENT_MIRRORS=1")
     add_test(NAME agc_resident_buffer_mirrors COMMAND agc_driver_recorder_tests --resident-buffer-mirrors-only)
     set_tests_properties(agc_resident_buffer_mirrors PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_RESIDENT_BUFFER_MIRRORS=1")
+    add_test(NAME agc_lazy_staging_out COMMAND agc_driver_recorder_tests --lazy-staging-out-only)
+    set_tests_properties(agc_lazy_staging_out PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_LAZY_STAGING_OUT=1;APS5_STAGING_REUSE_MIB=1")
+    add_test(NAME agc_lazy_staging_out_verify COMMAND agc_driver_recorder_tests --lazy-staging-out-only)
+    set_tests_properties(agc_lazy_staging_out_verify PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_LAZY_STAGING_OUT=1;APS5_LAZY_STAGING_VERIFY=1;APS5_STAGING_REUSE_MIB=1")
+    add_test(NAME agc_lazy_staging_out_bounded COMMAND agc_driver_recorder_tests --lazy-staging-out-only)
+    set_tests_properties(agc_lazy_staging_out_bounded PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_LAZY_STAGING_OUT=1;APS5_STAGING_REUSE_MIB=1;APS5_RESIDENT_STAGING_MIB=1")
     add_test(NAME agc_unit_shadow COMMAND agc_driver_recorder_tests --unit-shadow-only)
     set_tests_properties(agc_unit_shadow PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
     if(WIN32)
@@ -1154,7 +1169,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_present_then_store COMMAND agc_driver_recorder_tests --present-then-store-only)
     set_tests_properties(agc_slice_dirty agc_present_then_store PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_unit_shadow agc_snapshot_twins agc_draw_input_twins agc_draw_input_twins_sync agc_resident_mirrors agc_resident_buffer_mirrors agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_retire agc_multisample_guest_access agc_draw_inputs_in_place agc_resident_present agc_slice_dirty agc_queued_write_groups agc_present_then_store agc_staging_reuse PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_unit_shadow agc_snapshot_twins agc_draw_input_twins agc_draw_input_twins_sync agc_resident_mirrors agc_resident_buffer_mirrors agc_lazy_staging_out agc_lazy_staging_out_verify agc_lazy_staging_out_bounded agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_retire agc_multisample_guest_access agc_draw_inputs_in_place agc_resident_present agc_slice_dirty agc_queued_write_groups agc_present_then_store agc_staging_reuse PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         add_test(NAME agc_host_import_second_mapping COMMAND agc_driver_recorder_tests --host-import-second-mapping-only)
         set_tests_properties(agc_host_import_second_mapping PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT_MODIFICATION

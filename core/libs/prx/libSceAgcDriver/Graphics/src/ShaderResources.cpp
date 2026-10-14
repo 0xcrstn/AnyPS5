@@ -809,8 +809,11 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 }
 
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
+std::atomic<std::uint64_t> storageCacheSerial{0};
+
 std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
     auto texture = it->texture;
+    storageCacheSerial.fetch_add(1, std::memory_order_relaxed);
     it->texture->SetCached(false);
     noteUncached(it->texture);
     it->texture->Flush();
@@ -1010,6 +1013,7 @@ void ClearCachedTextures(VkDevice device) {
                 continue;
             }
             cleared.push_back(it->texture);
+            storageCacheSerial.fetch_add(1, std::memory_order_relaxed);
             it->texture->SetCached(false);
             noteUncached(it->texture);
             storage.bytes -= it->accounted;
@@ -1025,6 +1029,10 @@ void ClearCachedTextures(VkDevice device) {
             for (auto& resource : resources) recorder->Keep(std::move(resource));
         }
     }
+}
+
+std::uint64_t StorageCacheSerial() {
+    return storageCacheSerial.load(std::memory_order_relaxed);
 }
 
 bool StorageImageCached(const Context& context, const StorageTexture* image) {
@@ -1896,6 +1904,9 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> ownSourceViews{0};
     std::atomic<std::uint64_t> refreshedOverlaps{0};
     std::atomic<std::uint64_t> proofsVerified{0};
+    std::atomic<std::uint64_t> epochSkips{0};
+    std::atomic<std::uint64_t> epochVerifyChecks{0};
+    std::atomic<std::uint64_t> epochVerifyDisagreements{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -1963,12 +1974,12 @@ bool SameKeySurface(const StorageTexture* source, const GuestTextureResource& re
     return own.dccAddress == resource.dccAddress && source->GuestBytes() == guestBytes && own.format == resource.format && own.dccAlphaOnMsb == resource.dccAlphaOnMsb;
 }
 
-void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point start) {
+void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point start, bool skipped = false) {
     auto& profile = Revalidations();
     const auto now = std::chrono::steady_clock::now();
     profile.calls.fetch_add(1, std::memory_order_relaxed);
     profile.nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), std::memory_order_relaxed);
-    (!ok ? profile.failed : fast ? profile.fast : profile.full).fetch_add(1, std::memory_order_relaxed);
+    (skipped ? profile.epochSkips : !ok ? profile.failed : fast ? profile.fast : profile.full).fetch_add(1, std::memory_order_relaxed);
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     auto last = profile.lastReport.load();
     if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
@@ -1984,7 +1995,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto reasons = byReason(profile.fastFails, FastFailNames);
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
-    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; epoch dirty set: %llu revalidations skipped, verify %llu checked / %llu disagree\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()), static_cast<unsigned long long>(profile.epochSkips.load()), static_cast<unsigned long long>(profile.epochVerifyChecks.load()), static_cast<unsigned long long>(profile.epochVerifyDisagreements.load()));
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
@@ -1998,6 +2009,39 @@ bool EpochRevalidate() {
 
 // Turns the lookups' records into this object's per-texture validation records (see
 // ValidatedSurface); the last record of an object is the freshest.
+bool ShaderResources::epochProofHolds() {
+    if (!epochProof.valid) return false;
+    const auto epoch = GuestMemory::CollectEpoch();
+    if (epoch == 0 || epoch != epochProof.epoch) return false;
+    if (pendingSerialSeen == 0 || StorageTexture::PendingSerial() != pendingSerialSeen) return false;
+    if (Recorder::KeyStoreSerial() != epochProof.keyStores || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != epochProof.registry || DepthSurfaceSerial() != epochProof.depth || StorageCacheSerial() != epochProof.storageCache) return false;
+    if (!HostImportsUnchanged(context, importsProof)) return false;
+    if ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0) return false;
+    if (guestMemory.HasStagedRegions()) return false;
+    std::uint64_t through = 0;
+    if (!GuestMemory::UnchangedSinceDirtySerial(proofRanges, epochProof.dirtySerial, &through)) return false;
+    epochProof.dirtySerial = through;
+    return true;
+}
+
+void ShaderResources::recordEpochProof(std::uint64_t dirtySerial) {
+    epochProof.valid = false;
+    const auto epoch = GuestMemory::CollectEpoch();
+    if (epoch == 0 || pendingSerialSeen == 0) return;
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->IsDepthCopy()) return;
+    }
+    epochProof = {true, epoch, dirtySerial, Recorder::KeyStoreSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfaceSerial(), StorageCacheSerial()};
+}
+
+std::uint64_t ShaderResources::EpochSkips() {
+    return Revalidations().epochSkips.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ShaderResources::EpochSkipDisagreements() {
+    return Revalidations().epochVerifyDisagreements.load(std::memory_order_relaxed);
+}
+
 void ShaderResources::captureValidation() {
     const auto record = [](const void* object) -> const LookupRecord* {
         const auto& log = lookupLog();
@@ -2170,6 +2214,16 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
+    if (GuestMemory::EpochDirtySetEnabled()) {
+        proofRanges.clear();
+        for (const auto& [address, bytes, generation] : queries) proofRanges.emplace_back(address, address + bytes);
+        for (const auto& surface : validatedTextures) {
+            if (surface.valid && !surface.depth && surface.resource.dccAddress != 0) proofRanges.emplace_back(surface.resource.dccAddress, surface.resource.dccAddress + DccKeyBytes(surface.bytes));
+        }
+        for (const auto& image : storageTextures) {
+            if (image != nullptr && image->Descriptor().dccAddress != 0) proofRanges.emplace_back(image->Descriptor().dccAddress, image->Descriptor().dccAddress + DccKeyBytes(image->GuestBytes()));
+        }
+    }
     if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
     for (const auto* image : images) image->NoteProved();
@@ -2340,6 +2394,16 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto dirtySerialBefore = GuestMemory::DirtySerial();
+    bool epochSkip = false;
+    if (GuestMemory::EpochDirtySetEnabled() && epochProofHolds()) {
+        if (!GuestMemory::EpochDirtySetVerify()) {
+            if (profile) countRevalidate(true, true, start, true);
+            if (report != nullptr) *report = {ProofPath::EpochSkip, ProofFailure::None};
+            return true;
+        }
+        epochSkip = true;
+    }
     for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     for (const auto& range : describedRanges) {
         CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
@@ -2353,6 +2417,14 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
         if (profile) countRevalidate(fast, ok, start);
+        if (epochSkip) {
+            auto& revalidations = Revalidations();
+            revalidations.epochVerifyChecks.fetch_add(1, std::memory_order_relaxed);
+            if (!ok) revalidations.epochVerifyDisagreements.fetch_add(1, std::memory_order_relaxed);
+            GuestMemory::NoteDirtySetVerify(ok);
+        }
+        if (ok && fast && GuestMemory::EpochDirtySetEnabled()) recordEpochProof(dirtySerialBefore);
+        else if (!ok) epochProof.valid = false;
         if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
         return ok;
     };
@@ -3836,7 +3908,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             }
         }
         if (!stamped) {
-            stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
+            stamp = {GuestMemory::EpochDirtySetEnabled() ? GuestMemory::DirtySerial() : GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
         }
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp);
@@ -3878,7 +3950,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                 }
                 lap(&DrawBindingsStatistics::copyUs);
-                if (!partial) recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                if (!partial) recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer, Recorder::SnapshotUse::Storage, 0, GuestMemory::EpochDirtySetEnabled() ? stamp[0] : 0);
                 if (statistics != nullptr) {
                     ++statistics->copied;
                     statistics->copiedBytes += partial ? covered : bytes;
@@ -3894,7 +3966,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 reused = true;
                 if (statistics != nullptr) ++statistics->reused;
             }
-            if (!partial && generation != 0 && GuestMemory::TrackerGeneration() == stamp[0]) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer);
+            if (!partial && generation != 0 && (GuestMemory::EpochDirtySetEnabled() ? GuestMemory::DirtySerial() : GuestMemory::TrackerGeneration()) == stamp[0]) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, generation, buffer);
             else stamped = false;
         }
         lap(&DrawBindingsStatistics::keepUs);
