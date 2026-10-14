@@ -112,12 +112,14 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
+        const char* outcome = "drained (unresolved)";
         if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
 
                 orderedAlready = true;
                 drained = false;
+                outcome = "nothing to store";
             } else {
 
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
@@ -129,17 +131,23 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
                 const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
-                if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
+                const bool hostStore = reason == 3 && !Graphics::RegisteredReadableCovers(store->address, bytes.size()) && !localDevice->StoresPendingOver(store->address, bytes.size());
+                if (reason == 0 || reason == 1 || reason == 5 || hostStore) noteLabelStore(store->address, bytes, stamp, submission.queue);
                 if (reason == 0 || reason == 5) {
                     if (reason == 0) ++storesOnGpu;
                     else ++storesBehindCompletions;
                     wroteOnGpu = true;
                     drained = false;
-                } else if (reason == 1) {
+                    outcome = reason == 0 ? "stored on the GPU" : "stored behind completions";
+                } else if (reason == 1 || hostStore) {
                     GuestMemory::Write(store->address, bytes, 1);
-                    ++storesOnCpu;
+                    if (reason == 1) ++storesOnCpu;
+                    else ++storesToHostMemory;
                     wroteOnGpu = true;
                     drained = false;
+                    outcome = reason == 1 ? "stored on the CPU (idle)" : "stored on the CPU (not imported)";
+                } else {
+                    outcome = reason == 2 ? "drained (completions)" : reason == 3 ? "drained (not imported, stores pending)" : "drained (undecodable)";
                 }
                 Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
             }
@@ -151,21 +159,26 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
                 if (const auto localDevice = device.Load()) {
                     recordDeferredLabels(localDevice.get(), submission.queue);
-                    const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
-                    if (outcome.path == 1 || outcome.path == 3) {
+                    const auto copied = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+                    if (copied.path == 1 || copied.path == 3) {
                         wroteOnGpu = true;
                         drained = false;
-                    } else if (outcome.path == 2 && !Graphics::RegisteredReadableCovers(copy->destination, copy->bytes) && !localDevice->StoresPendingOver(copy->destination, copy->bytes)) {
+                        outcome = "copied on the GPU";
+                    } else if (copied.path == 2 && !Graphics::RegisteredReadableCovers(copy->destination, copy->bytes) && !localDevice->StoresPendingOver(copy->destination, copy->bytes)) {
                         Graphics::StorageTexture::FlushPending(copy->source, copy->bytes, nullptr, "buffer copy source", Graphics::PublishScope::Whole);
                         if (auto* recorder = Graphics::Recorder::Active()) recorder->SyncThrough(copy->source, copy->bytes);
                         ++copiesToHostMemory;
                         orderedAlready = true;
                         drained = false;
+                        outcome = "copied into host memory";
+                    } else {
+                        outcome = copied.path == 2 ? "drained (copy not imported)" : "drained (copy refused)";
                     }
                 }
             }
         }
         if (drained) ++storesDrained;
+        if (profile && opcode == 0x50) countDmaData(packet, outcome);
     }
 
     static const bool drawDrain = std::getenv("APS5_DRAW_DRAIN") != nullptr;
