@@ -782,6 +782,7 @@ void verifyCaptureMemo() {
     struct alignas(4096) Tables {
         std::array<std::uint32_t, 32> first{};
         std::array<std::uint32_t, 32> second{};
+        std::array<std::uint32_t, 32> third{};
     };
     static Tables tables;
     const auto fill = [&](std::array<std::uint32_t, 32>& srt, const std::array<std::uint32_t, 8>& image, std::uint32_t mode) {
@@ -864,7 +865,21 @@ void verifyCaptureMemo() {
     userData[0] = static_cast<std::uint32_t>(pointerTo(tables.second));
     userData[1] = static_cast<std::uint32_t>(pointerTo(tables.second) >> 32u);
     const auto relocated = capture();
-    require(!relocated.memoized && relocated.capture->userDataUse.reads.front().first >= pointerTo(tables.second), "capture memo: a moved SRT pointer was served from the memo");
+    require(!relocated.memoized && relocated.capture->userDataUse.reads.front().first >= pointerTo(tables.second), "capture memo: a moved SRT pointer over other guest words was served from the memo");
+    const auto pointTo = [&](const std::array<std::uint32_t, 32>& srt) {
+        userData[0] = static_cast<std::uint32_t>(pointerTo(srt));
+        userData[1] = static_cast<std::uint32_t>(pointerTo(srt) >> 32u);
+    };
+    pointTo(tables.first);
+    const auto movedBack = capture();
+    require(movedBack.memoized == memo && movedBack.capture->userDataUse.reads.front().first < pointerTo(tables.second), "capture memo: a moved SRT pointer over equal guest words was not relocated");
+    fill(tables.third, second, 1u);
+    pointTo(tables.third);
+    const auto movedOther = capture();
+    require(!movedOther.memoized && movedOther.capture->snapshot.images.at(0).dwords[0] == second[0], "capture memo: a moved SRT pointer over a different T# was served from the memo");
+    fill(tables.third, first, 1u);
+    require(!capture().memoized, "capture memo: a changed T# behind a relocated entry was served from the memo");
+    pointTo(tables.second);
 
     userData[2] = 9u;
     const auto patched = capture();
@@ -874,6 +889,33 @@ void verifyCaptureMemo() {
     fill(tables.second, first, 0u);
     const auto changedSecond = capture();
     require(!changedSecond.memoized, "capture memo: a changed branch condition behind a moved pointer was served from the memo");
+
+    {
+        std::vector<std::uint32_t> mixedCode(code.begin(), code.end());
+        mixedCode.insert(mixedCode.begin() + 7, 0x88100010u);
+        auto mixed = request;
+        mixed.shader = {ShaderStage::Compute, 0x25000u, mixedCode, 0, {}};
+        fill(tables.first, first, 1u);
+        fill(tables.second, first, 1u);
+        std::array<std::uint32_t, 3> mixedUser{static_cast<std::uint32_t>(pointerTo(tables.first)), static_cast<std::uint32_t>(pointerTo(tables.first) >> 32u), 7u};
+        mixed.context.userData = mixedUser;
+        const auto mixedHandle = PrepareShader(mixed);
+        const auto mixedCapture = [&] {
+            const auto before = AgcDriver::ShaderMemory::MemoizedCaptures();
+            AgcDriver::ShaderMemory memory({});
+            const auto prepared = PreparedShaderInvocation::TryCreate(mixed, mixedHandle);
+            require(prepared.has_value(), "capture memo: the mixed-use shader does not match its request");
+            const auto result = memory.Capture(*prepared);
+            AgcDriver::ShaderMemory reference({});
+            require(sameCapture(*result, *reference.Capture(mixed)) && sameRegions(memory.Regions(), reference.Regions()), "capture memo: the mixed-use capture differs from a fresh walk");
+            return std::pair(result, AgcDriver::ShaderMemory::MemoizedCaptures() == before + 1);
+        };
+        const auto [firstMixed, firstServed] = mixedCapture();
+        require(!firstServed && (firstMixed->userDataUse.asValue & 1u) != 0u, "capture memo: the pointer word read as data was not tracked as a value");
+        mixedUser[0] = static_cast<std::uint32_t>(pointerTo(tables.second));
+        mixedUser[1] = static_cast<std::uint32_t>(pointerTo(tables.second) >> 32u);
+        require(!mixedCapture().second, "capture memo: a moved pointer that is also read as data was relocated");
+    }
 
     constexpr int Iterations = 20000;
     const auto time = [&](const PreparedShaderInvocation& prepared, auto&& prepare) {
@@ -895,7 +937,28 @@ void verifyCaptureMemo() {
     const auto changedBefore = AgcDriver::ShaderMemory::MemoizedCaptures();
     const auto changedUs = time(*stable, [&](int i) { fill(tables.second, i % 2 == 0 ? first : second, 1u); });
     require(AgcDriver::ShaderMemory::MemoizedCaptures() - changedBefore <= 1u, "capture memo: captures over changed guest words were served from the memo");
-    std::cout << "Capture memo " << (memo ? "on" : "off") << ": " << unchangedUs << " us per capture over unchanged guest words, " << changedUs << " us per capture over changed guest words\n";
+    fill(tables.first, first, 1u);
+    fill(tables.second, first, 1u);
+    std::array<std::array<std::uint32_t, 3>, 2> alternating{};
+    std::vector<PreparedShaderInvocation> invocations;
+    for (std::size_t i = 0; i < alternating.size(); ++i) {
+        const auto pointer = pointerTo(i == 0 ? tables.first : tables.second);
+        alternating[i] = {static_cast<std::uint32_t>(pointer), static_cast<std::uint32_t>(pointer >> 32u), 7u};
+        request.context.userData = alternating[i];
+        const auto prepared = PreparedShaderInvocation::TryCreate(request, handle);
+        require(prepared.has_value(), "capture memo: the prepared shader stopped matching its request");
+        invocations.push_back(*prepared);
+    }
+    const auto movedBefore = AgcDriver::ShaderMemory::MemoizedCaptures();
+    const auto movingStarted = std::chrono::steady_clock::now();
+    for (int i = 0; i < Iterations; ++i) {
+        AgcDriver::ShaderMemory memory({});
+        static_cast<void>(memory.Capture(invocations[static_cast<std::size_t>(i % 2)]));
+    }
+    const auto movedUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - movingStarted).count() / Iterations;
+    const auto movedServed = AgcDriver::ShaderMemory::MemoizedCaptures() - movedBefore;
+    require(memo ? movedServed >= Iterations - 1 : movedServed == 0, "capture memo: captures over a moved pointer to equal guest words were not served as configured");
+    std::cout << "Capture memo " << (memo ? "on" : "off") << ": " << unchangedUs << " us per capture over unchanged guest words, " << movedUs << " us per capture over a moved pointer to equal guest words, " << changedUs << " us per capture over changed guest words\n";
 }
 
 // A compute program sampling a T# loaded from a table buffer at a runtime key (a bindless image

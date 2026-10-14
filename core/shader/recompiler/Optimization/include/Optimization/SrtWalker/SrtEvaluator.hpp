@@ -12,18 +12,23 @@ namespace ShaderRecompiler::Detail {
 
 class EvaluatedValues {
 public:
+    EvaluatedValues();
+    ~EvaluatedValues();
+    EvaluatedValues(const EvaluatedValues&) = delete;
+    EvaluatedValues& operator=(const EvaluatedValues&) = delete;
+
     bool Find(const IrValue* key, std::uint64_t& value) const {
         if (_slots.empty()) {
             return false;
         }
         for (std::size_t index = Home(key);; index = (index + 1u) & (_slots.size() - 1u)) {
             const auto& slot = _slots[index];
+            if (slot.generation != _generation) {
+                return false;
+            }
             if (slot.key == key) {
                 value = slot.value;
                 return true;
-            }
-            if (slot.key == nullptr) {
-                return false;
             }
         }
     }
@@ -33,37 +38,35 @@ public:
         }
         for (std::size_t index = Home(key);; index = (index + 1u) & (_slots.size() - 1u)) {
             auto& slot = _slots[index];
-            if (slot.key == key) {
+            if (slot.generation != _generation) {
+                slot = {key, value, _generation};
+                ++_count;
                 return;
             }
-            if (slot.key == nullptr) {
-                slot = {key, value};
-                ++_count;
+            if (slot.key == key) {
                 return;
             }
         }
     }
 
-private:
     struct Slot {
         const IrValue* key = nullptr;
         std::uint64_t value = 0;
+        std::uint32_t generation = 0;
     };
+    struct Storage {
+        std::vector<Slot> slots;
+        std::uint32_t generation = 0;
+    };
+
+private:
     std::size_t Home(const IrValue* key) const {
         return static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(key) >> 4u) * 0x9e3779b97f4a7c15ull >> 32u) & (_slots.size() - 1u);
     }
-    void Grow() {
-        std::vector<Slot> previous(_slots.empty() ? 64u : _slots.size() * 2u);
-        previous.swap(_slots);
-        _count = 0;
-        for (const auto& slot : previous) {
-            if (slot.key != nullptr) {
-                Insert(slot.key, slot.value);
-            }
-        }
-    }
+    void Grow();
     std::vector<Slot> _slots;
     std::size_t _count = 0;
+    std::uint32_t _generation = 1;
 };
 
 struct InaccessibleRead {
