@@ -17,9 +17,13 @@ struct BufferReadRange {
     bool operator==(const BufferReadRange& other) const = default;
 };
 
+enum class BufferReadUnbound : std::uint8_t { None, Offset, Soffset, ScalarOffset, Wrap, Formatted, Opcode, Alias, Count };
+
 struct BufferReadRanges {
     static constexpr std::size_t MaxRanges = 16;
+    static constexpr std::uint32_t AnyIndex = 0xffffffffu;
     bool bounded = true;
+    BufferReadUnbound unbound = BufferReadUnbound::None;
     std::vector<BufferReadRange> ranges;
 
     void Add(const BufferReadRange& range) {
@@ -48,7 +52,8 @@ struct BufferReadRanges {
         hull.end = std::max(hull.end, range.end);
         ranges.resize(1);
     }
-    void Unbound() {
+    void Unbound(BufferReadUnbound reason) {
+        if (bounded) unbound = reason;
         bounded = false;
         ranges.clear();
     }

@@ -505,6 +505,15 @@ void reportRecordParts(const DrawProfile& profile) {
         std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw; %llu copies limited to the read ranges, %.1f KiB left uncopied per such draw), %llu skipped, %llu descriptor writes; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.limited), static_cast<double>(bindings.uncopiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
     }
     std::fprintf(stderr, "%s\n", line);
+    char reasons[1024];
+    int r = std::snprintf(reasons, sizeof(reasons), "[draw-record] whole snapshot copies by reason (count, MiB):");
+    bool any = false;
+    for (std::size_t reason = 0; reason < bindings.wholeCopies.size() && r > 0 && static_cast<std::size_t>(r) < sizeof(reasons); ++reason) {
+        if (bindings.wholeCopies[reason] == 0) continue;
+        any = true;
+        r += std::snprintf(reasons + r, sizeof(reasons) - static_cast<std::size_t>(r), " %s %llu %.1f;", ShaderResources::WholeCopyName(static_cast<ShaderResources::WholeCopy>(reason)), static_cast<unsigned long long>(bindings.wholeCopies[reason]), static_cast<double>(bindings.wholeBytes[reason]) / 1048576.0);
+    }
+    if (any) std::fprintf(stderr, "%s\n", reasons);
 }
 
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
@@ -551,6 +560,10 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         profile.bindings.descriptorWrites += bindings.descriptorWrites;
         profile.bindings.limited += bindings.limited;
         profile.bindings.uncopiedBytes += bindings.uncopiedBytes;
+        for (std::size_t reason = 0; reason < bindings.wholeCopies.size(); ++reason) {
+            profile.bindings.wholeCopies[reason] += bindings.wholeCopies[reason];
+            profile.bindings.wholeBytes[reason] += bindings.wholeBytes[reason];
+        }
         profile.bindings.checkUs += bindings.checkUs;
         profile.bindings.collectUs += bindings.collectUs;
         profile.bindings.lookupUs += bindings.lookupUs;

@@ -249,6 +249,7 @@ private:
 
 void encodeReadRanges(Writer& writer, const BufferReadRanges& ranges) {
     writer.Value(ranges.bounded);
+    writer.Value(ranges.unbound);
     writer.List(ranges.ranges, [](Writer& out, const BufferReadRange& range) {
         out.Value(range.firstIndex);
         out.Value(range.lastIndex);
@@ -259,6 +260,8 @@ void encodeReadRanges(Writer& writer, const BufferReadRanges& ranges) {
 
 void decodeReadRanges(Reader& reader, BufferReadRanges& ranges) {
     reader.Value(ranges.bounded);
+    reader.Value(ranges.unbound);
+    if (static_cast<std::uint32_t>(ranges.unbound) >= static_cast<std::uint32_t>(BufferReadUnbound::Count)) ranges.unbound = BufferReadUnbound::Opcode;
     reader.List(ranges.ranges, 24, [](Reader& in, BufferReadRange& range) {
         in.Value(range.firstIndex);
         in.Value(range.lastIndex);
@@ -317,7 +320,7 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.samplerIntegerBorder);
     reader.Values(binding.imageSamplers);
     reader.Flags(binding.bufferRead);
-    reader.List(binding.bufferReadRanges, 9, [](Reader& in, BufferReadRanges& ranges) { decodeReadRanges(in, ranges); });
+    reader.List(binding.bufferReadRanges, 13, [](Reader& in, BufferReadRanges& ranges) { decodeReadRanges(in, ranges); });
 }
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
@@ -595,7 +598,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
     auto& info = compiled.info;
     reader.Value(info.scratchDwords);
     reader.Value(info.sharedMemoryBytes);
-    reader.List(info.buffers, 36, [](Reader& in, BufferResource& buffer) {
+    reader.List(info.buffers, 40, [](Reader& in, BufferResource& buffer) {
         in.Value(buffer.source);
         in.Value(buffer.firstUsePc);
         in.Value(buffer.maxByteExtent);

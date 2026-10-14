@@ -2408,8 +2408,16 @@ void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
     Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 16u, 1u << 23u), &strided, 256u).has_value(), "a descriptor that adds the thread id kept the read ranges");
     Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u | (1u << 15u), 16u, 0u), &strided, 256u).has_value(), "a swizzled descriptor kept the read ranges");
     ShaderRecompiler::BufferReadRanges unbounded;
-    unbounded.Unbound();
-    Require(!ShaderResources::GuestReadRanges(words(0x10000, 0u, 256u, 0u), &unbounded, 256u).has_value() && !ShaderResources::GuestReadRanges(words(0x10000, 0u, 256u, 0u), nullptr, 256u).has_value(), "an unbounded or unanalysed element was given read ranges");
+    unbounded.Unbound(ShaderRecompiler::BufferReadUnbound::Offset);
+    auto reason = ShaderResources::WholeCopy::NotAnalysed;
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 0u, 256u, 0u), &unbounded, 256u, &reason).has_value() && reason == ShaderResources::WholeCopy::Offset, "an element read at an unbounded offset was given read ranges or another reason");
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 0u, 256u, 0u), nullptr, 256u, &reason).has_value() && reason == ShaderResources::WholeCopy::NotAnalysed, "an unanalysed element was given read ranges or another reason");
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u | (1u << 15u), 16u, 0u), &strided, 256u, &reason).has_value() && reason == ShaderResources::WholeCopy::Swizzled, "a swizzled descriptor was not counted as swizzled");
+    ShaderRecompiler::BufferReadRanges anyIndex;
+    anyIndex.ranges = {{0u, ShaderRecompiler::BufferReadRanges::AnyIndex, 32u, 48u}};
+    const auto raw = ShaderResources::GuestReadRanges(words(0x10000, 0u, 256u, 0u), &anyIndex, 256u);
+    Require(raw.has_value() && *raw == ShaderResources::ByteRanges{{32u, 48u}}, "a load at any index of a stride-0 buffer, which ignores the index, was not limited to its offsets");
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 16u, 0u), &anyIndex, 256u, &reason).has_value() && reason == ShaderResources::WholeCopy::Index, "a load at any index of a strided buffer was given read ranges or another reason");
     constexpr std::size_t bytes = 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
@@ -2500,6 +2508,7 @@ void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
         ShaderResources::DrawBindingsStatistics statistics;
         const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, {}, &statistics);
         Require(bindings != nullptr && bindings->snapshots.size() == 1 && statistics.limited == 0 && statistics.copiedBytes == elementBytes, "an input read without bound was not copied whole");
+        Require(statistics.wholeCopies[static_cast<std::size_t>(ShaderResources::WholeCopy::Offset)] == 1 && statistics.wholeBytes[static_cast<std::size_t>(ShaderResources::WholeCopy::Offset)] == elementBytes, "a whole copy of an input read at an unbounded offset was not counted under that reason");
         const auto contents = bindings->snapshots[0].buffer->Bytes();
         bool same = true;
         for (std::size_t i = 0; i < elementBytes; ++i) same = same && contents[i] == static_cast<std::byte>(static_cast<std::uint8_t>((4096 + i) * 7u + 3u));
