@@ -42,6 +42,11 @@ std::atomic<bool>& VerifyFlag() {
     return flag;
 }
 
+std::atomic<bool>& DeviceTwinsFlag() {
+    static std::atomic<bool> flag{std::getenv("APS5_ARENA_DEVICE_TWINS") != nullptr && std::strcmp(std::getenv("APS5_ARENA_DEVICE_TWINS"), "0") != 0};
+    return flag;
+}
+
 std::atomic<std::uint64_t> nextIdentity{1};
 std::atomic<DrawSnapshotArena*> activeArena{nullptr};
 
@@ -93,6 +98,14 @@ void DrawSnapshotArena::SetVerify(bool verify) {
     VerifyFlag().store(verify, std::memory_order_relaxed);
 }
 
+bool DrawSnapshotArena::DeviceTwins() {
+    return DeviceTwinsFlag().load(std::memory_order_relaxed);
+}
+
+void DrawSnapshotArena::SetDeviceTwins(bool twins) {
+    DeviceTwinsFlag().store(twins, std::memory_order_relaxed);
+}
+
 DrawSnapshotArena::DrawSnapshotArena(const Context& context) : context(context), alignment(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4)), identity(nextIdentity.fetch_add(1, std::memory_order_relaxed)) {
     Require((alignment & (alignment - 1)) == 0 && alignment <= PlacementAlignment, "the storage buffer offset alignment does not divide the arena placement alignment");
     activeArena.store(this, std::memory_order_release);
@@ -114,7 +127,7 @@ void DrawSnapshotArena::ReportActive() {
         heldBytes += chunk->buffer->Bytes().size();
         if (chunk.use_count() > 1) ++busy;
     }
-    std::fprintf(stderr, "[draw-arena] (10 s) %llu takes (%.1f MiB requested): %llu hits (%.1f%%), %llu stale, %llu copies (%.1f MiB copied, %llu exact, %llu unindexed); refused: size %llu, budget %llu; chunks %zu (%zu in flight, %.0f MiB, %llu created, %llu recycled), %zu entries; verify %llu checked, %llu differing\n", static_cast<unsigned long long>(taken.takes), static_cast<double>(taken.requestedBytes) / 1048576.0, static_cast<unsigned long long>(taken.hits), 100.0 * static_cast<double>(taken.hits) / takes, static_cast<unsigned long long>(taken.stale), static_cast<unsigned long long>(taken.copies), static_cast<double>(taken.copiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.exactSegments), static_cast<unsigned long long>(taken.unindexed), static_cast<unsigned long long>(taken.refusedSize), static_cast<unsigned long long>(taken.refusedBudget), arena->chunks.size(), busy, static_cast<double>(heldBytes) / 1048576.0, static_cast<unsigned long long>(taken.chunksCreated), static_cast<unsigned long long>(taken.chunksRecycled), arena->entries.size(), static_cast<unsigned long long>(taken.verified), static_cast<unsigned long long>(taken.verifyDiffering));
+    std::fprintf(stderr, "[draw-arena] (10 s) %llu takes (%.1f MiB requested): %llu hits (%.1f%%), %llu stale, %llu copies (%.1f MiB copied, %llu exact, %llu unindexed); refused: size %llu, budget %llu; chunks %zu (%zu in flight, %.0f MiB, %llu created, %llu recycled), %zu entries; verify %llu checked, %llu differing; device twins%s: %llu views, %llu prologue copies (%.1f MiB), %llu refused\n", static_cast<unsigned long long>(taken.takes), static_cast<double>(taken.requestedBytes) / 1048576.0, static_cast<unsigned long long>(taken.hits), 100.0 * static_cast<double>(taken.hits) / takes, static_cast<unsigned long long>(taken.stale), static_cast<unsigned long long>(taken.copies), static_cast<double>(taken.copiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.exactSegments), static_cast<unsigned long long>(taken.unindexed), static_cast<unsigned long long>(taken.refusedSize), static_cast<unsigned long long>(taken.refusedBudget), arena->chunks.size(), busy, static_cast<double>(heldBytes) / 1048576.0, static_cast<unsigned long long>(taken.chunksCreated), static_cast<unsigned long long>(taken.chunksRecycled), arena->entries.size(), static_cast<unsigned long long>(taken.verified), static_cast<unsigned long long>(taken.verifyDiffering), DeviceTwins() ? "" : " (off)", static_cast<unsigned long long>(taken.twinViews), static_cast<unsigned long long>(taken.twinCopies), static_cast<double>(taken.twinCopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.twinsRefused));
 }
 
 DrawSnapshotArena::Counters DrawSnapshotArena::TakeCounters() {
@@ -148,6 +161,7 @@ std::optional<DrawSnapshotArena::Placement> DrawSnapshotArena::allocate(std::siz
     if (const auto reusable = reusableChunk(); reusable.has_value() && chunks[*reusable]->buffer->Bytes().size() >= aligned) {
         auto& chunk = *chunks[*reusable];
         chunk.used = aligned;
+        chunk.pending.clear();
         ++chunk.serial;
         current = *reusable;
         ++counters.chunksRecycled;
@@ -164,10 +178,36 @@ std::optional<DrawSnapshotArena::Placement> DrawSnapshotArena::allocate(std::siz
     return Placement{current, 0};
 }
 
+void DrawSnapshotArena::settleTwin(Recorder& recorder, Chunk& chunk) {
+    if (chunk.twin == nullptr) {
+        if (chunk.twinRefused) return;
+        try {
+            chunk.twin = std::make_shared<Buffer>(context, chunk.buffer->Size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        } catch (const std::exception&) {
+            chunk.twinRefused = true;
+            ++counters.twinsRefused;
+            return;
+        }
+        chunk.pending.assign(1, VkBufferCopy{0, 0, chunk.used});
+    }
+    if (chunk.pending.empty()) return;
+    context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(recorder.PrologueCommands(), chunk.buffer->Handle(), chunk.twin->Handle(), static_cast<std::uint32_t>(chunk.pending.size()), chunk.pending.data());
+    counters.twinCopies += chunk.pending.size();
+    for (const auto& copy : chunk.pending) counters.twinCopiedBytes += copy.size;
+    chunk.pending.clear();
+}
+
 DrawSnapshotArena::View DrawSnapshotArena::view(Recorder& recorder, std::size_t chunk, VkDeviceSize offset, std::size_t bytes, bool copied, std::size_t chargedBytes) {
     const auto& held = chunks[chunk];
     recorder.KeepOnce(held, chargedBytes);
     const auto all = held->buffer->Bytes();
+    if (DeviceTwins()) {
+        settleTwin(recorder, *held);
+        if (held->twin != nullptr) {
+            ++counters.twinViews;
+            return View{held->twin->Handle(), offset, std::span<const std::byte>(all.data() + offset, bytes), copied};
+        }
+    }
     return View{held->buffer->Handle(), offset, std::span<const std::byte>(all.data() + offset, bytes), copied};
 }
 
@@ -228,6 +268,7 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::Take(Recorder& recorde
     }
     auto& chunk = *chunks[placement->chunk];
     std::memcpy(chunk.buffer->Bytes().data() + placement->offset, reinterpret_cast<const void*>(first), segmentBytes);
+    if (chunk.twin != nullptr) chunk.pending.push_back({placement->offset, placement->offset, segmentBytes});
     ++counters.copies;
     counters.copiedBytes += segmentBytes;
     if (segmentGeneration != 0) {

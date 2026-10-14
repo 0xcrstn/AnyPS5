@@ -39,6 +39,10 @@ public:
         std::uint64_t chunksRecycled = 0;
         std::uint64_t verified = 0;
         std::uint64_t verifyDiffering = 0;
+        std::uint64_t twinCopies = 0;
+        std::uint64_t twinCopiedBytes = 0;
+        std::uint64_t twinViews = 0;
+        std::uint64_t twinsRefused = 0;
     };
 
     explicit DrawSnapshotArena(const Context& context);
@@ -64,6 +68,8 @@ public:
     static void SetExtendBytes(std::size_t bytes);
     static bool Verify();
     static void SetVerify(bool verify);
+    static bool DeviceTwins();
+    static void SetDeviceTwins(bool twins);
     static constexpr std::size_t SegmentGranule = 4096;
     static constexpr std::size_t MaxEntries = 16384;
     static constexpr std::size_t LookupDepth = 8;
@@ -71,6 +77,9 @@ public:
 private:
     struct Chunk {
         std::shared_ptr<Buffer> buffer;
+        std::shared_ptr<Buffer> twin;
+        bool twinRefused = false;
+        std::vector<VkBufferCopy> pending;
         std::size_t used = 0;
         std::uint64_t serial = 0;
     };
@@ -87,6 +96,7 @@ private:
         VkDeviceSize offset;
     };
     std::optional<Placement> allocate(std::size_t bytes);
+    void settleTwin(Recorder& recorder, Chunk& chunk);
     std::optional<std::size_t> reusableChunk() const;
     View view(Recorder& recorder, std::size_t chunk, VkDeviceSize offset, std::size_t bytes, bool copied, std::size_t chargedBytes);
     std::optional<View> lookup(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration);
