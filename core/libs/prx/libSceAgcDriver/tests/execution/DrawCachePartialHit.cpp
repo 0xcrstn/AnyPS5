@@ -287,6 +287,31 @@ void MovedBasePointerHits(bool libraries) {
     Require(after.nestedMoved - before.nestedMoved >= 8, "the hits did not follow the moved base word (" + std::to_string(after.nestedMoved - before.nestedMoved) + " stages followed it)" + mode);
 }
 
+void MovedDescriptorBlockHits(bool libraries) {
+    const auto mode = std::string(libraries ? " with" : " without") + " graphics pipeline libraries";
+    SetVertexRecords(3);
+    static std::array<std::array<std::uint32_t, 4>, 12> blocks{};
+    static std::array<std::array<float, 4>, 12> colours{};
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    std::vector<std::uint64_t> hits;
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        const bool half = i % 2 == 1;
+        colours[i] = {half ? 0.5f : 1.0f, 0.0f, 0.0f, 0.0f};
+        blocks[i] = BufferDescriptor(colours[i].data(), 0, 16u, 0x31016facu);
+        const auto address = reinterpret_cast<std::uintptr_t>(blocks[i].data());
+        PointerTable = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0u, 0u};
+        const auto counters = Draw(NestedPixelCode.data(), PointerTable.data(), half ? 128 : 255, "a draw whose table points at descriptor block " + std::to_string(i) + mode);
+        hits.push_back(counters.hits);
+    }
+    const auto late = hits.back() - hits[hits.size() - 9];
+    if (std::getenv("APS5_DRAW_CACHE_TEST_TRACE") != nullptr) {
+        for (std::size_t i = 1; i < hits.size(); ++i) std::cout << "moved descriptor block draw " << i << ": " << hits[i] - hits[i - 1] << " hits\n";
+    }
+    Require(late == 8, "draws whose table points at a new buffer descriptor block each time hit " + std::to_string(late) + " of the last 8 times" + mode);
+    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(after.nestedMoved - before.nestedMoved >= 8, "the hits did not follow the moved descriptor block (" + std::to_string(after.nestedMoved - before.nestedMoved) + " stages followed it)" + mode);
+}
+
 int main() {
     try {
         bool libraries = false;
@@ -305,6 +330,7 @@ int main() {
         LoadedValueIsData(libraries);
         AlternatingNestedTablesHit(libraries);
         MovedBasePointerHits(libraries);
+        MovedDescriptorBlockHits(libraries);
         AgcDriverShutdown_nid_postfix();
         std::cout << "Draw cache hits bound the current data " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
         return 0;

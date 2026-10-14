@@ -24,6 +24,8 @@ private:
 [[nodiscard]] std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request);
 [[nodiscard]] std::uint64_t EstimatePlanBytes(const IrResourcePlan& plan, std::uint64_t* values = nullptr);
 
+inline constexpr std::uint32_t NoBaseSlot = 0xffffffffu;
+
 struct SourceEntry;
 struct ResourceCapture {
     std::shared_ptr<const IrResourcePlan> plan;
