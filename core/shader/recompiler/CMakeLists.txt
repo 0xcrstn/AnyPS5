@@ -226,6 +226,7 @@ function(add_shader_recompiler target runtimeTarget)
             SrtCompiledWalkCounts
             SrtCompiledWalkRefusals
             SrtCompiledWalkRefusalNames
+            CountSpecializationWords
             DebugProbeActive
             DepthBitsTextureWidth
             EvaluateBufferIndex

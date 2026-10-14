@@ -66,7 +66,7 @@ public:
     std::shared_ptr<const ResourceCapture> Capture(const SrtRuntime& runtime) const;
     std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture) const;
     std::shared_ptr<const ResourceCapture> CaptureValues(const SrtRuntime& runtime) const;
-    std::shared_ptr<const RecompileResult> MaterializeValues(const ResourceCapture& capture) const;
+    std::shared_ptr<const RecompileResult> MaterializeValues(const ResourceCapture& capture, bool* templateHit = nullptr) const;
 
 private:
     PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);
@@ -74,6 +74,17 @@ private:
     std::shared_ptr<const SourceHandle> handle;
 };
 [[nodiscard]] std::span<const std::uint32_t> GetPreparedCode(const SourceHandle& handle);
+[[nodiscard]] std::uint64_t SpecializationKey(const SourceHandle& handle, const RecompileRequest& request, const ResourceSnapshot& snapshot);
+struct MaterializeValuesCounts {
+    std::uint64_t templateHits = 0;
+    std::uint64_t templateMisses = 0;
+};
+[[nodiscard]] MaterializeValuesCounts GetMaterializeValuesCounts();
+struct SnapshotWordCounts {
+    std::uint64_t keyWords = 0;
+    std::uint64_t valueWords = 0;
+};
+[[nodiscard]] SnapshotWordCounts CountSpecializationWords(const ResourceSnapshot& snapshot);
 [[nodiscard]] std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& request);
 [[nodiscard]] std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& request, ShaderPreparationContext* preparation);
 [[nodiscard]] bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& handle);

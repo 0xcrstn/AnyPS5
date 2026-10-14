@@ -50,7 +50,8 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
             phaseMs[DrawRowCaptureHookWaits] += waited;
         }
         phaseTiming.Phase(DrawRowCaptureRegions);
-        stageCapture.compiled = invocation.MaterializeValues(*values);
+        bool templateHit = false;
+        stageCapture.compiled = invocation.MaterializeValues(*values, &templateHit);
         phaseTiming.Phase(DrawRowRecompile);
         bool mismatch = false;
         auto part = SnapshotPart::None;
@@ -66,7 +67,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
             }
             phaseTiming.Phase(DrawRowVectors);
         }
-        notePlannedStage(verifyBindingPlan(), mismatch, part);
+        notePlannedStage(verifyBindingPlan(), mismatch, part, templateHit, ShaderRecompiler::CountSpecializationWords(values->snapshot));
         return *stageCapture.compiled;
     }
     const auto capture = [&] {

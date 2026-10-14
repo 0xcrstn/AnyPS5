@@ -112,7 +112,7 @@ inline constexpr const char* SnapshotPartNames[SnapshotParts] = {"none", "buffer
 SnapshotPart FirstSnapshotDifference(const ShaderRecompiler::ResourceCapture& full, const ShaderRecompiler::ResourceSnapshot& planned);
 
 struct BindingPlanCounters {
-    std::uint64_t draws = 0, decodeHits = 0, decodeMisses = 0, stages = 0, verifiedStages = 0, stageMismatches = 0, verifiedDecodes = 0, decodeMismatches = 0;
+    std::uint64_t draws = 0, decodeHits = 0, decodeMisses = 0, decodesPatched = 0, stages = 0, templateHits = 0, keyWords = 0, valueWords = 0, verifiedStages = 0, stageMismatches = 0, verifiedDecodes = 0, decodeMismatches = 0;
     std::array<std::uint64_t, SnapshotParts> mismatchParts{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };

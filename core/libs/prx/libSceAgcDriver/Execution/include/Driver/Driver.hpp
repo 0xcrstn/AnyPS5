@@ -41,6 +41,10 @@
 #include <utility>
 #include <vector>
 
+namespace ShaderRecompiler {
+struct SnapshotWordCounts;
+}
+
 namespace AgcDriver::DriverDetail {
 
 class Driver {
@@ -134,8 +138,9 @@ private:
     static bool drawEntries();
     static bool bindingPlan();
     static bool verifyBindingPlan();
-    void planDrawDecode(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial, std::shared_ptr<const DrawDecode>& decode, bool profile);
-    void notePlannedStage(bool verified, bool mismatch, SnapshotPart part = SnapshotPart::None);
+    void planDrawDecode(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches, bool profile);
+    void notePlannedStage(bool verified, bool mismatch, SnapshotPart part, bool templateHit, ShaderRecompiler::SnapshotWordCounts words);
+    static std::uint64_t drawDecodeKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
     void reportBindingPlan();
     static bool verifyDrawEntries();
     static bool registerKeyEnabled();

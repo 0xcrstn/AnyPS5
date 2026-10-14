@@ -70,6 +70,44 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
 }
 
 
+std::uint64_t Driver::drawDecodeKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
+    const auto& masks = registerMasks();
+    const auto fingerprint = [&](const Registers& registers, Graphics::RegisterBank bank) { return registers.Fingerprint(masks[static_cast<std::size_t>(bank)]); };
+    auto key = (0xcbf29ce484222325ull ^ fingerprint(queue.context, Graphics::RegisterBank::Context)) * 0x100000001b3ull;
+    key = (key ^ fingerprint(queue.shader, Graphics::RegisterBank::Shader)) * 0x100000001b3ull;
+    key = (key ^ fingerprint(queue.userConfig, Graphics::RegisterBank::UserConfig)) * 0x100000001b3ull;
+    const auto mix = [&](std::uint64_t value) {
+        key ^= value;
+        key *= 0x100000001b3ull;
+    };
+    mix(deviceSerial);
+    for (const auto offset : {0x082u, 0x083u, 0x102u, 0x103u}) {
+        const auto it = queue.shader.find(offset);
+        mix(it == queue.shader.end() ? 0 : 1);
+        mix(it == queue.shader.end() ? 0 : it->second);
+    }
+    for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
+        const auto low = queue.shader.find(base);
+        const auto high = queue.shader.find(base + 1);
+        if (low == queue.shader.end() || high == queue.shader.end()) {
+            mix(0);
+            continue;
+        }
+        const auto resources = queue.shader.find(base + 3);
+        mix(resources != queue.shader.end() ? resources->second : 0);
+        const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
+        auto it = registry.upper_bound(address);
+        if (it == registry.begin()) {
+            mix(1);
+            continue;
+        }
+        --it;
+        for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+        mix(address - it->first);
+    }
+    return key == 0 ? 1 : key;
+}
+
 std::uint64_t Driver::drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry) {
     std::uint64_t key = 0x84222325cbf29ce4ull;
     const auto mix = [&](std::uint64_t value) {

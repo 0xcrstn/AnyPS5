@@ -460,6 +460,23 @@ target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driv
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
 
+add_test_executable(agc_materialize_values_tests EXCLUDE_FROM_ALL tests/MaterializeValues.cpp)
+target_include_directories(agc_materialize_values_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_materialize_values_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_materialize_values_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_materialize_values_tests)
+if(BUILD_TESTING)
+    add_test(NAME agc_materialize_values COMMAND agc_materialize_values_tests)
+    add_test(NAME agc_materialize_values_off COMMAND agc_materialize_values_tests)
+    set_tests_properties(agc_materialize_values agc_materialize_values_off PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_RESULT_MEMO=1" TIMEOUT 30)
+    set_property(TEST agc_materialize_values_off APPEND PROPERTY ENVIRONMENT "APS5_NO_MATERIALIZE_TEMPLATES=1")
+    if(WIN32)
+        set_tests_properties(agc_materialize_values agc_materialize_values_off PROPERTIES
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_shared_write_tests EXCLUDE_FROM_ALL tests/SharedWrites.cpp)
 target_include_directories(agc_shared_write_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shared_write_tests PRIVATE libSceAgcDriver libkernel libc)
