@@ -6,8 +6,10 @@
 #include <cstdio>
 #include <ctime>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -36,7 +38,15 @@ std::vector<std::uint32_t> PreparedWords(const TSpirv& spirv) {
     else return spirv.Words();
 }
 
-void Replay(const char* path, bool frontEnd) {
+void WriteSpirv(const std::filesystem::path& directory, const char* path, std::span<const std::uint32_t> spirv) {
+    std::filesystem::create_directories(directory);
+    const auto target = directory / std::filesystem::path(path).filename().replace_extension(".spv");
+    std::ofstream file(target, std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char*>(spirv.data()), static_cast<std::streamsize>(spirv.size() * sizeof(std::uint32_t)));
+    if (!file) throw std::runtime_error("cannot write " + target.string());
+}
+
+void Replay(const char* path, bool frontEnd, const std::filesystem::path& spirvOut) {
     const auto bytes = ReadFile(path);
     const auto entry = AgcDriver::Tools::ReadComputeCacheEntry(bytes);
     if (entry == nullptr) {
@@ -56,6 +66,7 @@ void Replay(const char* path, bool frontEnd) {
     const auto spirv = PreparedWords(ShaderRecompiler::GetPreparedArtifact(*handle).spirv);
     std::uint64_t spirvHash = 0xcbf29ce484222325ull;
     for (const auto word : spirv) spirvHash = Hash(spirvHash, word);
+    if (!spirvOut.empty()) WriteSpirv(spirvOut, path, spirv);
     std::vector<std::byte> plan;
     if (!ShaderRecompiler::ShaderDiskCache::EncodePlan(*ShaderRecompiler::GetResourcePlan(entry->request), plan)) throw std::runtime_error("the resource plan cannot be encoded");
     std::uint64_t planHash = 0xcbf29ce484222325ull;
@@ -70,18 +81,23 @@ void Replay(const char* path, bool frontEnd) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_cache_replay [--front-end] <shader cache entry>...\n");
+        std::fprintf(stderr, "usage: agc_shader_cache_replay [--front-end] [--spirv-out DIRECTORY] <shader cache entry>...\n");
         return 2;
     }
     bool frontEnd = false;
+    std::filesystem::path spirvOut;
     int failures = 0;
     for (int index = 1; index < argc; ++index) {
         if (std::string(argv[index]) == "--front-end") {
             frontEnd = true;
             continue;
         }
+        if (std::string(argv[index]) == "--spirv-out" && index + 1 < argc) {
+            spirvOut = argv[++index];
+            continue;
+        }
         try {
-            Replay(argv[index], frontEnd);
+            Replay(argv[index], frontEnd, spirvOut);
         } catch (const std::exception& error) {
             std::printf("%s: failed: %.2000s\n", argv[index], error.what());
             ++failures;

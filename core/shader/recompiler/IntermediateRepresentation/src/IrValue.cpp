@@ -8,26 +8,6 @@ namespace ShaderRecompiler {
 IrValue::IrValue(IrOpcode opcode, IrType type, std::uint32_t id) : opcode(opcode), type(type), id(id), hasImmediate(false), parent(nullptr) {
 }
 
-std::uint32_t IrValue::Id() const {
-    return id;
-}
-
-const std::vector<IrValue*>& IrValue::Arguments() const {
-    return arguments;
-}
-
-const std::vector<IrValue*>& IrValue::Uses() const {
-    return uses;
-}
-
-IrBlock* IrValue::Parent() const {
-    return parent;
-}
-
-std::uint32_t IrValue::ImmediateU32() const {
-    return static_cast<std::uint32_t>(immediateBits);
-}
-
 void IrValue::AddArgument(IrValue* argument) {
     arguments.push_back(argument);
     if (argument == nullptr) {
@@ -76,32 +56,8 @@ void IrValue::SetImmediateU32(std::uint32_t value) {
     hasImmediate = true;
 }
 
-void IrValue::SetParent(IrBlock* parent) {
-    this->parent = parent;
-}
-
-bool IrValue::IsEmpty() const {
-    return opcode == IrOpcode::Void;
-}
-
-bool IrValue::IsPhi() const {
-    return opcode == IrOpcode::Phi;
-}
-
 bool IrValue::MayHaveSideEffects() const {
     return IrOpcodeHasSideEffects(opcode);
-}
-
-bool IrValue::HasUses() const {
-    return !uses.empty();
-}
-
-std::size_t IrValue::UseCount() const {
-    return uses.size();
-}
-
-std::size_t IrValue::PhiBlockCount() const {
-    return phiBlocks.size();
 }
 
 IrBlock* IrValue::PhiBlock(std::size_t index) const {
@@ -109,14 +65,6 @@ IrBlock* IrValue::PhiBlock(std::size_t index) const {
         throw std::out_of_range("IrValue::PhiBlock index is out of range");
     }
     return phiBlocks[index];
-}
-
-const std::vector<IrUse>& IrValue::OperandUses() const {
-    return operandUses;
-}
-
-std::uint64_t IrValue::ImmediateU64() const {
-    return immediateBits;
 }
 
 std::uint16_t IrValue::ImmediateF16Bits() const {

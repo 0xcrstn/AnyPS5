@@ -13,6 +13,7 @@
 #include <exception>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -68,6 +69,9 @@ struct PreparedShaders : PreparedShaderState {
     std::condition_variable settled;
     std::exception_ptr failure;
     std::atomic<bool> demanded{false};
+    std::atomic<bool> used{false};
+    std::uint64_t useKey = 0;
+    std::uint64_t useRank = std::numeric_limits<std::uint64_t>::max();
     bool pending = false;
     bool partialGroupsPending = false;
 };
@@ -124,6 +128,7 @@ void CloseRegistrationPreparation();
 struct RegistrationBacklog {
     std::uint64_t registered = 0;
     std::uint64_t queued = 0;
+    std::uint64_t queuedByUse = 0;
     std::uint64_t running = 0;
     std::uint64_t threads = 0;
     std::uint64_t prebuildsQueued = 0;

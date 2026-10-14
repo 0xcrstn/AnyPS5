@@ -119,6 +119,58 @@ inline bool IrValue::HasImmediate() const {
     return hasImmediate;
 }
 
+inline std::uint32_t IrValue::Id() const {
+    return id;
+}
+
+inline const std::vector<IrValue*>& IrValue::Arguments() const {
+    return arguments;
+}
+
+inline const std::vector<IrValue*>& IrValue::Uses() const {
+    return uses;
+}
+
+inline IrBlock* IrValue::Parent() const {
+    return parent;
+}
+
+inline std::uint32_t IrValue::ImmediateU32() const {
+    return static_cast<std::uint32_t>(immediateBits);
+}
+
+inline void IrValue::SetParent(IrBlock* parent) {
+    this->parent = parent;
+}
+
+inline bool IrValue::IsEmpty() const {
+    return opcode == IrOpcode::Void;
+}
+
+inline bool IrValue::IsPhi() const {
+    return opcode == IrOpcode::Phi;
+}
+
+inline bool IrValue::HasUses() const {
+    return !uses.empty();
+}
+
+inline std::size_t IrValue::UseCount() const {
+    return uses.size();
+}
+
+inline std::size_t IrValue::PhiBlockCount() const {
+    return phiBlocks.size();
+}
+
+inline const std::vector<IrUse>& IrValue::OperandUses() const {
+    return operandUses;
+}
+
+inline std::uint64_t IrValue::ImmediateU64() const {
+    return immediateBits;
+}
+
 inline bool IrValue::IsIdentity() const {
     return opcode == IrOpcode::Identity;
 }
