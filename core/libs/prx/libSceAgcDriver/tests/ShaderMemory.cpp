@@ -1076,8 +1076,9 @@ void verifyDescriptorPhis() {
         code.insert(code.begin() + 8, words);
         return code;
     };
-    const std::array<std::pair<std::vector<std::uint32_t>, const char*>, 3> invalidEntries{{
-        {entryWrites({0xbe8e1f00u}), "descriptor Phi: a T# holding the program counter was accepted"},
+    auto programCounterEntry = makeRequest(entryWrites({0xbe8e1f00u}));
+    require(GetResourcePlan(programCounterEntry)->info.images.size() == 2u, "descriptor Phi: a loop entry whose T# registers hold the program counter was not folded onto the loop's two SRT T#s");
+    const std::array<std::pair<std::vector<std::uint32_t>, const char*>, 2> invalidEntries{{
         {entryWrites({0xbe8e037eu}), "descriptor Phi: a T# holding EXEC was accepted"},
         {entryWrites({0x7d840080u, 0xbe8e036au}), "descriptor Phi: a T# holding a compare mask was accepted"},
     }};

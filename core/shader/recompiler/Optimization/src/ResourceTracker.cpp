@@ -887,6 +887,7 @@ private:
         static constexpr std::size_t maxStates = 512u;
         static constexpr std::size_t maxArms = 64u;
         std::string failure;
+        bool foldedProgramCounter = false;
         std::vector<std::vector<IrValue*>> arms;
         std::map<std::vector<IrValue*>, IrValue*> selectors;
         std::vector<std::pair<IrBlock*, IrValue*>> phis;
@@ -894,6 +895,14 @@ private:
         std::unordered_map<IrValue*, IrValue*> resolved;
         std::unordered_map<const IrBlock*, std::size_t> order;
     };
+
+    static bool StrictDescriptorWebs() {
+        static const bool strict = [] {
+            const char* value = std::getenv("APS5_STRICT_DESCRIPTOR_WEBS");
+            return value != nullptr && *value != '\0' && !(value[0] == '0' && value[1] == '\0');
+        }();
+        return strict;
+    }
 
     static IrValue* GiveUp(DescriptorWeb& web, const char* reason) {
         if (web.failure.empty()) {
@@ -924,10 +933,14 @@ private:
             return LaneSelector(tuple, **lane, web, position);
         }
         if (phi == tuple.end()) {
-            for (IrValue* value : tuple) {
-                if (HoldsProgramCounter(value, phiSearchDepth)) {
+            if (std::ranges::any_of(tuple, [](IrValue* value) { return HoldsProgramCounter(value, phiSearchDepth); })) {
+                if (StrictDescriptorWebs()) {
                     return GiveUp(web, "a descriptor dword depends on the program counter");
                 }
+                web.foldedProgramCounter = true;
+                return &m_builder.Constant(0u);
+            }
+            for (IrValue* value : tuple) {
                 if (Rematerialize(value, position, false, phiSearchDepth) == nullptr) {
                     return GiveUp(web, "a descriptor dword is not rebuilt from user data, the SRT and uniform operations before the read");
                 }
@@ -1104,7 +1117,7 @@ private:
             }
         }
         if (selector == nullptr || web.arms.empty()) {
-            const std::string reason = web.failure.empty() ? std::string("no descriptor was found on any path") : web.failure;
+            const std::string reason = !web.failure.empty() ? web.failure : web.foldedProgramCounter ? std::string("every path's descriptor depends on the program counter") : std::string("no descriptor was found on any path");
             for (std::uint32_t slot = 0; slot < handleCount; slot++) {
                 if (split[slot]) {
                     m_splitFailures.try_emplace(handles[slot], reason);
