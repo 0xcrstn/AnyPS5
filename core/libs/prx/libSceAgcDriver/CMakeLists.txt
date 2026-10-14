@@ -492,6 +492,7 @@ target_link_libraries(agc_materialize_values_tests PRIVATE shader_recompiler_agc
 set_target_properties(agc_materialize_values_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_materialize_values_tests)
 if(BUILD_TESTING)
+    set_target_properties(agc_materialize_values_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_materialize_values COMMAND agc_materialize_values_tests)
     add_test(NAME agc_materialize_values_off COMMAND agc_materialize_values_tests)
     add_test(NAME agc_materialize_values_storage_off COMMAND agc_materialize_values_tests)

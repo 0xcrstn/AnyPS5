@@ -248,6 +248,7 @@ function(add_shader_recompiler target runtimeTarget)
             MatchesPreparedShader
             GetPreparedArtifact
             GetRetainedShaderMemory
+            GetMaterializeValuesCounts
             MaterializeShader
             RegistrationResult
             ResolveSource
