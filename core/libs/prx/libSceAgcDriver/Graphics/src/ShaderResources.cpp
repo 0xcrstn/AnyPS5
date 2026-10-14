@@ -3622,7 +3622,9 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
                 if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
-                moved.push_back({index, address, static_cast<std::size_t>(size)});
+                MovedBuffer entry{index, address, static_cast<std::size_t>(size)};
+                entry.readRanges = GuestReadRanges(std::span<const std::uint32_t>(words, 4), element < binding.bufferReadRanges.size() ? &binding.bufferReadRanges[element] : nullptr, entry.size, &entry.wholeCopy);
+                moved.push_back(std::move(entry));
             }
         }
     }
@@ -3643,7 +3645,7 @@ bool PartialSnapshotsDisabled() {
 }
 
 const char* ShaderResources::WholeCopyName(WholeCopy reason) {
-    static constexpr std::array<const char*, static_cast<std::size_t>(WholeCopy::Count)> names{"not analysed", "unbounded index", "unbounded offset", "unbounded soffset", "unbounded scalar offset", "offset past 32 bits", "formatted load", "other read", "image alias", "swizzled", "add tid", "past 4 GiB", "over half", "moved", "disabled"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(WholeCopy::Count)> names{"not analysed", "unbounded index", "unbounded offset", "unbounded soffset", "unbounded scalar offset", "offset past 32 bits", "other read", "image alias", "swizzled", "add tid", "past 4 GiB", "over half", "disabled"};
     const auto index = static_cast<std::size_t>(reason);
     return index < names.size() ? names[index] : "?";
 }
@@ -3661,7 +3663,6 @@ std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std:
         case Unbound::Soffset: return whole(WholeCopy::Soffset);
         case Unbound::ScalarOffset: return whole(WholeCopy::ScalarOffset);
         case Unbound::Wrap: return whole(WholeCopy::Wrap);
-        case Unbound::Formatted: return whole(WholeCopy::Formatted);
         case Unbound::Alias: return whole(WholeCopy::Alias);
         default: return whole(WholeCopy::Opcode);
         }
@@ -3782,17 +3783,17 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, BufferExtent::SizeClass);
                 lap(&DrawBindingsStatistics::bufferUs);
                 std::uint64_t covered = 0;
-                auto wholeCopy = item.wholeCopy;
-                if (override != moved.end()) wholeCopy = WholeCopy::Moved;
-                else if (PartialSnapshotsDisabled()) wholeCopy = WholeCopy::Disabled;
-                else if (item.readRanges.has_value()) {
-                    for (const auto& [from, to] : *item.readRanges) covered += to - from;
+                const auto& readRanges = override != moved.end() ? override->readRanges : item.readRanges;
+                auto wholeCopy = override != moved.end() ? override->wholeCopy : item.wholeCopy;
+                if (PartialSnapshotsDisabled()) wholeCopy = WholeCopy::Disabled;
+                else if (readRanges.has_value()) {
+                    for (const auto& [from, to] : *readRanges) covered += to - from;
                     partial = covered * 2 <= bytes;
                     wholeCopy = WholeCopy::OverHalf;
                 }
                 if (partial) {
                     const auto bytesOut = buffer->Bytes();
-                    for (const auto& [from, to] : *item.readRanges) std::memcpy(bytesOut.data() + item.adjustment + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
+                    for (const auto& [from, to] : *readRanges) std::memcpy(bytesOut.data() + item.adjustment + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
                 } else {
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                 }
