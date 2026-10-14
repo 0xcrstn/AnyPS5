@@ -2996,6 +2996,21 @@ void StorageTexture::MarkDirty() {
     markLayersPending(0, trackedLayers);
 }
 
+void StorageTexture::MarkSliceDirty(std::uint32_t slice) {
+    if (geometry.thick || geometry.imageLayers <= 1 || slice >= geometry.imageLayers || geometry.layerBytes == 0 || trackedLayerBytes == 0 || descriptor.dccAddress != 0) {
+        MarkDirty();
+        return;
+    }
+    const auto begin = geometry.GuestLayerOffset(slice);
+    const auto first = static_cast<std::uint32_t>(begin / trackedLayerBytes);
+    const auto last = static_cast<std::uint32_t>(std::min<std::uint64_t>((begin + geometry.layerBytes + trackedLayerBytes - 1) / trackedLayerBytes, trackedLayers));
+    if (first >= last) {
+        MarkDirty();
+        return;
+    }
+    markLayersPending(first, last - first);
+}
+
 bool StorageTexture::anyLayerPending() const {
     return std::any_of(layerPending.begin(), layerPending.end(), [](bool pending) { return pending; });
 }
@@ -3307,6 +3322,26 @@ std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t addres
         if (containing == nullptr) containing = texture;
     }
     return containing != nullptr ? containing->weak_from_this().lock() : nullptr;
+}
+
+std::shared_ptr<StorageTexture> StorageTexture::FindPendingSlice(std::uint64_t address, std::uint64_t bytes) {
+    if (auto whole = FindPending(address, bytes)) return whole;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    StorageTexture* found = nullptr;
+    for (auto* texture : pending.textures) {
+        const auto base = texture->descriptor.baseAddress;
+        const auto layers = texture->geometry.imageLayers;
+        if (texture->geometry.thick || layers <= 1 || bytes == 0 || address <= base || texture->guestBytes % layers != 0 || texture->guestBytes / layers != bytes) continue;
+        if ((address - base) % bytes != 0 || (address - base) / bytes >= layers) continue;
+        if (found != nullptr) {
+            char message[256];
+            std::snprintf(message, sizeof(message), "AGC graphics: 0x%llx+0x%llx is a slice of the pending array images 0x%llx and 0x%llx: which one holds its results is not modeled", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(found->descriptor.baseAddress), static_cast<unsigned long long>(base));
+            throw std::runtime_error(message);
+        }
+        found = texture;
+    }
+    return found != nullptr ? found->weak_from_this().lock() : nullptr;
 }
 
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except) {

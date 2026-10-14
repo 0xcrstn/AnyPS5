@@ -115,14 +115,14 @@ private:
 
 class Image {
 public:
-    Image(const Context& context, VkFormat format, VkExtent2D extent, VkImageUsageFlags usage, VkImageCreateFlags flags = 0) : context(context), extent(extent) {
+    Image(const Context& context, VkFormat format, VkExtent2D extent, VkImageUsageFlags usage, VkImageCreateFlags flags = 0, std::uint32_t layers = 1) : context(context), extent(extent) {
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         info.flags = flags;
         info.imageType = VK_IMAGE_TYPE_2D;
         info.format = format;
         info.extent = {extent.width, extent.height, 1};
         info.mipLevels = 1;
-        info.arrayLayers = 1;
+        info.arrayLayers = layers;
         info.samples = VK_SAMPLE_COUNT_1_BIT;
         info.tiling = VK_IMAGE_TILING_OPTIMAL;
         info.usage = usage;
@@ -154,7 +154,7 @@ private:
     VkDeviceMemory memory = VK_NULL_HANDLE;
 };
 
-void transition(const Context& context, VkCommandBuffer commands, VkImage image, VkImageLayout from, VkImageLayout to, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) {
+void transition(const Context& context, VkCommandBuffer commands, VkImage image, VkImageLayout from, VkImageLayout to, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess, std::uint32_t layers = 1) {
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.srcAccessMask = sourceAccess;
     barrier.dstAccessMask = destinationAccess;
@@ -162,7 +162,7 @@ void transition(const Context& context, VkCommandBuffer commands, VkImage image,
     barrier.newLayout = to;
     barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
@@ -207,9 +207,9 @@ struct Source {
     std::vector<std::byte> decoded;
 };
 
-Source makeSource(std::uint64_t pixelFormat, VkFormat storage, std::uint32_t width, std::uint32_t height) {
+Source makeSource(std::uint64_t pixelFormat, VkFormat storage, std::uint32_t width, std::uint32_t height, std::uint32_t salt = 0) {
     Source source{pixelFormat, storage, width, height, std::vector<std::byte>(static_cast<std::size_t>(width) * height * 4), {}};
-    std::uint32_t seed = 0x9e3779b9u ^ static_cast<std::uint32_t>(storage) ^ static_cast<std::uint32_t>(pixelFormat >> 32u);
+    std::uint32_t seed = 0x9e3779b9u ^ static_cast<std::uint32_t>(storage) ^ static_cast<std::uint32_t>(pixelFormat >> 32u) ^ salt;
     for (auto& byte : source.words) {
         seed = seed * 1664525u + 1013904223u;
         byte = static_cast<std::byte>(seed >> 24u);
@@ -225,21 +225,28 @@ Source makeSource(std::uint64_t pixelFormat, VkFormat storage, std::uint32_t wid
     return source;
 }
 
-std::unique_ptr<Image> residentImage(const Context& context, const Source& source) {
-    auto image = std::make_unique<Image>(context, source.storage, VkExtent2D{source.width, source.height}, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
-    Buffer upload(context, source.words.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    std::memcpy(upload.Bytes().data(), source.words.data(), source.words.size());
+std::unique_ptr<Image> residentImage(const Context& context, const std::vector<const Source*>& slices) {
+    const auto& source = *slices.front();
+    const auto layers = static_cast<std::uint32_t>(slices.size());
+    auto image = std::make_unique<Image>(context, source.storage, VkExtent2D{source.width, source.height}, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT, layers);
+    Buffer upload(context, source.words.size() * layers, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    std::vector<VkBufferImageCopy> regions(layers);
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        std::memcpy(upload.Bytes().data() + source.words.size() * layer, slices[layer]->words.data(), source.words.size());
+        regions[layer].bufferOffset = source.words.size() * layer;
+        regions[layer].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+        regions[layer].imageExtent = {source.width, source.height, 1};
+    }
     CommandBatch batch(context);
     const auto commands = batch.Handle();
-    transition(context, commands, image->Handle(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
-    VkBufferImageCopy region{};
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {source.width, source.height, 1};
-    context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, upload.Handle(), image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    transition(context, commands, image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    transition(context, commands, image->Handle(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT, layers);
+    context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, upload.Handle(), image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, layers, regions.data());
+    transition(context, commands, image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, layers);
     batch.SubmitAndWait();
     return image;
 }
+
+std::unique_ptr<Image> residentImage(const Context& context, const Source& source) { return residentImage(context, std::vector<const Source*>{&source}); }
 
 std::vector<std::byte> convertPathPresent(const Context& context, const Source& source, VkExtent2D extent) {
     Buffer upload(context, source.decoded.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -265,11 +272,11 @@ std::vector<std::byte> convertPathPresent(const Context& context, const Source& 
     return bytesOf(readback, bytes);
 }
 
-std::vector<std::byte> passPresent(const Context& context, PresentationPass& pass, const Source& source, const Image& resident, VkExtent2D extent, VkFormat format) {
+std::vector<std::byte> passPresent(const Context& context, PresentationPass& pass, const Source& source, const Image& resident, VkExtent2D extent, VkFormat format, std::uint32_t layer = 0) {
     Image destination(context, format, extent, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     const auto bytes = static_cast<std::size_t>(extent.width) * extent.height * 4;
     Buffer readback(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    pass.Bind(0, resident.Handle(), source.width, source.height, source.pixelFormat);
+    pass.Bind(0, resident.Handle(), source.width, source.height, source.pixelFormat, layer);
     {
         CommandBatch batch(context);
         const auto commands = batch.Handle();
@@ -281,11 +288,11 @@ std::vector<std::byte> passPresent(const Context& context, PresentationPass& pas
     return bytesOf(readback, bytes);
 }
 
-std::vector<std::byte> passDump(const Context& context, PresentationPass& pass, const Source& source, const Image& resident, std::uint32_t stride) {
+std::vector<std::byte> passDump(const Context& context, PresentationPass& pass, const Source& source, const Image& resident, std::uint32_t stride, std::uint32_t layer = 0) {
     const auto extent = PresentationPass::DumpExtent(source.width, source.height, stride);
     const auto bytes = static_cast<std::size_t>(extent.width) * extent.height * 4;
     Buffer readback(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    pass.Bind(1, resident.Handle(), source.width, source.height, source.pixelFormat);
+    pass.Bind(1, resident.Handle(), source.width, source.height, source.pixelFormat, layer);
     {
         CommandBatch batch(context);
         pass.RecordDump(batch.Handle(), 1, stride, readback.Handle());
@@ -322,14 +329,14 @@ void passMatchesConvertPath(const Context& context, PresentationPass& pass, cons
     }
 }
 
-void passDumpMatchesSubsample(const Context& context, PresentationPass& pass, const Source& source, const Image& resident) {
+void passDumpMatchesSubsample(const Context& context, PresentationPass& pass, const Source& source, const Image& resident, std::uint32_t layer = 0) {
     for (const std::uint32_t stride : {1u, 3u, 4u}) {
         const auto extent = PresentationPass::DumpExtent(source.width, source.height, stride);
         std::vector<std::byte> expected(static_cast<std::size_t>(extent.width) * extent.height * 4);
         for (std::uint32_t y = 0; y < extent.height; ++y) {
             for (std::uint32_t x = 0; x < extent.width; ++x) std::memcpy(expected.data() + (static_cast<std::size_t>(y) * extent.width + x) * 4, source.decoded.data() + (static_cast<std::size_t>(y) * stride * source.width + x * stride) * 4, 4);
         }
-        Require(passDump(context, pass, source, resident, stride) == expected, "the presentation dump differs from the subsampled guest-path frame: " + describe(source, extent) + " stride " + std::to_string(stride));
+        Require(passDump(context, pass, source, resident, stride, layer) == expected, "the presentation dump differs from the subsampled guest-path frame: " + describe(source, extent) + " stride " + std::to_string(stride));
     }
 }
 
@@ -408,6 +415,21 @@ void blitLetterboxMatchesClear(const Context& context) {
     }
 }
 
+void passPresentsSlice(const Context& context, PresentationPass& pass) {
+    const auto first = makeSource(Bgra8, VK_FORMAT_B8G8R8A8_UNORM, 200, 130);
+    const auto second = makeSource(Bgra8, VK_FORMAT_B8G8R8A8_UNORM, 200, 130, 0x5a5a5a5au);
+    Require(first.decoded != second.decoded, "the two slices of the array test image hold the same texels");
+    const auto resident = residentImage(context, std::vector<const Source*>{&first, &second});
+    const std::array<const Source*, 2> slices{&first, &second};
+    for (std::uint32_t layer = 0; layer < slices.size(); ++layer) {
+        const auto& source = *slices[layer];
+        for (const auto extent : {VkExtent2D{source.width, source.height}, VkExtent2D{source.width + 60, source.height}}) {
+            Require(passPresent(context, pass, source, *resident, extent, VK_FORMAT_B8G8R8A8_UNORM, layer) == convertPathPresent(context, source, extent), "the presentation pass of slice " + std::to_string(layer) + " of an array image differs from the convert path: " + describe(source, extent));
+        }
+        passDumpMatchesSubsample(context, pass, source, *resident, layer);
+    }
+}
+
 void passRefusesHalfFloat(PresentationPass& pass, const Image& resident) {
     bool refused = false;
     try {
@@ -435,6 +457,7 @@ void residentPresentTests(const Context& context) {
         if (AgcDriver::DisplayTenBit(pixelFormat)) passKeepsTenBits(context, pass, source, *resident);
         if (pixelFormat == Bgra8) passRefusesHalfFloat(pass, *resident);
     }
+    passPresentsSlice(context, pass);
     blitLetterboxMatchesClear(context);
 }
 
