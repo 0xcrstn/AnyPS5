@@ -788,6 +788,47 @@ ImportRun windowRun(const HostImports& state, ImportRun run, std::uint64_t begin
     return run;
 }
 
+enum class ImportRefusal : std::size_t { None, ImportsOff, InImport, NotRegistered, NotCovering, NoRun, Unaligned, FailedBefore, Held, Budget, Uncommitted, ReadOnly, ImportFailed, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(ImportRefusal::Count)> ImportRefusalNames{"unknown", "imports off", "in an import, not bindable in place nor GPU-copied", "not registered", "import short of the region", "no import run", "unaligned run", "failed before", "overlapping import in use", "budget", "uncommitted pages", "read-only pages", "import failed"};
+
+thread_local ImportRefusal importRefusal = ImportRefusal::None;
+
+const HostImport* refuseImport(ImportRefusal reason) {
+    importRefusal = reason;
+    return nullptr;
+}
+
+struct CopyReasonTotals {
+    std::mutex mutex;
+    std::array<std::uint64_t, static_cast<std::size_t>(ImportRefusal::Count)> counts{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ImportRefusal::Count)> bytes{};
+    std::array<std::pair<std::uint64_t, std::uint64_t>, static_cast<std::size_t>(ImportRefusal::Count)> largest{};
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+void noteCopyReason(ImportRefusal reason, std::uint64_t begin, std::uint64_t bytes) {
+    static CopyReasonTotals totals;
+    const auto index = static_cast<std::size_t>(reason);
+    std::lock_guard lock(totals.mutex);
+    ++totals.counts[index];
+    totals.bytes[index] += bytes;
+    if (bytes > totals.largest[index].second) totals.largest[index] = {begin, bytes};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - totals.lastReport < std::chrono::seconds(10)) return;
+    totals.lastReport = now;
+    std::string line;
+    for (std::size_t i = 0; i < totals.counts.size(); ++i) {
+        if (totals.counts[i] == 0) continue;
+        char item[192];
+        std::snprintf(item, sizeof(item), "%s %s %llu/%.0f MiB (largest 0x%llx+0x%llx)", line.empty() ? "" : ",", ImportRefusalNames[i], static_cast<unsigned long long>(totals.counts[i]), totals.bytes[i] / 1048576.0, static_cast<unsigned long long>(totals.largest[i].first), static_cast<unsigned long long>(totals.largest[i].second));
+        line += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] CPU copies by why the region has no import (10 s, count/MiB):%s\n", line.c_str());
+    totals.counts = {};
+    totals.bytes = {};
+    totals.largest = {};
+}
+
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
 bool importsStale(const Context& context, const HostImports& state);
 const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict);
@@ -815,7 +856,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         if (const auto* current = findImport(state, address, run.ranges.empty() ? address + 1 : run.base + run.bytes)) return current;
     }
     if (end != 0) run = windowRun(state, std::move(run), address, end, context.hostImportAlignment);
-    if (run.ranges.empty()) return nullptr;
+    if (run.ranges.empty()) return refuseImport(ImportRefusal::NoRun);
     return importRunAt(context, state, std::move(run), false, address, lease, end, evict);
 }
 
@@ -835,12 +876,12 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     const auto alignment = context.hostImportAlignment;
     if (joined && (alignment == 0 || base % alignment != 0 || bytes % alignment != 0)) {
         failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(run.ranges.begin(), run.ranges.end())});
-        return nullptr;
+        return refuseImport(ImportRefusal::Unaligned);
     }
     if (const auto found = state.imports.find(base); found != state.imports.end() && sameRun(found->second, run)) return &found->second;
-    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return nullptr;
+    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return refuseImport(ImportRefusal::Unaligned);
     if (const auto failed = failures.find(base); failed != failures.end()) {
-        if (sameRun(failed->second, run)) return nullptr;
+        if (sameRun(failed->second, run)) return refuseImport(ImportRefusal::FailedBefore);
         failures.erase(failed);
     }
     // The imports this one replaces overlap it; none may be held by a build, and the import must fit the budget (with
@@ -853,7 +894,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     // hold (KeepThroughHold). Refusing it there would keep the run copied for good.
     const auto held = [&](const HostImport& entry) { return !joined && pointerHeld(state, entry); };
     for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
-        if (held(it->second)) return nullptr;
+        if (held(it->second)) return refuseImport(ImportRefusal::Held);
         replaced += it->second.bytes;
     }
     const auto budget = importBudget(context);
@@ -868,7 +909,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
             lastReport = std::chrono::steady_clock::now();
             std::fprintf(stderr, "[gpu] host import budget: %llu MiB live of %llu MiB (APS5_HOST_IMPORT_MIB); %llu imports (%llu MiB) refused so far, last 0x%llx+0x%llx\n", static_cast<unsigned long long>(state.liveBytes >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(refused), static_cast<unsigned long long>(refusedBytes >> 20u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
         }
-        return nullptr;
+        return refuseImport(ImportRefusal::Budget);
     }
     for (auto it = first; it != state.imports.end() && it->first < base + bytes;) {
         const auto next = std::next(it);
@@ -888,7 +929,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
             failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
-            return nullptr;
+            return refuseImport(ImportRefusal::Uncommitted);
         }
         const auto protection = info.Protect & 0xffu;
         const bool pageWritable = (info.Type == MEM_PRIVATE || info.Type == MEM_IMAGE) && (protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_WRITECOPY);
@@ -900,7 +941,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
     if (!writable && readOnly) {
         failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
-        return nullptr;
+        return refuseImport(ImportRefusal::ReadOnly);
     }
     if (!writable) {
         if (refused.BaseAddress != nullptr) {
@@ -914,7 +955,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
             if (entry.ranges.size() == 1) throw;
             if (joined) {
                 failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
-                return nullptr;
+                return refuseImport(ImportRefusal::ImportFailed);
             }
             state.unaliasedSpans.insert(base);
             return importAllocation(context, state, address, lease, end, evict);
@@ -923,7 +964,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
 #else
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes), true)) {
         failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
-        return nullptr;
+        return refuseImport(ImportRefusal::Uncommitted);
     }
 #endif
     decideImportWatch(context, state);
@@ -977,7 +1018,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
             std::fclose(maps);
         }
 #endif
-        return nullptr;
+        return refuseImport(ImportRefusal::ImportFailed);
     }
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
@@ -1052,9 +1093,13 @@ const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint6
 }
 
 const HostImport* importAccess(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
-    if (!runCovers(lease, begin, end)) return findImport(state, begin, end);
+    if (!runCovers(lease, begin, end)) {
+        const auto* found = findImport(state, begin, end);
+        return found != nullptr ? found : refuseImport(ImportRefusal::NotRegistered);
+    }
     const auto* entry = importAllocation(context, state, begin, lease, end);
-    return entry != nullptr && findImport(state, begin, end) == entry ? entry : nullptr;
+    if (entry == nullptr) return nullptr;
+    return findImport(state, begin, end) == entry ? entry : refuseImport(ImportRefusal::NotCovering);
 }
 
 // Whether the imports need reconciling before a lookup: the registry changed since the last walk.
@@ -3226,6 +3271,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (bound) continue;
         }
         bool copyOnGpu = false;
+        auto copyReason = context.hostImportAlignment != 0 ? ImportRefusal::None : ImportRefusal::ImportsOff;
         if (context.hostImportAlignment != 0) {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
@@ -3240,8 +3286,11 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
+                importRefusal = ImportRefusal::None;
                 entry = importAccess(context, state, region.begin, region.end, importRanges());
+                if (entry == nullptr) copyReason = importRefusal;
             }
+            if (entry != nullptr) copyReason = ImportRefusal::InImport;
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
             const bool staged = recorder != nullptr && stagingEligible(region, addressable);
@@ -3290,6 +3339,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.buffer.reset();
             region.deviceLocal = false;
         }
+        if (profile) noteCopyReason(copyReason, region.begin, bytes);
         const auto copyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         copyRegion(region, addressable);
         if (profile) copyUs += microsecondsSince(copyStart);

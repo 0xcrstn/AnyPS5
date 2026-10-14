@@ -3436,7 +3436,7 @@ void WatchMemory(std::uint64_t programAddress) {
 // 'indirect' GpuMutex hold ([lock] line) spends its time on inside the device call (the label
 // record before it is timed in the driver, [labels] line), with the longest hold seen and the
 // copied-writer lists the indirect decision scans. All under the mutex, like the rest.
-struct IndirectHold {
+struct DeviceCallHold {
     std::array<double, DispatchRows> phaseMs{};
     // Rows with a count (the cache insert's evictions, the image lookups by outcome).
     std::array<std::uint64_t, DispatchRows> phaseCounts{};
@@ -3451,6 +3451,13 @@ struct IndirectHold {
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
+enum HoldClass : std::size_t { HoldIndirect, HoldQueue0Direct, HoldOtherDirect, HoldClassCount };
+constexpr std::array<const char*, HoldClassCount> HoldClassNames{"indirect", "queue 0", "other queues"};
+
+std::size_t directHoldClass() {
+    return GuestMemory::GpuLockThreadTag() == 0 ? HoldQueue0Direct : HoldOtherDirect;
+}
+
 // The running totals of the device call (APS5_PROFILE_DRAW), shared by dispatch, DispatchRecipe
 // and recordDispatch; mutated under GuestMemory::GpuMutex like the calls themselves. The
 // [rescache] and [vk] counters: template hits by outcome, vkGetDeviceProcAddr lookups made inside
@@ -3458,7 +3465,7 @@ struct IndirectHold {
 struct DispatchCounters {
     std::array<double, DispatchRows> phaseTotals{};
     std::uint64_t profiledDispatches = 0;
-    IndirectHold indirectHold;
+    std::array<DeviceCallHold, HoldClassCount> holds;
     std::uint64_t cacheHits = 0, cacheMisses = 0, cacheInvalidated = 0, templateRefreshed = 0, templateSameWords = 0;
     double templateRevalidateMs = 0;
     std::uint64_t procLookups = 0, preBarriersRecorded = 0, preBarriersSkipped = 0;
@@ -3542,16 +3549,21 @@ struct DispatchTimer {
     bool indirect;
     std::size_t spirvWords;
     std::uint64_t programAddress;
+    std::size_t holdClass;
     std::array<double, DispatchRows> callMs{};
     std::chrono::steady_clock::time_point start;
     std::chrono::steady_clock::time_point phaseStart;
-    DispatchTimer(bool profile, bool indirect, std::size_t spirvWords, std::uint64_t programAddress) : profile(profile), indirect(indirect), spirvWords(spirvWords), programAddress(programAddress), start(std::chrono::steady_clock::now()), phaseStart(start) {}
+    DispatchTimer(bool profile, bool indirect, std::size_t spirvWords, std::uint64_t programAddress) : profile(profile), indirect(indirect), spirvWords(spirvWords), programAddress(programAddress), holdClass(indirect ? HoldIndirect : profile ? directHoldClass() : HoldOtherDirect), start(std::chrono::steady_clock::now()), phaseStart(start) {}
+    DeviceCallHold* holdRows() const {
+        if (indirect) return &Dispatches().holds[HoldIndirect];
+        return holdClass != HoldIndirect ? &Dispatches().holds[holdClass] : nullptr;
+    }
     void add(DispatchPhase which, double ms) {
         if (!profile) return;
         auto& d = Dispatches();
         callMs[which] += ms;
         d.phaseTotals[which] += ms;
-        if (indirect) d.indirectHold.phaseMs[which] += ms;
+        if (auto* rows = holdRows()) rows->phaseMs[which] += ms;
     }
     void phase(DispatchPhase which) {
         if (!profile) return;
@@ -3594,8 +3606,8 @@ struct DispatchTimer {
         const auto now = std::chrono::steady_clock::now();
         const auto totalMs = std::chrono::duration<double, std::milli>(now - start).count();
         if (totalMs > 100) AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %s %zu words:%s\n", groupsText, spirvWords, formatCall().c_str());
-        if (!indirectHold) return;
-        auto& hold = d.indirectHold;
+        const auto cls = indirectHold ? static_cast<std::size_t>(HoldIndirect) : holdClass;
+        auto& hold = d.holds[cls];
         ++hold.count;
         hold.totalMs += totalMs;
         if (totalMs > hold.maxMs) {
@@ -3612,7 +3624,8 @@ struct DispatchTimer {
             else std::snprintf(text, sizeof(text), " %s %.0f ms", DispatchRowName(i), hold.phaseMs[i]);
             report += text;
         }
-        AgcDriver::ProfilePrint_nid_no_patch("[indirect] %llu indirect dispatches spent %.0f ms inside the device call (10 s; max %.1f ms:%s), by phase (the 'resources: ...' rows split 'resources'; 'hook waits' overlaps them; 'images: ...' rows are the lookups by outcome, count x ms, inside 'B images'):%s; copied-writer lists scanned per decision: dispatch avg %.1f (max %zu), draw avg %.1f\n", static_cast<unsigned long long>(hold.count), hold.totalMs, hold.maxMs, hold.maxPhases.c_str(), report.c_str(), hold.count != 0 ? static_cast<double>(hold.writersScanned) / hold.count : 0.0, hold.maxWriters, hold.count != 0 ? static_cast<double>(hold.drawWritersScanned) / hold.count : 0.0);
+        if (cls == HoldIndirect) AgcDriver::ProfilePrint_nid_no_patch("[indirect] %llu indirect dispatches spent %.0f ms inside the device call (10 s; max %.1f ms:%s), by phase (the 'resources: ...' rows split 'resources'; 'hook waits' overlaps them; 'images: ...' rows are the lookups by outcome, count x ms, inside 'B images'):%s; copied-writer lists scanned per decision: dispatch avg %.1f (max %zu), draw avg %.1f\n", static_cast<unsigned long long>(hold.count), hold.totalMs, hold.maxMs, hold.maxPhases.c_str(), report.c_str(), hold.count != 0 ? static_cast<double>(hold.writersScanned) / hold.count : 0.0, hold.maxWriters, hold.count != 0 ? static_cast<double>(hold.drawWritersScanned) / hold.count : 0.0);
+        else AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %llu direct dispatches on %s spent %.0f ms inside the device call (10 s; %.2f ms per dispatch; max %.1f ms:%s), by phase (the 'resources: ...' rows split 'resources'; 'hook waits' overlaps them; 'images: ...' rows are the lookups by outcome, count x ms, inside 'B images'):%s\n", static_cast<unsigned long long>(hold.count), HoldClassNames[cls], hold.totalMs, hold.count != 0 ? hold.totalMs / static_cast<double>(hold.count) : 0.0, hold.maxMs, hold.maxPhases.c_str(), report.c_str());
         hold.phaseMs = {};
         hold.phaseCounts = {};
         hold.count = 0;
@@ -3900,7 +3913,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
         outcome.cpuReason = 3;
     }
     if (timer.profile) {
-        auto& hold = Dispatches().indirectHold;
+        auto& hold = Dispatches().holds[HoldIndirect];
         hold.writersScanned += state->copiedWriters->size();
         hold.drawWritersScanned += Graphics::DrawCopiedWriters()->size();
         hold.maxWriters = std::max(hold.maxWriters, state->copiedWriters->size());
@@ -4144,7 +4157,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     const auto waitedBefore = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     // The image lookups of this call by outcome (stage B, a Revalidate or a locked build), for the
     // [indirect] line: reset here, read after the resources phase.
-    if (profile && arguments != 0) Graphics::ThreadLookupOutcomes() = {};
+    if (profile) Graphics::ThreadLookupOutcomes() = {};
     // The resource cache insert evicts the oldest entry, destroying its ShaderResources here when the
     // cache was the last owner: timed apart from the build.
     const auto insert = [&] {
@@ -4158,7 +4171,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         for (auto& object : evicted) state->recorder->Keep(std::move(object));
         if (profile) {
             timer.add(PhaseResourcesInsert, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - insertStart).count());
-            if (arguments != 0) d.indirectHold.phaseCounts[PhaseResourcesInsert] += evicted.size();
+            if (auto* rows = timer.holdRows()) rows->phaseCounts[PhaseResourcesInsert] += evicted.size();
         }
     };
     if (prepared != nullptr && prepared->resources != nullptr) {
@@ -4231,14 +4244,14 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     // The lookup outcomes of this call: rows with counts on the [indirect] line, and a summary for
     // the longest call.
-    if (profile && arguments != 0) {
+    if (auto* rows = profile ? timer.holdRows() : nullptr) {
         const auto& outcomes = Graphics::ThreadLookupOutcomes();
         for (std::size_t kind = 0; kind < Graphics::LookupOutcomes::Count; ++kind) {
             if (outcomes.counts[kind] == 0) continue;
             const auto row = DispatchPhaseCount + kind;
             timer.callMs[row] += outcomes.ms[kind];
-            d.indirectHold.phaseMs[row] += outcomes.ms[kind];
-            d.indirectHold.phaseCounts[row] += outcomes.counts[kind];
+            rows->phaseMs[row] += outcomes.ms[kind];
+            rows->phaseCounts[row] += outcomes.counts[kind];
         }
     }
     if (profile && std::chrono::steady_clock::now() - d.cacheReport > std::chrono::seconds(10)) {
