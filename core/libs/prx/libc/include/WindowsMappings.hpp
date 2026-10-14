@@ -5,8 +5,10 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 
 namespace GuestArena {
 
@@ -363,6 +366,7 @@ public:
                 }
             }
         } else if (clear && !collectable(address, end)) return false;
+        precomputeDigests(address, end, collection);
         for (auto cursor = address; cursor < end;) {
             const auto nextClean = cleanRanges.upper_bound(cursor);
             if (nextClean != cleanRanges.begin()) {
@@ -402,7 +406,7 @@ public:
                 }
                 if (view.protection == PAGE_NOACCESS) return false;
                 const bool pinned = view.page->pins != 0;
-                if (!pinned && view.page->digested != 0) verifyDigests(*view.page, base, subpagesOf(base, cursor, stop));
+                if (!pinned && view.page->digested != 0) verifyDigests(*view.page, base, subpagesOf(base, cursor, stop), precomputedDigests(base));
                 std::uint8_t settled = 0;
                 auto settledEnd = cursor;
                 bool full = false;
@@ -523,6 +527,7 @@ private:
         std::uint64_t smallDeviceWrites = 0;
         std::uint64_t subpageDeviceWrites = 0;
         std::uint64_t largeDeviceWrites = 0;
+        std::uint64_t parallelCollections = 0;
         std::chrono::steady_clock::duration hashing{};
         std::map<std::uintptr_t, std::uint64_t> regions;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
@@ -539,6 +544,12 @@ private:
         std::uint8_t digested = 0;
         std::uint8_t deviceWritten = 0;
         std::unique_ptr<ExcludedWords> excluded;
+    };
+    struct DigestTask {
+        const SharedPage* page;
+        std::uintptr_t base;
+        std::uint8_t mask;
+        std::array<std::uint64_t, subpages> digest;
     };
     struct Section {
         HANDLE handle;
@@ -804,7 +815,117 @@ private:
         }
     }
 
-    void verifyDigests(SharedPage& page, std::uintptr_t base, std::uint8_t mask) {
+    class DigestWorkers {
+    public:
+        static DigestWorkers& Instance() {
+            static auto* workers = new DigestWorkers();
+            return *workers;
+        }
+
+        std::size_t Count() const { return threads; }
+
+        template <typename TJob>
+        void Run(std::size_t items, TJob& job) {
+            std::unique_lock lock(mutex);
+            context = &job;
+            call = [](void* context, std::size_t item) { (*static_cast<TJob*>(context))(item); };
+            count = items;
+            next.store(0);
+            active = threads;
+            ++round;
+            lock.unlock();
+            wake.notify_all();
+            work();
+            lock.lock();
+            done.wait(lock, [&] { return active == 0; });
+        }
+
+    private:
+        DigestWorkers() {
+            const char* value = std::getenv("APS5_DIGEST_THREADS");
+            const auto hardware = std::max(1u, std::thread::hardware_concurrency());
+            threads = value != nullptr && *value != '\0' ? std::strtoul(value, nullptr, 10) : std::min<std::size_t>(8, std::max(1u, hardware / 4));
+            for (std::size_t index = 0; index < threads; ++index) std::thread([this] { serve(); }).detach();
+        }
+
+        void work() {
+            for (auto item = next.fetch_add(1); item < count; item = next.fetch_add(1)) call(context, item);
+        }
+
+        void serve() {
+            std::uint64_t seen = 0;
+            for (;;) {
+                {
+                    std::unique_lock lock(mutex);
+                    wake.wait(lock, [&] { return round != seen; });
+                    seen = round;
+                }
+                work();
+                std::lock_guard lock(mutex);
+                if (--active == 0) done.notify_one();
+            }
+        }
+
+        std::size_t threads = 0;
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::condition_variable done;
+        std::uint64_t round = 0;
+        std::size_t active = 0;
+        std::size_t count = 0;
+        std::atomic<std::size_t> next{0};
+        void* context = nullptr;
+        void (*call)(void*, std::size_t) = nullptr;
+    };
+
+    static std::size_t parallelDigestSubpages() {
+        static const std::size_t threshold = [] {
+            const char* value = std::getenv("APS5_PARALLEL_DIGEST_SUBPAGES");
+            return value != nullptr && *value != '\0' ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{256};
+        }();
+        return threshold;
+    }
+
+    void precomputeDigests(std::uintptr_t address, std::uintptr_t end, Collection collection) {
+        digestTasks.clear();
+        digestCursor = 0;
+        if (parallelDigestSubpages() == 0 || DigestWorkers::Instance().Count() == 0) return;
+        std::size_t total = 0;
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
+            const auto& view = it->second;
+            if (view.protection == PAGE_NOACCESS) break;
+            if (view.page->pins != 0 || view.page->digested == 0) continue;
+            auto mask = static_cast<std::uint8_t>(subpagesOf(it->first, std::max(address, it->first), std::min(end, it->first + pageBytes)) & view.page->digested);
+            if (collection == Collection::Armed) mask &= view.collected;
+            else if (collection != Collection::All) mask &= static_cast<std::uint8_t>(~view.collected);
+            if (mask == 0) continue;
+            digestTasks.push_back({view.page.get(), it->first, mask, {}});
+            total += static_cast<std::size_t>(std::popcount(static_cast<unsigned>(mask)));
+        }
+        if (total < parallelDigestSubpages()) {
+            digestTasks.clear();
+            return;
+        }
+        const bool traced = traceWriteTracking();
+        const auto start = traced ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        auto job = [this](std::size_t item) {
+            auto& task = digestTasks[item];
+            for (std::size_t sub = 0; sub < subpages; ++sub) {
+                if ((task.mask & (1u << sub)) != 0) task.digest[sub] = subpageDigest(*task.page, task.base, sub);
+            }
+        };
+        DigestWorkers::Instance().Run(digestTasks.size(), job);
+        if (!traced) return;
+        ++statistics.parallelCollections;
+        statistics.hashing += std::chrono::steady_clock::now() - start;
+    }
+
+    const DigestTask* precomputedDigests(std::uintptr_t base) {
+        while (digestCursor < digestTasks.size() && digestTasks[digestCursor].base < base) ++digestCursor;
+        return digestCursor < digestTasks.size() && digestTasks[digestCursor].base == base ? &digestTasks[digestCursor] : nullptr;
+    }
+
+    void verifyDigests(SharedPage& page, std::uintptr_t base, std::uint8_t mask, const DigestTask* precomputed = nullptr) {
         const bool traced = traceWriteTracking();
         const auto start = traced ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto checked = static_cast<std::uint8_t>(mask & page.digested);
@@ -812,7 +933,8 @@ private:
         for (std::size_t sub = 0; sub < subpages; ++sub) {
             const auto bit = static_cast<std::uint8_t>(1u << sub);
             if ((checked & bit) == 0) continue;
-            if (subpageDigest(page, base, sub) != page.digest[sub]) changed |= bit;
+            const auto digest = precomputed != nullptr && (precomputed->mask & bit) != 0 ? precomputed->digest[sub] : subpageDigest(page, base, sub);
+            if (digest != page.digest[sub]) changed |= bit;
         }
         if (changed != 0) invalidate(page, changed);
         if (!traced) return;
@@ -835,7 +957,7 @@ private:
         const auto now = std::chrono::steady_clock::now();
         if (now - statistics.since < std::chrono::seconds(5)) return;
         const auto seconds = std::chrono::duration<double>(now - statistics.since).count();
-        std::fprintf(stderr, "[write-tracking] %.0f s: %llu collections, %llu digested subpages checked (%.1f MiB) in %.1f ms, %llu changed, %llu guest write faults, device writes: %llu up to %zu bytes excluded from digests, %llu up to a subpage, %llu larger\n", seconds, static_cast<unsigned long long>(statistics.collections), static_cast<unsigned long long>(statistics.hashed), static_cast<double>(statistics.hashed) * subpageBytes / 1048576.0, std::chrono::duration<double, std::milli>(statistics.hashing).count(), static_cast<unsigned long long>(statistics.changed), static_cast<unsigned long long>(statistics.faults), static_cast<unsigned long long>(statistics.smallDeviceWrites), smallDeviceWriteBytes, static_cast<unsigned long long>(statistics.subpageDeviceWrites), static_cast<unsigned long long>(statistics.largeDeviceWrites));
+        std::fprintf(stderr, "[write-tracking] %.0f s: %llu collections (%llu hashed on %zu threads), %llu digested subpages checked (%.1f MiB) in %.1f ms, %llu changed, %llu guest write faults, device writes: %llu up to %zu bytes excluded from digests, %llu up to a subpage, %llu larger\n", seconds, static_cast<unsigned long long>(statistics.collections), static_cast<unsigned long long>(statistics.parallelCollections), DigestWorkers::Instance().Count() + 1, static_cast<unsigned long long>(statistics.hashed), static_cast<double>(statistics.hashed) * subpageBytes / 1048576.0, std::chrono::duration<double, std::milli>(statistics.hashing).count(), static_cast<unsigned long long>(statistics.changed), static_cast<unsigned long long>(statistics.faults), static_cast<unsigned long long>(statistics.smallDeviceWrites), smallDeviceWriteBytes, static_cast<unsigned long long>(statistics.subpageDeviceWrites), static_cast<unsigned long long>(statistics.largeDeviceWrites));
         std::vector<std::pair<std::uint64_t, std::uintptr_t>> busiest;
         for (const auto& [region, changes] : statistics.regions) busiest.emplace_back(changes, region);
         std::sort(busiest.rbegin(), busiest.rend());
@@ -997,6 +1119,8 @@ private:
     Ranges cleanRanges;
     Ranges freshRanges;
     Statistics statistics;
+    std::vector<DigestTask> digestTasks;
+    std::size_t digestCursor = 0;
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, Physical> physical;
     std::map<std::uintptr_t, Run> residentRuns;
