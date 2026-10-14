@@ -109,8 +109,8 @@ std::shared_ptr<const ShaderSnapshot> RegisteredHeader(const ShaderRegistry& reg
 std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& registry, std::uint64_t address, std::initializer_list<std::uint8_t> types);
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot);
 void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared = nullptr);
-unsigned RegistrationPreparationThreads();
 void PrioritizeRegistrationPreparation(PreparedShaders& prepared);
+unsigned RegistrationPreparationThreads();
 void SubmitLibraryPrebuild(std::function<void()> task);
 void CloseRegistrationPreparation();
 
