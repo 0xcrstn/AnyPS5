@@ -794,7 +794,7 @@ public:
 private:
     static unsigned PreparationThreads() {
         const char* text = std::getenv("APS5_PREPARE_THREADS");
-        if (text == nullptr || *text == '\0') return std::max(2u, std::thread::hardware_concurrency() / 2u);
+        if (text == nullptr || *text == '\0') return std::clamp(std::thread::hardware_concurrency() / 4u, 2u, 8u);
         char* end = nullptr;
         const auto value = std::strtoul(text, &end, 10);
         if (end == text || *end != '\0' || value == 0 || value > 1024) throw std::runtime_error("APS5_PREPARE_THREADS is not a thread count from 1 to 1024: " + std::string(text));
