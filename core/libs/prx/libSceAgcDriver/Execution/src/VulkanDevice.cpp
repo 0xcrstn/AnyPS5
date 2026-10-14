@@ -3071,6 +3071,9 @@ std::string VulkanDevice::DescribeMemoryHeaps() const {
     for (const auto count : libraries.built) built += count;
     std::snprintf(part, sizeof(part), "; pipelines created: compute %llu, graphics libraries %llu, linked %llu, optimized %llu", static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(built), static_cast<unsigned long long>(libraries.linked), static_cast<unsigned long long>(libraries.optimized));
     text += part;
+    const auto modules = Graphics::CreatedShaderModules();
+    std::snprintf(part, sizeof(part), "; shader modules handed to the driver %llu (%.0f MiB SPIR-V)", static_cast<unsigned long long>(modules.modules), static_cast<double>(modules.spirvBytes) / 1048576.0);
+    text += part;
     return text;
 }
 
@@ -3841,6 +3844,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
     moduleInfo.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
     moduleInfo.pCode = shader.spirv.data();
     check(DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
+    Graphics::NoteShaderModule(moduleInfo.codeSize);
     const std::array<VkDescriptorSetLayout, 2> setLayouts{resources.Layout(), shader.workgroupMemoryDwords != 0 ? workgroupMemoryLayout : VK_NULL_HANDLE};
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
     VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};

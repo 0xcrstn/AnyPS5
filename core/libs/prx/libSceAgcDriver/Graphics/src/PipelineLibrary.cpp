@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -302,6 +303,22 @@ void ClearPipelineLibraries(VkDevice device) {
     for (const auto& [key, handle] : libraries.layouts) libraries.destroyLayout(device, handle, nullptr);
     for (const auto module : libraries.modules) libraries.destroyModule(device, module, nullptr);
     store.devices.erase(found);
+}
+
+namespace {
+
+std::atomic<std::uint64_t> createdModules{0};
+std::atomic<std::uint64_t> createdModuleBytes{0};
+
+}
+
+void NoteShaderModule(std::size_t spirvBytes) {
+    createdModules.fetch_add(1, std::memory_order_relaxed);
+    createdModuleBytes.fetch_add(spirvBytes, std::memory_order_relaxed);
+}
+
+ShaderModuleCounters CreatedShaderModules() {
+    return {createdModules.load(std::memory_order_relaxed), createdModuleBytes.load(std::memory_order_relaxed)};
 }
 
 std::array<std::uint64_t, 4>& ThreadBuiltLibraryParts() {

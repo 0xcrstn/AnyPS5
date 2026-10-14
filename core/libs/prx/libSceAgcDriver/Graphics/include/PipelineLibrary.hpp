@@ -51,6 +51,14 @@ struct PipelineLibraryCounters {
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device);
 
+struct ShaderModuleCounters {
+    std::uint64_t modules = 0;
+    std::uint64_t spirvBytes = 0;
+};
+
+void NoteShaderModule(std::size_t spirvBytes);
+ShaderModuleCounters CreatedShaderModules();
+
 }
 
 #endif

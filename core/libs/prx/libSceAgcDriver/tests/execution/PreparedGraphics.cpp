@@ -139,9 +139,16 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
                 shaders.push_back({group[index].stage, group[index].registration.get(), group[index].pushOffset});
             }
             const auto before = AgcDriver::Graphics::PipelineLibraryCountersOf(device.Device());
+            const auto modulesBefore = AgcDriver::Graphics::CreatedShaderModules();
             Require(device.PrebuildGraphicsLibraries(prepared.state.stages, shaders), "registration modules: the shader libraries were not prebuilt");
             const auto after = AgcDriver::Graphics::PipelineLibraryCountersOf(device.Device());
+            const auto modulesAfter = AgcDriver::Graphics::CreatedShaderModules();
             Require(after.linked == before.linked, "registration modules: a prebuild linked a pipeline");
+            std::uint64_t built = 0;
+            for (std::size_t part = 1; part < 3; ++part) built += after.built[part] - before.built[part];
+            std::uint64_t spirvBytes = 0;
+            for (const auto index : picked) spirvBytes += group[index].registration->spirv.size() * sizeof(std::uint32_t);
+            Require(built == 0 || (modulesAfter.modules - modulesBefore.modules >= picked.size() && modulesAfter.spirvBytes - modulesBefore.spirvBytes >= spirvBytes), "registration modules: the shader modules handed to the driver were not counted with their SPIR-V");
             return std::pair{after.built[1] - before.built[1], after.built[2] - before.built[2]};
         };
         const auto vertexOnly = prebuild(stages, {0u});
