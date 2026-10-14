@@ -125,7 +125,8 @@ private:
     static bool drawRelocationEnabled();
     static std::uint64_t relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable, std::vector<std::uint32_t>* raw = nullptr);
     static bool drawMissDiagnosisEnabled();
-    static void tagDataLeaves(DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads);
+    static bool relocatedOnlyEntries();
+    static DataWordPositionCounts tagDataLeaves(DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads);
     void noteDrawKeyMiss(DrawKeyMiss reason);
     void diagnoseStructureMiss(const DrawAliasKeys& aliases);
     void diagnoseStageMiss(const DrawAliasKeys& aliases, std::size_t stage, std::uint32_t userDataBase, std::uint64_t donorKey, bool refused);
@@ -337,6 +338,7 @@ private:
     std::unordered_map<std::uint64_t, DrawRelocationTrial> drawRelocationTrials;
     DrawRelocationCounters drawRelocationCounters;
     DrawMissDiagnosis drawMissDiagnosis;
+    bool drawExactKeySeen = false;
     std::vector<std::uint64_t> drawStageDonorKeys;
     std::mutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;

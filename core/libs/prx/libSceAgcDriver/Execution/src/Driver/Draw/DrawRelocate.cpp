@@ -30,6 +30,11 @@ std::uint64_t UserDataReads(const ShaderRecompiler::SrtUserDataUse& use, const S
     return reads;
 }
 
+bool Driver::relocatedOnlyEntries() {
+    static const bool enabled = std::getenv("APS5_DRAW_EXACT_RELOCATED_ENTRIES") == nullptr;
+    return enabled;
+}
+
 bool Driver::drawRelocationEnabled() {
     static const bool enabled = std::getenv("APS5_NO_DRAW_RELOCATION") == nullptr;
     return enabled;
@@ -115,44 +120,62 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
 }
 
 void Driver::learnPendingRelocation() {
-    const auto pending = drawRelocationPending;
+    auto pending = std::move(drawRelocationPending);
     drawRelocationPending = {};
     if (pending.key == 0) return;
-    const auto inserted = drawCache.find(pending.key);
-    if (inserted == drawCache.end() || inserted->second->decode == nullptr) return;
-    const auto& entry = *inserted->second;
-    const auto& programs = entry.decode->programs;
-    if (entry.stages.size() != programs.size()) return;
+    std::shared_ptr<const DrawDecode> decode;
+    std::vector<std::shared_ptr<DispatchVariant>> fronts;
+    if (pending.decode != nullptr) {
+        decode = pending.decode;
+        fronts = std::move(pending.stages);
+    } else {
+        const auto inserted = drawCache.find(pending.key);
+        if (inserted == drawCache.end() || inserted->second->decode == nullptr) return;
+        decode = inserted->second->decode;
+        for (const auto& variants : inserted->second->stages) fronts.push_back(variants.empty() ? nullptr : variants.front());
+    }
+    const auto& programs = decode->programs;
+    if (fronts.size() != programs.size()) return;
     const auto known = drawRelocations.find(pending.identity);
-    auto shape = std::make_shared<DrawRelocation>();
-    if (known != drawRelocations.end()) *shape = *known->second;
-    bool changed = known == drawRelocations.end();
+    static const DrawRelocation none;
+    const DrawRelocation* view = known != drawRelocations.end() ? known->second.get() : &none;
+    std::shared_ptr<DrawRelocation> owned;
+    const auto writable = [&]() -> DrawRelocation& {
+        if (owned == nullptr) {
+            owned = std::make_shared<DrawRelocation>(*view);
+            view = owned.get();
+        }
+        return *owned;
+    };
+    if (known == drawRelocations.end()) writable();
     for (std::size_t i = 0; i < programs.size(); ++i) {
-        if (entry.stages[i].empty()) continue;
-        const auto& variant = *entry.stages[i].front();
+        if (fronts[i] == nullptr) continue;
+        const auto& variant = *fronts[i];
         const auto& program = programs[i];
         for (std::uint32_t index = program.hiddenUserWords; index < program.userData.size() && index < 64; ++index) {
             const auto reg = program.userDataBase + index - program.hiddenUserWords;
             const bool readHere = (variant.userDataReads >> index & 1u) != 0;
-            const bool knownRead = std::find(shape->read.begin(), shape->read.end(), reg) != shape->read.end();
-            const auto unread = std::find(shape->unread.begin(), shape->unread.end(), reg);
+            const bool knownRead = std::find(view->read.begin(), view->read.end(), reg) != view->read.end();
+            const bool knownUnread = std::find(view->unread.begin(), view->unread.end(), reg) != view->unread.end();
             if (readHere && !knownRead) {
-                shape->read.push_back(reg);
-                if (unread != shape->unread.end()) shape->unread.erase(unread);
-                changed = true;
-            } else if (!readHere && !knownRead && unread == shape->unread.end()) {
-                shape->unread.push_back(reg);
-                changed = true;
+                auto& shape = writable();
+                shape.read.push_back(reg);
+                if (const auto unread = std::find(shape.unread.begin(), shape.unread.end(), reg); unread != shape.unread.end()) shape.unread.erase(unread);
+            } else if (!readHere && !knownRead && !knownUnread) {
+                writable().unread.push_back(reg);
             }
-            const auto held = std::find_if(shape->words.begin(), shape->words.end(), [&](const RelocatableUserWord& word) { return word.reg == reg; });
+            const auto heldAt = std::find_if(view->words.begin(), view->words.end(), [&](const RelocatableUserWord& word) { return word.reg == reg; });
+            const bool held = heldAt != view->words.end();
+            const auto heldIndex = static_cast<std::size_t>(heldAt - view->words.begin());
             if ((variant.relocatableWords >> index & 1u) == 0) {
-                if (held == shape->words.end()) continue;
-                shape->words.erase(held);
-                shape->banned.push_back(reg);
-                changed = true;
+                if (!held) continue;
+                auto& shape = writable();
+                shape.words.erase(shape.words.begin() + static_cast<std::ptrdiff_t>(heldIndex));
+                shape.banned.push_back(reg);
                 continue;
             }
-            if (std::find(shape->banned.begin(), shape->banned.end(), reg) != shape->banned.end()) continue;
+            if (std::find(view->banned.begin(), view->banned.end(), reg) != view->banned.end()) continue;
+            if (held && variant.dataPositions.empty()) continue;
             RelocatableUserWord word{reg, {}};
             const auto base = AlignedWord(program.userData[index]);
             std::uint32_t position = 0;
@@ -166,30 +189,29 @@ void Driver::learnPendingRelocation() {
                 }
                 position += count;
             }
-            if (held != shape->words.end()) {
-                const auto before = held->dataOffsets.size();
+            if (held) {
+                const auto& offsets = view->words[heldIndex].dataOffsets;
+                const bool fresh = std::any_of(word.dataOffsets.begin(), word.dataOffsets.end(), [&](std::int64_t offset) { return std::find(offsets.begin(), offsets.end(), offset) == offsets.end(); });
+                if (!fresh) continue;
+                auto& merged = writable().words[heldIndex].dataOffsets;
                 for (const auto offset : word.dataOffsets) {
-                    if (std::find(held->dataOffsets.begin(), held->dataOffsets.end(), offset) == held->dataOffsets.end()) held->dataOffsets.push_back(offset);
+                    if (std::find(merged.begin(), merged.end(), offset) == merged.end()) merged.push_back(offset);
                 }
-                if (held->dataOffsets.size() != before) {
-                    std::sort(held->dataOffsets.begin(), held->dataOffsets.end());
-                    changed = true;
-                }
+                std::sort(merged.begin(), merged.end());
                 continue;
             }
-            shape->words.push_back(std::move(word));
-            changed = true;
+            writable().words.push_back(std::move(word));
         }
     }
-    if (changed) {
-        std::sort(shape->words.begin(), shape->words.end(), [](const RelocatableUserWord& a, const RelocatableUserWord& b) { return a.reg < b.reg; });
-        drawRelocations[pending.identity] = std::move(shape);
+    if (owned != nullptr) {
+        std::sort(owned->words.begin(), owned->words.end(), [](const RelocatableUserWord& a, const RelocatableUserWord& b) { return a.reg < b.reg; });
+        drawRelocations[pending.identity] = std::move(owned);
     }
     if (pending.aliases.structure == 0) return;
-    DrawDecodeDonor donor{entry.decode, std::vector<std::uint64_t>(programs.size(), 0)};
+    DrawDecodeDonor donor{decode, std::vector<std::uint64_t>(programs.size(), 0)};
     for (std::size_t i = 0; i < programs.size(); ++i) {
-        if (entry.stages[i].empty() || entry.stages[i].front() == nullptr || entry.stages[i].front()->prepared == nullptr) continue;
-        const auto& variant = entry.stages[i].front();
+        if (fronts[i] == nullptr || fronts[i]->prepared == nullptr) continue;
+        const auto& variant = fronts[i];
         const auto& program = programs[i];
         std::uint64_t key = 0xcbf29ce484222325ull;
         const auto mix = [&](std::uint64_t value) {
@@ -449,13 +471,13 @@ void Driver::tagBufferWords(DispatchVariant& variant, std::span<const ShaderReco
     }
 }
 
-void Driver::tagDataLeaves(DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads) {
-    if (!drawRelocationEnabled() || !dataHits() || leaves.empty() || variant.compiled == nullptr || variant.dataPositions.size() != variant.dataSlots.size()) return;
+DataWordPositionCounts Driver::tagDataLeaves(DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads) {
+    if (!drawRelocationEnabled() || !dataHits() || leaves.empty() || variant.compiled == nullptr || variant.dataPositions.size() != variant.dataSlots.size()) return {};
     const auto& bindings = variant.compiled->bindings;
     const auto flat = std::find_if(bindings.begin(), bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt; });
-    if (flat == bindings.end()) return;
+    if (flat == bindings.end()) return {};
     std::vector<std::uint32_t> positions, slots;
-    DataWordPositions(variant.runs, leaves, otherReads, variant.words, flat->guestDescriptor, positions, slots);
+    const auto counts = DataWordPositions(variant.runs, leaves, otherReads, variant.words, flat->guestDescriptor, positions, slots);
     struct Tagged {
         std::uint32_t position, slot;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> patches;
@@ -464,12 +486,11 @@ void Driver::tagDataLeaves(DispatchVariant& variant, std::span<const std::pair<s
     for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) merged.push_back({variant.dataPositions[k], variant.dataSlots[k], variant.bufferWordBuffers[k]});
     const auto buffers = merged.size();
     for (std::size_t k = 0; k < positions.size(); ++k) {
-        const bool repeated = (k > 0 && positions[k - 1] == positions[k]) || (k + 1 < positions.size() && positions[k + 1] == positions[k]);
-        if (repeated || std::any_of(merged.begin(), merged.begin() + static_cast<std::ptrdiff_t>(buffers), [&](const Tagged& entry) { return entry.position == positions[k]; })) continue;
+        if (std::any_of(merged.begin(), merged.begin() + static_cast<std::ptrdiff_t>(buffers), [&](const Tagged& entry) { return entry.position == positions[k]; })) continue;
         merged.push_back({positions[k], slots[k], {}});
     }
-    if (merged.size() == buffers) return;
-    std::sort(merged.begin(), merged.end(), [](const Tagged& a, const Tagged& b) { return a.position < b.position; });
+    if (merged.size() == buffers) return counts;
+    std::stable_sort(merged.begin(), merged.end(), [](const Tagged& a, const Tagged& b) { return a.position < b.position; });
     variant.dataPositions.clear();
     variant.dataSlots.clear();
     variant.bufferWordBuffers.clear();
@@ -479,6 +500,7 @@ void Driver::tagDataLeaves(DispatchVariant& variant, std::span<const std::pair<s
         variant.bufferWordBuffers.push_back(std::move(entry.patches));
     }
     variant.flatBinding = static_cast<std::uint32_t>(flat - bindings.begin());
+    return counts;
 }
 
 std::shared_ptr<DispatchVariant> Driver::patchBufferWords(const DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint32_t>> live) {
@@ -493,8 +515,11 @@ std::shared_ptr<DispatchVariant> Driver::patchBufferWords(const DispatchVariant&
         if (variant.dataSlots[k] != DispatchVariant::NoFlatBinding) {
             if (variant.flatBinding >= rebased->bindings.size()) return nullptr;
             auto& descriptor = rebased->bindings[variant.flatBinding].guestDescriptor;
-            if (variant.dataSlots[k] >= descriptor.size() || descriptor[variant.dataSlots[k]] != stored) return nullptr;
-            descriptor[variant.dataSlots[k]] = fresh;
+            for (auto at = k; at < variant.dataPositions.size() && variant.dataPositions[at] == position; ++at) {
+                const auto slot = variant.dataSlots[at];
+                if (slot == DispatchVariant::NoFlatBinding || slot >= descriptor.size() || descriptor[slot] != stored) return nullptr;
+                descriptor[slot] = fresh;
+            }
             copy->words[position] = fresh;
             continue;
         }

@@ -117,7 +117,17 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             tagVariantRuns(*variant, regions, stageCapture.userDataUse, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords);
             variant->userDataReads = UserDataReads(stageCapture.userDataUse, *stageCapture.compiled, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords);
             tagBufferWords(*variant, stageCapture.bufferBaseWords);
-            tagDataLeaves(*variant, stageCapture.dataLeaves, stageCapture.otherReads);
+            const auto leafCounts = tagDataLeaves(*variant, stageCapture.dataLeaves, stageCapture.otherReads);
+            if (drawMissDiagnosisEnabled()) {
+                std::lock_guard cacheLock(drawCacheMutex);
+                auto& diagnosis = drawMissDiagnosis;
+                diagnosis.leavesOffered += stageCapture.dataLeaves.size();
+                diagnosis.leavesUnmapped += leafCounts.unmapped;
+                diagnosis.leavesMismatched += leafCounts.mismatched;
+                diagnosis.leavesAliased += leafCounts.aliased;
+                diagnosis.leavesTagged += static_cast<std::uint64_t>(std::count_if(variant->dataSlots.begin(), variant->dataSlots.end(), [](std::uint32_t slot) { return slot != DispatchVariant::NoFlatBinding; }));
+                ++diagnosis.stagesTagged;
+            }
             variant->inputExports = stageCapture.inputExports;
             const auto sameContent = [](const DispatchVariant& a, const DispatchVariant& b) {
                 const auto flatten = [](const DispatchVariant& source) {
@@ -160,7 +170,18 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             }
             fresh[i] = std::move(variant);
         }
-        insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr);
+        bool stashed = false;
+        if (registerKey && decode != nullptr && !verifyHit && relocatedOnlyEntries()) {
+            std::lock_guard cacheLock(drawCacheMutex);
+            auto& pending = drawRelocationPending;
+            if (!drawExactKeySeen && pending.key == drawKey && pending.relocation != nullptr && pending.aliases.structure != 0) {
+                pending.decode = decode;
+                pending.stages = fresh;
+                ++drawEntryCounters.stashed;
+                stashed = true;
+            }
+        }
+        if (!stashed) insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr);
         if (unstable != 0 || mismatches != 0) {
             std::lock_guard cacheLock(drawCacheMutex);
             drawEntryCounters.unstable += unstable;
