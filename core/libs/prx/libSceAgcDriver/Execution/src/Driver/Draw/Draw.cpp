@@ -451,7 +451,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 rejected = std::move(*known);
                 return DrawVerdict::Rejected;
             }
+            phaseTiming.Phase(DrawRowVectors);
             localDevice->PrewarmDrawPipeline(graphics, stages);
+            phaseTiming.Phase(DrawRowPipelinePrepare);
             lockForDraw();
             noteDrawWriters(stages, submission.queue);
             phaseTiming.Phase(DrawRowVectors);
@@ -478,7 +480,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             rejected = std::move(*known);
             return DrawVerdict::Rejected;
         }
+        phaseTiming.Phase(DrawRowVectors);
         localDevice->PrewarmDrawPipeline(graphics, stages);
+        phaseTiming.Phase(DrawRowPipelinePrepare);
     }
     lockForDraw();
     noteDrawWriters(stages, submission.queue);

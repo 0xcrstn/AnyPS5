@@ -18,6 +18,7 @@ void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, b
     totals.captures += captures;
     const auto now = std::chrono::steady_clock::now();
     if (now - totals.lastReport < std::chrono::seconds(10)) return;
+    const auto elapsedSeconds = std::chrono::duration<double>(now - totals.lastReport).count();
     totals.lastReport = now;
     std::string report;
     double total = 0;
@@ -27,7 +28,7 @@ void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, b
         report += text;
         total += totals.ms[i];
     }
-    AgcDriver::ProfilePrint_nid_no_patch( "[draw] driver phases (10 s, %llu draw packets, %llu drawn, %llu captures), us per packet:%s, total %.1f (%.1f ms; Graphics::Draw %.1f ms, skipped %.1f ms)\n", static_cast<unsigned long long>(totals.packets), static_cast<unsigned long long>(totals.drawn), static_cast<unsigned long long>(totals.captures), report.c_str(), total * 1000 / static_cast<double>(totals.packets), total, totals.ms[DrawRowGraphics], totals.ms[DrawRowSkipped]);
+    AgcDriver::ProfilePrint_nid_no_patch( "[draw] driver phases (%.3f s, %llu draw packets, %llu drawn, %llu captures), us per packet:%s, total %.1f (%.1f ms; Graphics::Draw %.1f ms, skipped %.1f ms)\n", elapsedSeconds, static_cast<unsigned long long>(totals.packets), static_cast<unsigned long long>(totals.drawn), static_cast<unsigned long long>(totals.captures), report.c_str(), total * 1000 / static_cast<double>(totals.packets), total, totals.ms[DrawRowGraphics], totals.ms[DrawRowSkipped]);
     totals.ms = {};
     totals.packets = totals.drawn = totals.captures = 0;
 }

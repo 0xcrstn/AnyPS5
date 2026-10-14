@@ -2494,6 +2494,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     ++timingBatches;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
+    const auto elapsedSeconds = std::chrono::duration<double>(now - lastReport).count();
     lastReport = now;
     const auto presents = timingPresents.exchange(0, std::memory_order_relaxed);
     const double perPresent = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
@@ -2518,8 +2519,11 @@ void Recorder::readGpuTiming(Batch& batch) {
         }
     }
     // The first field stays the program sum: the measure scripts match on it.
-    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
-    AgcDriver::ProfilePrint_nid_no_patch("%s; by draw program (%.0f ms in %zu programs):%s", FormatGpuPrograms(std::move(dispatchPrograms), false, 12).c_str(), timingDrawProgramMs, drawPrograms.size(), FormatGpuPrograms(std::move(drawPrograms), true, 16).c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over %.3f s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), elapsedSeconds, timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
+    const auto drawProgramCount = drawPrograms.size();
+    const auto dispatchReport = FormatGpuPrograms(std::move(dispatchPrograms), false, 12);
+    const auto drawReport = FormatGpuPrograms(std::move(drawPrograms), true, 16);
+    AgcDriver::ProfilePrint_nid_no_patch("%s; by draw program (%.0f ms in %zu programs):%s", dispatchReport.c_str(), timingDrawProgramMs, drawProgramCount, drawReport.c_str());
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();
     timingPlacement.clear();
