@@ -3850,6 +3850,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
         bool reused = buffer != nullptr;
+        bool partial = false;
         if (buffer != nullptr) {
             if (statistics != nullptr) ++statistics->reused;
         } else {
@@ -3857,7 +3858,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             lap(&DrawBindingsStatistics::collectUs);
             buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
             lap(&DrawBindingsStatistics::lookupUs);
-            bool partial = false;
             if (buffer == nullptr) {
                 buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, BufferExtent::SizeClass);
                 lap(&DrawBindingsStatistics::bufferUs);
@@ -3899,7 +3899,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         lap(&DrawBindingsStatistics::keepUs);
         selected.push_back(index);
-        auto twin = reused ? recorder.SnapshotTwin(buffer) : std::shared_ptr<Buffer>{};
+        auto twin = partial ? std::shared_ptr<Buffer>{} : recorder.SnapshotTwin(begin, Recorder::SnapshotUse::Storage, buffer, reused);
         if (twin != nullptr && statistics != nullptr) ++statistics->twins;
         const auto snapshotHandle = twin != nullptr ? twin->Handle() : buffer->Handle();
         const auto snapshotBytes = buffer->Bytes();

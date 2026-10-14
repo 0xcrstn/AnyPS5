@@ -108,7 +108,7 @@ public:
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer);
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
-    std::shared_ptr<Buffer> SnapshotTwin(const std::shared_ptr<Buffer>& snapshot);
+    std::shared_ptr<Buffer> SnapshotTwin(std::uint64_t address, SnapshotUse use, const std::shared_ptr<Buffer>& snapshot, bool reused = true);
     VkCommandBuffer PrologueCommands() { return prologueCommands(); }
     const Context& GetContext() const { return context; }
     struct SnapshotTwinCounters {
@@ -119,6 +119,7 @@ public:
         std::uint64_t dropped = 0;
         std::uint64_t patched = 0;
         std::uint64_t patchedBytes = 0;
+        std::uint64_t unkept = 0;
     };
     static SnapshotTwinCounters TwinCounters();
     static bool SnapshotTwinsEnabled();
@@ -885,16 +886,18 @@ private:
     std::list<DrawSnapshotKey> indexRangeRecency;
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
     struct SnapshotTwinEntry {
-        std::weak_ptr<Buffer> source;
         std::shared_ptr<Buffer> twin;
+        const Buffer* source;
+        std::uint64_t generation;
+        std::uint64_t registryGeneration;
+        std::list<DrawSnapshotKey>::iterator recent;
     };
-    std::unordered_map<const Buffer*, SnapshotTwinEntry> snapshotTwins;
+    std::map<DrawSnapshotKey, SnapshotTwinEntry> snapshotTwins;
+    std::list<DrawSnapshotKey> snapshotTwinRecency;
     std::size_t snapshotTwinBytes = 0;
-    void sweepSnapshotTwins();
+    void dropSnapshotTwin(std::map<DrawSnapshotKey, SnapshotTwinEntry>::iterator entry);
     std::vector<VkCommandBuffer> sparePrologues;
     VkCommandBuffer prologueCommands();
-    void forgetSnapshotTwin(const Buffer* snapshot);
-    void patchSnapshotTwin(const std::shared_ptr<Buffer>& snapshot, std::span<const std::pair<std::size_t, std::size_t>> spans);
 };
 
 }

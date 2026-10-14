@@ -547,7 +547,7 @@ void reportRecordParts(const DrawProfile& profile) {
         static Recorder::SnapshotTwinCounters reportedTwins{};
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw; %llu copies limited to the read ranges, %.1f KiB left uncopied per such draw), %llu skipped, %llu descriptor writes; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.limited), static_cast<double>(bindings.uncopiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
         if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) {
-            std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; device twins%s: %llu snapshot reads bound to one (%.1f MiB), %llu made (%.1f MiB copied in batch prologues), %llu patched in place (%.1f MiB), %llu dropped", Recorder::SnapshotTwinsEnabled() ? "" : " (off)", static_cast<unsigned long long>(twins.bound - reportedTwins.bound), static_cast<double>(twins.boundBytes - reportedTwins.boundBytes) / 1048576.0, static_cast<unsigned long long>(twins.made - reportedTwins.made), static_cast<double>(twins.madeBytes - reportedTwins.madeBytes) / 1048576.0, static_cast<unsigned long long>(twins.patched - reportedTwins.patched), static_cast<double>(twins.patchedBytes - reportedTwins.patchedBytes) / 1048576.0, static_cast<unsigned long long>(twins.dropped - reportedTwins.dropped));
+            std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; device twins%s: %llu snapshot reads bound to one (%.1f MiB), %llu made (%.1f MiB copied in batch prologues), %llu refreshed by changed blocks (%.1f MiB), %llu evicted, %llu reads of unkept snapshots", Recorder::SnapshotTwinsEnabled() ? "" : " (off)", static_cast<unsigned long long>(twins.bound - reportedTwins.bound), static_cast<double>(twins.boundBytes - reportedTwins.boundBytes) / 1048576.0, static_cast<unsigned long long>(twins.made - reportedTwins.made), static_cast<double>(twins.madeBytes - reportedTwins.madeBytes) / 1048576.0, static_cast<unsigned long long>(twins.patched - reportedTwins.patched), static_cast<double>(twins.patchedBytes - reportedTwins.patchedBytes) / 1048576.0, static_cast<unsigned long long>(twins.dropped - reportedTwins.dropped), static_cast<unsigned long long>(twins.unkept - reportedTwins.unkept));
         }
         reportedTwins = twins;
     }
@@ -1119,7 +1119,12 @@ struct DrawInputs {
     std::vector<VkBuffer> vertexHandles;
     std::vector<VkDeviceSize> vertexOffsets;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
-    std::vector<std::shared_ptr<Buffer>> reusedCopies;
+    struct ReusedCopy {
+        std::uint64_t address;
+        Recorder::SnapshotUse use;
+        std::shared_ptr<Buffer> buffer;
+    };
+    std::vector<ReusedCopy> reusedCopies;
     std::set<std::uint32_t> fragmentOutputs;
     VkPipelineStageFlags shaderStages = 0;
     std::uint32_t meshGroups = 0;
@@ -1257,7 +1262,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.indexOffset = draw.indexAddress - import->base;
             inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
         } else {
-            if (copy.reused) inputs.reusedCopies.push_back(copy.buffer);
+            if (copy.reused) inputs.reusedCopies.push_back({draw.indexAddress, use, copy.buffer});
             inputs.indices = std::move(copy.buffer);
             inputs.indexHandle = inputs.indices->Handle();
         }
@@ -1325,7 +1330,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
-        if (copy.reused) inputs.reusedCopies.push_back(copy.buffer);
+        if (copy.reused) inputs.reusedCopies.push_back({begin, Recorder::SnapshotUse::Vertex, copy.buffer});
         rangeHandles.push_back(copy.buffer->Handle());
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
@@ -1587,8 +1592,8 @@ struct IndirectRecord {
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
 void bindInputTwins(Recorder& recorder, DrawInputs& inputs) {
-    for (const auto& copy : inputs.reusedCopies) {
-        auto twin = recorder.SnapshotTwin(copy);
+    for (const auto& [address, use, copy] : inputs.reusedCopies) {
+        auto twin = recorder.SnapshotTwin(address, use, copy);
         if (twin == nullptr) continue;
         const auto handle = copy->Handle();
         if (inputs.indices == copy && inputs.indexHandle == handle) inputs.indexHandle = twin->Handle();
