@@ -18,7 +18,7 @@ public:
     PresentationPass(const PresentationPass&) = delete;
     PresentationPass& operator=(const PresentationPass&) = delete;
 
-    void Bind(std::size_t slot, VkImage image, std::uint32_t width, std::uint32_t height, std::uint64_t pixelFormat);
+    void Bind(std::size_t slot, VkImage image, std::uint32_t width, std::uint32_t height, std::uint64_t pixelFormat, std::uint32_t layer = 0);
     void RecordPresent(VkCommandBuffer commands, std::size_t slot, VkImage destination, VkFormat format, VkExtent2D extent, VkImageLayout finalLayout);
     void RecordDump(VkCommandBuffer commands, std::size_t slot, std::uint32_t stride, VkBuffer destination);
     void Release(std::size_t slot) noexcept;
@@ -45,7 +45,7 @@ private:
     };
 
     const Target& target(VkFormat format, VkImageLayout finalLayout);
-    VkImageView createView(VkImage image, VkFormat format, VkImageUsageFlags usage) const;
+    VkImageView createView(VkImage image, VkFormat format, VkImageUsageFlags usage, std::uint32_t layer = 0) const;
     VkFramebuffer createFramebuffer(VkRenderPass renderPass, VkImageView view, VkExtent2D extent) const;
     void ensureDumpTarget(Slot& slot, VkExtent2D extent);
     void releaseDumpTarget(Slot& slot) noexcept;

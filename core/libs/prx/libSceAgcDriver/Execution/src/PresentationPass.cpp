@@ -113,7 +113,7 @@ void PresentationPass::Release(std::size_t index) noexcept {
     slot.source = VK_NULL_HANDLE;
 }
 
-VkImageView PresentationPass::createView(VkImage image, VkFormat format, VkImageUsageFlags usage) const {
+VkImageView PresentationPass::createView(VkImage image, VkFormat format, VkImageUsageFlags usage, std::uint32_t layer) const {
     VkImageViewUsageCreateInfo usageInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     usageInfo.usage = usage;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -122,7 +122,7 @@ VkImageView PresentationPass::createView(VkImage image, VkFormat format, VkImage
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = format;
     viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1};
     VkImageView view = VK_NULL_HANDLE;
     Graphics::Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView presentation pass");
     return view;
@@ -226,13 +226,13 @@ const PresentationPass::Target& PresentationPass::target(VkFormat format, VkImag
     return targets.emplace(key, created).first->second;
 }
 
-void PresentationPass::Bind(std::size_t index, VkImage image, std::uint32_t width, std::uint32_t height, std::uint64_t pixelFormat) {
+void PresentationPass::Bind(std::size_t index, VkImage image, std::uint32_t width, std::uint32_t height, std::uint64_t pixelFormat, std::uint32_t layer) {
     Graphics::Require(index < slots.size(), "presentation pass slot is out of range");
     Graphics::Require(image != VK_NULL_HANDLE && width != 0 && height != 0, "presentation pass source is unavailable");
     Graphics::Require(!DisplayHalfFloat(pixelFormat), "presentation pass does not decode 16-bit float display buffers");
     Release(index);
     auto& slot = slots[index];
-    slot.source = createView(image, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT);
+    slot.source = createView(image, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_SAMPLED_BIT, layer);
     slot.width = width;
     slot.height = height;
     slot.mode = (DisplayTenBit(pixelFormat) ? ModeTenBit : 0u) | (DisplayRedLow(pixelFormat) ? ModeRedLow : 0u);

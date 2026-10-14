@@ -104,7 +104,7 @@ void PresentationScaler::RecordBlitInto(VkCommandBuffer commands, VkImage image,
     RecordBlitInto(commands, image, layout, filter, sourceWidth, sourceHeight);
 }
 
-void PresentationScaler::RecordBlitInto(VkCommandBuffer commands, VkImage image, VkImageLayout layout, VkFilter filter, std::uint32_t width, std::uint32_t height) {
+void PresentationScaler::RecordBlitInto(VkCommandBuffer commands, VkImage image, VkImageLayout layout, VkFilter filter, std::uint32_t width, std::uint32_t height, std::uint32_t layer) {
     Graphics::Require(sourceImage != VK_NULL_HANDLE && image != VK_NULL_HANDLE, "presentation image is unavailable");
     Graphics::Require(width != 0 && height != 0, "presentation blit extent must be non-zero");
     const auto pipelineBarrier = context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
@@ -118,9 +118,9 @@ void PresentationScaler::RecordBlitInto(VkCommandBuffer commands, VkImage image,
     barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     pipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     VkImageBlit blit{};
-    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
     blit.srcOffsets[1] = {static_cast<std::int32_t>(width), static_cast<std::int32_t>(height), 1};
-    blit.dstSubresource = blit.srcSubresource;
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.dstOffsets[1] = {static_cast<std::int32_t>(sourceWidth), static_cast<std::int32_t>(sourceHeight), 1};
     context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage")(commands, image, layout, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -144,11 +144,11 @@ void PresentationScaler::RecordBlit(VkCommandBuffer commands, VkImage destinatio
     RecordBlitFrom(context, commands, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sourceWidth, sourceHeight, VK_FILTER_LINEAR, destinationImage, destinationWidth, destinationHeight);
 }
 
-void PresentationScaler::RecordBlitFrom(const Graphics::Context& context, VkCommandBuffer commands, VkImage image, VkImageLayout layout, std::uint32_t width, std::uint32_t height, VkFilter filter, VkImage destinationImage, std::uint32_t destinationWidth, std::uint32_t destinationHeight) {
+void PresentationScaler::RecordBlitFrom(const Graphics::Context& context, VkCommandBuffer commands, VkImage image, VkImageLayout layout, std::uint32_t width, std::uint32_t height, VkFilter filter, VkImage destinationImage, std::uint32_t destinationWidth, std::uint32_t destinationHeight, std::uint32_t layer) {
     Graphics::Require(image != VK_NULL_HANDLE && width != 0 && height != 0, "presentation blit source is unavailable");
     const auto rect = ComputeContainRect_nid_postfix(width, height, destinationWidth, destinationHeight);
     VkImageBlit blit{};
-    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
     blit.srcOffsets[0] = {0, 0, 0};
     blit.srcOffsets[1] = {static_cast<std::int32_t>(width), static_cast<std::int32_t>(height), 1};
     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
