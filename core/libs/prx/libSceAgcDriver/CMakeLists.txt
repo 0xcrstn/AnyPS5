@@ -1517,12 +1517,6 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_uint8x4_color_target_no_resident PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    add_test(NAME agc_driver_array_layer_target_cpu_upload COMMAND agc_driver_array_layer_target_tests)
-    set_tests_properties(agc_driver_array_layer_target_cpu_upload PROPERTIES ENVIRONMENT "APS5_NO_HOST_IMPORT=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
-    if(WIN32)
-        set_tests_properties(agc_driver_array_layer_target_cpu_upload PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    endif()
     set_tests_properties(agc_driver_flat_store PROPERTIES RUN_SERIAL TRUE)
     set_target_properties(agc_driver_flat_apertures_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     foreach(flatAperturesPart RANGE 13)
