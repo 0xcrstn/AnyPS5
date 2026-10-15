@@ -644,6 +644,7 @@ private:
         std::shared_ptr<Buffer> buffer;
         DrawSnapshotArena::Placed placed{};
     };
+    mutable std::mutex movedWordMutex;
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
     struct PersistentDrawSet {
         std::vector<std::array<std::uint64_t, 4>> key;
@@ -653,7 +654,14 @@ private:
     mutable std::vector<PersistentDrawSet> persistentDrawSets;
     mutable std::size_t persistentDrawSetNext = 0;
     mutable std::size_t movedWordBufferNext = 0;
-    mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
+    struct DrawSetShape {
+        std::array<std::vector<VkDescriptorPoolSize>, 2> sizes;
+        std::array<std::optional<std::uint32_t>, 2> variable;
+        std::array<bool, 2> used{};
+    };
+    mutable std::once_flag drawSetShapeOnce;
+    mutable DrawSetShape drawSetShape;
+    const DrawSetShape& DrawSetShapeOf() const;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
