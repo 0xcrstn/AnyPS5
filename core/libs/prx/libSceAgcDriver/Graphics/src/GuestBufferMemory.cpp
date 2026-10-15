@@ -2057,9 +2057,6 @@ void reportMirrors() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
     auto& state = Mirrors();
-    const auto now = std::chrono::steady_clock::now();
-    if (now - state.lastReport < std::chrono::seconds(10)) return;
-    state.lastReport = now;
     std::size_t count = 0;
     std::size_t writable = 0;
     std::size_t heaps = 0;
@@ -2067,6 +2064,9 @@ void reportMirrors() {
     std::uint64_t heapBytes = 0;
     {
         std::lock_guard lock(state.mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - state.lastReport < std::chrono::seconds(10)) return;
+        state.lastReport = now;
         for (const auto& [base, mirror] : state.entries) {
             ++count;
             bytes += mirror->bytes;

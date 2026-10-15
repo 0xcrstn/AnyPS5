@@ -54,6 +54,7 @@ struct ResidentMirrorCounters {
     double collectMs = 0;
 };
 ResidentMirrorCounters MirrorTotals();
+void ReportMirrorsEveryBatchForTests(bool everyBatch);
 
 }
 
