@@ -73,13 +73,13 @@ struct SpecializedModule {
 
 std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     ShaderCompileTrace::Event specializeEvent("specialize");
+    const auto input = artifact.spirv.Resolved();
     if (specializeEvent.Active()) {
         std::vector<std::uint32_t> vector;
         for (const auto& constant : constants) vector.insert(vector.end(), {constant.id, constant.value});
-        const auto input = artifact.spirv.Resolved();
         specializeEvent.Hex("variant", artifact.variantId).Number("spirv_words_in", input.size()).Hex("spirv_in_hash", ShaderCompileTrace::HashOf(input.Words())).Number("constants", constants.size()).Hex("specialization_hash", ShaderCompileTrace::HashOf(std::span<const std::uint32_t>(vector))).Hex("vertex_classes_hash", ShaderCompileTrace::HashOf(classes));
     }
-    auto source = SpecializeVertexInputTypes(artifact, classes);
+    auto source = SpecializeVertexInputTypes(artifact, input, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
     for (const auto& constant : constants) {
         if (!supplied.emplace(constant.id, constant.value).second) throw std::runtime_error("duplicate prepared specialization ID");

@@ -39,6 +39,8 @@ const char* TranslationName(BdaTable::Translation translation) {
     case BdaTable::Translation::Legacy: return "legacy";
     case BdaTable::Translation::Radix: return "radix";
     case BdaTable::Translation::Verify: return "verify";
+    case BdaTable::Translation::Linear: return "linear";
+    case BdaTable::Translation::LinearVerify: return "linear_verify";
     }
     throw std::runtime_error("unknown BDA translation in the shader manifest");
 }
