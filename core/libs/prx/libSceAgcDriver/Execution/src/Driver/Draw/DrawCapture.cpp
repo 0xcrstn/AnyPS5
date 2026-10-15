@@ -59,13 +59,10 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             part = FirstSnapshotDifference(*full, values->snapshot);
             if (part == SnapshotPart::None && !SameStageResult(*reference, *stageCapture.compiled)) part = SnapshotPart::Result;
             mismatch = part != SnapshotPart::None;
-            if (mismatch) {
-                static std::atomic<std::uint64_t> reports{0};
-                if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[binding-plan] verify: stage %zu (program 0x%llx) differs from the full capture and materialize, first in: %s%c", i, static_cast<unsigned long long>(program.binary.codeAddress), SnapshotPartNames[static_cast<std::size_t>(part)], 10);
-            }
             phaseTiming.Phase(DrawRowStageVerify);
         }
         notePlannedStage(verifyBindingPlan(), mismatch, part, templateHit, ShaderRecompiler::CountSpecializationWords(values->snapshot));
+        if (mismatch) ThrowStageMismatch(submission.queue, submission.serial, currentPacketOffset(), i, program.binary.codeAddress, part);
         return stageCapture.compiled;
     }
     const auto capture = [&] {
