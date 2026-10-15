@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "ThreadOwned.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -1371,7 +1372,10 @@ private:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
 };
 
-thread_local EpochCoverage threadCoverage;
+EpochCoverage& threadCoverage() {
+    struct CoverageTag {};
+    return HostThreadLocal<EpochCoverage, CoverageTag>();
+}
 
 struct SharedCoverageSlot {
     std::mutex mutex;
@@ -1384,7 +1388,7 @@ std::array<SharedCoverageSlot, 32>& sharedCoverage() {
 }
 
 bool coveredThisEpoch(std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t first, std::uint64_t stop) {
-    if (threadCoverage.Covers(epoch, unwatched, first, stop)) {
+    if (threadCoverage().Covers(epoch, unwatched, first, stop)) {
         coverageCounters().threadHits.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -1392,12 +1396,12 @@ bool coveredThisEpoch(std::uint64_t epoch, std::uint64_t unwatched, std::uint64_
     std::lock_guard lock(slot.mutex);
     if (!slot.coverage.Covers(epoch, unwatched, first, stop)) return false;
     coverageCounters().sharedHits.fetch_add(1, std::memory_order_relaxed);
-    threadCoverage.Add(epoch, unwatched, first, stop);
+    threadCoverage().Add(epoch, unwatched, first, stop);
     return true;
 }
 
 void noteCovered(std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t begin, std::uint64_t end) {
-    threadCoverage.Add(epoch, unwatched, begin, end);
+    threadCoverage().Add(epoch, unwatched, begin, end);
     auto& slot = sharedCoverage()[epoch % sharedCoverage().size()];
     std::lock_guard lock(slot.mutex);
     slot.coverage.Add(epoch, unwatched, begin, end);
