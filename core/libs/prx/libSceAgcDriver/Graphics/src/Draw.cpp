@@ -3546,7 +3546,7 @@ std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const St
                     masked->blends.at(state.colors[index].exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
                 }
                 const State& pipelineState = masked.has_value() ? *masked : state;
-                resolved->pipeline = CachedPipeline(context, pipelineState, resolved->inputs.VertexLayout(), *resolved->resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+                resolved->pipeline = FindCachedPipeline(context, pipelineState, resolved->inputs.VertexLayout(), *resolved->resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
                 resolved->proxied = std::move(proxied);
             } catch (const std::exception&) {
                 resolved->pipeline = nullptr;
