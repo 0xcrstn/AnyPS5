@@ -1152,17 +1152,21 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
 }
 
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
-    auto* recorder = context.recorder;
-    if (recorder == nullptr || bytes == 0) return nullptr;
+    if (context.recorder == nullptr) return nullptr;
+    return InPlaceDrawInput(context, *context.recorder, address, bytes, alignment);
+}
+
+const HostImport* InPlaceDrawInput(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
+    if (bytes == 0) return nullptr;
     GuestMemory::FlushGpuWrites(address, bytes);
-    if (recorder->PendingWriteOverlaps(address, bytes) || recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
+    if (recorder.PendingWriteOverlaps(address, bytes) || recorder.PendingLabelIn(address, bytes) || recorder.QueuedStoreOverlaps(address, bytes)) return nullptr;
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
     if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
     const auto drawWriters = DrawCopiedWriters();
     if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || (address - import->base) % alignment != 0) return nullptr;
-    recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
+    recorder.NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
     return import;
 }
 

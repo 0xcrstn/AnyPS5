@@ -99,6 +99,7 @@ void MovedReadOnlyBuffersHitTheirTemplate() {
     const auto movedInput = counters();
     Require(movedInput.hits == first.hits + 1 && movedInput.buffers == first.buffers + 1, "a dispatch whose only change is a read-only buffer's address did not hit its template through one moved buffer: " + Describe(movedInput));
     Require(movedInput.verified == movedInput.hits, "a moved-buffer template hit was not verified against a fresh build: " + Describe(movedInput));
+    Guest->outputs[0].words = {};
     Require(Dispatch(Guest->tables[2], Guest->outputs[1]) == 301, "a dispatch whose written buffer moved stored the wrong value: " + Describe(counters()));
     const auto movedOutput = counters();
     Require(movedOutput.hits == movedInput.hits, "a dispatch whose written buffer moved was served by a template: " + Describe(movedOutput));

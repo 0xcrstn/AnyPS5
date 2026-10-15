@@ -5096,7 +5096,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         lap(&DrawBindingsStatistics::checkUs);
         if (override != moved.end() && InPlaceDrawInputs()) {
-            if (const auto* import = InPlaceDrawInput(context, begin, bytes, std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4))) {
+            if (const auto* import = InPlaceDrawInput(context, recorder, begin, bytes, std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4))) {
                 selected.push_back(index);
                 result->snapshots.push_back({begin, nullptr, {}, import->buffer, begin - import->base, std::span<const std::byte>(reinterpret_cast<const std::byte*>(begin), bytes), true});
                 recorder.NoteInPlaceDrawInput(begin, bytes);
