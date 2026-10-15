@@ -3387,7 +3387,6 @@ void StorageTexture::refreshGeneration() {
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     if (Coherence::Tracking()) coherenceVersion = Coherence::NextVersion();
-    if (Coherence::FaultOwnership() && accessProtection == 0 && guestBytes != 0) accessProtection = Coherence::ProtectDeviceOwned({descriptor.baseAddress, descriptor.baseAddress + guestBytes}, Coherence::Source::PendingImage, coherenceVersion);
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (!handedFrom.empty()) supersedeHandedFrom(first, count);
     std::vector<bool> unsaved(trackedLayers, false);
@@ -3432,11 +3431,12 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
         if (wasLent) BumpPendingSerial();
-        return;
+    } else {
+        dirty = true;
+        pending.textures.push_back(this);
+        BumpPendingSerial();
     }
-    dirty = true;
-    pending.textures.push_back(this);
-    BumpPendingSerial();
+    if (Coherence::FaultOwnership() && accessProtection == 0 && guestBytes != 0) accessProtection = Coherence::ProtectDeviceOwned({descriptor.baseAddress, descriptor.baseAddress + guestBytes}, Coherence::Source::PendingImage, coherenceVersion);
 }
 
 void StorageTexture::reconcilePending() {
