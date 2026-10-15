@@ -33,7 +33,7 @@ foreach(source IN LISTS sources)
     list(APPEND sourcesReal "${real}")
 endforeach()
 
-set(afterCacheSources "^core/shader/recompiler/(CompileTrace|SpirvIntern)\\.(cpp|hpp)$|^core/shader/recompiler/SpirvBackend/(src/SpirvSpecialization\\.cpp|include/SpirvBackend/SpirvSpecialization\\.hpp|src/SpirvModuleShape\\.cpp|include/SpirvBackend/SpirvModuleShape\\.hpp)$")
+set(afterCacheSources "^core/shader/recompiler/Materialize\\.cpp$|^core/shader/recompiler/(CompileTrace|SpirvIntern)\\.(cpp|hpp)$|^core/shader/recompiler/SpirvBackend/(src/SpirvSpecialization\\.cpp|include/SpirvBackend/SpirvSpecialization\\.hpp|src/SpirvModuleShape\\.cpp|include/SpirvBackend/SpirvModuleShape\\.hpp)$")
 set(failures)
 set(manifest "${EXTRA}\n")
 set(frontendManifest "${EXTRA}\n")
