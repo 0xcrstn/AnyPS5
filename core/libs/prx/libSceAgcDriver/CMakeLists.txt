@@ -580,6 +580,10 @@ target_link_libraries(shader_spirv_interface_tests PRIVATE libc)
 if(BUILD_TESTING)
     set_target_properties(shader_spirv_interface_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME shader_spirv_interface COMMAND shader_spirv_interface_tests)
+    if(WIN32)
+        set_tests_properties(shader_spirv_interface PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(shader_spirv_interface PROPERTIES TIMEOUT 20)
 endif()
 
@@ -686,6 +690,10 @@ configure_windows_unwind(agc_coherence_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_coherence_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_coherence COMMAND agc_coherence_tests)
+    if(WIN32)
+        set_tests_properties(agc_coherence PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(agc_coherence PROPERTIES TIMEOUT 30)
 endif()
 
