@@ -40,6 +40,11 @@ inline RewriteMode FlushProofsSetting() {
     return mode;
 }
 
+inline RewriteMode WindowRegistersSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_WINDOW_REGISTERS", std::getenv("APS5_WINDOW_REGISTERS"), RewriteMode::On);
+    return mode;
+}
+
 inline RewriteMode BallotReuseSetting() {
     static const RewriteMode mode = ParseRewriteMode("APS5_BALLOT_REUSE", std::getenv("APS5_BALLOT_REUSE"), RewriteMode::On);
     return mode;

@@ -343,6 +343,11 @@ void BdaResources::CheckFault() const {
         message << "APS5_FLUSH_PROOFS=verify: shader stage " << report.stage << " saw the denormal 0x" << std::hex << static_cast<std::uint32_t>(report.address) << std::dec << " where a proof said a denormal flush was unneeded";
         throw std::runtime_error(message.str());
     }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RegisterWindowMismatch) {
+        message.str({});
+        message << "APS5_WINDOW_REGISTERS=verify: shader stage " << report.stage << " read 0x" << std::hex << static_cast<std::uint32_t>(report.address) << " from the relative-addressing window where the register selection gave 0x" << report.bytes << std::dec;
+        throw std::runtime_error(message.str());
+    }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::BallotReuseMismatch) {
         message.str({});
         message << "APS5_BALLOT_REUSE=verify: shader stage " << report.stage << " balloted 0x" << std::hex << static_cast<std::uint32_t>(report.address >> 32u) << "'" << static_cast<std::uint32_t>(report.address) << " where an earlier ballot of the same value in the same block gave 0x" << report.instruction << "'" << report.bytes << std::dec;

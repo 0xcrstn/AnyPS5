@@ -690,6 +690,21 @@ void RunBdaWriteNoteTests(const Context& context) {
     SetBdaTestWriteNotes(ShaderRecompiler::BdaWriteNotesSetting());
 }
 
+void RunEqualCheckTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    Buffer unused(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    for (const auto [expected, actual] : {std::pair{7u, 7u}, std::pair{7u, 8u}, std::pair{0u, 0x80000000u}}) {
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        Pipeline pipeline(context, MakeEqualCheckTestShader(expected, actual), {&unused, &fault, &unused});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        if (expected != actual) Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::RegisterWindowMismatch && report.address == expected && report.bytes == actual, "APS5_WINDOW_REGISTERS=verify did not stop on differing window and register values");
+        else Require(report.state == Abi::FaultState::Empty, "an equality check stopped on equal values");
+    }
+}
+
 void RunBallotReuseTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
     using ShaderRecompiler::RewriteMode;

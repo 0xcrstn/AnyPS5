@@ -37,6 +37,7 @@ public:
     void SetScalarMaskTag(ScalarReg reg, IrValue& value);
     IrValue& GetVectorReg(VectorReg reg);
     void SetVectorReg(VectorReg reg, IrValue& value);
+    void SetVectorRegOutsideWindow(VectorReg reg, IrValue& value);
     IrValue& GetGotoVariable(std::uint32_t id);
     void SetGotoVariable(std::uint32_t id, IrValue& value);
     IrValue& GetScc();

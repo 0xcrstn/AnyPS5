@@ -16,6 +16,7 @@ void SetBdaTestSpanHelpers(ShaderRecompiler::RewriteMode mode, std::uint32_t inj
 void SetBdaTestWriteNotes(ShaderRecompiler::RewriteMode mode, std::uint64_t injection = 0);
 void SetBdaTestInlineFastPath(bool enabled);
 std::vector<std::uint32_t> MakeBallotReuseTestShader(ShaderRecompiler::RewriteMode mode, bool inject);
+std::vector<std::uint32_t> MakeEqualCheckTestShader(std::uint32_t expected, std::uint32_t actual);
 std::vector<std::uint32_t> MakeFlushCheckTestShader(std::uint32_t value, ShaderRecompiler::BdaAbi::FaultReason reason);
 std::vector<std::uint32_t> MakeRepairTestShader(std::uint32_t function, ShaderRecompiler::RewriteMode mode, std::uint32_t injection);
 std::vector<std::uint32_t> MakeBdaResolveTestShader(std::uint32_t permission);
@@ -35,6 +36,7 @@ void RunBdaTranslationTests(const AgcDriver::Graphics::Context& context);
 void RunBdaSpanHelperTests(const AgcDriver::Graphics::Context& context);
 void RunFloatRepairTests(const AgcDriver::Graphics::Context& context);
 void RunBallotReuseTests(const AgcDriver::Graphics::Context& context);
+void RunEqualCheckTests(const AgcDriver::Graphics::Context& context);
 void RunFlushProofCheckTests(const AgcDriver::Graphics::Context& context);
 void RunBdaPlacementTests(const AgcDriver::Graphics::Context& context);
 void RunBdaWriteNoteTests(const AgcDriver::Graphics::Context& context);

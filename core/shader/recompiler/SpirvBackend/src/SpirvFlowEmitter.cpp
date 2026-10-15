@@ -388,6 +388,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::ReferenceU32: return Invoke(EmitReferenceU32, ctx, inst);
         case IrOpcode::UnlinkedCall: return Invoke(EmitUnlinkedCall, ctx, inst);
         case IrOpcode::CheckDenormalFree: return Invoke(EmitCheckDenormalFree, ctx, inst);
+        case IrOpcode::CheckEqualU32: return Invoke(EmitCheckEqualU32, ctx, inst);
         case IrOpcode::GetUserData: return Invoke(EmitGetUserData, ctx, inst);
         case IrOpcode::GetShaderBase: return Invoke(EmitGetShaderBase, ctx, inst);
         case IrOpcode::ShaderClock: return Invoke(EmitShaderClock, ctx, inst);
@@ -1133,6 +1134,16 @@ void EmitCheckDenormalFree(SpirvValueEmitContext& ctx, const IrValue& inst, std:
     const auto nonZero = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, value, ConstantU32(state, 0x7fffffffu)), ConstantU32(state, 0u));
     EmitIfCondition(state, Binary(state, spv::OpLogicalAnd, boolean, exponentZero, nonZero), [&] {
         RecordBdaFaultWords(state, value, ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, 0u), faultReason);
+    });
+}
+
+void EmitCheckEqualU32(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t expected, std::uint32_t actual, const IrValue* reason) {
+    auto& state = ctx.state;
+    if (state.faultBufferVariable == 0) ctx.Fail(inst, "checks an equality without a fault buffer");
+    const auto faultReason = static_cast<BdaAbi::FaultReason>(reason->Resolve()->ImmediateU32());
+    if (faultReason != BdaAbi::FaultReason::RegisterWindowMismatch) ctx.Fail(inst, "checks an equality with an unknown fault reason");
+    EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), expected, actual), [&] {
+        RecordBdaFaultWords(state, expected, ConstantU32(state, 0u), actual, ConstantU32(state, 0u), faultReason);
     });
 }
 

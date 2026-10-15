@@ -222,6 +222,7 @@ void EmitReference(SpirvValueEmitContext& context);
 void EmitReferenceU32(SpirvValueEmitContext& context);
 void EmitUnlinkedCall(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t low, std::uint32_t high, std::uint32_t programCounter);
 void EmitCheckDenormalFree(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t value, const IrValue* reason);
+void EmitCheckEqualU32(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t expected, std::uint32_t actual, const IrValue* reason);
 void EmitControlNop(SpirvValueEmitContext& context);
 void EmitWaitcnt(SpirvValueEmitContext& context);
 void EmitSendmsg(SpirvValueEmitContext& context);

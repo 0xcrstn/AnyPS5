@@ -143,6 +143,37 @@ std::vector<std::uint32_t> MakeFlushCheckTestShader(std::uint32_t value, ShaderR
     return state.module.Finalize();
 }
 
+std::vector<std::uint32_t> MakeEqualCheckTestShader(std::uint32_t expected, std::uint32_t actual) {
+    using namespace ShaderRecompiler;
+    IrProgram program;
+    program.Resources().stage = IrShaderStage::Compute;
+    program.Info().usesFaultBuffer = true;
+    SpirvEmitterState state(program, {});
+    EmitBaseHeader(state.module, program);
+    const auto define = [&](std::uint32_t binding) {
+        const auto variable = state.module.DefineGlobalVariable(TypeStorageBufferPointer(state), spv::StorageClassStorageBuffer);
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0u);
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+        return variable;
+    };
+    static_cast<void>(define(0));
+    state.faultBufferVariable = define(1);
+    static_cast<void>(define(2));
+    DefineBdaFaultFunction(state);
+    state.mainFunc = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
+    EmitLabel(state, state.module.AllocateId());
+    SpirvValueEmitContext ctx(state);
+    auto& reasonValue = IrBuilder(program).Constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::RegisterWindowMismatch));
+    auto& check = program.CreateValue(IrOpcode::CheckEqualU32, IrType::Void);
+    EmitCheckEqualU32(ctx, check, ConstantU32(state, expected), ConstantU32(state, actual), &reasonValue);
+    state.module.AddFunction(spv::OpReturn);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeLocalSize, 1u, 1u, 1u);
+    state.module.EmitEntryPoint(spv::ExecutionModelGLCompute, state.mainFunc, "main", {});
+    return state.module.Finalize();
+}
+
 std::vector<std::uint32_t> MakeBallotReuseTestShader(ShaderRecompiler::RewriteMode mode, bool inject) {
     using namespace ShaderRecompiler;
     IrProgram program;
