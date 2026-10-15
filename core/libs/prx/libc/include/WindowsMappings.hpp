@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBC_INCLUDE_WINDOWSMAPPINGS_HPP
 
 #ifdef _WIN32
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <windows.h>
 #include <algorithm>
 #include <array>
@@ -84,7 +85,7 @@ public:
     }
 
     bool ResolveAccess(std::uintptr_t address, std::size_t bytes) {
-        if (!activeAccessResolvers.empty()) throw std::runtime_error("nested guest access resolution is not implemented");
+        if (!activeAccessResolvers().empty()) throw std::runtime_error("nested guest access resolution is not implemented");
         if (bytes == 0) return true;
         if (bytes > std::numeric_limits<std::uintptr_t>::max() - address) return false;
         if (accessGuardCount.load(std::memory_order_acquire) == 0) return true;
@@ -116,8 +117,8 @@ public:
                     if (!accessGuards.contains(token)) continue;
                 }
                 struct Resolving {
-                    explicit Resolving(std::uint64_t token) { activeAccessResolvers.push_back(token); }
-                    ~Resolving() { activeAccessResolvers.pop_back(); }
+                    explicit Resolving(std::uint64_t token) { activeAccessResolvers().push_back(token); }
+                    ~Resolving() { activeAccessResolvers().pop_back(); }
                 } resolvingScope(token);
                 if (!guard->resolve(token, guard->context)) throw std::runtime_error("guest access resolver refused publication");
                 std::lock_guard lock(mutex);
@@ -1089,7 +1090,8 @@ private:
     std::atomic<std::size_t> accessGuardCount{0};
     std::uint64_t nextAccessToken = 0;
     std::uint64_t viewIdentity = 0;
-    inline static thread_local std::vector<std::uint64_t> activeAccessResolvers;
+    struct ActiveAccessResolversTag {};
+    static std::vector<std::uint64_t>& activeAccessResolvers() { return HostThreadLocal<std::vector<std::uint64_t>, ActiveAccessResolversTag>(); }
 
     using Views = std::map<std::uintptr_t, View>;
 

@@ -2007,8 +2007,11 @@ std::optional<UserDataCallee> DecodeUserDataCallee(std::span<const std::byte> fi
     FileHeader header;
     std::memcpy(&header, file.data(), sizeof(header));
     if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != SourceVersion()) return std::nullopt;
-    const auto key = file.subspan(sizeof(header));
-    if (header.keyBytes != key.size() || header.payloadBytes != 0u || header.keyHash != HashBytes(key) || header.payloadHash != HashBytes(std::span<const std::byte>{})) return std::nullopt;
+    if (header.keyBytes > file.size() - sizeof(header) || PayloadOffset(static_cast<std::size_t>(header.keyBytes)) != file.size()) return std::nullopt;
+    const auto key = file.subspan(sizeof(header), static_cast<std::size_t>(header.keyBytes));
+    const auto padding = file.subspan(sizeof(header) + key.size());
+    if (std::ranges::any_of(padding, [](std::byte value) { return value != std::byte{0}; })) return std::nullopt;
+    if (header.payloadBytes != 0u || header.keyHash != HashBytes(key) || header.payloadHash != HashBytes(std::span<const std::byte>{})) return std::nullopt;
     Reader reader(key);
     if (reader.Get<std::uint32_t>() != FileMagic || reader.Get<std::uint32_t>() != FormatVersion || reader.Get<std::uint64_t>() != SourceVersion() || reader.Get<std::uint32_t>() != UserDataCalleeEntryKind) return std::nullopt;
     UserDataCallee callee;
