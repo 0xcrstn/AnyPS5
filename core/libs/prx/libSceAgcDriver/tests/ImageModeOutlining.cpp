@@ -30,10 +30,9 @@ void Require(bool value, const std::string& message) {
 
 void SetOutlining(bool enabled) {
 #ifdef _WIN32
-    _putenv_s("APS5_OUTLINE_IMAGE_MODES", enabled ? "1" : "");
+    _putenv_s("APS5_OUTLINE_IMAGE_MODES", enabled ? "1" : "0");
 #else
-    if (enabled) setenv("APS5_OUTLINE_IMAGE_MODES", "1", 1);
-    else unsetenv("APS5_OUTLINE_IMAGE_MODES");
+    setenv("APS5_OUTLINE_IMAGE_MODES", enabled ? "1" : "0", 1);
 #endif
 }
 

@@ -167,8 +167,9 @@ std::size_t PipelineCompileThreads() {
 bool PriorityCompileScheduler() {
     static const bool priority = [] {
         const char* text = std::getenv("APS5_COMPILE_SCHEDULER");
-        if (text == nullptr || *text == '\0') return false;
-        require(std::string_view(text) == "priority", "APS5_COMPILE_SCHEDULER accepts only priority");
+        if (text == nullptr || *text == '\0') return !LockedPipelines();
+        if (std::string_view(text) == "legacy") return false;
+        require(std::string_view(text) == "priority", "APS5_COMPILE_SCHEDULER accepts only priority or legacy");
         require(!LockedPipelines(), "APS5_COMPILE_SCHEDULER=priority cannot build pipelines under the GPU mutex (APS5_LOCKED_PIPELINES)");
         return true;
     }();
@@ -178,7 +179,8 @@ bool PriorityCompileScheduler() {
 bool PipelinePrewarm() {
     static const bool prewarm = [] {
         const char* text = std::getenv("APS5_PIPELINE_PREWARM");
-        if (text == nullptr || *text == '\0' || std::string_view(text) == "0") return false;
+        if (text == nullptr || *text == '\0') return PriorityCompileScheduler();
+        if (std::string_view(text) == "0") return false;
         require(std::string_view(text) == "1", "APS5_PIPELINE_PREWARM accepts only 0 or 1");
         require(PriorityCompileScheduler(), "APS5_PIPELINE_PREWARM=1 needs APS5_COMPILE_SCHEDULER=priority");
         return true;
@@ -210,7 +212,8 @@ bool PipelineContentDedup() {
 bool CompileParking() {
     static const bool parking = [] {
         const char* text = std::getenv("APS5_COMPILE_PARK");
-        if (text == nullptr || *text == '\0' || std::string_view(text) == "0") return false;
+        if (text == nullptr || *text == '\0') return PriorityCompileScheduler();
+        if (std::string_view(text) == "0") return false;
         require(std::string_view(text) == "1", "APS5_COMPILE_PARK accepts only 0 or 1");
         require(PriorityCompileScheduler(), "APS5_COMPILE_PARK=1 needs APS5_COMPILE_SCHEDULER=priority");
         return true;

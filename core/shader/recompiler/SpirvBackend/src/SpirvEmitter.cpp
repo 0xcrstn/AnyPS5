@@ -21,8 +21,8 @@ namespace {
 
 bool OutlineImageModes() {
     const char* value = std::getenv("APS5_OUTLINE_IMAGE_MODES");
-    if (value == nullptr || *value == '\0' || std::string_view(value) == "0") return false;
-    if (std::string_view(value) == "1") return true;
+    if (value == nullptr || *value == '\0' || std::string_view(value) == "1") return true;
+    if (std::string_view(value) == "0") return false;
     throw std::invalid_argument("APS5_OUTLINE_IMAGE_MODES accepts only 0 or 1");
 }
 
