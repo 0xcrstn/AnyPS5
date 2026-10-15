@@ -4718,6 +4718,7 @@ int coherenceFaultTests(const Device& device, Recorder& recorder) {
     Require(DescribeSurface(resource).guestBytes == unit, "the fault image does not fill its 64 KiB block");
     auto image = StorageTexture::Create(context, detiler, resource, 0);
     const auto paint = [&](std::array<float, 4> color) {
+        image->Refresh();
         const VkClearColorValue value{{color[0], color[1], color[2], color[3]}};
         const auto commands = recorder.Commands();
         recorder.Keep(image);
