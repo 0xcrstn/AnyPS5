@@ -2895,7 +2895,7 @@ const HostImport* StorageTexture::surfaceImport() const {
     if (blockUnits && UnitShadowEnabled()) {
         std::vector<RegisteredPiece> pieces;
         if (!RegisteredReadableCovers(descriptor.baseAddress, bytes, &pieces)) return nullptr;
-        if (std::any_of(pieces.begin() + 1, pieces.end(), [](const RegisteredPiece& piece) { return piece.address % 65536 != 0; })) return nullptr;
+        if (pieces.size() > 1 && std::any_of(pieces.begin() + 1, pieces.end(), [](const RegisteredPiece& piece) { return piece.address % 65536 != 0; })) return nullptr;
     }
     return HostImportSpanning(context, descriptor.baseAddress, bytes);
 }
