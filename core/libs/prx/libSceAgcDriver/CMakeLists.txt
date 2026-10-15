@@ -225,6 +225,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LabelVersions.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/CommandSink.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ChunkedRecording.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/EmitRecording.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DrawSnapshotArena.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/IndexBounds.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
@@ -1524,6 +1525,16 @@ if(BUILD_TESTING)
     set_tests_properties(agc_staged_draw_builds_verify PROPERTIES ENVIRONMENT "APS5_PARALLEL_RESOLVE=1;APS5_STAGED_DRAW_BUILDS=1;APS5_VERIFY_STAGED_DRAW_BUILDS=1")
     if(WIN32)
         set_tests_properties(agc_staged_draw_builds agc_staged_draw_builds_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_emit_failure COMMAND agc_driver_recorder_tests --emit-failure-only)
+    add_test(NAME agc_emit_recording COMMAND agc_driver_recorder_tests --emit-recording-only)
+    add_test(NAME agc_emit_recording_verify COMMAND agc_driver_recorder_tests --emit-recording-only)
+    set_tests_properties(agc_emit_failure agc_emit_recording agc_emit_recording_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_emit_recording PROPERTIES ENVIRONMENT "APS5_EMIT_WORKERS=2")
+    set_tests_properties(agc_emit_recording_verify PROPERTIES ENVIRONMENT "APS5_EMIT_WORKERS=3;APS5_VERIFY_EMIT=1")
+    if(WIN32)
+        set_tests_properties(agc_emit_failure agc_emit_recording agc_emit_recording_verify PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_chunk_commands COMMAND agc_driver_recorder_tests --chunk-commands-only)
