@@ -56,8 +56,12 @@ namespace AgcDriver::Graphics {
         std::uint32_t CmaskErrors();
 
     private:
+        struct Retired {};
+        TextureDetiler(const Context& context, Retired);
         VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image = false);
         void release() noexcept;
+        void adopt(TextureDetiler& other) noexcept;
+        bool retireToRecorders();
         struct DescriptorRing {
             std::vector<VkDescriptorPool> pools;
             std::vector<std::uint64_t> serials;
@@ -84,6 +88,7 @@ namespace AgcDriver::Graphics {
         VkPipelineLayout imagePipelineLayout = VK_NULL_HANDLE;
         VkShaderModule imageModule = VK_NULL_HANDLE;
         DescriptorRing imageDescriptorSets;
+        bool recorded = false;
     };
 
 }

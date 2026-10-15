@@ -60,6 +60,7 @@ VkDescriptorSet TextureDetiler::allocateFrom(DescriptorRing& ring, VkDescriptorS
     Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &set), allocateWhat);
     ++ring.used;
     ring.serials[ring.current] = recorder != nullptr ? recorder->OpenSerial() : 0;
+    recorded = recorded || recorder != nullptr;
     return set;
 }
 
