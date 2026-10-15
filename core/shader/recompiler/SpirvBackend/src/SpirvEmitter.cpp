@@ -274,6 +274,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.lazyLog2Repair = LazyLog2RepairSetting();
     state.lazyTrigSeries = LazyTrigSeriesSetting();
     state.bdaSpanHelpers = BdaSpanHelpersSetting();
+    state.bdaWriteNotes = BdaWriteNotesSetting();
     static const bool guestLines = std::getenv("APS5_SPIRV_GUEST_LINES") != nullptr;
     if (guestLines) state.guestLineFile = state.module.AddString("guest");
     state.hostSubgroupSize = target.subgroupSize;

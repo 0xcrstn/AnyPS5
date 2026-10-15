@@ -466,9 +466,34 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
     state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, boolean), done, spv::StorageClassFunction);
     const auto counter = state.module.AllocateId();
     state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, u32), counter, spv::StorageClassFunction);
+    const bool cached = state.bdaWriteNotes != RewriteMode::Off;
+    const bool verified = state.bdaWriteNotes == RewriteMode::Verify;
+    const auto wasSet = state.module.AllocateId();
+    if (verified) state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, boolean), wasSet, spv::StorageClassFunction);
     state.module.AddFunction(spv::OpStore, done, ConstantBool(state, false));
     state.module.AddFunction(spv::OpStore, counter, constant(0u));
+    if (verified) state.module.AddFunction(spv::OpStore, wasSet, ConstantBool(state, false));
     const auto u64 = TypeScalarU64(state);
+    std::uint32_t lastPage = 0;
+    std::uint32_t page64 = 0;
+    std::uint32_t hit = 0;
+    if (cached) {
+        lastPage = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u64), spv::StorageClassPrivate, BdaConstant(state, state.rewriteMismatchInjection != 0u ? state.rewriteMismatchInjection : ~std::uint64_t{0}));
+        state.module.AddName(lastPage, "bda_last_noted_page");
+        page64 = binary(spv::OpShiftRightLogical, u64, address, BdaConstant(state, BdaAbi::WrittenPageShift));
+        const auto last = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u64, last, lastPage);
+        hit = binary(spv::OpIEqual, boolean, page64, last);
+        if (!verified) {
+            const auto hitLabel = state.module.AllocateId();
+            const auto next = state.module.AllocateId();
+            state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
+            state.module.AddFunction(spv::OpBranchConditional, hit, hitLabel, next);
+            EmitLabel(state, hitLabel);
+            state.module.AddFunction(spv::OpReturn);
+            EmitLabel(state, next);
+        }
+    }
     const auto key = binary(spv::OpIAdd, u32, Unary(state, spv::OpUConvert, u32, binary(spv::OpShiftRightLogical, u64, address, BdaConstant(state, BdaAbi::WrittenChunkShift))), constant(1));
     const auto page = binary(spv::OpBitwiseAnd, u32, Unary(state, spv::OpUConvert, u32, binary(spv::OpShiftRightLogical, u64, address, BdaConstant(state, BdaAbi::WrittenPageShift))), constant(BdaAbi::WrittenChunkPages - 1u));
     const auto bit = binary(spv::OpShiftLeftLogical, u32, constant(1u), page);
@@ -512,6 +537,7 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
         const auto maskWord = binary(spv::OpIAdd, u32, keyWord, constant(1u));
         const auto mask = state.module.AllocateId();
         state.module.AddFunction(spv::OpAtomicLoad, u32, mask, BdaWord(state, state.faultBufferVariable, maskWord), scope, relaxed);
+        if (verified) state.module.AddFunction(spv::OpStore, wasSet, binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, mask, bit), constant(0u)));
         EmitIfCondition(state, binary(spv::OpIEqual, boolean, binary(spv::OpBitwiseAnd, u32, mask, bit), constant(0u)), [&] {
             state.module.AddFunction(spv::OpAtomicOr, u32, state.module.AllocateId(), BdaWord(state, state.faultBufferVariable, maskWord), scope, relaxed, bit);
         });
@@ -526,6 +552,14 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
     EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, noted), [&] {
         state.module.AddFunction(spv::OpAtomicStore, BdaWord(state, state.faultBufferVariable, constant(BdaAbi::WrittenOverflowWord)), scope, relaxed, constant(1u));
     });
+    if (verified) {
+        const auto set = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, boolean, set, wasSet);
+        EmitIfCondition(state, binary(spv::OpLogicalAnd, boolean, hit, Unary(state, spv::OpLogicalNot, boolean, set)), [&] {
+            RecordBdaFault(state, address, constant(0u), constant(0u), BdaAbi::FaultReason::WriteNoteMismatch);
+        });
+    }
+    if (cached) EmitIfCondition(state, noted, [&] { state.module.AddFunction(spv::OpStore, lastPage, page64); });
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;

@@ -656,3 +656,34 @@ void RunBdaPlacementTests(const Context& context) {
     Require(run(0, bytes, true).mismatches == 0, "APS5_BDA_PLACEMENT=verify reported a difference after a consistent copy-back");
     ClearMirrors(context.device);
 }
+
+void RunBdaWriteNoteTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    using ShaderRecompiler::RewriteMode;
+    constexpr std::uint64_t guest = 0x7fff12350000ULL;
+    Buffer target(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    const std::array<Abi::Range, 1> ranges{{{guest, guest + 16, target.DeviceAddress(), Abi::Read | Abi::Write, 0}}};
+    const auto table = MakeTable(context, ranges, ranges.size());
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const auto page = static_cast<std::uint32_t>(guest >> Abi::WrittenPageShift);
+    const auto store = [&](RewriteMode mode, std::uint32_t injection) {
+        SetBdaTestWriteNotes(mode, injection);
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        Pipeline pipeline(context, MakeBdaStoreTestShader(guest + 4, 0xa1b2c3d4u, 32u, false), {table.get(), &fault, &output});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        std::uint64_t noted = 0;
+        Require(Abi::ForEachWrittenRange(reinterpret_cast<const std::uint32_t*>(fault.Bytes().data()), [&](std::uint64_t begin, std::size_t bytes) { noted += begin <= guest && guest < begin + bytes ? 1u : 0u; }), "a BDA store left an invalid written-page record");
+        return std::pair{report, noted};
+    };
+    for (const auto mode : {RewriteMode::On, RewriteMode::Verify}) {
+        const auto [report, noted] = store(mode, 0u);
+        Require(report.state == Abi::FaultState::Empty && noted == 1u, "a cached BDA write note lost the page of the first store");
+    }
+    Require(store(RewriteMode::On, page).second == 0u, "the injected write-note cache entry did not skip the note it stands for");
+    const auto [report, noted] = store(RewriteMode::Verify, page);
+    Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::WriteNoteMismatch && report.address == guest + 4 && noted == 1u, "APS5_BDA_WRITE_NOTES=verify did not fail on an injected cache entry");
+    SetBdaTestWriteNotes(ShaderRecompiler::BdaWriteNotesSetting());
+}

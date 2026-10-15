@@ -166,6 +166,7 @@ int main(int argc, char** argv) {
         SetBdaTestTranslation(ShaderRecompiler::BdaTable::TranslationSetting());
         SetBdaTestRelative(ShaderRecompiler::BdaTable::RelativeSetting());
         SetBdaTestSpanHelpers(ShaderRecompiler::BdaSpanHelpersSetting());
+        SetBdaTestWriteNotes(ShaderRecompiler::BdaWriteNotesSetting());
         if (device->RunsOnCpu()) {
             std::cout << "CPU Vulkan device: BDA read and multi-dword write execution not tested\n";
         } else {
@@ -180,6 +181,7 @@ int main(int argc, char** argv) {
             }
         }
         RunBdaStoreExecutionTests(device->GetContext());
+        RunBdaWriteNoteTests(device->GetContext());
         std::cout << "BDA store boundary tests passed\n";
         RunColorTransferTests(device->GetContext());
         std::cout << "Vulkan BDA allocation and execution tests passed\n";

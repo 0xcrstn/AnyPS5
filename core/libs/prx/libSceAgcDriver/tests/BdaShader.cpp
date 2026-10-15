@@ -16,6 +16,8 @@ ShaderRecompiler::BdaTable::Translation testTranslation = ShaderRecompiler::BdaT
 ShaderRecompiler::BdaTable::Relative testRelative = ShaderRecompiler::BdaTable::Relative::Off;
 ShaderRecompiler::RewriteMode testSpanHelpers = ShaderRecompiler::RewriteMode::Off;
 std::uint32_t testSpanInjection = 0;
+ShaderRecompiler::RewriteMode testWriteNotes = ShaderRecompiler::RewriteMode::Off;
+std::uint32_t testNoteInjection = 0;
 
 template<typename TEmit>
 std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, std::uint32_t extracted = 0, bool writes = false, const std::function<void(ShaderRecompiler::SpirvEmitterState&)>& prologue = {}) {
@@ -49,7 +51,8 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     state.bdaTranslation = testTranslation;
     state.bdaRelative = testRelative;
     state.bdaSpanHelpers = testSpanHelpers;
-    state.rewriteMismatchInjection = testSpanInjection;
+    state.bdaWriteNotes = testWriteNotes;
+    state.rewriteMismatchInjection = testSpanInjection != 0u ? testSpanInjection : testNoteInjection;
     DefineGetBdaPointer(state);
     const auto main = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), main, spv::FunctionControlMaskNone, TypeFunction(state));
@@ -90,6 +93,11 @@ void SetBdaTestTranslation(ShaderRecompiler::BdaTable::Translation translation) 
 
 ShaderRecompiler::BdaTable::Translation BdaTestTranslation() {
     return testTranslation;
+}
+
+void SetBdaTestWriteNotes(ShaderRecompiler::RewriteMode mode, std::uint32_t injection) {
+    testWriteNotes = mode;
+    testNoteInjection = injection;
 }
 
 void SetBdaTestSpanHelpers(ShaderRecompiler::RewriteMode mode, std::uint32_t injection) {

@@ -143,6 +143,7 @@ struct SpirvEmitterState {
     RewriteMode lazyLog2Repair = RewriteMode::Off;
     RewriteMode lazyTrigSeries = RewriteMode::Off;
     RewriteMode bdaSpanHelpers = RewriteMode::Off;
+    RewriteMode bdaWriteNotes = RewriteMode::Off;
     std::uint32_t rewriteMismatchInjection = 0;
     std::map<std::array<std::uint32_t, 4>, std::uint32_t> bdaSpecializedSpanFunctions;
     bool nativeF16ModesEmitted = false;

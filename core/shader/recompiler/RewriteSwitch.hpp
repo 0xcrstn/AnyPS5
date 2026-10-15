@@ -30,6 +30,11 @@ inline RewriteMode LazyTrigSeriesSetting() {
     return mode;
 }
 
+inline RewriteMode BdaWriteNotesSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_BDA_WRITE_NOTES", std::getenv("APS5_BDA_WRITE_NOTES"));
+    return mode;
+}
+
 inline RewriteMode BdaSpanHelpersSetting() {
     static const RewriteMode mode = ParseRewriteMode("APS5_BDA_SPAN_HELPERS", std::getenv("APS5_BDA_SPAN_HELPERS"));
     return mode;
