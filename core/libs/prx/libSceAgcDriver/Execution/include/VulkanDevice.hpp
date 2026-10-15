@@ -319,6 +319,8 @@ public:
         std::uint64_t buffers = 0;
         std::uint64_t refused = 0;
         std::uint64_t verified = 0;
+        std::uint64_t preparedAdopted = 0;
+        std::uint64_t preparedRefused = 0;
     };
     static MovedTemplateStatistics MovedTemplateCounters();
     // The driver's recipe events for the [recipe] line: a restart after Rebuild, an attach; the

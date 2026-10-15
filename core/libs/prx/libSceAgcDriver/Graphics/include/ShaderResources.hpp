@@ -248,6 +248,12 @@ public:
     };
     std::optional<std::vector<MovedDispatchBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder& recorder) const;
     std::shared_ptr<DrawBindings> BindMovedDispatchBuffers(Recorder& recorder, std::span<const MovedDispatchBuffer> moved) const;
+    struct PreparedMovedDispatch {
+        std::vector<MovedDispatchBuffer> moved;
+        std::shared_ptr<DrawBindings> set;
+    };
+    std::optional<PreparedMovedDispatch> PrepareMovedDispatchBuffers(const CompiledShader& shader) const;
+    std::optional<std::vector<MovedDispatchBuffer>> CheckMovedDispatchBuffers(const PreparedMovedDispatch& prepared, Recorder& recorder) const;
     struct GuestBufferView {
         std::uint64_t address;
         std::size_t size;
@@ -433,6 +439,17 @@ private:
         std::uint32_t adjustment;
     };
     void writeDataWords(VkCommandBuffer commands, std::size_t allocation, std::span<const std::uint32_t> words) const;
+    struct MovedDispatchCandidate {
+        std::size_t allocation;
+        std::uint64_t address;
+        std::size_t size;
+        std::uint64_t begin;
+        std::size_t bytes;
+        std::uint32_t adjustment;
+    };
+    std::optional<std::vector<MovedDispatchCandidate>> planMovedDispatch(const CompiledShader& shader) const;
+    std::optional<VkDescriptorBufferInfo> movedDispatchView(const MovedDispatchCandidate& candidate, Recorder& recorder) const;
+    std::shared_ptr<DrawBindings> writeMovedDispatchSet(std::span<const MovedDispatchBuffer> moved) const;
 
     struct Binding {
         VkDescriptorSetLayoutBinding layout;

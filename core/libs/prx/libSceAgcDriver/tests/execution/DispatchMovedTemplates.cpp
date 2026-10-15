@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <initializer_list>
 #include <iostream>
@@ -109,6 +110,8 @@ void MovedReadOnlyBuffersHitTheirTemplate() {
     Require(Dispatch(Guest->tables[1], Guest->outputs[0]) == 401, "a moved-buffer template hit read stale bytes after a CPU store: " + Describe(counters()));
     const auto last = counters();
     Require(last.verified == last.hits, "moved-buffer template hits were not all verified: " + Describe(last));
+    const char* prepared = std::getenv("APS5_PREPARED_MOVED_SETS");
+    if (prepared == nullptr || std::strcmp(prepared, "0") != 0) Require(last.preparedAdopted != 0, "no moved-buffer set prepared before the device call was adopted: " + Describe(last));
 }
 
 void SetEnvironment(const char* name, const char* value) {

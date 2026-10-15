@@ -4821,11 +4821,10 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::CheckM
     return plan.moved;
 }
 
-std::optional<std::vector<ShaderResources::MovedDispatchBuffer>> ShaderResources::MovedDispatchBuffers(const CompiledShader& shader, Recorder& recorder) const {
-    std::vector<MovedDispatchBuffer> moved;
+std::optional<std::vector<ShaderResources::MovedDispatchCandidate>> ShaderResources::planMovedDispatch(const CompiledShader& shader) const {
+    std::vector<MovedDispatchCandidate> moved;
     if (shader.program == nullptr || usesBda || fragment.set != VK_NULL_HANDLE || splitSets) return std::nullopt;
     if (_set == VK_NULL_HANDLE) return moved;
-    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     for (const auto& binding : shader.program->bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
         const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
@@ -4850,18 +4849,69 @@ std::optional<std::vector<ShaderResources::MovedDispatchBuffer>> ShaderResources
             const auto begin = address - item.adjustment;
             const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
             if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
-            if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || recorder.PendingLabelIn(begin, bytes) || recorder.QueuedStoreOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes) || AnyDeviceResidentOverlaps(begin, bytes)) return std::nullopt;
-            if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), [&](const std::shared_ptr<ShaderResources>& writer) { return writer != nullptr && writer->WritesOverlap(begin, bytes); })) return std::nullopt;
-            GuestMemory::FlushGpuWrites(begin, bytes);
-            const auto* import = HostImportFor(context, begin, bytes);
-            if (import == nullptr || begin < import->base || (address - import->base) % alignment != item.adjustment || bytes > import->bytes - (begin - import->base) || bytes > context.limits.maxStorageBufferRange) return std::nullopt;
-            moved.push_back({index, address, size, {import->buffer, begin - import->base, bytes}, begin});
+            moved.push_back({index, address, size, begin, bytes, item.adjustment});
         }
     }
     return moved;
 }
 
+std::optional<VkDescriptorBufferInfo> ShaderResources::movedDispatchView(const MovedDispatchCandidate& candidate, Recorder& recorder) const {
+    const auto begin = candidate.begin;
+    const auto bytes = candidate.bytes;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
+    if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || recorder.PendingLabelIn(begin, bytes) || recorder.QueuedStoreOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes) || AnyDeviceResidentOverlaps(begin, bytes)) return std::nullopt;
+    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), [&](const std::shared_ptr<ShaderResources>& writer) { return writer != nullptr && writer->WritesOverlap(begin, bytes); })) return std::nullopt;
+    GuestMemory::FlushGpuWrites(begin, bytes);
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+    const auto* import = HostImportFor(context, begin, bytes);
+    if (import == nullptr || begin < import->base || (candidate.address - import->base) % alignment != candidate.adjustment || bytes > import->bytes - (begin - import->base) || bytes > context.limits.maxStorageBufferRange) return std::nullopt;
+    return VkDescriptorBufferInfo{import->buffer, begin - import->base, bytes};
+}
+
+std::optional<std::vector<ShaderResources::MovedDispatchBuffer>> ShaderResources::MovedDispatchBuffers(const CompiledShader& shader, Recorder& recorder) const {
+    const auto plan = planMovedDispatch(shader);
+    if (!plan.has_value()) return std::nullopt;
+    std::vector<MovedDispatchBuffer> moved;
+    moved.reserve(plan->size());
+    for (const auto& candidate : *plan) {
+        const auto view = movedDispatchView(candidate, recorder);
+        if (!view.has_value()) return std::nullopt;
+        moved.push_back({candidate.allocation, candidate.address, candidate.size, *view, candidate.begin});
+    }
+    return moved;
+}
+
+std::optional<ShaderResources::PreparedMovedDispatch> ShaderResources::PrepareMovedDispatchBuffers(const CompiledShader& shader) const {
+    const auto plan = planMovedDispatch(shader);
+    if (!plan.has_value()) return std::nullopt;
+    PreparedMovedDispatch prepared;
+    prepared.moved.reserve(plan->size());
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+    for (const auto& candidate : *plan) {
+        const auto import = ImportedHostRange(context, candidate.begin, candidate.bytes);
+        if (!import.has_value() || candidate.begin < import->base || (candidate.address - import->base) % alignment != candidate.adjustment || candidate.bytes > context.limits.maxStorageBufferRange) return std::nullopt;
+        prepared.moved.push_back({candidate.allocation, candidate.address, candidate.size, {import->buffer, candidate.begin - import->base, candidate.bytes}, candidate.begin});
+    }
+    if (!prepared.moved.empty()) prepared.set = writeMovedDispatchSet(prepared.moved);
+    return prepared;
+}
+
+std::optional<std::vector<ShaderResources::MovedDispatchBuffer>> ShaderResources::CheckMovedDispatchBuffers(const PreparedMovedDispatch& prepared, Recorder& recorder) const {
+    for (const auto& entry : prepared.moved) {
+        const MovedDispatchCandidate candidate{entry.allocation, entry.address, entry.size, entry.begin, static_cast<std::size_t>(entry.view.range), allocations[entry.allocation].adjustment};
+        const auto view = movedDispatchView(candidate, recorder);
+        if (!view.has_value() || view->buffer != entry.view.buffer || view->offset != entry.view.offset || view->range != entry.view.range) return std::nullopt;
+    }
+    return prepared.moved;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::BindMovedDispatchBuffers(Recorder& recorder, std::span<const MovedDispatchBuffer> moved) const {
+    auto result = writeMovedDispatchSet(moved);
+    recorder.Keep(result);
+    return result;
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::writeMovedDispatchSet(std::span<const MovedDispatchBuffer> moved) const {
     Require(context.descriptorCache != nullptr, "moved dispatch buffers require a descriptor cache");
     Require(_set != VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE && !splitSets, "moved dispatch buffers need the template's single descriptor set");
     std::map<VkDescriptorType, std::uint32_t> counts;
@@ -4893,7 +4943,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::BindMovedDispatc
     }
     Require(nextWrite == writes.end(), "moved dispatch buffer writes disagree with their descriptor bindings");
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    recorder.Keep(result);
     return result;
 }
 
