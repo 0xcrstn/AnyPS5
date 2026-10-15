@@ -23,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -816,7 +817,15 @@ void Driver::noteDrawRecordRecipe(DrawRecordResult& result, std::shared_ptr<cons
 struct PacketWaitCounts {
     std::array<std::atomic<std::uint64_t>, 0x103> waits{};
     std::array<std::atomic<std::uint64_t>, 0x103> waitedNs{};
+    std::atomic<std::uint64_t> commandProcessorReads{0};
+    std::atomic<std::uint64_t> commandProcessorReadsAhead{0};
+    std::atomic<std::uint64_t> commandProcessorReadsVerified{0};
 };
+
+std::atomic<int>& commandProcessorReadsOverride() {
+    static std::atomic<int> mode{-1};
+    return mode;
+}
 
 PacketWaitCounts& packetWaitCounts() {
     static PacketWaitCounts counts;
@@ -834,6 +843,61 @@ void Driver::waitDrawRecordsAt(std::uint32_t opcode) {
         ~Reset() { packetWaitOpcode() = 0x102u; }
     } reset;
     waitDrawRecords();
+}
+
+CommandProcessorReads ParseCommandProcessorReads(const char* text) {
+    if (text == nullptr) return CommandProcessorReads::Drain;
+    const std::string_view value(text);
+    if (value == "0" || value == "off") return CommandProcessorReads::Drain;
+    if (value == "1" || value == "on") return CommandProcessorReads::Overlap;
+    if (value == "verify") return CommandProcessorReads::Verify;
+    throw std::invalid_argument("APS5_CP_READS_OVERLAP must be 0, 1, off, on or verify, not \"" + std::string(value) + "\"");
+}
+
+CommandProcessorReads CommandProcessorReadsMode() {
+    static const auto parsed = ParseCommandProcessorReads(std::getenv("APS5_CP_READS_OVERLAP"));
+    const auto forced = commandProcessorReadsOverride().load(std::memory_order_relaxed);
+    return forced >= 0 ? static_cast<CommandProcessorReads>(forced) : parsed;
+}
+
+void SetCommandProcessorReadsMode(CommandProcessorReads mode) {
+    commandProcessorReadsOverride().store(static_cast<int>(mode), std::memory_order_relaxed);
+}
+
+CommandProcessorReadCounters CommandProcessorReadTotals() {
+    const auto& counts = packetWaitCounts();
+    return {counts.commandProcessorReads.load(std::memory_order_relaxed), counts.commandProcessorReadsAhead.load(std::memory_order_relaxed), counts.commandProcessorReadsVerified.load(std::memory_order_relaxed)};
+}
+
+bool Driver::overlapCommandProcessorRead(std::span<const std::uint32_t> packet) {
+    const auto mode = CommandProcessorReadsMode();
+    if (mode == CommandProcessorReads::Drain) return false;
+    const auto read = Pm4::CommandProcessorReadOf(packet);
+    if (!read) return false;
+    auto& counts = packetWaitCounts();
+    counts.commandProcessorReads.fetch_add(1, std::memory_order_relaxed);
+    const bool ahead = drawRecords().Pending() || !frozenDraws().Idle();
+    if (ahead) counts.commandProcessorReadsAhead.fetch_add(1, std::memory_order_relaxed);
+    if (mode == CommandProcessorReads::Overlap || !ahead) return true;
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    std::vector<std::byte> early(read->bytes);
+    std::vector<std::byte> late(read->bytes);
+    {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Registers);
+        GuestMemory::Read(read->address, early, 4);
+    }
+    waitDrawRecordsAt(opcode);
+    {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Registers);
+        GuestMemory::Read(read->address, late, 4);
+    }
+    counts.commandProcessorReadsVerified.fetch_add(1, std::memory_order_relaxed);
+    const auto differs = std::mismatch(early.begin(), early.end(), late.begin());
+    if (differs.first == early.end()) return true;
+    const auto offset = static_cast<std::size_t>(differs.first - early.begin());
+    char what[256];
+    std::snprintf(what, sizeof(what), "APS5_CP_READS_OVERLAP=verify: packet 0x%02x read 0x%llx+0x%zx ahead of the draw records, and byte 0x%zx changed from 0x%02x to 0x%02x once they were recorded", opcode, static_cast<unsigned long long>(read->address), read->bytes, offset, static_cast<unsigned>(*differs.first), static_cast<unsigned>(*differs.second));
+    throw std::runtime_error(what);
 }
 
 void Driver::waitDrawRecords() {
@@ -951,7 +1015,10 @@ void Driver::reportDrawRecords() {
             else std::snprintf(item, sizeof(item), " 0x%02x x%llu %.1fms", opcode, static_cast<unsigned long long>(waits), static_cast<double>(waitedNs) / 1e6);
             text += item;
         }
-        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s\n", text.empty() ? " none" : text.c_str());
+        static CommandProcessorReadCounters lastReads{};
+        const auto reads = CommandProcessorReadTotals();
+        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s; command processor reads without a drain: %llu, %llu of them ahead of pending records, %llu verified\n", text.empty() ? " none" : text.c_str(), static_cast<unsigned long long>(reads.reads - lastReads.reads), static_cast<unsigned long long>(reads.ahead - lastReads.ahead), static_cast<unsigned long long>(reads.verified - lastReads.verified));
+        lastReads = reads;
     }
     const auto seconds = std::chrono::duration<double>(now - lastReport).count();
     lastReport = now;
