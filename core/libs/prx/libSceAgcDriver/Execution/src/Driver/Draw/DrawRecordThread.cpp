@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -434,8 +435,10 @@ void Driver::freezeDispatch(QueueState& queue, std::span<const std::uint32_t> pa
 
 std::shared_ptr<Driver::PreparedFrozenDraw> Driver::prepareFrozen(const FrozenDraw& frozen, bool inOrder) {
     if (frozenProducer()) throw std::logic_error("prepare workers: a frozen draw reached preparation on queue 0's own thread");
-    thread_local FrozenQueueCopy copy;
-    thread_local Submission submission{};
+    struct CopyTag {};
+    struct SubmissionTag {};
+    auto& copy = HostThreadLocal<FrozenQueueCopy, CopyTag>();
+    auto& submission = HostThreadLocal<Submission, SubmissionTag>();
     auto& queue = copy.Apply(frozen.state);
     submission.serial = frozen.serial;
     submission.queue = frozen.queue;
