@@ -190,6 +190,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostThread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Coherence.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/MemoryReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ProcessMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/RecordQueue.cpp
@@ -634,6 +635,19 @@ target_include_directories(agc_shared_write_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shared_write_tests PRIVATE libSceAgcDriver libkernel libc)
 set_target_properties(agc_shared_write_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shared_write_tests)
+
+add_test_executable(agc_coherence_tests EXCLUDE_FROM_ALL
+        tests/Coherence.cpp
+        Execution/src/Coherence.cpp
+)
+target_include_directories(agc_coherence_tests PRIVATE ${LIBS_INCLUDE_DIR})
+set_target_properties(agc_coherence_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_coherence_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_coherence_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_coherence COMMAND agc_coherence_tests)
+    set_tests_properties(agc_coherence PROPERTIES TIMEOUT 30)
+endif()
 
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
@@ -1224,6 +1238,7 @@ add_custom_command(
 
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
+        tests/BdaShader.cpp
         tests/DrawSnapshotArena.cpp
         tests/ResidentPresent.cpp
         ${agcTriangleHeaders}
@@ -1236,6 +1251,7 @@ add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
 
 target_include_directories(agc_driver_recorder_tests PRIVATE
         ${LIBS_INCLUDE_DIR}
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
         ${agcTestShaderGeneratedRoot}
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler
         ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
@@ -1412,6 +1428,16 @@ if(BUILD_TESTING)
     set_tests_properties(agc_unit_shadow PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
     add_test(NAME agc_pointer_access_shadow COMMAND agc_driver_recorder_tests --pointer-access-shadow-only)
     set_tests_properties(agc_pointer_access_shadow PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
+    add_test(NAME agc_coherence_ordering COMMAND agc_driver_recorder_tests --coherence-ordering-only)
+    set_tests_properties(agc_coherence_ordering PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
+    add_test(NAME agc_coherence_faults COMMAND agc_driver_recorder_tests --coherence-faults-only)
+    set_tests_properties(agc_coherence_faults PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
+    add_test(NAME agc_coherence_input_leases COMMAND agc_driver_recorder_tests --coherence-input-leases-only)
+    set_tests_properties(agc_coherence_input_leases PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
+    add_test(NAME agc_coherence_residency COMMAND agc_driver_recorder_tests --coherence-residency-only)
+    set_tests_properties(agc_coherence_residency PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
+    add_test(NAME agc_coherence_lazy_release COMMAND agc_driver_recorder_tests --coherence-lazy-release-only)
+    set_tests_properties(agc_coherence_lazy_release PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
     if(WIN32)
         add_test(NAME agc_storage_cpu_snapshot COMMAND agc_driver_recorder_tests --storage-cpu-snapshot-only)
         set_tests_properties(agc_storage_cpu_snapshot PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" TIMEOUT 30 SKIP_RETURN_CODE 77
@@ -1445,7 +1471,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_metadata_pass COMMAND agc_driver_recorder_tests --metadata-pass-only)
     set_tests_properties(agc_metadata_pass PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_recorder_read_list agc_sparse_run_import agc_sparse_run_import_copied agc_metadata_pass agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_unit_shadow agc_pointer_access_shadow agc_snapshot_twins agc_draw_input_twins agc_draw_input_twins_sync agc_resident_mirrors agc_resident_buffer_mirrors agc_lazy_staging_out agc_lazy_staging_out_verify agc_lazy_staging_out_bounded agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_retire agc_draw_snapshot_epoch agc_multisample_guest_access agc_draw_inputs_in_place agc_resident_present agc_slice_dirty agc_queued_write_groups agc_present_then_store agc_staging_reuse agc_tiled_resolve PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_recorder_read_list agc_sparse_run_import agc_sparse_run_import_copied agc_metadata_pass agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_unit_shadow agc_pointer_access_shadow agc_coherence_ordering agc_coherence_faults agc_coherence_input_leases agc_coherence_residency agc_coherence_lazy_release agc_snapshot_twins agc_draw_input_twins agc_draw_input_twins_sync agc_resident_mirrors agc_resident_buffer_mirrors agc_lazy_staging_out agc_lazy_staging_out_verify agc_lazy_staging_out_bounded agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_retire agc_draw_snapshot_epoch agc_multisample_guest_access agc_draw_inputs_in_place agc_resident_present agc_slice_dirty agc_queued_write_groups agc_present_then_store agc_staging_reuse agc_tiled_resolve PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         add_test(NAME agc_host_import_second_mapping COMMAND agc_driver_recorder_tests --host-import-second-mapping-only)
         set_tests_properties(agc_host_import_second_mapping PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT_MODIFICATION

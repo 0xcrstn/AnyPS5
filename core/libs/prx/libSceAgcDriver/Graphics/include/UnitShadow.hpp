@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_UNITSHADOW_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_UNITSHADOW_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <atomic>
 #include <cstddef>
@@ -96,6 +97,8 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes);
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 std::size_t ForgetPublishedShadows(std::uint64_t address, std::size_t bytes);
+std::size_t PublishUnprotectedShadows(PublishReason reason);
+bool AnyUnprotectedShadow();
 
 // The sources of a storage upload's surface-relative runs: [begin, end) pieces of them, each read
 // from one buffer (a slab while the unit is fresh, else the import) at `offset` (byte x of the run
@@ -136,7 +139,7 @@ VkDeviceSize SlabOffset(const HostImport& import, const ShadowSlab& slab, std::u
 // After a retile's copies were recorded: the units of `ranges` (guest) hold the newest bytes at
 // `generation`, unpublished. A unit whose slab is no longer the one the copies went into is not
 // marked (counted `slab lost`). Bumps StorageTexture's pending serial.
-void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation);
+void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation, Coherence::Version version = 0);
 // retireImport: publishes the fresh units whose memory `registered` still names as a readable
 // registered range into the (old) import buffer, hands the slabs to the batch and drops the shadow.
 // The import retires because its registration vanished or changed size, so the rest of its memory

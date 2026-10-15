@@ -3386,6 +3386,8 @@ void StorageTexture::refreshGeneration() {
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
+    if (Coherence::Tracking()) coherenceVersion = Coherence::NextVersion();
+    if (Coherence::FaultOwnership() && accessProtection == 0 && guestBytes != 0) accessProtection = Coherence::ProtectDeviceOwned({descriptor.baseAddress, descriptor.baseAddress + guestBytes}, Coherence::Source::PendingImage, coherenceVersion);
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (!handedFrom.empty()) supersedeHandedFrom(first, count);
     std::vector<bool> unsaved(trackedLayers, false);
@@ -3438,14 +3440,63 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
 }
 
 void StorageTexture::reconcilePending() {
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        const bool any = anyLayerPending();
+        if (any == dirty) return;
+        dirty = any;
+        if (any) pending.textures.push_back(this);
+        else pending.textures.remove(this);
+        BumpPendingSerial();
+    }
+    settleProtection();
+}
+
+void StorageTexture::settleProtection() {
+    if (accessProtection == 0) return;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        if (anyLayerPending()) return;
+    }
+    const auto protection = std::exchange(accessProtection, 0);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    if (auto* recorder = Recorder::Active()) recorder->OnCompleteWithoutGuestAccess([protection] { Coherence::ReleaseDeviceOwned(protection); });
+    else Coherence::ReleaseDeviceOwned(protection);
+}
+
+std::size_t StorageTexture::FlushUnprotected(const char* reason) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        for (auto* texture : pending.textures) {
+            if (texture->accessProtection == 0 && texture->guestBytes != 0) ranges.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
+        }
+    }
+    std::size_t stored = 0;
+    for (const auto& [begin, end] : ranges) stored += FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, reason, PublishScope::Whole) ? 1 : 0;
+    return stored + PublishUnprotectedShadows(PublishReasonFor(reason));
+}
+
+bool StorageTexture::AnyUnprotectedPending() {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
-    const bool any = anyLayerPending();
-    if (any == dirty) return;
-    dirty = any;
-    if (any) pending.textures.push_back(this);
-    else pending.textures.remove(this);
-    BumpPendingSerial();
+    for (auto* texture : pending.textures) {
+        if (texture->accessProtection == 0) return true;
+    }
+    return false;
+}
+
+void StorageTexture::MaterializeForNativeAccess(std::uint64_t address, std::size_t bytes) {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) Coherence::NoteLockedFault({address, address + bytes});
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    static_cast<void>(FlushPending(address, bytes, nullptr, "native access", PublishScope::Whole));
+    if (auto* recorder = Recorder::Active()) {
+        if (AnyDeviceResident()) static_cast<void>(PublishDeviceResident(*recorder, address, bytes, ResidentSite::Native));
+        recorder->Sync();
+    }
 }
 
 void StorageTexture::Flush() {
@@ -3735,6 +3786,27 @@ bool StorageTexture::StoreForPointerAccess(std::uint64_t address, std::size_t by
     return stored || published;
 }
 
+void StorageTexture::AuditPointerReads(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt) {
+    if (!Coherence::Tracking()) return;
+    std::vector<std::pair<Coherence::Interval, Coherence::Version>> stale;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        for (auto* texture : pending.textures) {
+            if (!texture->overlaps(address, bytes)) continue;
+            if (std::any_of(exempt.begin(), exempt.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return texture->overlaps(range.first, static_cast<std::size_t>(range.second - range.first)); })) continue;
+            for (std::uint32_t layer = 0; layer < texture->trackedLayers; ++layer) {
+                if (!texture->layerPending[layer]) continue;
+                const auto begin = std::max(texture->layerBegin(layer), address);
+                const auto end = std::min(texture->layerBegin(layer) + texture->layerBytes(layer), address + bytes);
+                if (begin < end) stale.push_back({{begin, end}, texture->coherenceVersion});
+            }
+        }
+    }
+    for (const auto& [range, version] : stale) static_cast<void>(Coherence::CheckRead(Coherence::Source::PendingImage, version, range, "address-based heap"));
+    if (AnyShadowedOverlaps(address, bytes)) static_cast<void>(Coherence::CheckRead(Coherence::Source::ShadowUnit, Coherence::CurrentVersion(), {address, address + bytes}, "address-based heap"));
+}
+
 namespace {
 
 struct StorageDumpSelector {
@@ -3818,6 +3890,13 @@ std::optional<PublishScope> StorageTexture::StoreAtFlipRequested(const char* val
 }
 
 bool StorageTexture::PresentThenStore(std::optional<PublishScope> storeAtFlip, const std::function<bool()>& present) {
+    if (Coherence::LazyRelease()) {
+        FlushDumpSelected("flip");
+        const bool presented = present();
+        static_cast<void>(FlushUnprotected("flip"));
+        Coherence::CheckReleaseCovered(AnyUnprotectedPending(), AnyUnprotectedShadow(), "flip");
+        return presented;
+    }
     if (!storeAtFlip) FlushDumpSelected("flip");
     const bool presented = present();
     if (storeAtFlip) FlushAllPending("flip", *storeAtFlip);
@@ -5283,7 +5362,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 Require(range.end <= segment.end, "a shadowed storage write-back range crosses the end of its import segment");
                 ranges.push_back(range);
             }
-            if (!ranges.empty()) MarkShadowed(*segment.import, ranges, generation);
+            if (!ranges.empty()) MarkShadowed(*segment.import, ranges, generation, coherenceVersion);
         }
     };
     const auto settle = [&](bool memoizedCollect) {
@@ -5310,6 +5389,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         settle(true);
         return;
     }
+    for (const auto& [from, to] : keep) static_cast<void>(Coherence::CheckPublication(Coherence::Source::PendingImage, coherenceVersion, {from, to}, flushReason));
     if (const auto* import = surfaceImport()) segments.push_back({import, descriptor.baseAddress, descriptor.baseAddress + guestBytes});
     else segments = importSegments();
     if (!segments.empty()) {
@@ -5609,6 +5689,7 @@ StorageTexture::~StorageTexture() {
             if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx destroyed with GPU results pending\n", static_cast<unsigned long long>(descriptor.baseAddress));
         }
     }
+    Coherence::ReleaseDeviceOwned(std::exchange(accessProtection, 0));
     release();
     original = std::vector<std::byte>();
     generationBaseline = std::vector<std::byte>();

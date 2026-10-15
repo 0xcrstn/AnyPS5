@@ -184,6 +184,35 @@ GPU results in storage images and render targets stay on the GPU until something
 
 A title's own CPU reads of that memory are not seen, so a title that waits for a GPU label and then reads the results reads stale memory. `APS5_STORE_AT_LABEL=1` stores every pending result before each label the GPU writes (`RELEASE_MEM`, `WRITE_DATA`, `DMA_DATA`), at the cost of a write-back of every pending image per label. Any other value stops the title at its first label.
 
+### Guest-memory coherence checks
+
+Three switches take `0` (the default), `1` or `verify`; any other value stops the title when the GPU device is created.
+
+`APS5_COHERENCE_AUDIT=1` keeps a version for every GPU writer the driver records (address-based shaders that may store through pointers, and written buffer elements) and checks every store of an older GPU result into guest memory (a pending storage image, a unit shadow) against it. The first stale store prints a `[coherence] stale publication` line with the writers and stores that touched those bytes; later ones are counted on a `[coherence]` line every 10 s. An address-based shader that reads host memory under a pending image or an unpublished unit shadow prints `[coherence] stale read`. `verify` stops the title at the first stale store instead. Rendering is unchanged; the checks cost CPU time.
+
+`APS5_COHERENCE_ORDERING=1` changes what the driver stores before GPU work:
+- A shader that may store through pointers:
+  - its heaps are noted as pending writes, so driver CPU reads of them wait for it;
+  - only its color target and the storage images it writes are left pending.
+- Every pending result is stored before each label, as with `APS5_STORE_AT_LABEL=1`.
+
+`verify` also runs the audit and stops the title at the first stale store, stale read, or label written while results are still pending.
+
+`APS5_COHERENCE_DIRECTORY=1` makes those checks compare guest bytes by the memory backing them, so a write through one mapping and a store through another mapping of the same memory are compared. `verify` also stops the title when a writer completes after its range was mapped to other memory. This switch is Windows only; on other systems it stops the title at start.
+
+`APS5_COHERENCE_FAULTS=1` makes guest memory whose newest bytes are only on the GPU inaccessible to the title's own CPU code. That covers the whole 4 KiB pages under a pending storage image or an unpublished unit shadow, through every mapping of them.
+- **First access:** the first load or store there is held. The driver stores and publishes the GPU results over the range and waits for them, then lets the access proceed. A title reading results after a label, or overwriting part of a GPU result, then sees the right bytes, including a store of a value the old bytes already held.
+- **File reads:** kernel file reads into such memory resolve it first.
+- **Refused ranges:** ranges the protection refuses (pinned or resident pages) keep the default behaviour.
+- **`verify`:** stops the title at a refused or partly covered range, and at a driver access to such memory made while it holds the GPU lock.
+- **Limits:** unmapping or reprotecting such memory before the driver stored it stops the title. Windows only. Each pending image costs a protection change, so expect a slowdown.
+
+`APS5_COHERENCE_INPUT_LEASES=1` protects the guest memory that a recorded dispatch reads in place through host imports, from recording until its batch completes. A native store into that memory waits until the recorded work has run, so the dispatch reads the bytes it was given rather than a later write. The protection covers every 4 KiB page the reads touch, so reads beside the stored bytes wait as well. Address-based heaps are not leased, because their reach is the whole heap. `verify` stops the title when a lease is refused. Windows only. Each dispatch costs a protection change, and the title's stores into memory the GPU still reads wait for the GPU.
+
+`APS5_COHERENCE_RESIDENCY=1` protects the guest memory under device-resident buffer results (`APS5_LAZY_STAGING_OUT`) the same way. The title's first load or store there publishes those results into guest memory and waits for them before it proceeds. A CPU store over such results then keeps the device bytes around it instead of reaching the unsupported publish after a CPU store. `verify` stops the title when the protection is refused or does not cover whole pages. Windows only.
+
+`APS5_COHERENCE_LAZY_RELEASE=1` makes labels and flips store only the pending results whose memory the native protection does not cover. Protected results stay on the GPU until something reads them, and the title's own CPU accesses resolve them when they happen. Every `APS5_STORE_AT_FLIP` value then behaves the same, and `APS5_STORE_AT_LABEL=1` still stores everything. `verify` stops the title when a label or flip leaves results that are neither stored nor protected. The switch needs `APS5_COHERENCE_FAULTS`, and `APS5_COHERENCE_RESIDENCY` too when `APS5_LAZY_STAGING_OUT` is on; without them the title stops at start.
+
 ### Tracing system library calls
 
 Windows only. An executable converted with `--trace-imports` records the calls it makes to the libraries named in `APS5_TRACE_CALLS`, a comma-separated list such as `libkernel,libSceSaveData`, or `all`. Without the variable nothing is recorded. The crash and abort reports then end with the last 64 calls: sequence number, thread, library, import name as the executable imports it (a NID) and the caller's address. They are followed by the 32 most called imports since start-up, with their number of calls.

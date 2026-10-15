@@ -21,6 +21,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
+#include "BdaShader.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -4331,6 +4334,806 @@ void pointerAccessShadowTests(const Device& device, Recorder& recorder) {
         Require(sources.size() == 1 && !sources[0].shadow, "a unit under an address-based build that stores through pointers still reads from its slab");
     }
     std::cout << "pointer access over unit shadows: ok\n";
+}
+
+class AddressProgram {
+public:
+    AddressProgram(const Context& context, std::span<const std::uint32_t> code, const std::array<VkDescriptorBufferInfo, 3>& buffers) : context(context) {
+        try {
+            std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
+            for (std::uint32_t index = 0; index < bindings.size(); ++index) bindings[index] = {index, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+            VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            setInfo.bindingCount = bindings.size();
+            setInfo.pBindings = bindings.data();
+            Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &setInfo, nullptr, &setLayout), "vkCreateDescriptorSetLayout");
+            const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            poolInfo.maxSets = 1;
+            poolInfo.poolSizeCount = 1;
+            poolInfo.pPoolSizes = &size;
+            Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool");
+            VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, pool, 1, &setLayout};
+            Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &set), "vkAllocateDescriptorSets");
+            for (std::uint32_t index = 0; index < buffers.size(); ++index) {
+                VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                write.dstSet = set;
+                write.dstBinding = index;
+                write.descriptorCount = 1;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                write.pBufferInfo = &buffers[index];
+                context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 1, &write, 0, nullptr);
+            }
+            VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layoutInfo.setLayoutCount = 1;
+            layoutInfo.pSetLayouts = &setLayout;
+            Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout");
+            VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            moduleInfo.codeSize = code.size_bytes();
+            moduleInfo.pCode = code.data();
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
+            VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+            pipelineInfo.layout = layout;
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines");
+        } catch (...) {
+            release();
+            throw;
+        }
+    }
+    AddressProgram(const AddressProgram&) = delete;
+    AddressProgram& operator=(const AddressProgram&) = delete;
+    ~AddressProgram() { release(); }
+
+    void Record(Recorder& recorder) const {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        context.Function<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        recorder.MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    }
+
+private:
+    void release() noexcept {
+        if (pipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+        if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        if (layout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+        if (pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+        if (setLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, setLayout, nullptr);
+        pipeline = VK_NULL_HANDLE;
+        module = VK_NULL_HANDLE;
+        layout = VK_NULL_HANDLE;
+        pool = VK_NULL_HANDLE;
+        setLayout = VK_NULL_HANDLE;
+    }
+
+    Context context;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+int coherenceOrderingTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    namespace Coherence = AgcDriver::Coherence;
+    const auto& base = device.GetContext();
+    if (!base.bufferDeviceAddress) {
+        std::cout << "skipped, buffer device addresses are unavailable\n";
+        return 77;
+    }
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 6 * unit;
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared coherence section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    struct Release {
+        void* block;
+        ~Release() {
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+#else
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "unit shadows are on without write watching");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+#endif
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            Coherence::SetModesForTests(Coherence::Mode::Reference, Coherence::Mode::Reference, Coherence::Mode::Reference);
+            Coherence::ResetForTests();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the coherence block refused or compared: not tested\n";
+        return 77;
+    }
+    CollectWritesUncached(address, bytes);
+    const auto* words = static_cast<const std::uint8_t*>(block);
+    const auto copyBuffer = base.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto retile = [&](std::uint64_t begin, std::uint8_t value, Coherence::Version version) {
+        auto destination = ShadowDestinationFor(base, *import, begin, begin + unit);
+        Require(destination.has_value() && destination->seedUnits.empty(), "a whole-unit retile piece has no destination");
+        auto pattern = std::make_shared<Buffer>(base, static_cast<std::size_t>(unit), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(pattern->Bytes().data(), value, pattern->Bytes().size());
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(destination->slab);
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, SlabOffset(*import, *destination->slab, begin), unit};
+        copyBuffer(commands, pattern->Handle(), destination->buffer, 1, &piece);
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const ShadowedRange range{begin, begin + unit, destination->slab};
+        MarkShadowed(*import, std::span(&range, 1), TrackerGeneration(), version);
+    };
+    auto output = std::make_shared<Buffer>(base, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    struct Use {
+        std::unique_ptr<GuestBufferMemory> memory;
+        std::unique_ptr<BdaResources> bda;
+        std::unique_ptr<AddressProgram> program;
+    };
+    const auto record = [&](bool writes, std::vector<std::uint32_t> code) {
+        Use use;
+        use.memory = std::make_unique<GuestBufferMemory>(base);
+        use.memory->AcquireRegistered();
+        use.memory->SetPointerAccess(writes, {});
+        use.memory->Upload(true);
+        use.bda = std::make_unique<BdaResources>(base, *use.memory);
+        std::memset(output->Bytes().data(), 0, output->Bytes().size());
+        use.program = std::make_unique<AddressProgram>(base, code, std::array<VkDescriptorBufferInfo, 3>{use.bda->Table(), use.bda->Fault(), VkDescriptorBufferInfo{output->Handle(), 0, 16}});
+        use.program->Record(recorder);
+        if (writes) {
+            use.memory->ForgetPointerShadows();
+            use.memory->PointerRecorded();
+            if (Coherence::Ordering()) recorder.NotePendingWrites(use.memory->PointerHeaps());
+        }
+        return use;
+    };
+    const auto complete = [&](Use& use) {
+        recorder.Sync();
+        use.bda->CheckFault();
+        use.memory->CompletePointerWrites(use.bda->WrittenRanges());
+        use.memory->WriteBack();
+    };
+    const auto dword = [&] {
+        std::uint32_t value = 0;
+        std::memcpy(&value, output->Bytes().data(), sizeof(value));
+        return value;
+    };
+    const auto filled = [&](std::uint64_t from, std::uint64_t to, std::uint8_t value) {
+        for (auto at = from; at < to; ++at) {
+            if (words[at] != value) return false;
+        }
+        return true;
+    };
+    constexpr std::uint32_t stored = 0xa1b2c3d4u;
+    constexpr std::uint64_t storeOffset = 16;
+
+    Coherence::SetModesForTests(Coherence::Mode::Reference, Coherence::Mode::Verify, Coherence::Mode::Reference);
+    Coherence::ResetForTests();
+    retile(address, 0x22, 0);
+    {
+        auto writer = record(true, MakeBdaStoreTestShader(address + storeOffset, stored, 32, false));
+        Require(Coherence::CurrentCounters().activeWriters == 1, "the pointer writer was not reserved before its completion");
+        StorageTexture::FlushAllPending("flip", PublishScope::Whole);
+        complete(writer);
+    }
+    Require(filled(0, storeOffset, 0x22) && filled(storeOffset + 4, unit, 0x22), "the bytes around a pointer store lost the shadow published before it");
+    Require(words[storeOffset] == 0xd4 && words[storeOffset + 1] == 0xc3 && words[storeOffset + 2] == 0xb2 && words[storeOffset + 3] == 0xa1, "a pointer store did not survive a flip recorded before its completion");
+    {
+        auto reader = record(false, MakeBdaDwordReadTestShader(address + storeOffset, 1, false, true));
+        complete(reader);
+    }
+    Require(dword() == stored, "a later address-based reader did not see the pointer store");
+    auto counters = Coherence::CurrentCounters();
+    Require(counters.stalePublications == 0 && counters.staleReads == 0 && counters.completions >= 1 && counters.activeWriters == 0, "ordered pointer store: " + Coherence::Report());
+
+    for (const auto audit : {Coherence::Mode::Verify, Coherence::Mode::New}) {
+        Coherence::SetModesForTests(audit, Coherence::Mode::Reference, Coherence::Mode::Reference);
+        Coherence::ResetForTests();
+        const auto old = Coherence::NextVersion();
+        const auto target = address + 2 * unit;
+        auto writer = record(true, MakeBdaStoreTestShader(target + storeOffset, stored, 32, false));
+        retile(target, 0x55, old);
+        std::string failure;
+        try {
+            StorageTexture::FlushAllPending("flip", PublishScope::Whole);
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+        complete(writer);
+        if (audit == Coherence::Mode::Verify) {
+            Require(failure.find("stale publication: shadow-unit") != std::string::npos, "audit verify accepted an old shadow published over a recorded pointer writer: " + failure);
+            Coherence::SetModesForTests(Coherence::Mode::Reference, Coherence::Mode::Reference, Coherence::Mode::Reference);
+            StorageTexture::FlushAllPending("teardown", PublishScope::Whole);
+            recorder.Sync();
+        } else {
+            Require(failure.empty(), "audit 1 threw: " + failure);
+            Require(Coherence::CurrentCounters().stalePublications != 0, "audit 1 did not flag an old shadow published over a recorded pointer writer: " + Coherence::Report());
+        }
+    }
+
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address + 4 * unit;
+    resource.width = 128;
+    resource.height = 128;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == unit, "the coherence image does not fill its 64 KiB block");
+    auto image = StorageTexture::Create(context, detiler, resource, 0);
+    const auto paint = [&](const VkClearColorValue& color) {
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+    };
+
+    Coherence::SetModesForTests(Coherence::Mode::New, Coherence::Mode::Reference, Coherence::Mode::Reference);
+    Coherence::ResetForTests();
+    paint({{1.0f, 0.0f, 0.0f, 1.0f}});
+    {
+        auto reader = record(false, MakeBdaDwordReadTestShader(address + 4 * unit, 1, false, true));
+        complete(reader);
+    }
+    Require(StorageTexture::FindPending(address + 4 * unit, unit) == nullptr && dword() == 0xff0000ffu, "a read-only address-based build read host bytes under a pending image");
+    Require(Coherence::CurrentCounters().staleReads == 0, "audit 1 flagged a read-only address-based build that stored the pending image first: " + Coherence::Report());
+
+    Coherence::SetModesForTests(Coherence::Mode::Reference, Coherence::Mode::Verify, Coherence::Mode::Reference);
+    Coherence::ResetForTests();
+    paint({{0.0f, 1.0f, 0.0f, 1.0f}});
+    {
+        auto reader = record(false, MakeBdaDwordReadTestShader(address + 4 * unit, 1, false, true));
+        complete(reader);
+    }
+    Require(StorageTexture::FindPending(address + 4 * unit, unit) == nullptr, "an ordered read-only address-based build left the image pending over its heap");
+    Require(dword() == 0xff00ff00u, "an ordered read-only address-based build read stale bytes under a pending image");
+    counters = Coherence::CurrentCounters();
+    Require(counters.staleReads == 0 && counters.stalePublications == 0, "ordered pointer reader: " + Coherence::Report());
+    std::cout << "coherence ordering with address-based stores and loads: ok\n";
+    return 0;
+}
+
+int coherenceFaultTests(const Device& device, Recorder& recorder) {
+#ifndef _WIN32
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+    std::cout << "skipped, guest access protection is Windows only\n";
+    return 77;
+#else
+    using namespace AgcDriver::GuestMemory;
+    namespace Coherence = AgcDriver::Coherence;
+    const auto& base = device.GetContext();
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 2 * unit;
+    std::unique_lock gpu(GpuMutex());
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared fault section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto* alias = static_cast<std::uint8_t*>(GuestArena::GuestArenaMapAlias_nid_postfix(address, bytes));
+    Require(alias != nullptr, "cannot map an alias of the fault block");
+    struct Release {
+        void* block;
+        void* alias;
+        ~Release() {
+            Coherence::SetFaultsModeForTests(Coherence::Mode::Reference);
+            Coherence::ResetForTests();
+            GuestArena::GuestArenaUnmapAlias_nid_postfix(alias);
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block, alias};
+    std::memset(block, 0x11, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the fault block refused or compared: not tested\n";
+        return 77;
+    }
+    CollectWritesUncached(address, bytes);
+    Coherence::SetFaultsModeForTests(Coherence::Mode::New);
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetMaterializer([](Coherence::Interval range) { StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin)); });
+    Coherence::ResetForTests();
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = 128;
+    resource.height = 128;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == unit, "the fault image does not fill its 64 KiB block");
+    auto image = StorageTexture::Create(context, detiler, resource, 0);
+    const auto paint = [&](std::array<float, 4> color) {
+        const VkClearColorValue value{{color[0], color[1], color[2], color[3]}};
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+        const auto counters = Coherence::CurrentCounters();
+        Require(counters.liveProtections != 0, "a pending image over shared guest memory was not protected: " + Coherence::Report());
+    };
+    const auto texel = [](std::array<std::uint8_t, 4> color, std::uint64_t offset) { return color[offset % 4]; };
+    const auto holds = [&](std::uint64_t from, std::uint64_t to, std::array<std::uint8_t, 4> color, std::uint64_t skipFrom, std::uint64_t skipTo) {
+        for (auto at = from; at < to; ++at) {
+            if (at >= skipFrom && at < skipTo) continue;
+            if (alias[at] != texel(color, at)) return false;
+        }
+        return true;
+    };
+
+    paint({1.0f, 0.0f, 0.0f, 1.0f});
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint32_t*>(address + 100) = 0x12345678u;
+    gpu.lock();
+    Require(alias[100] == 0x78 && alias[101] == 0x56 && alias[102] == 0x34 && alias[103] == 0x12, "a native store over a pending image was lost");
+    Require(holds(0, unit, {255, 0, 0, 255}, 100, 104), "the GPU bytes around a native store were not materialized before it");
+    Require(StorageTexture::FindPending(address, unit) == nullptr, "the faulting store left the image pending");
+
+    paint({0.0f, 1.0f, 0.0f, 1.0f});
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint8_t*>(address + 200) = 0xff;
+    gpu.lock();
+    Require(alias[200] == 0xff, "a native store of the value the host bytes already held lost to the GPU result");
+    Require(holds(0, unit, {0, 255, 0, 255}, 200, 201), "the GPU bytes around a same-value store are wrong");
+
+    paint({0.0f, 0.0f, 1.0f, 1.0f});
+    gpu.unlock();
+    {
+        const std::uint64_t value = 0x0102030405060708ull;
+        std::memcpy(reinterpret_cast<void*>(address + 0x3ffc), &value, sizeof(value));
+    }
+    gpu.lock();
+    Require(alias[0x3ffc] == 0x08 && alias[0x4003] == 0x01, "a native store across a protection page boundary was lost");
+    Require(holds(0, unit, {0, 0, 255, 255}, 0x3ffc, 0x4004), "the GPU bytes around a cross-page store are wrong");
+
+    paint({1.0f, 1.0f, 1.0f, 1.0f});
+    gpu.unlock();
+    {
+        std::atomic<int> ready{0};
+        const auto store = [&](std::uint64_t offset, std::uint32_t value) {
+            ++ready;
+            while (ready.load() < 2) std::this_thread::yield();
+            *reinterpret_cast<volatile std::uint32_t*>(address + offset) = value;
+        };
+        std::thread first(store, 0x1000, 0xaaaaaaaau);
+        std::thread second(store, 0x2008, 0xbbbbbbbbu);
+        first.join();
+        second.join();
+    }
+    gpu.lock();
+    Require(alias[0x1000] == 0xaa && alias[0x2008] == 0xbb, "one of two native writers on one protected page was lost");
+    Require(holds(0, unit, {255, 255, 255, 255}, 0x1000, 0x2010), "the GPU bytes around two native writers are wrong");
+
+    {
+        auto destination = ShadowDestinationFor(base, *import, address + unit, address + 2 * unit);
+        Require(destination.has_value() && destination->seedUnits.empty(), "the shadow fault unit has no destination");
+        auto pattern = std::make_shared<Buffer>(base, static_cast<std::size_t>(unit), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(pattern->Bytes().data(), 0x77, pattern->Bytes().size());
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(destination->slab);
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, SlabOffset(*import, *destination->slab, address + unit), unit};
+        base.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, pattern->Handle(), destination->buffer, 1, &piece);
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const ShadowedRange range{address + unit, address + 2 * unit, destination->slab};
+        MarkShadowed(*import, std::span(&range, 1), TrackerGeneration());
+    }
+    Require(AnyShadowedOverlaps(address + unit, unit), "the shadow fault unit is not shadowed");
+    gpu.unlock();
+    const auto loaded = *reinterpret_cast<volatile std::uint8_t*>(address + unit + 5);
+    gpu.lock();
+    Require(loaded == 0x77, "a native load of an unpublished shadow unit read the stale host bytes");
+    Require(!AnyShadowedOverlaps(address + unit, unit), "a native load left the shadow unit unpublished");
+
+    recorder.Sync();
+    const auto counters = Coherence::CurrentCounters();
+    Require(counters.faultsResolved >= 5 && counters.liveProtections == 0 && counters.lockedFaults == 0, "native access ownership: " + Coherence::Report());
+    std::cout << "coherence native access ownership: ok\n";
+    return 0;
+#endif
+}
+
+int coherenceLeaseTests(const Device& device, Recorder& recorder) {
+#ifndef _WIN32
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+    std::cout << "skipped, guest access protection is Windows only\n";
+    return 77;
+#else
+    using namespace AgcDriver::GuestMemory;
+    namespace Coherence = AgcDriver::Coherence;
+    const auto& base = device.GetContext();
+    constexpr std::size_t bytes = 65536;
+    std::unique_lock gpu(GpuMutex());
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared lease section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    struct Release {
+        void* block;
+        ~Release() {
+            Coherence::SetInputLeasesModeForTests(Coherence::Mode::Reference);
+            Coherence::ResetForTests();
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+    std::memset(block, 0x41, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the lease block refused: not tested\n";
+        return 77;
+    }
+    Coherence::SetInputLeasesModeForTests(Coherence::Mode::Verify);
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetLeaseWaiter([](Coherence::Interval) {
+        std::lock_guard lock(GpuMutex());
+        if (auto* active = Recorder::Active()) active->Sync();
+    });
+    Coherence::ResetForTests();
+    const auto copyBuffer = base.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto read = [&](Buffer& output) {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{address - import->base, 0, 16};
+        copyBuffer(commands, import->buffer, output.Handle(), 1, &piece);
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const auto lease = Coherence::AcquireReadLease({address, address + 16}, Coherence::CurrentVersion());
+        Require(lease != 0, "a read lease over shared guest memory was refused");
+        recorder.OnCompleteWithoutGuestAccess([lease] { Coherence::RetireReadLease(lease); });
+    };
+    Buffer first(base, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer second(base, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::memset(first.Bytes().data(), 0, 16);
+    std::memset(second.Bytes().data(), 0, 16);
+    read(first);
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint32_t*>(address) = 0x42424242u;
+    gpu.lock();
+    read(second);
+    recorder.Sync();
+    const auto* early = reinterpret_cast<const std::uint8_t*>(first.Bytes().data());
+    const auto* late = reinterpret_cast<const std::uint8_t*>(second.Bytes().data());
+    Require(early[0] == 0x41 && early[3] == 0x41 && early[4] == 0x41, "a reader recorded before a native write saw the write");
+    Require(late[0] == 0x42 && late[3] == 0x42 && late[4] == 0x41, "a reader recorded after a native write missed it");
+    auto counters = Coherence::CurrentCounters();
+    Require(counters.leaseWaits == 1 && counters.liveProtections == 0, "leased in-place reads: " + Coherence::Report());
+    for (int draw = 0; draw < 1000; ++draw) read(second);
+    recorder.Sync();
+    counters = Coherence::CurrentCounters();
+    Require(counters.leases == 1002 && counters.leaseWaits == 1 && counters.liveProtections == 0, "unwritten leased reads waited or kept their leases: " + Coherence::Report());
+    std::cout << "coherence input leases: ok\n";
+    return 0;
+#endif
+}
+
+int coherenceResidencyTests(const Device& device, Recorder& recorder) {
+#ifndef _WIN32
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+    std::cout << "skipped, guest access protection is Windows only\n";
+    return 77;
+#else
+    using namespace AgcDriver::GuestMemory;
+    namespace Coherence = AgcDriver::Coherence;
+    const auto& base = device.GetContext();
+    constexpr std::size_t bytes = 65536;
+    std::unique_lock gpu(GpuMutex());
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared residency section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto* alias = static_cast<std::uint8_t*>(GuestArena::GuestArenaMapAlias_nid_postfix(address, bytes));
+    Require(alias != nullptr, "cannot map an alias of the residency block");
+    struct Release {
+        void* block;
+        void* alias;
+        ~Release() {
+            Coherence::SetResidencyModeForTests(Coherence::Mode::Reference);
+            Coherence::SetModesForTests(Coherence::Mode::Reference, Coherence::Mode::Reference, Coherence::Mode::Reference);
+            Coherence::ResetForTests();
+            GuestArena::GuestArenaUnmapAlias_nid_postfix(alias);
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block, alias};
+    std::memset(block, 0x11, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            ClearDeviceResident(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the residency block refused or compared: not tested\n";
+        return 77;
+    }
+    Coherence::SetModesForTests(Coherence::Mode::Verify, Coherence::Mode::Reference, Coherence::Mode::Reference);
+    Coherence::SetResidencyModeForTests(Coherence::Mode::Verify);
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetMaterializer([](Coherence::Interval range) { StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin)); });
+    Coherence::ResetForTests();
+    const auto resident = [&](std::uint8_t value) {
+        auto shadow = std::make_shared<Buffer>(base, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::memset(shadow->Bytes().data(), value, bytes);
+        const auto generation = CollectWritesUncached(address, bytes);
+        Require(generation != 0, "the residency block is not write-watched");
+        NoteDeviceResident(base.device, address, address + bytes, shadow, address, import->buffer, import->base, generation);
+        Require(AnyDeviceResidentOverlaps(address, bytes), "the device-resident results were not noted");
+        Require(Coherence::CurrentCounters().liveProtections != 0, "device-resident results over shared guest memory were not protected: " + Coherence::Report());
+    };
+
+    resident(0x5a);
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint32_t*>(address + 0x2000) = 0x11111111u;
+    gpu.lock();
+    Require(!AnyDeviceResidentOverlaps(address, bytes), "a native store left device-resident results unpublished");
+    for (std::size_t at = 0; at < bytes; ++at) {
+        const auto expected = at >= 0x2000 && at < 0x2004 ? std::uint8_t{0x11} : std::uint8_t{0x5a};
+        Require(alias[at] == expected, "a native store over device-resident results lost the device bytes or the store");
+    }
+
+    resident(0xa5);
+    gpu.unlock();
+    const auto loaded = *reinterpret_cast<volatile std::uint8_t*>(address + 0x8000);
+    gpu.lock();
+    Require(loaded == 0xa5 && !AnyDeviceResidentOverlaps(address, bytes), "a native load read host bytes under device-resident results");
+
+    recorder.Sync();
+    const auto counters = Coherence::CurrentCounters();
+    Require(counters.faultsResolved == 2 && counters.liveProtections == 0 && counters.stalePublications == 0, "device residency: " + Coherence::Report());
+    std::cout << "coherence device residency: ok\n";
+    return 0;
+#endif
+}
+
+int coherenceLazyReleaseTests(const Device& device, Recorder& recorder) {
+#ifndef _WIN32
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+    std::cout << "skipped, guest access protection is Windows only\n";
+    return 77;
+#else
+    using namespace AgcDriver::GuestMemory;
+    namespace Coherence = AgcDriver::Coherence;
+    const auto& base = device.GetContext();
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 2 * unit;
+    std::unique_lock gpu(GpuMutex());
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared release section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    struct Release {
+        void* block;
+        ~Release() {
+            Coherence::SetLazyReleaseModeForTests(Coherence::Mode::Reference);
+            Coherence::SetFaultsModeForTests(Coherence::Mode::Reference);
+            Coherence::ResetForTests();
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the release block refused or compared: not tested\n";
+        return 77;
+    }
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetMaterializer([](Coherence::Interval range) { StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin)); });
+    Coherence::SetLazyReleaseModeForTests(Coherence::Mode::Verify);
+    Coherence::ResetForTests();
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    const auto create = [&](std::uint64_t at) {
+        GuestTextureResource resource{};
+        resource.baseAddress = at;
+        resource.width = 128;
+        resource.height = 128;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kLinear;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        Require(DescribeSurface(resource).guestBytes == unit, "a release image does not fill its 64 KiB block");
+        return StorageTexture::Create(context, detiler, resource, 0);
+    };
+    auto covered = create(address);
+    auto uncovered = create(address + unit);
+    const auto paint = [&](const std::shared_ptr<StorageTexture>& image, std::array<float, 4> color, bool protect) {
+        Coherence::SetFaultsModeForTests(protect ? Coherence::Mode::New : Coherence::Mode::Reference);
+        const VkClearColorValue value{{color[0], color[1], color[2], color[3]}};
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+        Coherence::SetFaultsModeForTests(Coherence::Mode::New);
+    };
+    const auto* words = static_cast<const std::uint8_t*>(block);
+    paint(covered, {1.0f, 0.0f, 0.0f, 1.0f}, true);
+    Require(Coherence::CurrentCounters().liveProtections == 1, "the covered image was not protected: " + Coherence::Report());
+    const std::array<std::optional<PublishScope>, 3> flips{std::nullopt, PublishScope::Whole, PublishScope::None};
+    std::uint8_t shade = 0x20;
+    for (const auto& flip : flips) {
+        const auto value = static_cast<float>(shade) / 255.0f;
+        paint(uncovered, {value, value, value, 1.0f}, false);
+        Require(StorageTexture::AnyUnprotectedPending(), "the uncovered image is protected");
+        bool presented = false;
+        Require(StorageTexture::PresentThenStore(flip, [&] {
+            presented = true;
+            return true;
+        }), "the flip did not present");
+        Require(presented, "the flip skipped its present");
+        recorder.Sync();
+        Require(StorageTexture::FindPending(address, unit) == covered, "a lazy flip stored a protected image");
+        Require(StorageTexture::FindPending(address + unit, unit) == nullptr, "a lazy flip left an unprotected image pending");
+        Require(words[unit] == shade && words[unit + 1] == shade && words[unit + 3] == 0xff, "a lazy flip did not store the unprotected image's results");
+        shade = static_cast<std::uint8_t>(shade + 0x20);
+    }
+    gpu.unlock();
+    const auto loaded = *reinterpret_cast<volatile std::uint32_t*>(address + 0x1230);
+    gpu.lock();
+    Require(loaded == 0xff0000ffu, "a native load after a lazy flip read stale bytes under the protected image");
+    Require(StorageTexture::FindPending(address, unit) == nullptr, "a native load left the protected image pending");
+    recorder.Sync();
+    const auto counters = Coherence::CurrentCounters();
+    Require(counters.uncoveredReleases == 0 && counters.liveProtections == 0 && counters.faultsResolved == 1, "lazy release: " + Coherence::Report());
+    std::cout << "coherence lazy release: ok\n";
+    return 0;
+#endif
 }
 
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
@@ -10366,6 +11169,48 @@ int main(int argc, char** argv) {
         }
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--coherence-input-leases-only") {
+            if (device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, host imports are unavailable\n";
+                return 77;
+            }
+            gpu.unlock();
+            const auto result = coherenceLeaseTests(device, recorder);
+            gpu.lock();
+            return result;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--coherence-residency-only") {
+            if (device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, host imports are unavailable\n";
+                return 77;
+            }
+            gpu.unlock();
+            const auto result = coherenceResidencyTests(device, recorder);
+            gpu.lock();
+            return result;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--coherence-lazy-release-only") {
+            if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, unit shadows or host imports are unavailable
+";
+                return 77;
+            }
+            gpu.unlock();
+            const auto result = coherenceLazyReleaseTests(device, recorder);
+            gpu.lock();
+            return result;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--coherence-faults-only") {
+            if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, unit shadows or host imports are unavailable
+";
+                return 77;
+            }
+            gpu.unlock();
+            const auto result = coherenceFaultTests(device, recorder);
+            gpu.lock();
+            return result;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
             return 0;
@@ -10513,6 +11358,13 @@ int main(int argc, char** argv) {
             }
             unitShadowTests(device, recorder);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--coherence-ordering-only") {
+            if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, unit shadows or host imports are unavailable\n";
+                return 77;
+            }
+            return coherenceOrderingTests(device, recorder);
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pointer-access-shadow-only") {
             if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
