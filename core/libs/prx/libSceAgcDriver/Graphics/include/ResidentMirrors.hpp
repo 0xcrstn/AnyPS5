@@ -36,6 +36,10 @@ struct ResidentMirrorCounters {
     std::uint64_t midBatchSyncs = 0;
     std::uint64_t midBatchBytes = 0;
     std::uint64_t invalidatedBlocks = 0;
+    std::uint64_t deferred = 0;
+    std::uint64_t denied = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t verifyDiffering = 0;
     double collectMs = 0;
 };
 ResidentMirrorCounters MirrorTotals();

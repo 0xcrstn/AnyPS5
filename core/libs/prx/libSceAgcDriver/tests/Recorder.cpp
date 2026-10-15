@@ -7343,6 +7343,7 @@ bool residentMirrorTests(const Device& device, Recorder& recorder, bool descript
     Require(same(afterLate, expected), "a GPU write after the last read of its batch left the mirror stale");
     const auto after = AgcDriver::Graphics::MirrorTotals();
     Require(after.made - before.made <= 1 && after.uses - before.uses == 9 && after.refreshes - before.refreshes >= 8 && after.midBatchSyncs - before.midBatchSyncs == 1, "resident mirror counters do not match the reads");
+    if (const char* verify = std::getenv("APS5_VERIFY_RESIDENT_MIRRORS"); verify != nullptr && std::strcmp(verify, "0") != 0) Require(after.verified - before.verified >= 8 && after.verifyDiffering == before.verifyDiffering, "a resident mirror differed from its import at the start of a batch");
     leased.WriteBack();
     std::cout << "resident mirror tests passed (" << (after.refreshedBytes - before.refreshedBytes) / 1024 << " KiB refreshed, " << (after.midBatchBytes - before.midBatchBytes) / 1024 << " KiB synced mid-batch)\n";
     return true;
