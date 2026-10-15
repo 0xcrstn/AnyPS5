@@ -63,6 +63,7 @@ public:
     T As() { return static_cast<T>(Next()); }
     bool Flag() { return Next() != 0u; }
     [[nodiscard]] bool Done() const { return index == words.size(); }
+    [[nodiscard]] std::size_t Remaining() const { return words.size() - index; }
 
 private:
     std::span<const std::uint64_t> words;
@@ -287,6 +288,8 @@ std::unique_ptr<Decoded> Decode(std::span<const std::byte> key, std::vector<std:
     target.registrationWordLimit = words.As<std::uint32_t>();
     target.vertexSubgroups = words.Flag();
     target.float16DenormPreserve = words.Flag();
+    const bool robustWord = words.Remaining() == 4u;
+    if (robustWord) target.robustBufferAccess2 = words.Flag();
     if (words.Flag()) throw std::runtime_error("debug probe entries are not replayed");
     static_cast<void>(words.Next());
     static_cast<void>(words.Next());
@@ -294,6 +297,7 @@ std::unique_ptr<Decoded> Decode(std::span<const std::byte> key, std::vector<std:
     request.useCache = false;
     std::vector<std::uint64_t> rebuilt;
     RecompileCacheKey::Build(request, rebuilt);
+    if (!robustWord && rebuilt.size() == decoded->storedKey.size() + 1u) rebuilt.erase(rebuilt.end() - 4);
     if (rebuilt != decoded->storedKey) throw std::runtime_error("the decoded request does not rebuild its key");
     return decoded;
 }

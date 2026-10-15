@@ -3,7 +3,7 @@
 
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include <cstdint>
-#include <unordered_map>
+#include <vector>
 
 namespace ShaderRecompiler {
 
@@ -17,9 +17,12 @@ public:
     [[nodiscard]] bool Contains(const IrValue* value) const;
 
 private:
-    [[nodiscard]] bool evaluate(const IrValue& value) const;
+    enum class State : std::uint8_t { Untracked, Free, NotFree };
 
-    std::unordered_map<const IrValue*, bool> state;
+    [[nodiscard]] bool evaluate(const IrValue& value) const;
+    [[nodiscard]] State stateOf(const IrValue* value) const;
+
+    std::vector<State> state;
 };
 
 }
