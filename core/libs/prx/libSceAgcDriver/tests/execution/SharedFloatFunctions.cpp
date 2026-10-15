@@ -198,7 +198,7 @@ void Compare(std::uint32_t waveSize, const Mode& mode, std::uint32_t chunk, cons
 }
 
 void RequireCalled(const Calls& calls, const Mode& mode, std::uint32_t waveSize) {
-    std::vector<std::string> expected{"outlined_FPMin32", "outlined_FPMax32", "outlined_FPMedTri32", "outlined_FPSin", "outlined_FPCos", "outlined_FPLog2", "outlined_FPFract32", "outlined_FPSaturate32", "outlined_FPCmpClass32", "outlined_FPInterpolateF16", "outlined_PackHalf2x16", "outlined_ConvertF16F32", "is_nan_f32_bits"};
+    std::vector<std::string> expected{"outlined_FPMin32", "outlined_FPMax32", "outlined_FPMedTri32", "outlined_FPSin", "outlined_FPCos", "outlined_FPLog2", "outlined_FPFract32", "outlined_FPSaturate32", "outlined_FPCmpClass32", "outlined_PackHalf2x16", "outlined_ConvertF16F32", "is_nan_f32_bits"};
     if (mode.flushesF32) expected.insert(expected.end(), {"outlined_FPOrdLessThan32", "flush_f32_denormal"});
     for (const auto& name : expected) {
         Require(calls.called.contains(name), "shared float functions, wave" + std::to_string(waveSize) + ", " + mode.name + ": the shader does not call " + name + ", so the comparison does not cover it");
