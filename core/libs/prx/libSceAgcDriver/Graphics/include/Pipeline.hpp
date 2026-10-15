@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include <mutex>
 #include <set>
 
 namespace AgcDriver::Graphics {
@@ -93,6 +94,7 @@ private:
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::vector<std::uint32_t> colorSlots;
     bool sampleLocationsEnabled = false;
+    std::mutex framebufferMutex;
     std::vector<CachedFramebuffer> framebuffers;
 };
 

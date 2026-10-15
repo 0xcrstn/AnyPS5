@@ -9409,11 +9409,257 @@ void Run(Context context) {
 }
 #endif
 
+void resolveStampTests() {
+    const ResolveStamp first{};
+    Require(ChangedSerials(first, first) == 0, "an unchanged resolve stamp reported a change");
+    for (std::size_t i = 0; i < first.values.size(); ++i) {
+        auto moved = first;
+        ++moved.values[i];
+        Require(ChangedSerials(first, moved) == (1u << i), std::string("a change of the ") + ResolveSerialName(static_cast<ResolveSerial>(i)) + " serial was not reported alone");
+        Require(ChangedSerials(moved, first) == (1u << i), std::string("a change of the ") + ResolveSerialName(static_cast<ResolveSerial>(i)) + " serial depends on the comparison order");
+    }
+    auto both = first;
+    ++both.values[static_cast<std::size_t>(ResolveSerial::Ledger)];
+    ++both.values[static_cast<std::size_t>(ResolveSerial::ResourceCache)];
+    const auto expected = (1u << static_cast<std::size_t>(ResolveSerial::Ledger)) | (1u << static_cast<std::size_t>(ResolveSerial::ResourceCache));
+    Require(ChangedSerials(first, both) == expected, "two changed serials were not both reported");
+    Require(both.Of(ResolveSerial::Ledger) == 1 && both.Of(ResolveSerial::WriteGeneration) == 0, "ResolveStamp::Of read the wrong serial");
+    ResourceCache cache;
+    const auto before = cache.Serial();
+    cache.Remove(ResourceCache::Key{1u, 2u, 3u});
+    Require(cache.Serial() == before, "removing an absent key moved the resource cache serial");
+    Require(!cache.Touch(ResourceCache::Key{1u, 2u, 3u}) && cache.Find(ResourceCache::Key{1u, 2u, 3u}) == nullptr && cache.Serial() == before, "a lookup moved the resource cache serial");
+    cache.Clear();
+    Require(cache.Serial() == before + 1, "clearing the resource cache did not move its serial");
+    std::cout << "resolve stamp tests passed\n";
+}
+
+void ledgerSerialTests(const Device& device, Recorder& recorder) {
+    static_cast<void>(device);
+    recorder.Sync();
+    const auto moved = [](std::uint64_t before) { return Recorder::LedgerSerial() != before; };
+    auto before = Recorder::LedgerSerial();
+    Require(!recorder.PendingWriteOverlaps(0x50000, 16) && !recorder.PendingLabelIn(0x50000, 16) && !recorder.QueuedStoreOverlaps(0x50000, 16), "an idle recorder reported pending work");
+    Require(!Recorder::AccessNeedsFlush(0x50000, 16), "the hook-free flush check reported unwritten memory");
+    Require(!moved(before), "a query moved the ledger serial");
+    recorder.NotePendingWrite(0x50000, 16);
+    Require(moved(before), "a pending write note did not move the ledger serial");
+    Require(Recorder::AccessNeedsFlush(0x50008, 4) && Recorder::AccessNeedsFlush(0x4fff0, 0x20), "the hook-free flush check missed a pending write");
+    Require(!Recorder::AccessNeedsFlush(0x50010, 16) && !Recorder::AccessNeedsFlush(0x50000, 0), "the hook-free flush check reported memory beyond the pending write");
+    before = Recorder::LedgerSerial();
+    const std::array ranges{std::pair<std::uint64_t, std::uint64_t>{0x51000, 0x51010}};
+    recorder.NotePendingWrites(ranges);
+    Require(moved(before), "a pending write list did not move the ledger serial");
+    before = Recorder::LedgerSerial();
+    recorder.NotePendingFill(0x52000, 16, 0x5a);
+    Require(moved(before), "a pending fill did not move the ledger serial");
+    alignas(64) static std::array<std::byte, 64> labels{};
+    const auto labelAddress = reinterpret_cast<std::uint64_t>(labels.data());
+    const std::array value{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    before = Recorder::LedgerSerial();
+    recorder.NoteLabel(labelAddress, value, 1, 0);
+    Require(moved(before), "a label note did not move the ledger serial");
+    const auto stamp = ResolveStamp::Now();
+    Require(stamp.Of(ResolveSerial::Ledger) == Recorder::LedgerSerial() && stamp.Of(ResolveSerial::WriteGeneration) == Recorder::WriteGeneration() && stamp.Of(ResolveSerial::FinishedBatches) == Recorder::FinishedBatches() && stamp.Of(ResolveSerial::KeyStores) == Recorder::KeyStoreSerial() && stamp.Of(ResolveSerial::ResourceCache) == SharedResourceCache().Serial(), "ResolveStamp::Now did not read the current serials");
+    const auto finished = Recorder::FinishedBatches();
+    before = Recorder::LedgerSerial();
+    recorder.Sync();
+    Require(moved(before) && Recorder::FinishedBatches() > finished, "a sync of noted work did not move the ledger serial and the finished batches");
+    Require(!Recorder::AccessNeedsFlush(0x50000, 16) && !recorder.PendingWriteOverlaps(0x50000, 16), "a synced write still asked for a flush");
+    const auto changed = ChangedSerials(stamp, ResolveStamp::Now());
+    Require(((changed >> static_cast<std::size_t>(ResolveSerial::Ledger)) & 1u) != 0 && ((changed >> static_cast<std::size_t>(ResolveSerial::FinishedBatches)) & 1u) != 0, "the stamp did not see the sync");
+    before = Recorder::LedgerSerial();
+    recorder.Sync();
+    Require(moved(before), "a sync did not move the ledger serial");
+    std::cout << "ledger serial tests passed\n";
+}
+
+void framebufferMutexTests(const Device& device) {
+    std::lock_guard gpu(GpuMutex());
+    const auto& context = device.GetContext();
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { ClearCachedPipelines(device); }
+    } cleanup{context.device};
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 11;
+    fragment.variantId = 12;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.hasColorTarget = true;
+    state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    state.color.extent = {64, 64};
+    state.color.bytes = 64 * 64 * 4;
+    state.colors.push_back(state.color);
+    state.blend.colorWriteMask = 15;
+    state.blends.push_back(state.blend);
+    ShaderResources resources(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), 0, 0);
+    const auto pipeline = CachedPipeline(context, state, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    RenderTarget target(context, state.color, false);
+    const std::array views{target.View()};
+    const std::array<std::shared_ptr<StorageTexture>, 1> owners{};
+    const std::array<std::uint8_t, 1> persistent{1u};
+    const auto first = pipeline->AcquireFramebuffer(views, owners, {64, 64}, 1, persistent);
+    Require(first != nullptr && pipeline->AcquireFramebuffer(views, owners, {64, 64}, 1, persistent) == first, "a persistent framebuffer was not reused");
+    std::atomic<std::uint32_t> differing{0};
+    std::vector<std::thread> threads;
+    for (std::uint32_t thread = 0; thread < 4; ++thread) {
+        threads.emplace_back([&, thread] {
+            for (std::uint32_t i = 0; i < 2000; ++i) {
+                const VkExtent2D extent{32u + ((i + thread) % 4u) * 8u, 32u};
+                const auto other = pipeline->AcquireFramebuffer(views, owners, extent, 1, persistent);
+                if (other == nullptr || other == first) differing.fetch_add(1, std::memory_order_relaxed);
+                if (pipeline->AcquireFramebuffer(views, owners, {64, 64}, 1, persistent) != first) differing.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    Require(differing.load() == 0, "concurrent framebuffer acquisitions lost or replaced a cached framebuffer");
+    std::array<std::shared_ptr<Framebuffer>, 4> sizes;
+    for (std::uint32_t i = 0; i < sizes.size(); ++i) sizes[i] = pipeline->AcquireFramebuffer(views, owners, {32u + i * 8u, 32u}, 1, persistent);
+    for (std::uint32_t i = 0; i < sizes.size(); ++i) Require(pipeline->AcquireFramebuffer(views, owners, {32u + i * 8u, 32u}, 1, persistent) == sizes[i], "a framebuffer made by the concurrent acquisitions was not cached");
+    std::cout << "framebuffer mutex tests passed\n";
+}
+
+bool parallelResolveTests(const Device& device, Recorder& recorder) {
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0 || device.GetContext().descriptorCache == nullptr) return false;
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 3;
+    void* watched = AllocateWatched(bytes, unit);
+    std::vector<std::byte> fallback(watched == nullptr ? bytes + unit : 0);
+    auto* block = watched != nullptr ? static_cast<std::byte*>(watched) : reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(fallback.data()) + unit - 1) & ~(unit - 1));
+    struct Release {
+        void* watched;
+        ~Release() { if (watched != nullptr) ReleaseWatched(watched, bytes); }
+    } release{watched};
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    if (HostImportFor(context, address, bytes) == nullptr) return false;
+    const auto shader = [](auto& words, std::uint64_t variant) {
+        ShaderRecompiler::RecompileResult program;
+        program.spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
+        program.variantId = variant;
+        return program;
+    };
+    auto vertex = shader(VERTEXRANGE_VERT_SPV, 303);
+    auto pixel = shader(COVER_FRAG_SPV, 304);
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.color = {address, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {64, 64};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, 64, 64, -64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    const auto vertices = address + unit;
+    const auto indices = address + 2 * unit;
+    const std::array<float, 4> offset{0.5f, 0.0f, 0.0f, 0.0f};
+    for (std::size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex) AgcDriver::GuestMemory::Write(vertices + vertexIndex * 16, std::as_bytes(std::span(offset)));
+    const std::array<std::uint16_t, 3> indexWords{0, 1, 2};
+    AgcDriver::GuestMemory::Write(indices, std::as_bytes(std::span(indexWords)));
+    vertex.vertexAttributes = {ShaderRecompiler::VertexAttribute{0, 4, {{static_cast<std::uint32_t>(vertices), static_cast<std::uint32_t>(vertices >> 32u) | (16u << 16u), 3u, 77u << 12u}}, 0}};
+    const auto check = [&](const char* what) {
+        std::vector<std::byte> texels(64 * 64 * 4);
+        ReadColorTarget(state.color, texels);
+        for (std::size_t y = 0; y < 64; ++y) {
+            for (std::size_t x = 0; x < 64; ++x) {
+                const auto expected = x < 16 ? std::byte{0} : std::byte{255};
+                Require(texels[(y * 64 + x) * 4] == expected, what);
+            }
+        }
+    };
+    const auto clear = [&] {
+        std::vector<std::byte> cleared(unit);
+        AgcDriver::GuestMemory::Write(address, cleared);
+    };
+    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
+    auto indexed = triangle;
+    indexed.indexed = true;
+    indexed.indexSize = 2;
+    indexed.indexAddress = indices;
+    const auto before = ParallelResolveStatistics();
+    for (int round = 0; round < 3; ++round) {
+        for (const auto* draw : {&triangle, &indexed}) {
+            clear();
+            const auto resolved = ResolveDraw(context, state, *draw, shaders);
+            Require(resolved != nullptr, "the resolve returned nothing");
+            EncodeDraw(context, state, *draw, shaders, {}, *resolved);
+            WaitForOptimizedPipelines(context.device);
+            const auto read = recorder.DescribePendingRead(vertices, 16);
+            Require(read.has_value() && read->kind == Recorder::ReadKind::DrawInput, "an encoded in-place vertex range was not noted as a pending draw input read");
+            check(draw == &triangle ? "a resolved and encoded draw rendered other pixels than the serial draw" : "a resolved and encoded indexed draw rendered other pixels than the serial draw");
+        }
+    }
+    clear();
+    Draw(context, state, indexed, shaders);
+    WaitForOptimizedPipelines(context.device);
+    check("the serial draw after resolved draws rendered other pixels");
+    const auto after = ParallelResolveStatistics();
+    Require(after.resolves - before.resolves == 6 && after.encodes - before.encodes == 6, "the resolves and encodes were not counted");
+    Require(after.inputsResolved - before.inputsResolved == 6 && after.inputsAdopted - before.inputsAdopted == 6, "in-place draw inputs resolved on the side were not adopted at encode");
+    Require(!VerifyParallelResolve() || after.verified - before.verified == 6, "APS5_VERIFY_PARALLEL_RESOLVE compared fewer draws than were adopted");
+    recorder.NotePendingWrite(vertices, 16);
+    const auto pending = ResolveDraw(context, state, triangle, shaders);
+    const auto refusals = ParallelResolveStatistics();
+    Require(refusals.inputRefusals[static_cast<std::size_t>(ResolveRefusal::NeedsSync)] == after.inputRefusals[static_cast<std::size_t>(ResolveRefusal::NeedsSync)] + 1, "a vertex range with a pending write was resolved in place on the side");
+    clear();
+    recorder.Sync();
+    const auto stale = ResolveDraw(context, state, indexed, shaders);
+    recorder.NotePendingWrite(indices + 4096, 16);
+    recorder.Sync();
+    EncodeDraw(context, state, indexed, shaders, {}, *stale);
+    WaitForOptimizedPipelines(context.device);
+    const auto redone = ParallelResolveStatistics();
+    Require(redone.redos[static_cast<std::size_t>(ResolveRedo::IndexData)] == refusals.redos[static_cast<std::size_t>(ResolveRedo::IndexData)] + 1 && redone.inputsAdopted == refusals.inputsAdopted, "a batch that wrote and finished between resolve and encode did not send the index bounds back to the serial resolve");
+    check("a draw whose inputs were redone in encode rendered other pixels");
+    static_cast<void>(pending);
+    std::cout << "parallel resolve tests passed (" << (after.resourcesAdopted - before.resourcesAdopted) << " templates and " << (after.pipelinesAdopted - before.pipelinesAdopted) << " pipelines adopted" << (VerifyParallelResolve() ? ", verified" : "") << ")\n";
+    return true;
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {
             queuedWriteGroupTests();
             std::cout << "queued write group tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--resolve-stamp-only") {
+            resolveStampTests();
             return 0;
         }
         std::unique_ptr<Device> created;
@@ -9461,6 +9707,10 @@ int main(int argc, char** argv) {
             return pipelineCacheFileTests(device);
         }
 
+        if (argc == 2 && std::string_view(argv[1]) == "--framebuffer-mutex-only") {
+            framebufferMutexTests(device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-only") {
             descriptorPoolTests(device);
             return 0;
@@ -9488,6 +9738,13 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--ledger-serial-only") {
+            ledgerSerialTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--parallel-resolve-only") {
+            return parallelResolveTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {
             pendingWriteSnapshotTests(device, recorder);

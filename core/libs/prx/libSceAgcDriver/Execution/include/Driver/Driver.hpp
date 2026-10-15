@@ -253,6 +253,7 @@ private:
     };
     using FrozenPipeline = OrderedPrepare<std::shared_ptr<FrozenDraw>, std::shared_ptr<PreparedFrozenDraw>>;
     static std::uint32_t prepareWorkers();
+    static bool parallelResolve();
     static std::uint32_t frozenBound();
     static FrozenPipeline& frozenDraws();
     static FrozenSink*& frozenSink();

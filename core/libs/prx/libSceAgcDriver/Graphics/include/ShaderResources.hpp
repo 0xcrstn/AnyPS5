@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <list>
@@ -209,6 +210,12 @@ public:
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsStatistics* statistics = nullptr, const DrawIndexRanges* drawRanges = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    struct MovedReadOnlyPlan {
+        std::vector<MovedBuffer> moved;
+        std::vector<std::pair<std::uint64_t, std::size_t>> checks;
+    };
+    std::optional<MovedReadOnlyPlan> PlanMovedReadOnlyBuffers(std::span<const CompiledShader> shaders) const;
+    std::optional<std::vector<MovedBuffer>> CheckMovedReadOnlyBuffers(const MovedReadOnlyPlan& plan, Recorder& recorder) const;
     static std::size_t MaxDrawSnapshotBytes();
     static void SetMovedWordRing(bool enabled);
     static void SetInPlaceDrawInputs(bool enabled);
@@ -697,6 +704,7 @@ public:
     // Find and Touch calls so far (the [rescache] line: a recipe hit touches instead of finding).
     static std::uint64_t Finds();
     static std::uint64_t Touches();
+    std::uint64_t Serial() const { return serial.load(std::memory_order_acquire); }
     void Clear();
     std::size_t Size() const;
     std::uint64_t Bytes() const;
@@ -722,6 +730,7 @@ private:
         std::uint64_t bytes = 0;
     };
     mutable std::mutex mutex;
+    std::atomic<std::uint64_t> serial{0};
     std::list<Entry> entries;
     std::unordered_map<Key, std::list<Entry>::iterator, KeyHash> index;
     std::uint64_t bytes = 0;

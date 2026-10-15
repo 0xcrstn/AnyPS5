@@ -3337,6 +3337,7 @@ void ResourceCache::noteMiss(const Key& key) {
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
     if (!resources->HasCachedStorageImages()) return;
+    serial.fetch_add(1, std::memory_order_acq_rel);
     if (const auto found = index.find(key); found != index.end()) {
         if (evicted != nullptr) evicted->push_back(std::move(found->second->resources));
         bytes -= found->second->bytes;
@@ -3354,6 +3355,7 @@ void ResourceCache::evictOverLimit(std::vector<std::shared_ptr<ShaderResources>>
     while (sizing.OverLimit(entries.size(), bytes)) {
         auto& last = entries.back();
         sizing.Evicted(CacheSizing::KeyHash(last.key.data(), last.key.size()));
+        serial.fetch_add(1, std::memory_order_acq_rel);
         if (evicted != nullptr) evicted->push_back(std::move(last.resources));
         bytes -= last.bytes;
         index.erase(last.key);
@@ -3370,6 +3372,7 @@ void ResourceCache::evictOverLimit(std::vector<std::shared_ptr<ShaderResources>>
         }
         tables -= elements;
         sizing.Evicted(CacheSizing::KeyHash(it->key.data(), it->key.size()));
+        serial.fetch_add(1, std::memory_order_acq_rel);
         if (evicted != nullptr) evicted->push_back(std::move(it->resources));
         bytes -= it->bytes;
         index.erase(it->key);
@@ -3393,6 +3396,7 @@ void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
+        serial.fetch_add(1, std::memory_order_acq_rel);
         if (evicted != nullptr) evicted->push_back(std::move(it->resources));
         bytes -= it->bytes;
         index.erase(it->key);
@@ -3419,6 +3423,7 @@ std::uint64_t ResourceCache::Touches() {
 
 void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
+    serial.fetch_add(1, std::memory_order_acq_rel);
     index.clear();
     entries.clear();
     bytes = 0;
@@ -3491,6 +3496,7 @@ std::uint64_t ResourceCache::TableElements() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
+    serial.fetch_add(1, std::memory_order_acq_rel);
     bytes -= found->second->bytes;
     entries.erase(found->second);
     index.erase(found);
@@ -4583,6 +4589,63 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
         }
     }
     return moved;
+}
+
+std::optional<ShaderResources::MovedReadOnlyPlan> ShaderResources::PlanMovedReadOnlyBuffers(std::span<const CompiledShader> shaders) const {
+    MovedReadOnlyPlan plan;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return plan;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) return std::nullopt;
+        for (const auto& binding : shader.program->bindings) {
+            if (DataRole(binding.role)) {
+                const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+                if (kept == bindings.end() || kept->allocations.size() != 1) return std::nullopt;
+                const auto index = kept->allocations.front();
+                const auto& item = allocations[index];
+                if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return std::nullopt;
+                const bool patched = std::any_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == index; });
+                const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
+                if (same) continue;
+                if (item.dataWords.empty() && patched) return std::nullopt;
+                plan.moved.push_back({index, 0, item.size, binding.guestDescriptor});
+                continue;
+            }
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+            if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return std::nullopt;
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+                const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+                const auto address = descriptor.Base48();
+                const auto size = descriptor.GetSize();
+                const auto index = kept->allocations[element];
+                const auto& item = allocations[index];
+                const bool empty = size == 0 || address == 0;
+                if (!item.guest) {
+                    if (empty) continue;
+                    return std::nullopt;
+                }
+                if (item.address == address && item.size == size) continue;
+                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
+                const auto begin = address - item.adjustment;
+                const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+                plan.checks.emplace_back(begin, bytes);
+                MovedBuffer entry{index, address, static_cast<std::size_t>(size)};
+                entry.readAnalysis = ElementReadAnalysis(binding, element);
+                plan.moved.push_back(std::move(entry));
+            }
+        }
+    }
+    return plan;
+}
+
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::CheckMovedReadOnlyBuffers(const MovedReadOnlyPlan& plan, Recorder& recorder) const {
+    for (const auto& [begin, bytes] : plan.checks) {
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
+        if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
+    }
+    return plan.moved;
 }
 
 std::size_t ShaderResources::MaxDrawSnapshotBytes() {

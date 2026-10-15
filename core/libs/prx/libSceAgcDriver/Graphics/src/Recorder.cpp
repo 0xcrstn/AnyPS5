@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
@@ -512,6 +513,8 @@ constexpr std::int64_t NoPendingLabel = std::numeric_limits<std::int64_t>::min()
 std::atomic<std::int64_t> pendingLabelSince{NoPendingLabel};
 std::atomic<std::uint64_t> writeGeneration{0};
 std::atomic<std::uint64_t> publishGeneration{0};
+std::atomic<std::uint64_t> ledgerSerial{0};
+std::atomic<std::uint64_t> finishedBatches{0};
 std::atomic<std::uint64_t> completionLabels{0};
 std::atomic<std::uint64_t> writeBackCompletions{0};
 std::atomic<std::uint64_t> completionStoresSkipped{0};
@@ -521,6 +524,10 @@ std::atomic<std::uint64_t> writeBacksOverLabels{0};
 // Completion labels that entered the pending count at a write-back (see NoteWrittenBack).
 std::atomic<std::uint64_t> completionLabelsCountedLate{0};
 std::atomic<std::uint64_t> workSinceSubmit{0};
+
+void bumpLedger() {
+    ledgerSerial.fetch_add(1, std::memory_order_acq_rel);
+}
 
 // APS5_COUNT_ALL_COMPLETION_LABELS=1: a completion label also stored on the GPU counts as pending
 // from its registration, as before (see Recorder::AfterCompletions).
@@ -1400,6 +1407,22 @@ std::uint64_t Recorder::KeyStoreSerial() {
     return keyStoreCount.load(std::memory_order_relaxed);
 }
 
+std::uint64_t Recorder::LedgerSerial() {
+    return ledgerSerial.load(std::memory_order_acquire);
+}
+
+std::uint64_t Recorder::FinishedBatches() {
+    return finishedBatches.load(std::memory_order_acquire);
+}
+
+bool Recorder::AccessNeedsFlush(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return false;
+    if (!HookSnapshotEnabled() || AgcDriver::Graphics::SnapshotOverlaps(address, bytes)) return true;
+    if (AnyDeviceResidentOverlaps(address, bytes)) return true;
+    const std::array range{std::pair{address, address + bytes}};
+    return StorageTexture::AnyPendingOverlaps(range) || AnyShadowedOverlaps(address, bytes);
+}
+
 namespace {
 
 bool DrawOrGpuProfiled();
@@ -1503,6 +1526,7 @@ void Recorder::endOpenRenderPass(bool barrier) {
 
 void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end) {
     ensureOpen();
+    bumpLedger();
     NoteMirroredWrite(begin, end);
     // A queued label store over the keys lands first (program order: the key store is later).
     FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
@@ -1533,6 +1557,7 @@ bool Recorder::AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::ui
 
 void Recorder::FlushKeyStores() {
     if (open == nullptr || open->keyStores.empty()) return;
+    bumpLedger();
     recordKeyStores(true);
 }
 
@@ -1613,6 +1638,7 @@ void Recorder::ensureOpen() {
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
     ensureOpen();
+    bumpLedger();
     NoteMirroredWrite(address, address + bytes.size());
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
@@ -1806,6 +1832,7 @@ bool Recorder::AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint6
 
 void Recorder::FlushStores() {
     if (open == nullptr || open->run.queued.empty()) return;
+    bumpLedger();
     closeStoreRun(false);
 }
 
@@ -3060,6 +3087,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     ensureOpen();
+    bumpLedger();
     const auto end = address + bytes;
     NoteMirroredWrite(address, end);
     open->writes.emplace_back(address, end);
@@ -3087,6 +3115,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
         return;
     }
     NoteMirroredWrite(address, address + bytes);
+    bumpLedger();
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
@@ -3184,6 +3213,7 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
     publishedResidentWrites = !resident.empty();
     publishedWriteRanges = merged;
     pendingWrites.store(std::move(merged), std::memory_order_release);
+    bumpLedger();
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -3459,6 +3489,7 @@ void Recorder::markBehindCompletion(const Batch& batch, std::uint64_t begin, std
 
 void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
     ensureOpen();
+    bumpLedger();
     NoteMirroredWrite(address, address + bytes.size());
     // The table entry before the write note: the note bumps the write generation a poller
     // watches, and a poller that sees the bump then finds the label without the GPU mutex.
@@ -3832,6 +3863,7 @@ void Recorder::FinishUpTo(std::uint64_t serial) {
     // recorded here is the bookkeeping only (a caller that did not wait first, WaitForLeases, shows
     // up in the site table by its own address).
     ++syncCounts[0];
+    bumpLedger();
     announcedSource = 4;
     const void* site = std::exchange(announcedSite, nullptr);
     const auto previousSite = inFlight.empty() || inFlight.front()->serial > serial ? activeSyncSite : BeginSyncSite(0, site != nullptr ? site : __builtin_return_address(0));
@@ -3847,6 +3879,7 @@ void Recorder::Sync() {
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
+    bumpLedger();
     Submit();
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
@@ -4152,6 +4185,7 @@ bool Recorder::Reap() {
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
     inFlightKeptBytes -= batch->keptBytes;
+    bumpLedger();
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;
@@ -4169,6 +4203,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 recorder.publishPendingWrites();
             } catch (...) {
             }
+            finishedBatches.fetch_add(1, std::memory_order_acq_rel);
+            bumpLedger();
         }
     } finishingScope{*this, batch.get()};
     finishing.push_back(batch.get());

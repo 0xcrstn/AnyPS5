@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/RecordQueue.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include <array>
@@ -218,6 +219,19 @@ std::uint32_t Driver::prepareWorkers() {
         return static_cast<std::uint32_t>(value);
     }();
     return workers;
+}
+
+bool Driver::parallelResolve() {
+    static const bool enabled = [] {
+        if (!Graphics::ParallelResolveRequested()) return false;
+        if (prepareWorkers() == 0) {
+            std::fprintf(stderr, "[record-thread] APS5_PARALLEL_RESOLVE ignored: it needs APS5_PREPARE_WORKERS\n");
+            return false;
+        }
+        std::fprintf(stderr, "[record-thread] parallel resolve: preparation workers resolve draw inputs, templates and pipelines; the record thread encodes%s\n", Graphics::VerifyParallelResolve() ? " and verifies every adopted decision against the serial resolve" : "");
+        return true;
+    }();
+    return enabled;
 }
 
 std::uint32_t Driver::frozenBound() {

@@ -34,6 +34,7 @@ struct Driver::DrawInputs {
     std::shared_ptr<const DrawRecipe> recipe;
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
     std::uint64_t drawKey = 0;
+    std::shared_ptr<const Graphics::ResolvedDraw> resolved;
 };
 
 void Driver::recordDrawInputs(const DrawInputs& inputs, DrawRecordResult& result, const std::shared_ptr<VulkanDevice>& localDevice) {
@@ -43,7 +44,7 @@ void Driver::recordDrawInputs(const DrawInputs& inputs, DrawRecordResult& result
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(state, inputs.draw, inputs.stages, inputs.snapshots, inputs.recipeStages.empty() ? nullptr : &built);
+    localDevice->Draw(state, inputs.draw, inputs.stages, inputs.snapshots, inputs.recipeStages.empty() ? nullptr : &built, inputs.resolved.get());
     if (built != nullptr) noteDrawRecordRecipe(result, std::move(built), inputs.drawKey, inputs.recipeStages);
 }
 
@@ -665,6 +666,10 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         sink->reads.reserve(snapshots.size());
         for (const auto& read : snapshots) sink->reads.push_back({read.address, read.bytes.size()});
         sink->inputs = std::make_shared<DrawInputs>(DrawInputs{relocatedDecode, decode, entry, shaderMemoryOwner, drawParameters, std::move(programs), std::move(decodeReads), std::move(memory), std::move(matchedRegions), std::move(matched), std::move(fresh), std::move(stageCaptures), std::move(results), std::move(stages), std::move(snapshots), recipe, std::move(recipeStages), drawKey});
+        if (!sink->inOrder && recipe == nullptr && parallelResolve()) {
+            auto& prepared = *sink->inputs;
+            prepared.resolved = localDevice->ResolveDraw(prepared.state->state, prepared.draw, prepared.stages);
+        }
         phaseTiming.Phase(DrawRowGraphics);
         timing.Mark("draw_and_resource_release");
         return drawn();

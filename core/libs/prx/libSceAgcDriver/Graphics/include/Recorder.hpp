@@ -415,6 +415,9 @@ public:
     // labels waiting in completion actions (the CPU must reap their batch for them to land);
     static std::uint64_t PendingCompletionLabels();
     static std::uint64_t KeyStoreSerial();
+    static std::uint64_t LedgerSerial();
+    static std::uint64_t FinishedBatches();
+    static bool AccessNeedsFlush(std::uint64_t address, std::size_t bytes);
     // write-back completions (OnComplete) of unfinished batches: a reaper retires them when every
     // worker sleeps, as for the labels above;
     static std::uint64_t PendingWriteBackCompletions();

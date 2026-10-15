@@ -671,6 +671,7 @@ VkPipelineLayout Pipeline::Layout() const {
 
 std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers, std::span<const std::uint8_t> persistent) {
     Require(targets.size() == attachments && owners.size() == colorAttachments, "render targets do not match the pipeline's attachments");
+    std::lock_guard lock(framebufferMutex);
     bool resident = true;
     for (std::size_t i = 0; i < owners.size(); ++i) resident = resident && (owners[i] != nullptr || (i < persistent.size() && persistent[i] != 0));
     if (resident) {
