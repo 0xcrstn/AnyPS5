@@ -2192,6 +2192,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     parts.lap(RecordStores);
     std::optional<ShaderResources::DrawIndexRanges> drawRanges;
     if (args == nullptr && !state.stages.mesh && !state.stages.tessellation && state.stages.path == ShaderPath::Vertex && draw.instanceCount != 0 && static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount - 1u <= std::numeric_limits<std::uint32_t>::max() && inputs.minIndex <= inputs.maxIndex) drawRanges = ShaderResources::DrawIndexRanges{inputs.minIndex, inputs.maxIndex, draw.firstInstance, draw.firstInstance + draw.instanceCount - 1u, shaders.empty() || shaders.front().program == nullptr ? -1 : shaders.front().program->vertexOffsetSgpr, draw.vertexFold, shaders.empty() || shaders.front().program == nullptr ? -1 : shaders.front().program->instanceOffsetSgpr, draw.instanceFold, draw.firstUserSgpr, draw.userData};
+    resources.PublishResidentReads(*recorder);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.profile ? &outcome.bindings : nullptr, drawRanges ? &*drawRanges : nullptr);
     parts.lap(RecordBindings);
     const bool capture = CaptureInputsEnabled();

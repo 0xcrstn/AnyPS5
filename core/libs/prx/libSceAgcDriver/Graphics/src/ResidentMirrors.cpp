@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -28,6 +30,7 @@ struct ResidentMirror {
     bool anyWritten = false;
     const Recorder* usedBy = nullptr;
     std::uint64_t usedBatch = 0;
+    std::uint32_t churn = 0;
     bool retired = false;
 };
 
@@ -35,9 +38,19 @@ namespace {
 
 constexpr std::uint64_t BlockBytes = 65536;
 
+constexpr std::uint64_t DeniedBatches = 256;
+constexpr std::uint64_t VerifyBytesPerBatch = 64ull << 20u;
+
 struct Statistics {
     std::atomic<std::uint64_t> made{0}, refused{0}, uses{0}, refreshes{0}, refreshedBlocks{0}, refreshedBytes{0}, midBatchSyncs{0}, midBatchBytes{0}, invalidatedBlocks{0};
     std::atomic<std::uint64_t> collectNs{0};
+    std::atomic<std::uint64_t> deferred{0}, denied{0}, deniedUses{0}, verified{0}, verifiedBytes{0}, verifyDiffering{0};
+};
+
+struct Seen {
+    std::uint64_t lastBatch = 0;
+    std::uint32_t batches = 0;
+    std::uint64_t deniedUntil = 0;
 };
 
 Statistics& Stats() {
@@ -49,6 +62,7 @@ struct Registry {
     std::mutex mutex;
     std::map<std::uint64_t, std::shared_ptr<ResidentMirror>> byBase;
     std::vector<std::shared_ptr<ResidentMirror>> used;
+    std::map<std::uint64_t, Seen> seen;
     std::uint64_t bytes = 0;
     std::atomic<bool> any{false};
 };
@@ -64,6 +78,30 @@ std::uint64_t BudgetBytes() {
         return (text != nullptr ? std::strtoull(text, nullptr, 10) : 4096ull) << 20u;
     }();
     return bytes;
+}
+
+std::uint32_t MirrorAfterBatches() {
+    static const std::uint32_t batches = [] {
+        const char* text = std::getenv("APS5_RESIDENT_MIRROR_AFTER");
+        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 2u;
+    }();
+    return batches;
+}
+
+std::uint32_t ChurnLimit() {
+    static const std::uint32_t limit = [] {
+        const char* text = std::getenv("APS5_RESIDENT_MIRROR_CHURN");
+        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 4u;
+    }();
+    return limit;
+}
+
+bool VerifyMirrors() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_RESIDENT_MIRRORS");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
 }
 
 std::size_t BlockCount(std::uint64_t base, std::uint64_t bytes) {
@@ -116,6 +154,14 @@ void reportMirrors() {
     if (now - last < std::chrono::seconds(10)) return;
     last = now;
     const auto totals = MirrorTotals();
+    const auto take = [](const std::atomic<std::uint64_t>& value, std::uint64_t& last) {
+        const auto now = value.load(std::memory_order_relaxed);
+        const auto delta = now - last;
+        last = now;
+        return static_cast<unsigned long long>(delta);
+    };
+    static std::uint64_t deferred = 0, denied = 0, deniedUses = 0, verified = 0, verifiedBytes = 0, verifyDiffering = 0;
+    AgcDriver::ProfilePrint_nid_no_patch("[mirrors] reuse gate (after %u batches, churn limit %u): %llu deferred, %llu denied for churn, %llu uses refused while denied; verify%s: %llu checked (%llu MiB), %llu blocks differing\n", MirrorAfterBatches(), ChurnLimit(), take(Stats().deferred, deferred), take(Stats().denied, denied), take(Stats().deniedUses, deniedUses), VerifyMirrors() ? "" : " (off)", take(Stats().verified, verified), take(Stats().verifiedBytes, verifiedBytes) >> 20u, take(Stats().verifyDiffering, verifyDiffering));
     AgcDriver::ProfilePrint_nid_no_patch("[mirrors] resident read mirrors%s: %llu live (%.0f MiB), last 10 s: %llu made, %llu refused, %llu uses, %llu batch refreshes (%llu blocks, %.1f MiB copied in prologues, collect %.1f ms), %llu mid-batch syncs (%.1f MiB), %llu blocks invalidated by GPU writes\n", ResidentMirrorsEnabled() ? "" : " (off)", static_cast<unsigned long long>(totals.live), static_cast<double>(totals.liveBytes) / 1048576.0, static_cast<unsigned long long>(totals.made - previous.made), static_cast<unsigned long long>(totals.refused - previous.refused), static_cast<unsigned long long>(totals.uses - previous.uses), static_cast<unsigned long long>(totals.refreshes - previous.refreshes), static_cast<unsigned long long>(totals.refreshedBlocks - previous.refreshedBlocks), static_cast<double>(totals.refreshedBytes - previous.refreshedBytes) / 1048576.0, totals.collectMs - previous.collectMs, static_cast<unsigned long long>(totals.midBatchSyncs - previous.midBatchSyncs), static_cast<double>(totals.midBatchBytes - previous.midBatchBytes) / 1048576.0, static_cast<unsigned long long>(totals.invalidatedBlocks - previous.invalidatedBlocks));
     previous = totals;
 }
@@ -136,12 +182,32 @@ std::shared_ptr<ResidentMirror> MirrorOfImport(const Context& context, const Hos
     if (!(ResidentMirrorsEnabled() || BufferMirrorsEnabled()) || import.bytes == 0 || import.unwatched || import.dmaBuf || !context.bufferDeviceAddress) return {};
     if (!GuestMemory::Watched(import.base, static_cast<std::size_t>(import.bytes))) return {};
     auto& registry = Mirrors();
+    const auto* recorder = Recorder::Active();
+    const auto batch = recorder != nullptr ? recorder->Submissions() + 1 : 0;
     std::lock_guard lock(registry.mutex);
+    auto& seen = registry.seen[import.base];
+    if (batch != 0 && batch < seen.deniedUntil) {
+        Stats().deniedUses.fetch_add(1, std::memory_order_relaxed);
+        if (const auto found = registry.byBase.find(import.base); found != registry.byBase.end() && found->second.use_count() == 1) {
+            found->second->retired = true;
+            registry.bytes -= found->second->bytes;
+            registry.byBase.erase(found);
+        }
+        return {};
+    }
+    if (batch != 0 && seen.lastBatch != batch) {
+        seen.lastBatch = batch;
+        if (seen.batches < MirrorAfterBatches()) ++seen.batches;
+    }
     if (const auto found = registry.byBase.find(import.base); found != registry.byBase.end()) {
         if (found->second->device == context.device && found->second->source == import.buffer && found->second->bytes == import.bytes) return found->second;
         registry.bytes -= found->second->bytes;
         found->second->retired = true;
         registry.byBase.erase(found);
+    }
+    if (batch != 0 && seen.batches < MirrorAfterBatches()) {
+        Stats().deferred.fetch_add(1, std::memory_order_relaxed);
+        return {};
     }
     if (registry.bytes + import.bytes > BudgetBytes()) {
         for (auto it = registry.byBase.begin(); it != registry.byBase.end() && registry.bytes + import.bytes > BudgetBytes();) {
@@ -160,7 +226,7 @@ std::shared_ptr<ResidentMirror> MirrorOfImport(const Context& context, const Hos
     }
     auto mirror = std::make_shared<ResidentMirror>();
     try {
-        mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(import.bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(import.bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     } catch (const std::exception&) {
         Stats().refused.fetch_add(1, std::memory_order_relaxed);
         return {};
@@ -273,6 +339,8 @@ void SubmitMirrors(Recorder& recorder) {
     }
     std::vector<std::uint8_t> changed;
     VkCommandBuffer prologue = VK_NULL_HANDLE;
+    std::vector<const ResidentMirror*> verified;
+    std::uint64_t verifyBytes = 0;
     for (const auto& mirror : used) {
         if (mirror->retired) continue;
         const auto started = std::chrono::steady_clock::now();
@@ -290,6 +358,51 @@ void SubmitMirrors(Recorder& recorder) {
         std::fill(mirror->generations.begin(), mirror->generations.end(), generation);
         recorder.Keep(mirror);
         Stats().refreshes.fetch_add(1, std::memory_order_relaxed);
+        if (ChurnLimit() != 0) {
+            mirror->churn = copiedBytes(copies) * 2 > mirror->bytes ? mirror->churn + 1 : 0;
+            if (mirror->churn >= ChurnLimit()) {
+                mirror->churn = 0;
+                std::lock_guard lock(registry.mutex);
+                auto& seen = registry.seen[mirror->base];
+                seen.deniedUntil = batch + DeniedBatches;
+                seen.batches = 0;
+                Stats().denied.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (VerifyMirrors() && (verified.empty() || verifyBytes + mirror->bytes <= VerifyBytesPerBatch)) {
+            verifyBytes += mirror->bytes;
+            verified.push_back(mirror.get());
+        }
+    }
+    if (!verified.empty()) {
+        if (prologue == VK_NULL_HANDLE) prologue = recorder.PrologueCommands();
+        RecordMemoryBarrier(recorder.GetContext(), prologue, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        for (const auto* mirror : verified) {
+            const auto bytes = mirror->bytes;
+            auto scratch = std::make_shared<Buffer>(recorder.GetContext(), static_cast<std::size_t>(bytes * 2), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            const VkBufferCopy held{0, 0, bytes};
+            const VkBufferCopy source{0, bytes, bytes};
+            recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologue, mirror->buffer->Handle(), scratch->Handle(), 1, &held);
+            recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologue, mirror->source, scratch->Handle(), 1, &source);
+            recorder.Keep(scratch);
+            const auto base = mirror->base;
+            recorder.OnCompleteWithoutGuestAccess([scratch, bytes, base] {
+                const auto contents = scratch->Bytes();
+                std::uint64_t differing = 0;
+                for (std::uint64_t block = 0; block < BlockCount(base, bytes); ++block) {
+                    const auto first = base / BlockBytes * BlockBytes + block * BlockBytes;
+                    const auto from = std::max(first, base) - base;
+                    const auto to = std::min(first + BlockBytes, base + bytes) - base;
+                    if (std::memcmp(contents.data() + from, contents.data() + bytes + from, static_cast<std::size_t>(to - from)) != 0) ++differing;
+                }
+                Stats().verified.fetch_add(1, std::memory_order_relaxed);
+                Stats().verifiedBytes.fetch_add(bytes, std::memory_order_relaxed);
+                Stats().verifyDiffering.fetch_add(differing, std::memory_order_relaxed);
+                static std::atomic<std::uint32_t> reports{0};
+                if (differing != 0 && reports.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[mirrors] verify: the resident mirror of 0x%llx+0x%llx differs from its import in %llu blocks at the start of its batch\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(differing));
+            });
+        }
+        RecordMemoryBarrier(recorder.GetContext(), prologue, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     }
     std::lock_guard lock(registry.mutex);
     const auto settle = [&](ResidentMirror& mirror) {
@@ -350,6 +463,10 @@ ResidentMirrorCounters MirrorTotals() {
     totals.midBatchSyncs = stats.midBatchSyncs.load(std::memory_order_relaxed);
     totals.midBatchBytes = stats.midBatchBytes.load(std::memory_order_relaxed);
     totals.invalidatedBlocks = stats.invalidatedBlocks.load(std::memory_order_relaxed);
+    totals.deferred = stats.deferred.load(std::memory_order_relaxed);
+    totals.denied = stats.denied.load(std::memory_order_relaxed);
+    totals.verified = stats.verified.load(std::memory_order_relaxed);
+    totals.verifyDiffering = stats.verifyDiffering.load(std::memory_order_relaxed);
     totals.collectMs = static_cast<double>(stats.collectNs.load(std::memory_order_relaxed)) / 1e6;
     return totals;
 }

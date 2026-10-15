@@ -2432,15 +2432,12 @@ bool lazyStagingOutTests(const Device& device, Recorder& recorder) {
     before = totals();
     stage(element, 0x28282828u, nullptr);
     guest[element - address + 100] = 0x77;
-    bool refused = false;
-    try {
-        AgcDriver::GuestMemory::Read(element + 1000, read, 1);
-    } catch (const std::runtime_error& error) {
-        refused = std::string_view(error.what()).find("after another writer changed the range") != std::string_view::npos;
-    }
+    AgcDriver::GuestMemory::Read(element + 1000, read, 1);
+    sync();
     now = totals();
-    Require(refused && now.refusedStoredOver - before.refusedStoredOver == 1 && now.live == 1 && now.liveBytes == elementBytes, "an ambiguous CPU store did not preserve the resident results and refuse publication");
-    Require(guest[element - address + 100] == 0x77 && guest[element - address] == (verify ? 0x28 : 0x17), "a refused publication overwrote the CPU store");
+    Require(now.refusedStoredOver - before.refusedStoredOver == 1 && now.refusedStoredOverBytes - before.refusedStoredOverBytes == 4096 && now.live == 0, "a CPU store over resident results did not keep its page out of their publication");
+    Require(guest[element - address + 100] == 0x77 && guest[element - address] == (verify ? 0x28 : 0x17), "the publication overwrote the page of a newer CPU store");
+    Require(guestAll(element + 4096, element + elementBytes, 0x28), "the pages no newer store touched were not published");
     AgcDriver::Graphics::ClearDeviceResident(context.device);
     before = totals();
     stage(element, 0x38383838u, nullptr);
@@ -8063,6 +8060,7 @@ bool residentMirrorTests(const Device& device, Recorder& recorder, bool descript
     Require(same(afterLate, expected), "a GPU write after the last read of its batch left the mirror stale");
     const auto after = AgcDriver::Graphics::MirrorTotals();
     Require(after.made - before.made <= 1 && after.uses - before.uses == 9 && after.refreshes - before.refreshes >= 8 && after.midBatchSyncs - before.midBatchSyncs == 1, "resident mirror counters do not match the reads");
+    if (const char* verify = std::getenv("APS5_VERIFY_RESIDENT_MIRRORS"); verify != nullptr && std::strcmp(verify, "0") != 0) Require(after.verified - before.verified >= 8 && after.verifyDiffering == before.verifyDiffering, "a resident mirror differed from its import at the start of a batch");
     leased.WriteBack();
     std::cout << "resident mirror tests passed (" << (after.refreshedBytes - before.refreshedBytes) / 1024 << " KiB refreshed, " << (after.midBatchBytes - before.midBatchBytes) / 1024 << " KiB synced mid-batch)\n";
     return true;

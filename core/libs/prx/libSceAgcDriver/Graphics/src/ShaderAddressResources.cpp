@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -28,7 +29,8 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         const bool tableFaultsOnly = std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap; });
         faultChecks = faultChecks || tables != 0 || (faults != 0 && (!tableFaultsOnly || shader.program->imageTableFaults != 0 || shader.program->poisonedSrtReads != 0 || loopGuarded));
     }
-    mirrorReads = usesBda && context.recorder != nullptr && ResidentMirrorsEnabled() && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.program->bdaWrites; });
+    bdaReadOnly = usesBda && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.program->bdaWrites; });
+    mirrorReads = bdaReadOnly && context.recorder != nullptr && ResidentMirrorsEnabled();
     if (usesBda) {
         Require(context.bufferDeviceAddress, "buffer device address is not enabled");
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -42,6 +44,13 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
 void ShaderResources::UseMirrors(Recorder& recorder) const {
     if (bda != nullptr) Graphics::UseMirrors(recorder, bda->Mirrors());
     if (!bufferMirrors.empty()) Graphics::UseMirrors(recorder, bufferMirrors);
+}
+
+void ShaderResources::PublishResidentReads(Recorder& recorder) const {
+    if (!AnyDeviceResident()) return;
+    for (const auto& [begin, end] : guestMemory.DeviceReads()) {
+        if (end > begin) PublishDeviceResident(recorder, begin, static_cast<std::size_t>(end - begin), ResidentSite::InPlace);
+    }
 }
 
 void ShaderResources::RefreshMirrorsForDirectUse(Recorder& recorder) const {

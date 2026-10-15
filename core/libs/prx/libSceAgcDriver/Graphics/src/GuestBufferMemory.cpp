@@ -3878,7 +3878,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     }
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     if (addressable && AnyDeviceResident()) {
-        if (auto* active = Recorder::Active()) PublishAllDeviceResident(*active, ResidentSite::AddressBased);
+        if (auto* active = Recorder::Active()) {
+            for (const auto& [begin, end] : DeviceReads()) PublishDeviceResident(*active, begin, static_cast<std::size_t>(end - begin), ResidentSite::AddressBased);
+        }
     }
     takeHeapReferences();
     if (!profile) return;
