@@ -3977,6 +3977,17 @@ bool StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t,
     return false;
 }
 
+void StorageTexture::MarkPendingReached(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::vector<std::uint8_t>& reached) {
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    for (std::size_t index = 0; index < ranges.size() && index < reached.size(); ++index) {
+        const auto [begin, end] = ranges[index];
+        if (reached[index] != 0 || end <= begin) continue;
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (pending.textures.MayOverlap(begin, bytes) || std::any_of(pending.flushing.begin(), pending.flushing.end(), [&](const StorageTexture* texture) { return texture->overlaps(begin, bytes); })) reached[index] = 1;
+    }
+}
+
 std::uint64_t StorageTexture::PendingSerial() {
     return pendingSerial.load(std::memory_order_acquire);
 }
