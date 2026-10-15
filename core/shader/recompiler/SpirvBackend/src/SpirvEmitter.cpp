@@ -20,13 +20,10 @@ namespace ShaderRecompiler {
 namespace {
 
 bool SharedFloatFunctions() {
-    static const bool shared = [] {
-        const char* value = std::getenv("APS5_NO_SHARED_FLOAT_FUNCTIONS");
-        if (value == nullptr || std::string_view(value) == "0") return true;
-        if (std::string_view(value) == "1") return false;
-        throw std::invalid_argument("APS5_NO_SHARED_FLOAT_FUNCTIONS accepts only 0 or 1");
-    }();
-    return shared;
+    const char* value = std::getenv("APS5_NO_SHARED_FLOAT_FUNCTIONS");
+    if (value == nullptr || *value == '\0' || std::string_view(value) == "0") return true;
+    if (std::string_view(value) == "1") return false;
+    throw std::invalid_argument("APS5_NO_SHARED_FLOAT_FUNCTIONS accepts only 0 or 1");
 }
 
 [[noreturn]] void FailProgram(const IrProgram& program, const char* reason) {

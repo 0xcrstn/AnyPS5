@@ -577,6 +577,8 @@ target_include_directories(shader_spirv_interface_tests PRIVATE
         ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR})
 target_compile_features(shader_spirv_interface_tests PRIVATE cxx_std_20)
 target_link_libraries(shader_spirv_interface_tests PRIVATE libc)
+set_target_properties(shader_spirv_interface_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(shader_spirv_interface_tests)
 if(BUILD_TESTING)
     set_target_properties(shader_spirv_interface_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME shader_spirv_interface COMMAND shader_spirv_interface_tests)
