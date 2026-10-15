@@ -303,6 +303,30 @@ void ContentIndex() {
     Require(index.Find(key) == nullptr && index.Size() == 0, "an expired entry was returned or kept");
 }
 
+void FinishedJobsStayFinished() {
+    CompileService::Limits limits;
+    limits.workers = 6;
+    limits.demandReservedWorkers = 1;
+    limits.aging = std::chrono::milliseconds(0);
+    for (int round = 0; round < 20; ++round) {
+        CompileService service(limits);
+        constexpr int count = 400;
+        std::vector<std::atomic<int>> runs(count);
+        std::vector<std::shared_ptr<CompileTicket>> tickets;
+        tickets.reserve(count);
+        for (int index = 0; index < count; ++index) {
+            const auto priority = index % 2 == 0 ? CompilePriority::Demand : CompilePriority::Registration;
+            tickets.push_back(service.Submit("job:" + std::to_string(index), priority, 1, [&runs, index](const CompileTicket&) { runs[index].fetch_add(1); }));
+        }
+        for (const auto& ticket : tickets) ticket->Wait();
+        for (int index = 0; index < count; ++index) {
+            Require(runs[index].load() == 1, "a finished compile job ran again before its ticket settled");
+            Require(tickets[index]->State() == CompileState::Ready, "a compile job that ran once did not stay ready");
+        }
+        Require(service.Counters().failed == 0, "a compile job failed while the service handed out finished jobs");
+    }
+}
+
 std::atomic<bool> guardHeld{false};
 
 void WaitGuard() {
@@ -395,6 +419,7 @@ int main() {
         Teardown();
         WaitGuard();
         Parking();
+        FinishedJobsStayFinished();
         RecipeVerification();
         ContentIndex();
     } catch (const std::exception& error) {
