@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -146,9 +147,34 @@ TInfo Shared(const TInfo& info, const DeviceDispatch& device) {
     return shared;
 }
 
+template<typename TInfo>
+bool MissesFamilies(const TInfo& info, const DeviceDispatch& device) {
+    const std::span listed(info.pQueueFamilyIndices, info.pQueueFamilyIndices != nullptr ? info.queueFamilyIndexCount : 0u);
+    return std::ranges::any_of(device.families, [&](std::uint32_t family) { return std::ranges::find(listed, family) == listed.end(); });
+}
+
+template<typename TInfo>
+TInfo Joined(const TInfo& info, const DeviceDispatch& device, std::vector<std::uint32_t>& families) {
+    families.assign(info.pQueueFamilyIndices, info.pQueueFamilyIndices + info.queueFamilyIndexCount);
+    for (const auto family : device.families) {
+        if (std::ranges::find(families, family) == families.end()) families.push_back(family);
+    }
+    auto joined = info;
+    joined.queueFamilyIndexCount = static_cast<std::uint32_t>(families.size());
+    joined.pQueueFamilyIndices = families.data();
+    return joined;
+}
+
 VkResult VKAPI_CALL CreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* allocator, VkImage* image) {
     const auto& dispatch = DeviceOf(device);
-    if (info == nullptr || info->sharingMode != VK_SHARING_MODE_EXCLUSIVE) return dispatch.createImage(device, info, allocator, image);
+    if (info == nullptr) return dispatch.createImage(device, info, allocator, image);
+    if (info->sharingMode == VK_SHARING_MODE_CONCURRENT) {
+        if (!MissesFamilies(*info, dispatch)) return dispatch.createImage(device, info, allocator, image);
+        std::vector<std::uint32_t> families;
+        const auto joined = Joined(*info, dispatch, families);
+        State().sharedImages.fetch_add(1, std::memory_order_relaxed);
+        return dispatch.createImage(device, &joined, allocator, image);
+    }
     const auto shared = Shared(*info, dispatch);
     State().sharedImages.fetch_add(1, std::memory_order_relaxed);
     return dispatch.createImage(device, &shared, allocator, image);
@@ -156,7 +182,14 @@ VkResult VKAPI_CALL CreateImage(VkDevice device, const VkImageCreateInfo* info, 
 
 VkResult VKAPI_CALL CreateBuffer(VkDevice device, const VkBufferCreateInfo* info, const VkAllocationCallbacks* allocator, VkBuffer* buffer) {
     const auto& dispatch = DeviceOf(device);
-    if (info == nullptr || info->sharingMode != VK_SHARING_MODE_EXCLUSIVE) return dispatch.createBuffer(device, info, allocator, buffer);
+    if (info == nullptr) return dispatch.createBuffer(device, info, allocator, buffer);
+    if (info->sharingMode == VK_SHARING_MODE_CONCURRENT) {
+        if (!MissesFamilies(*info, dispatch)) return dispatch.createBuffer(device, info, allocator, buffer);
+        std::vector<std::uint32_t> families;
+        const auto joined = Joined(*info, dispatch, families);
+        State().sharedBuffers.fetch_add(1, std::memory_order_relaxed);
+        return dispatch.createBuffer(device, &joined, allocator, buffer);
+    }
     const auto shared = Shared(*info, dispatch);
     State().sharedBuffers.fetch_add(1, std::memory_order_relaxed);
     return dispatch.createBuffer(device, &shared, allocator, buffer);
