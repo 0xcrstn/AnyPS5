@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LinearSpace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
@@ -26,6 +27,9 @@ struct ResidentMirror {
     std::uint64_t bytes = 0;
     VkBuffer source = VK_NULL_HANDLE;
     std::shared_ptr<Buffer> buffer;
+    VkBuffer handle = VK_NULL_HANDLE;
+    VkDeviceSize bufferOffset = 0;
+    bool linear = false;
     VkDeviceAddress address = 0;
     std::shared_ptr<Buffer> pristine;
     VkDeviceAddress pristineAddress = 0;
@@ -39,6 +43,12 @@ struct ResidentMirror {
     std::uint64_t usedBatch = 0;
     std::uint32_t churn = 0;
     bool retired = false;
+    ResidentMirror() = default;
+    ResidentMirror(const ResidentMirror&) = delete;
+    ResidentMirror& operator=(const ResidentMirror&) = delete;
+    ~ResidentMirror() {
+        if (linear) ReleaseLinearRange(device, base, base + bytes);
+    }
 };
 
 namespace {
@@ -240,6 +250,11 @@ std::vector<VkBufferCopy> blockCopies(const ResidentMirror& mirror, const std::v
     return copies;
 }
 
+std::vector<VkBufferCopy> intoMirror(const ResidentMirror& mirror, std::vector<VkBufferCopy> copies) {
+    for (auto& copy : copies) copy.dstOffset += mirror.bufferOffset;
+    return copies;
+}
+
 std::uint64_t copiedBytes(const std::vector<VkBufferCopy>& copies) {
     std::uint64_t total = 0;
     for (const auto& copy : copies) total += copy.size;
@@ -265,6 +280,10 @@ void reportMirrors() {
     AgcDriver::ProfilePrint_nid_no_patch("[mirrors] reuse gate (after %u batches, churn limit %u): %llu deferred, %llu denied for churn, %llu uses refused while denied; verify%s: %llu checked (%llu MiB), %llu blocks differing\n", MirrorAfterBatches(), ChurnLimit(), take(Stats().deferred, deferred), take(Stats().denied, denied), take(Stats().deniedUses, deniedUses), VerifyMirrors() ? "" : " (off)", take(Stats().verified, verified), take(Stats().verifiedBytes, verifiedBytes) >> 20u, take(Stats().verifyDiffering, verifyDiffering));
     AgcDriver::ProfilePrint_nid_no_patch("[mirrors] resident read mirrors%s: %llu live (%.0f MiB), last 10 s: %llu made, %llu refused, %llu uses, %llu batch refreshes (%llu blocks, %.1f MiB copied in prologues, collect %.1f ms), %llu mid-batch syncs (%.1f MiB), %llu blocks invalidated by GPU writes\n", ResidentMirrorsEnabled() ? "" : " (off)", static_cast<unsigned long long>(totals.live), static_cast<double>(totals.liveBytes) / 1048576.0, static_cast<unsigned long long>(totals.made - previous.made), static_cast<unsigned long long>(totals.refused - previous.refused), static_cast<unsigned long long>(totals.uses - previous.uses), static_cast<unsigned long long>(totals.refreshes - previous.refreshes), static_cast<unsigned long long>(totals.refreshedBlocks - previous.refreshedBlocks), static_cast<double>(totals.refreshedBytes - previous.refreshedBytes) / 1048576.0, totals.collectMs - previous.collectMs, static_cast<unsigned long long>(totals.midBatchSyncs - previous.midBatchSyncs), static_cast<double>(totals.midBatchBytes - previous.midBatchBytes) / 1048576.0, static_cast<unsigned long long>(totals.invalidatedBlocks - previous.invalidatedBlocks));
     previous = totals;
+    static LinearSpaceCounters linearPrevious{};
+    const auto linear = LinearSpaceTotals();
+    AgcDriver::ProfilePrint_nid_no_patch("[mirrors] linear address space (APS5_LINEAR_ADDRESS_SPACE): %llu pages bound (%.0f MiB), %llu in use; last 10 s: %llu pages bound, %llu unbound, %llu ranges refused\n", static_cast<unsigned long long>(linear.boundPages), static_cast<double>(linear.boundPages * LinearPageBytes) / 1048576.0, static_cast<unsigned long long>(linear.usedPages), static_cast<unsigned long long>(linear.binds - linearPrevious.binds), static_cast<unsigned long long>(linear.unbinds - linearPrevious.unbinds), static_cast<unsigned long long>(linear.refused - linearPrevious.refused));
+    linearPrevious = linear;
 }
 
 }
@@ -374,18 +393,27 @@ std::shared_ptr<ResidentMirror> mirrorOf(const Context& context, const HostImpor
         }
     }
     auto mirror = std::make_shared<ResidentMirror>();
+    mirror->device = context.device;
+    mirror->base = import.base;
+    mirror->bytes = import.bytes;
+    if (const auto space = LinearSpace(context); space.has_value() && AcquireLinearRange(context, import.base, import.base + import.bytes, budget)) {
+        mirror->linear = true;
+        mirror->handle = space->buffer;
+        mirror->bufferOffset = import.base;
+        mirror->address = space->deviceBase + import.base;
+    }
     try {
-        mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(import.bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!mirror->linear) mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(import.bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (writable) mirror->pristine = std::make_shared<Buffer>(context, static_cast<std::size_t>(import.bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     } catch (const std::exception&) {
         Stats().refused.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
-    mirror->device = context.device;
-    mirror->base = import.base;
-    mirror->bytes = import.bytes;
     mirror->source = import.buffer;
-    mirror->address = mirror->buffer->DeviceAddress();
+    if (!mirror->linear) {
+        mirror->handle = mirror->buffer->Handle();
+        mirror->address = mirror->buffer->DeviceAddress();
+    }
     if (writable) {
         mirror->pristineAddress = mirror->pristine->DeviceAddress();
         mirror->placedBy = recorder;
@@ -435,7 +463,11 @@ VkDeviceAddress MirrorDeviceAddress(const ResidentMirror& mirror) {
 }
 
 VkBuffer MirrorBuffer(const ResidentMirror& mirror) {
-    return mirror.buffer->Handle();
+    return mirror.handle;
+}
+
+VkDeviceSize MirrorBufferOffset(const ResidentMirror& mirror) {
+    return mirror.bufferOffset;
 }
 
 void NoteMirroredWrite(std::uint64_t begin, std::uint64_t end) {
@@ -497,7 +529,8 @@ void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirr
         std::lock_guard lock(registry.mutex);
         for (auto* mirror : unsynced) {
             const auto copies = blockCopies(*mirror, mirror->unsynced);
-            if (!copies.empty()) recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, mirror->source, mirror->buffer->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+            const auto mirrored = intoMirror(*mirror, copies);
+            if (!copies.empty()) recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, mirror->source, mirror->handle, static_cast<std::uint32_t>(mirrored.size()), mirrored.data());
             if (!copies.empty() && mirror->pristine != nullptr) recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, mirror->source, mirror->pristine->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
             bytes += copiedBytes(copies);
             std::fill(mirror->unsynced.begin(), mirror->unsynced.end(), std::uint8_t{0});
@@ -551,7 +584,8 @@ void SubmitMirrors(Recorder& recorder) {
         const auto copies = blockCopies(*mirror, changed);
         if (!copies.empty()) {
             if (prologue == VK_NULL_HANDLE) prologue = recorder.PrologueCommands();
-            recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologue, mirror->source, mirror->buffer->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+            const auto mirrored = intoMirror(*mirror, copies);
+            recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologue, mirror->source, mirror->handle, static_cast<std::uint32_t>(mirrored.size()), mirrored.data());
             if (mirror->pristine != nullptr) recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologue, mirror->source, mirror->pristine->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
             Stats().refreshedBlocks.fetch_add(static_cast<std::uint64_t>(std::count(changed.begin(), changed.end(), GuestMemory::BlockWritten)), std::memory_order_relaxed);
             Stats().refreshedBytes.fetch_add(copiedBytes(copies), std::memory_order_relaxed);
@@ -581,9 +615,9 @@ void SubmitMirrors(Recorder& recorder) {
         for (const auto* mirror : verified) {
             const auto bytes = mirror->bytes;
             auto scratch = std::make_shared<Buffer>(recorder.GetContext(), static_cast<std::size_t>(bytes * 2), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-            const VkBufferCopy held{0, 0, bytes};
+            const VkBufferCopy held{mirror->bufferOffset, 0, bytes};
             const VkBufferCopy source{0, bytes, bytes};
-            recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologue, mirror->buffer->Handle(), scratch->Handle(), 1, &held);
+            recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologue, mirror->handle, scratch->Handle(), 1, &held);
             recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologue, mirror->source, scratch->Handle(), 1, &source);
             recorder.Keep(scratch);
             const auto base = mirror->base;
@@ -641,6 +675,7 @@ void ForgetMirrors(VkDevice device, std::uint64_t begin, std::uint64_t end) {
 
 void ClearMirrors(VkDevice device) {
     ForgetMirrors(device, 0, ~std::uint64_t{0});
+    ClearLinearSpace(device);
     DestroyCopyBackPipeline(device);
     auto& registry = Mirrors();
     std::lock_guard lock(registry.mutex);

@@ -48,6 +48,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LinearSpace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -478,6 +479,7 @@ struct VulkanDevice::State {
     VkDeviceSize hostImportAlignment = 0;
     bool dmaBufImport = false;
     bool sparseBinding = false;
+    bool sparseResidencyBuffer = false;
     std::uint32_t queueFamily = 0;
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
     VkQueue sparseQueue = VK_NULL_HANDLE;
@@ -1830,7 +1832,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // instead of a GPU fault that loses the device.
     enabled.robustBufferAccess = available.robustBufferAccess;
     VkDeviceQueueCreateInfo queueInfos[3]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
-    if (available.sparseBinding && state->dmaBufImport) {
+    const bool linearSpace = Graphics::ParseLinearSpace(std::getenv("APS5_LINEAR_ADDRESS_SPACE")) && available.sparseResidencyBuffer;
+    if (available.sparseBinding && (state->dmaBufImport || linearSpace)) {
         std::uint32_t families = 0;
         auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
         getFamilies(selected, &families, nullptr);
@@ -1855,6 +1858,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             state->sparseBinding = family < families && (queues[family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0;
         }
         enabled.sparseBinding = state->sparseBinding ? VK_TRUE : VK_FALSE;
+        state->sparseResidencyBuffer = state->sparseBinding && linearSpace;
+        enabled.sparseResidencyBuffer = state->sparseResidencyBuffer ? VK_TRUE : VK_FALSE;
     }
     {
         std::uint32_t familyCount = 0;
@@ -4044,6 +4049,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.pipelineCacheSynchronization = state->pipelineCache ? &state->pipelineCache->Synchronization() : nullptr;
     context.dmaBufImport = state->dmaBufImport;
     context.sparseBinding = state->sparseBinding;
+    context.sparseResidencyBuffer = state->sparseResidencyBuffer;
     context.queueFamily = state->queueFamily;
     context.sparseFamily = state->sparseFamily;
     context.sparseQueue = state->sparseQueue;

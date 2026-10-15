@@ -4853,6 +4853,7 @@ VkDescriptorBufferInfo GuestBufferMemory::MirroredDescriptor(std::uint64_t addre
     auto mirror = MirrorOfImport(context, *region->direct);
     if (mirror == nullptr) return info;
     info.buffer = MirrorBuffer(*mirror);
+    info.offset += MirrorBufferOffset(*mirror);
     if (std::find(mirrors.begin(), mirrors.end(), mirror) == mirrors.end()) mirrors.push_back(std::move(mirror));
     return info;
 }
