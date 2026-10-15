@@ -2432,12 +2432,24 @@ bool lazyStagingOutTests(const Device& device, Recorder& recorder) {
     before = totals();
     stage(element, 0x28282828u, nullptr);
     guest[element - address + 100] = 0x77;
-    AgcDriver::GuestMemory::Read(element + 1000, read, 1);
+    bool refused = false;
+    try {
+        AgcDriver::GuestMemory::Read(element + 1000, read, 1);
+    } catch (const std::runtime_error& error) {
+        refused = std::string_view(error.what()).find("after a CPU store or a store of unknown extent") != std::string_view::npos;
+    }
+    now = totals();
+    Require(refused && now.refusedStoredOver - before.refusedStoredOver == 1 && now.live == 1 && now.liveBytes == elementBytes, "a CPU store over part of a resident page did not preserve the results and refuse publication");
+    Require(guest[element - address + 100] == 0x77 && guest[element - address] == (verify ? 0x28 : 0x17), "a refused publication overwrote the CPU store");
+    AgcDriver::Graphics::ClearDeviceResident(context.device);
+    before = totals();
+    stage(element, 0x2a2a2a2au, nullptr);
+    static_cast<void>(AgcDriver::GuestMemory::MarkWritten(element + 8192, 16));
+    Require(AgcDriver::Graphics::PublishAllDeviceResident(recorder, ResidentSite::Copy) == elementBytes - 16, "a publication did not leave out the bytes of a newer driver store");
     sync();
     now = totals();
-    Require(now.refusedStoredOver - before.refusedStoredOver == 1 && now.refusedStoredOverBytes - before.refusedStoredOverBytes == 4096 && now.live == 0, "a CPU store over resident results did not keep its page out of their publication");
-    Require(guest[element - address + 100] == 0x77 && guest[element - address] == (verify ? 0x28 : 0x17), "the publication overwrote the page of a newer CPU store");
-    Require(guestAll(element + 4096, element + elementBytes, 0x28), "the pages no newer store touched were not published");
+    Require(now.storedAround - before.storedAround == 1 && now.storedAroundBytes - before.storedAroundBytes == 16 && now.live == 0, "a publication around a newer driver store was not counted");
+    Require(guestAll(element, element + 8192, 0x2a) && guestAll(element + 8208, element + elementBytes, 0x2a) && guestAll(element + 8192, element + 8208, verify ? 0x2a : 0x17), "a publication around a newer driver store stored the wrong bytes");
     AgcDriver::Graphics::ClearDeviceResident(context.device);
     before = totals();
     stage(element, 0x38383838u, nullptr);
