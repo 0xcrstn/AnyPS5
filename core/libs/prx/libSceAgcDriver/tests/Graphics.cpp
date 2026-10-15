@@ -3895,8 +3895,8 @@ void descriptorSnapshotTests() {
                     Require(descriptor.buffer == original[index].buffer && descriptor.offset == original[index].offset && descriptor.range == original[index].range, "snapshot update changed an untouched buffer descriptor");
                 } else {
                     const auto& item = snapshots->snapshots[snapshot];
-                    Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == 0 && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
-                    Require(sameBytes(bufferBytes(descriptor.buffer), moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
+                    Require(descriptor.buffer == item.handle && descriptor.offset == item.offset && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
+                    Require(sameBytes(item.bytes, moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
                     ++snapshot;
                 }
             }
@@ -4279,7 +4279,7 @@ void imageTableSnapshotAllocationTests() {
         const auto snapshots = resources.PrepareDrawBindings(recorder, moved);
         Require(snapshots != nullptr && snapshots->snapshots.size() == 1 && cache.Counters().sets == sets + 1, "an empty image table prevented draw snapshot allocation");
         Require(mock.variableDescriptorCount == 1u, "an empty draw snapshot table did not reserve one physical image descriptor");
-        Require(sameBytes(bufferBytes(snapshots->snapshots[0].buffer->Handle()), moved[0].words.data(), moved[0].size), "an empty image table changed draw snapshot contents");
+        Require(sameBytes(snapshots->snapshots[0].bytes, moved[0].words.data(), moved[0].size), "an empty image table changed draw snapshot contents");
         const auto& currentMap = findWrite(map.binding).buffers.at(0);
         Require(currentMap.buffer == originalMap.buffer && currentMap.offset == originalMap.offset && currentMap.range == originalMap.range, "draw snapshots replaced the empty image table map");
         std::array<std::uint32_t, Abi::HeaderWords> header{};
