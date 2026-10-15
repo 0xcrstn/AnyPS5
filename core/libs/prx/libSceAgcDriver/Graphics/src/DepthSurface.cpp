@@ -761,6 +761,7 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Depth);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     const bool cleared = takeClearedHtile(target);
@@ -865,6 +866,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         std::lock_guard lock(surfacesMutex());
         if (std::none_of(surfaces().begin(), surfaces().end(), held)) return nullptr;
     }
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Depth);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     auto* found = planeSurface(context.device, resource.baseAddress);

@@ -2150,6 +2150,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
         }
     } else {
         try {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Leases);
             std::lock_guard lock(GuestMemory::GpuMutex());
             auto& state = Leases();
             auto* recorder = Recorder::Current();

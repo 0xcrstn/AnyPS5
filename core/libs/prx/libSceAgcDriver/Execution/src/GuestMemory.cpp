@@ -2261,7 +2261,7 @@ namespace {
 // Per-thread GpuMutex wait accounting (APS5_PROFILE_DRAW): a queue worker tags its thread, other
 // threads (the presenter) report untagged.
 constexpr std::size_t GpuLockSiteCount = static_cast<std::size_t>(GpuLockSite::Count);
-constexpr const char* GpuLockSiteNames[GpuLockSiteCount] = {"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try"};
+constexpr const char* GpuLockSiteNames[GpuLockSiteCount] = {"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try", "fault", "unwatch", "leases", "images", "depth", "presync"};
 
 // Hold-side holder matrix: nanoseconds held per (holder thread, site), added by EndHold. Column 0
 // is every untagged thread (the presenter, game threads); the queue workers take a column each on

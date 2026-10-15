@@ -1138,6 +1138,7 @@ void MaterializeNativeAccess(Coherence::Interval range) {
 
 void WaitForGuestReaders(Coherence::Interval range) {
     if (GuestMemory::GpuMutex().HeldByThisThread()) Coherence::NoteLockedFault(range);
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Leases);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     for (std::uint32_t queue = 0; queue < Graphics::Recorder::PhysicalQueues; ++queue) {
         if (auto* recorder = Graphics::Recorder::ForPhysicalQueue(queue)) recorder->Sync();
@@ -4670,6 +4671,7 @@ std::uint64_t VulkanDevice::presync(std::span<const std::pair<std::uint64_t, std
     if (overlaps) {
         // No reap here (SubmitAndEpoch's would run completions, which a compute worker must not do
         // on queue 0's behalf, see SubmitRecorded): the dispatch reaps after the wait.
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Presync);
         std::lock_guard lock(GuestMemory::GpuMutex());
         if (state->recorder) {
             bool open = false;
