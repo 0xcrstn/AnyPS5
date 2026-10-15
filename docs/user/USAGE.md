@@ -184,6 +184,8 @@ GPU results in storage images and render targets stay on the GPU until something
 
 A title's own CPU reads of that memory are not seen, so a title that waits for a GPU label and then reads the results reads stale memory. `APS5_STORE_AT_LABEL=1` stores every pending result before each label the GPU writes (`RELEASE_MEM`, `WRITE_DATA`, `DMA_DATA`), at the cost of a write-back of every pending image per label. Any other value stops the title at its first label.
 
+Before taking the device lock to present, the presenter settles the GPU work still writing the display buffer and its DCC keys, waiting for it with the lock released, so the queues are not blocked behind that wait. `APS5_NO_DISPLAY_PRESYNC=1` skips this; the wait then happens inside the presentation, under the lock.
+
 ### Guest-memory coherence checks
 
 Three switches take `0` (the default), `1` or `verify`; any other value stops the title when the GPU device is created.

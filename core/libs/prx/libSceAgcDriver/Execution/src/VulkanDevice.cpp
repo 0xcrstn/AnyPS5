@@ -3284,6 +3284,12 @@ FrameDumps& Dumps() {
 
 }
 
+void VulkanDevice::PresyncDisplayBuffer(const DisplayBuffer& buffer) {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) return;
+    GuestMemory::FlushGpuWrites(buffer.address, DisplayBufferSize(buffer));
+    if (buffer.dccAddress != 0 && buffer.tilingMode == 0) GuestMemory::FlushGpuWrites(buffer.dccAddress, DisplayBufferKeyBytes(buffer));
+}
+
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     static const auto storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     return Graphics::StorageTexture::PresentThenStore(storeAtFlip, [&] { return presentDisplayBuffer(buffer); });

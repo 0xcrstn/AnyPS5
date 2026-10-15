@@ -69,6 +69,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     require(window.getDrawableSize != nullptr, "missing window drawable size query");
 
     static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr;
+    static const bool presyncDisplay = std::getenv("APS5_NO_DISPLAY_PRESYNC") == nullptr;
     static const std::size_t inFlight = VulkanDevice::FlipInFlight();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::shared_ptr<VulkanDevice> presenting;
@@ -103,6 +104,10 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             }
             presentable = presenting->AcquireImage();
             timing.Mark("acquire_image");
+        }
+        if (presentable && buffer != nullptr && presyncDisplay) {
+            presenting->PresyncDisplayBuffer(*buffer);
+            timing.Mark("display_presync");
         }
         if (presentable) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
