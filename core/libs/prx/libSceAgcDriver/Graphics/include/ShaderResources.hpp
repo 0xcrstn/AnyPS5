@@ -728,6 +728,10 @@ private:
     // no image other than the object's own sources has results pending over its surfaces and
     // regions, so those checks are skipped (see fastRevalidate).
     std::uint64_t pendingSerialSeen = 0;
+    std::vector<StorageTexture::PendingQuery> pendingProofQueries;
+    std::size_t pendingProofRegions = 0;
+    bool recordPendingAnswers();
+    bool pendingAnswersHold();
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
