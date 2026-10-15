@@ -306,7 +306,6 @@ These switches change how recompiled shaders reach guest memory through addresse
 - `APS5_FLUSH_PROOFS=off|on|verify` (default `on`): whether denormal flushes are also removed where a value provably cannot be denormal: loop values that only ever carry flushed values through min, max or selects, NaN-propagation selects, products with constants of magnitude one or more, truncation and rounding, square roots and reciprocal square roots. `verify` keeps the flushes and stops the title when such a value is ever denormal.
 - `APS5_LAZY_LOG2_REPAIR=off|on|verify`, `APS5_LAZY_TRIG_SERIES=off|on|verify` (default `off`): whether log2, sin and cos evaluate only the correction they select.
 - `APS5_BDA_PLACEMENT=host|device|verify` (default `device`): whether compute shaders that store through addresses (without atomics or coherent accesses) work on device-local copies of the host memory they write, copied back after each dispatch.
-- `APS5_RESIDENT_MIRRORS=0|1` (default `1`): whether address-based shaders that only read host memory read device-local copies of it, refreshed from the host before each batch and after GPU writes in it.
 - `APS5_SHADER_MANIFEST=<folder>` writes one line per compiled shader with its address and instruction counts; `APS5_SHADER_MANIFEST_SPIRV=all` (or comma-separated hexadecimal addresses) also writes the shaders. `APS5_SPIRV_GUEST_LINES=1` tags shaders with guest program counters for GPU profilers.
 
 ### GPU placement and render pass experiments
@@ -315,6 +314,7 @@ Both switches are on by default (`1`); `0` turns one off, and any other value th
 
 - `APS5_DEVICE_UPLOADS=0|1|verify`: whether buffers the driver only writes from the CPU and the GPU reads (address tables, shader data of up to 64 KiB, image table maps, mesh arguments) go to video memory the CPU can write directly, instead of system memory the GPU reads over PCIe. It needs a device-local, host-visible memory heap of at least 1 GiB (resizable BAR); without one the buffers stay in system memory and the `[uploads]` line counts them. `verify` reads each write back and stops the title if it differs.
 - `APS5_READONLY_ADDRESS_PASSES=0|1|verify`: whether a draw whose shaders read through addresses but never store through them is treated as reading unknown memory only, instead of also writing it, so it no longer ends the render pass for the draws after it. `verify` keeps the old behaviour and counts the pass breaks only such draws caused, on the `[barriers]` line.
+- `APS5_RESIDENT_MIRRORS=0|1`, `APS5_RESIDENT_BUFFER_MIRRORS=0|1`: whether shaders read guest memory they do not write through device-local copies of its host imports (through addresses, and through buffer descriptors respectively) instead of over PCIe. The copies are refreshed from the title's tracked CPU writes before each batch and after the GPU writes the memory in place. `APS5_RESIDENT_MIRROR_MIB=<n>` bounds their size (default: half the video memory; `0` turns both off), and `APS5_VERIFY_RESIDENT_MIRRORS=1` compares them with guest memory at the start of their batches and reports differences on the `[mirrors]` line.
 
 ### Tracing system library calls
 
