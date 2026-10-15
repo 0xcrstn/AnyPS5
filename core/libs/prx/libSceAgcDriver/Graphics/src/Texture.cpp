@@ -3716,8 +3716,7 @@ bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes
     return PublishShadow(address, bytes, scope, PublishReasonFor(reason)) != 0;
 }
 
-bool StorageTexture::StoreForPointerAccess(std::uint64_t address, std::size_t bytes, bool writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt) {
-    if (!writes && !Coherence::Ordering()) return PublishShadowsOnly(address, bytes, PublishScope::Whole, "address-based heap");
+bool StorageTexture::StoreForPointerAccess(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt) {
     const auto previous = std::exchange(pointerExempt, exempt);
     struct Restore {
         std::span<const std::pair<std::uint64_t, std::uint64_t>> previous;

@@ -3903,7 +3903,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         }
         for (const auto& region : regions) heap(region);
     }
-    for (const auto& [begin, end] : pointerHeaps) static_cast<void>(StorageTexture::StoreForPointerAccess(begin, static_cast<std::size_t>(end - begin), pointerWrites, pointerExempt));
+    for (const auto& [begin, end] : pointerHeaps) static_cast<void>(StorageTexture::StoreForPointerAccess(begin, static_cast<std::size_t>(end - begin), pointerExempt));
     if (Coherence::Tracking() && !pointerHeaps.empty()) {
         for (const auto& [begin, end] : pointerHeaps) StorageTexture::AuditPointerReads(begin, static_cast<std::size_t>(end - begin), pointerExempt);
         if (pointerWrites) {
