@@ -260,8 +260,8 @@ The wait broker (on by default, `APS5_WAIT_BROKER=0` turns it off) makes a block
 Queue 0's draws and dispatches are prepared on worker threads and recorded on a record thread by default. Each switch below is on unless it is set to `0`; switches that depend on another one are off when that one is off. The `APS5_VERIFY_*` switches stay off unless set, and stop the title on the first difference they find.
 
 - `APS5_RECORD_THREAD`: a record thread records queue 0's draws while queue 0 decodes the next packets. `APS5_RECORD_THREAD_DISPATCH` records queue 0's dispatches there too.
-- `APS5_PREPARE_AHEAD=<1-64>`: how many records queue 0 may post ahead of the record thread (4 by default).
-- `APS5_PREPARE_WORKERS=<1-16>`: threads that prepare frozen draws (one per 8 logical processors, 1 to 8, by default). `APS5_PREPARE_DISPATCHES` prepares queue 0's dispatches on them too.
+- `APS5_PREPARE_AHEAD=<1-64>`: how many records queue 0 may post ahead of the record thread (by default the number of preparation workers, at least 4).
+- `APS5_PREPARE_WORKERS=<1-16>`: threads that prepare frozen draws. By default one per efficiency core on a hybrid CPU (16 on an i9-13900K), which leaves the performance cores to queue 0, the record thread and the title's own threads; otherwise half the logical processors less two. Both are capped at 16. `APS5_PREPARE_DISPATCHES` prepares queue 0's dispatches on them too.
 - `APS5_PARALLEL_RESOLVE`, `APS5_PARALLEL_REVALIDATE`, `APS5_PARALLEL_TARGETS`: the preparation workers also resolve a draw's inputs, template, pipeline, template proof and render targets; the record thread re-checks them. Verify: `APS5_VERIFY_PARALLEL_RESOLVE`, `APS5_VERIFY_PARALLEL_REVALIDATE`, `APS5_VERIFY_PARALLEL_TARGETS`.
 - `APS5_WORKER_SNAPSHOT_COPIES`: the preparation workers copy a draw's input snapshots; the record thread adopts a copy when its memory is unchanged. Verify: `APS5_VERIFY_WORKER_SNAPSHOT_COPIES`.
 - `APS5_BINDING_PLAN`, `APS5_INCREMENTAL_BINDINGS`, `APS5_INCREMENTAL_PLANS`: draws read their resource descriptors through a planned walk, and reuse the parts of it whose inputs did not change.

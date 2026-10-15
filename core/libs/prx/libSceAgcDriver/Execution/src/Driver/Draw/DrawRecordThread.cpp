@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DefaultSwitch.hpp"
+#include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareWorkers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -14,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -250,10 +252,21 @@ bool Driver::deferDrawRecords(std::uint32_t queue) const {
     return queue == 0 && recordThread();
 }
 
+namespace {
+
+unsigned long defaultPrepareWorkers() {
+    const auto& layout = CpuTopology::Get();
+    if (layout.hybrid) return std::clamp<unsigned long>(static_cast<unsigned long>(std::popcount(layout.efficient & (layout.process != 0 ? layout.process : ~std::uint64_t{0}))), 1ul, 16ul);
+    const auto logical = static_cast<unsigned long>(std::thread::hardware_concurrency());
+    return std::clamp<unsigned long>(logical > 4ul ? logical / 2ul - 2ul : 1ul, 1ul, 16ul);
+}
+
+}
+
 std::uint32_t Driver::prepareAhead() {
     static const std::uint32_t depth = [] {
         const char* text = std::getenv("APS5_PREPARE_AHEAD");
-        unsigned long value = 4;
+        unsigned long value = std::max(4ul, defaultPrepareWorkers());
         if (text != nullptr) {
             if (std::strcmp(text, "0") == 0) return std::uint32_t{0};
             char* end = nullptr;
@@ -276,7 +289,7 @@ std::uint32_t Driver::prepareAhead() {
 std::uint32_t Driver::prepareWorkers() {
     static const std::uint32_t workers = [] {
         const char* text = std::getenv("APS5_PREPARE_WORKERS");
-        unsigned long value = std::clamp<unsigned long>(std::thread::hardware_concurrency() / 8u, 1ul, 8ul);
+        unsigned long value = defaultPrepareWorkers();
         if (text != nullptr) {
             if (std::strcmp(text, "0") == 0) return std::uint32_t{0};
             char* end = nullptr;
