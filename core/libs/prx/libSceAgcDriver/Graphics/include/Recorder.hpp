@@ -80,6 +80,8 @@ public:
         }
     }
     std::uint32_t PhysicalQueue() const { return physicalQueue; }
+    bool GraphicsCapable() const { return context.graphicsQueue; }
+    static Recorder* GraphicsRecorder();
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
     explicit Recorder(const Context& context, bool timelineSemaphores = false, std::uint32_t physicalQueue = 0);
     VkSemaphore Timeline() const { return timeline; }

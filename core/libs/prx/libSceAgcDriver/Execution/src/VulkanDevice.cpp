@@ -12,6 +12,7 @@
 #endif
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueTopology.hpp"
+#include "prx/libSceAgcDriver/Execution/include/QueueFamilyDispatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DriverHeapTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -461,6 +462,9 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::Recorder> recorder;
     QueueTopology topology = QueueTopology::Serial;
     bool topologyForced = false;
+    std::uint32_t computeFamily = VK_QUEUE_FAMILY_IGNORED;
+    std::uint32_t computeIndex = 0;
+    bool familyDispatch = false;
     VkQueue computeQueue = VK_NULL_HANDLE;
     VkCommandPool computePool = VK_NULL_HANDLE;
     std::unique_ptr<Graphics::Recorder> computeRecorder;
@@ -955,6 +959,7 @@ struct VulkanDevice::State {
             }
             if (computePool != VK_NULL_HANDLE) destroyPool(device, computePool, nullptr);
             destroyDevice(device, nullptr);
+            if (familyDispatch) RemoveQueueFamilyDispatch(device);
         }
         if (instance != VK_NULL_HANDLE) {
             if (surface) reinterpret_cast<PFN_vkDestroySurfaceKHR>(instanceProc(instance, "vkDestroySurfaceKHR"))(instance, surface, nullptr);
@@ -1684,7 +1689,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // Guest shaders routinely read past descriptor ranges; robust access turns that into zeros
     // instead of a GPU fault that loses the device.
     enabled.robustBufferAccess = available.robustBufferAccess;
-    VkDeviceQueueCreateInfo queueInfos[2]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
+    VkDeviceQueueCreateInfo queueInfos[3]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
     if (available.sparseBinding && state->dmaBufImport) {
         std::uint32_t families = 0;
         auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
@@ -1730,13 +1735,25 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         APS5_LOG_OUT("Vulkan queue families: %s; graphics family %u, sparse family %d", DescribeQueueFamilies(topologyFamilies).c_str(), family, state->sparseFamily == VK_QUEUE_FAMILY_IGNORED ? -1 : static_cast<int>(state->sparseFamily));
         const char* requestedTopology = std::getenv("APS5_QUEUE_TOPOLOGY");
         state->topologyForced = requestedTopology != nullptr;
-        const auto topology = requestedTopology != nullptr ? ParseQueueTopology(requestedTopology) : family < topologyFamilies.size() && topologyFamilies[family].count >= 2 ? QueueTopology::SameFamily : QueueTopology::Serial;
+        const auto topology = requestedTopology != nullptr ? ParseQueueTopology(requestedTopology) : DefaultQueueTopology(topologyFamilies, family, state->sparseFamily);
         const auto plan = PlanQueueTopology(topology, topologyFamilies, family, state->sparseFamily);
         for (std::uint32_t guest = 0; guest < Graphics::Recorder::GuestQueues; ++guest) Graphics::Recorder::MapGuestQueue(guest, 0);
-        if (plan.topology == QueueTopology::Dedicated) {
-            throw std::runtime_error(std::string("APS5_QUEUE_TOPOLOGY=dedicated: compute queue family ") + std::to_string(plan.computeFamily) + " is available, but queue family ownership transfers for a dedicated compute family are not implemented");
-        }
         state->topology = plan.topology;
+        if (plan.topology == QueueTopology::Dedicated) {
+            static const float priorities[2] = {1.0f, 1.0f};
+            state->computeFamily = plan.computeFamily;
+            state->computeIndex = plan.computeIndex;
+            if (plan.computeFamily == state->sparseFamily) {
+                queueInfos[1].queueCount = plan.computeIndex + 1;
+                queueInfos[1].pQueuePriorities = priorities;
+            } else {
+                auto& computeInfo = queueInfos[deviceInfo.queueCreateInfoCount];
+                computeInfo.queueFamilyIndex = plan.computeFamily;
+                computeInfo.queueCount = 1;
+                computeInfo.pQueuePriorities = priorities;
+                ++deviceInfo.queueCreateInfoCount;
+            }
+        }
         if (plan.topology == QueueTopology::SameFamily) {
             static const float priorities[2] = {1.0f, 1.0f};
             queueInfos[0].queueCount = plan.queuesFromGraphicsFamily;
@@ -2011,6 +2028,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     deviceInfo.pNext = &bdaFeatures;
     auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
+    if (state->topology == QueueTopology::Dedicated && !compileOnly) {
+        state->deviceProc = InstallQueueFamilyDispatch(state->device, state->deviceProc, family, state->computeFamily);
+        state->familyDispatch = true;
+    }
     state->shaderProfile = std::move(shaderProfile);
     if (compileOnly) return;
     if (calibratedTimestamps != nullptr) {
@@ -2034,6 +2055,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     if (state->topology == QueueTopology::SameFamily) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 1, &state->computeQueue);
+    if (state->topology == QueueTopology::Dedicated) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->computeFamily, state->computeIndex, &state->computeQueue);
     state->queueFamily = family;
     if (state->sparseFamily != VK_QUEUE_FAMILY_IGNORED) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->sparseFamily, 0, &state->sparseQueue);
     if (checkpoints) state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
@@ -2053,6 +2075,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     poolInfo.queueFamilyIndex = family;
     check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &poolInfo, nullptr, &state->pool), "vkCreateCommandPool");
     if (state->topology == QueueTopology::SameFamily) check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &poolInfo, nullptr, &state->computePool), "vkCreateCommandPool compute");
+    if (state->topology == QueueTopology::Dedicated) {
+        VkCommandPoolCreateInfo computePoolInfo = poolInfo;
+        computePoolInfo.queueFamilyIndex = state->computeFamily;
+        check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &computePoolInfo, nullptr, &state->computePool), "vkCreateCommandPool dedicated compute");
+        RegisterComputeFamilyPool(state->computePool);
+    }
     static const bool procTable = std::getenv("APS5_NO_PROC_TABLE") == nullptr;
     if (procTable) {
         Graphics::FillDeviceFunctions(graphicsContext(), state->deviceFunctions);
@@ -2078,15 +2106,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->recorder->Activate();
     state->context = buildContext();
     state->contextReady = true;
-    if (state->topology == QueueTopology::SameFamily && !state->topologyForced && !(state->timelineSemaphores && state->recorder->HasTimeline())) {
+    if (state->topology != QueueTopology::Serial && !state->topologyForced && !(state->timelineSemaphores && state->recorder->HasTimeline())) {
         APS5_LOG_OUT("Vulkan queue topology serial: %s", "the device has no timeline semaphores to order a second queue");
         state->topology = QueueTopology::Serial;
     }
-    if (state->topology == QueueTopology::SameFamily) {
-        require(state->timelineSemaphores && state->recorder->HasTimeline(), "APS5_QUEUE_TOPOLOGY=same-family needs timeline semaphores to order the two queues");
+    if (state->topology != QueueTopology::Serial) {
+        require(state->timelineSemaphores && state->recorder->HasTimeline(), (std::string("APS5_QUEUE_TOPOLOGY=") + QueueTopologyName(state->topology) + " needs timeline semaphores to order the two queues").c_str());
         auto compute = state->context;
         compute.queue = state->computeQueue;
         compute.pool = state->computePool;
+        if (state->topology == QueueTopology::Dedicated) {
+            compute.queueFamily = state->computeFamily;
+            compute.graphicsQueue = false;
+        }
         state->computeRecorder = std::make_unique<Graphics::Recorder>(compute, state->timelineSemaphores, 1);
         require(state->computeRecorder->HasTimeline(), "the compute recorder has no timeline semaphore");
         state->computeRecorder->Activate();
@@ -2095,7 +2127,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->recorder->SetPeer(state->computeRecorder.get());
         state->computeRecorder->SetPeer(state->recorder.get());
         for (std::uint32_t guest = 1; guest < Graphics::Recorder::GuestQueues; ++guest) Graphics::Recorder::MapGuestQueue(guest, 1);
-        APS5_LOG_OUT("Vulkan queue topology same-family: guest queue 0 on queue %p, the other guest queues on queue %p", reinterpret_cast<void*>(state->queue), reinterpret_cast<void*>(state->computeQueue));
+        APS5_LOG_OUT("Vulkan queue topology %s: guest queue 0 on queue %p (family %u), the other guest queues on queue %p (family %u)", QueueTopologyName(state->topology), reinterpret_cast<void*>(state->queue), family, reinterpret_cast<void*>(state->computeQueue), state->topology == QueueTopology::Dedicated ? state->computeFamily : family);
     }
     if (window != nullptr) {
         require(window->getDrawableSize != nullptr, "missing window drawable size query");

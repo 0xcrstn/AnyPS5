@@ -1132,6 +1132,14 @@ Recorder* Recorder::Current() {
     return ForPhysicalQueue(PhysicalQueueOf(GuestMemory::GpuLockThreadTag()));
 }
 
+Recorder* Recorder::GraphicsRecorder() {
+    auto* current = Current();
+    if (current == nullptr || current->GraphicsCapable()) return current;
+    auto* graphics = ForPhysicalQueue(0);
+    Require(graphics != nullptr && graphics->GraphicsCapable(), "graphics work from a compute-only queue has no graphics recorder to go to");
+    return graphics;
+}
+
 Recorder* Recorder::ForPhysicalQueue(std::uint32_t physicalQueue) {
     Require(physicalQueue < PhysicalQueues, "recorder for an unknown physical queue");
     return Domain(physicalQueue).active;
