@@ -5043,6 +5043,15 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     } else {
         recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
     }
+    if (Coherence::InputLeases() && kind == Recorder::ReadKind::DispatchElement) {
+        std::vector<std::uint64_t> leases;
+        for (const auto& [begin, end] : guestMemory.InPlaceReads()) {
+            if (const auto lease = Coherence::AcquireReadLease({begin, end}, Coherence::CurrentVersion()); lease != 0) leases.push_back(lease);
+        }
+        if (!leases.empty()) recorder.OnCompleteWithoutGuestAccess([leases] {
+            for (const auto lease : leases) Coherence::RetireReadLease(lease);
+        });
+    }
     if (usesBda && !bdaReadOnly) {
         guestMemory.ForgetPointerShadows();
         guestMemory.PointerRecorded();

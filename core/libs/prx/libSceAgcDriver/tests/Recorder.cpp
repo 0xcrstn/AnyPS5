@@ -4806,6 +4806,104 @@ int coherenceFaultTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
+int coherenceLeaseTests(const Device& device, Recorder& recorder) {
+#ifndef _WIN32
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+    std::cout << "skipped, guest access protection is Windows only\n";
+    return 77;
+#else
+    using namespace AgcDriver::GuestMemory;
+    namespace Coherence = AgcDriver::Coherence;
+    const auto& base = device.GetContext();
+    constexpr std::size_t bytes = 65536;
+    std::unique_lock gpu(GpuMutex());
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared lease section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    struct Release {
+        void* block;
+        ~Release() {
+            Coherence::SetInputLeasesModeForTests(Coherence::Mode::Reference);
+            Coherence::ResetForTests();
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+    std::memset(block, 0x41, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the lease block refused: not tested\n";
+        return 77;
+    }
+    Coherence::SetInputLeasesModeForTests(Coherence::Mode::Verify);
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetLeaseWaiter([](Coherence::Interval) {
+        std::lock_guard lock(GpuMutex());
+        if (auto* active = Recorder::Active()) active->Sync();
+    });
+    Coherence::ResetForTests();
+    const auto copyBuffer = base.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto read = [&](Buffer& output) {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{address - import->base, 0, 16};
+        copyBuffer(commands, import->buffer, output.Handle(), 1, &piece);
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const auto lease = Coherence::AcquireReadLease({address, address + 16}, Coherence::CurrentVersion());
+        Require(lease != 0, "a read lease over shared guest memory was refused");
+        recorder.OnCompleteWithoutGuestAccess([lease] { Coherence::RetireReadLease(lease); });
+    };
+    Buffer first(base, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer second(base, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::memset(first.Bytes().data(), 0, 16);
+    std::memset(second.Bytes().data(), 0, 16);
+    read(first);
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint32_t*>(address) = 0x42424242u;
+    gpu.lock();
+    read(second);
+    recorder.Sync();
+    const auto* early = reinterpret_cast<const std::uint8_t*>(first.Bytes().data());
+    const auto* late = reinterpret_cast<const std::uint8_t*>(second.Bytes().data());
+    Require(early[0] == 0x41 && early[3] == 0x41 && early[4] == 0x41, "a reader recorded before a native write saw the write");
+    Require(late[0] == 0x42 && late[3] == 0x42 && late[4] == 0x41, "a reader recorded after a native write missed it");
+    auto counters = Coherence::CurrentCounters();
+    Require(counters.leaseWaits == 1 && counters.liveProtections == 0, "leased in-place reads: " + Coherence::Report());
+    for (int draw = 0; draw < 1000; ++draw) read(second);
+    recorder.Sync();
+    counters = Coherence::CurrentCounters();
+    Require(counters.leases == 1002 && counters.leaseWaits == 1 && counters.liveProtections == 0, "unwritten leased reads waited or kept their leases: " + Coherence::Report());
+    std::cout << "coherence input leases: ok\n";
+    return 0;
+#endif
+}
+
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -10102,6 +10200,16 @@ int main(int argc, char** argv) {
         }
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--coherence-input-leases-only") {
+            if (device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, host imports are unavailable\n";
+                return 77;
+            }
+            gpu.unlock();
+            const auto result = coherenceLeaseTests(device, recorder);
+            gpu.lock();
+            return result;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--coherence-faults-only") {
             if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
                 std::cout << "skipped, unit shadows or host imports are unavailable

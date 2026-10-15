@@ -987,18 +987,25 @@ void MaterializeNativeAccess(Coherence::Interval range) {
     Graphics::StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin));
 }
 
+void WaitForGuestReaders(Coherence::Interval range) {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) Coherence::NoteLockedFault(range);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    if (auto* recorder = Graphics::Recorder::Active()) recorder->Sync();
+}
+
 void InstallCoherence() {
     if (Coherence::Canonicalizing()) {
         Coherence::SetBackingTranslator(&GuestArena::GuestArenaBackingRuns_nid_postfix);
         static_cast<void>(Coherence::Translate({0x10000, 0x10001}));
     }
-    if (!Coherence::FaultOwnership()) return;
+    if (!Coherence::FaultOwnership() && !Coherence::InputLeases()) return;
 #ifdef _WIN32
     Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
     Coherence::SetMaterializer(&MaterializeNativeAccess);
+    Coherence::SetLeaseWaiter(&WaitForGuestReaders);
     GuestArena::GuestArenaSetResolveHostWrites_nid_postfix(true);
 #else
-    throw std::runtime_error("APS5_COHERENCE_FAULTS: guest access protection is not implemented on this platform");
+    throw std::runtime_error("APS5_COHERENCE_FAULTS and APS5_COHERENCE_INPUT_LEASES: guest access protection is not implemented on this platform");
 #endif
 }
 

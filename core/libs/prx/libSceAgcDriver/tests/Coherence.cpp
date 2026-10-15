@@ -287,6 +287,41 @@ void FaultTests() {
     SetMaterializer(nullptr);
 }
 
+std::vector<Interval> waited;
+
+void LeaseTests() {
+    guards.clear();
+    waited.clear();
+    materialized.clear();
+    refuseProtection = false;
+    Reset(Mode::Reference, Mode::Reference);
+    SetInputLeasesModeForTests(Mode::Reference);
+    SetProtectionBackend({&FakeProtect, &FakeRelease});
+    SetMaterializer([](Interval range) { materialized.push_back(range); });
+    SetLeaseWaiter([](Interval range) { waited.push_back(range); });
+    Require(AcquireReadLease({0x10010, 0x10020}, 1) == 0 && guards.empty(), "the reference path leased guest memory");
+    SetInputLeasesModeForTests(Mode::New);
+    const auto lease = AcquireReadLease({0x10010, 0x12020}, 1);
+    Require(lease != 0 && guards.size() == 1 && guards[0].address == 0x10000 && guards[0].bytes == 0x3000, "a read lease does not cover every page its range touches");
+    Require(CurrentCounters().partialProtections == 0 && CurrentCounters().leases == 1, "a read lease was counted as device-owned memory");
+    Require(FakeFault(0x11004), "a write under a read lease found no guard");
+    Require(waited.size() == 1 && materialized.empty() && waited[0].begin == 0x10000 && waited[0].end == 0x13000, "a write under a read lease did not wait for its readers");
+    Require(CurrentCounters().leaseWaits == 1 && CurrentCounters().faultsResolved == 0 && guards.empty(), "a resolved read lease kept its guard");
+    RetireReadLease(lease);
+    const auto quiet = AcquireReadLease({0x20000, 0x20010}, 2);
+    RetireReadLease(quiet);
+    Require(guards.empty() && waited.size() == 1, "a lease retired without a write made its reader wait");
+    refuseProtection = true;
+    Require(AcquireReadLease({0x30000, 0x30010}, 3) == 0 && CurrentCounters().refusedProtections == 1, "a refused read lease was not counted");
+    SetInputLeasesModeForTests(Mode::Verify);
+    Require(Throws([] { static_cast<void>(AcquireReadLease({0x30000, 0x30010}, 4)); }).find("APS5_COHERENCE_INPUT_LEASES=verify") != std::string::npos, "input leases verify accepted a refused lease");
+    refuseProtection = false;
+    SetInputLeasesModeForTests(Mode::Reference);
+    SetProtectionBackend({});
+    SetMaterializer(nullptr);
+    SetLeaseWaiter(nullptr);
+}
+
 void LifetimeTests() {
     Reset(Mode::New, Mode::Reference);
     const auto before = NextVersion();
@@ -383,6 +418,7 @@ int main() {
         DirectoryTests();
         ReleaseTests();
         FaultTests();
+        LeaseTests();
         LifetimeTests();
         CommitSplitTests();
         EvictionTests();

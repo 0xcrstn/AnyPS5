@@ -18,12 +18,15 @@ Mode AuditMode();
 Mode OrderingMode();
 Mode DirectoryMode();
 Mode FaultsMode();
+Mode InputLeasesMode();
 void SetModesForTests(Mode audit, Mode ordering, Mode directory);
 void SetFaultsModeForTests(Mode faults);
+void SetInputLeasesModeForTests(Mode leases);
 bool Tracking();
 bool Ordering();
 bool Canonicalizing();
 bool FaultOwnership();
+bool InputLeases();
 
 using Version = std::uint64_t;
 
@@ -47,7 +50,7 @@ void SetBackingTranslator(BackingTranslator translator);
 std::vector<BackingRun> Translate(Interval range);
 
 enum class Producer : std::uint8_t { PointerWriter, ElementWriter, Count };
-enum class Source : std::uint8_t { PendingImage, ShadowUnit, ResidentStaging, Count };
+enum class Source : std::uint8_t { PendingImage, ShadowUnit, ResidentStaging, ReadLease, Count };
 
 const char* ProducerName(Producer producer);
 const char* SourceName(Source source);
@@ -114,6 +117,9 @@ void SetMaterializer(Materializer materializer);
 std::uint64_t ProtectDeviceOwned(Interval range, Source source, Version version);
 void ReleaseDeviceOwned(std::uint64_t protection);
 void NoteLockedFault(Interval range);
+void SetLeaseWaiter(Materializer waiter);
+std::uint64_t AcquireReadLease(Interval range, Version version);
+void RetireReadLease(std::uint64_t lease);
 
 struct Counters {
     std::uint64_t reservations = 0;
@@ -133,6 +139,8 @@ struct Counters {
     std::uint64_t faultsResolved = 0;
     std::uint64_t lockedFaults = 0;
     std::uint64_t liveProtections = 0;
+    std::uint64_t leases = 0;
+    std::uint64_t leaseWaits = 0;
 };
 
 Counters CurrentCounters();
