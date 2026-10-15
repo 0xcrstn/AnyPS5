@@ -32,6 +32,9 @@ class Buffer;
 class DrawSnapshotArena;
 class ChunkedRecording;
 class ChunkPool;
+class EmitRecording;
+class EmitPools;
+struct EmitTicket;
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -142,6 +145,7 @@ public:
     EmitSlot CutForEmit();
     void PostEmitUnit(EmitUnit&& unit);
     bool ChunkPass();
+    bool EmitPass();
     CommandSink OpenChunk(const Context& drawContext, const ChunkInheritance& inheritance, const ChunkDraw& draw);
     CommandSink PassSink(const Context& drawContext, const ChunkDraw& draw);
     static void DrainChunks();
@@ -828,6 +832,13 @@ private:
         std::vector<KeyStore> keyStores;
         std::shared_ptr<ChunkPool> chunkPool;
         std::string chunkFailure;
+        struct Slot {
+            VkCommandBuffer commands = VK_NULL_HANDLE;
+            std::shared_ptr<EmitTicket> ticket;
+        };
+        std::vector<Slot> slots;
+        std::shared_ptr<EmitPools> emitPools;
+        std::uint64_t emitIdentity = 0;
     };
     struct LabelEntry {
         std::uint32_t value;
@@ -1067,6 +1078,11 @@ private:
     void dropSnapshotTwin(std::map<DrawSnapshotKey, SnapshotTwinEntry>::iterator entry);
     std::vector<VkCommandBuffer> sparePrologues;
     VkCommandBuffer prologueCommands();
+    std::unique_ptr<EmitRecording> emit;
+    std::vector<VkCommandBuffer> spareLedgers;
+    std::uint64_t emitIdentities = 0;
+    VkCommandBuffer takeLedger();
+    void collectEmitUnits(Batch& batch);
     mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
     mutable bool publishedWriteRangesValid = false;
     mutable bool publishedResidentWrites = false;

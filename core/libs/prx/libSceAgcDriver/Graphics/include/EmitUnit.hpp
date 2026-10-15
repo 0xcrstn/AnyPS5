@@ -43,6 +43,7 @@ struct EmitSlot {
 
 struct EmitUnit {
     EmitSlot slot;
+    const DeviceFunctions* functions = nullptr;
     std::vector<EmitPass> passes;
 };
 

@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ChunkedRecording.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/EmitRecording.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/IndexBounds.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -7556,6 +7557,10 @@ public:
     }
 
     static constexpr std::uint64_t Samples = 64;
+    VkRenderPass RenderPass() const { return renderPass; }
+    VkFramebuffer Framebuffer() const { return framebuffer; }
+    VkPipeline Pipeline() const { return pipeline; }
+    VkImage Image() const { return target.Image(); }
 
 private:
     static constexpr std::uint64_t PassKey = 0xc0de;
@@ -11508,6 +11513,128 @@ bool chunkedRecordingTests(const Device& device, Recorder& recorder) {
     });
 }
 
+EmitUnit coverUnit(const Context& context, const CoverPass& cover, EmitSlot slot, std::uint64_t program) {
+    EmitUnit unit;
+    unit.slot = slot;
+    unit.functions = context.functions;
+    auto& pass = unit.passes.emplace_back();
+    pass.begin.renderPass = cover.RenderPass();
+    pass.begin.framebuffer = cover.Framebuffer();
+    pass.begin.area = {{0, 0}, {8, 8}};
+    const CommandSink sink(pass.commands, 5);
+    pass.drawOffsets.push_back(0);
+    pass.draws.push_back(ChunkDraw{program, 3, 1, 0x8080});
+    sink.BindPipeline(context, VK_PIPELINE_BIND_POINT_GRAPHICS, cover.Pipeline());
+    sink.Draw(context, 3, 1, 0, 0);
+    return unit;
+}
+
+bool emitFailureTests(const Device& device) {
+    if (!device.Graphics()) return false;
+    const auto& context = device.GetContext();
+    const CoverPass cover(context);
+    EmitRecording recording(context, 2);
+    const auto before = EmitRecording::Statistics();
+    auto pools = recording.TakePools();
+    auto unit = coverUnit(context, cover, {1, 1}, 0x900d);
+    unit.passes.front().drawOffsets.push_back(unit.passes.front().commands.Words().size());
+    unit.passes.front().draws.push_back(ChunkDraw{0xbad0, 6, 1, 0x8080});
+    unit.passes.front().commands.Append(static_cast<ChunkCommand>(0x7777), {});
+    const auto ticket = recording.Post(std::move(unit), pools);
+    const auto failed = recording.Wait(*ticket);
+    Require(failed.commands == VK_NULL_HANDLE && !failed.mismatch, "a failed emit unit handed out its command buffer");
+    Require(failed.failure.find("program 0xbad0") != std::string::npos && failed.failure.find("unknown command") != std::string::npos, "an emit unit's recording failure did not name the failing draw: " + failed.failure);
+    const auto good = recording.Wait(*recording.Post(coverUnit(context, cover, {1, 2}, 0x900d), pools));
+    Require(good.failure.empty() && good.commands != VK_NULL_HANDLE, "an emit unit recorded after a failed one with the same pools failed: " + good.failure);
+    const auto after = EmitRecording::Statistics();
+    Require(after.units - before.units == 2 && after.failures - before.failures == 1 && after.draws - before.draws == 3, "the emit units were not counted");
+    recording.Recycle(std::move(pools));
+    std::cout << "emit failure tests passed\n";
+    return true;
+}
+
+bool emitRecordingTests(const Device& device, Recorder& recorder) {
+    if (Recorder::EmitWorkers() == 0 || !device.Graphics()) {
+        std::cout << "skipped, the emit recording test needs APS5_EMIT_WORKERS and a graphics queue\n";
+        return false;
+    }
+    const auto& context = device.GetContext();
+    const CoverPass cover(context);
+    constexpr VkDeviceSize imageBytes = 8 * 8 * 4;
+    constexpr std::uint32_t copies = 6;
+    Buffer readback(context, imageBytes * copies, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    const auto barrier = [&](VkCommandBuffer commands) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    };
+    const auto clear = [&] {
+        const auto commands = recorder.Commands();
+        barrier(commands);
+        const VkClearColorValue black{};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, cover.Image(), VK_IMAGE_LAYOUT_GENERAL, &black, 1, &range);
+        barrier(commands);
+    };
+    const auto copy = [&](std::uint32_t index) {
+        const auto commands = recorder.Commands();
+        barrier(commands);
+        VkBufferImageCopy region{};
+        region.bufferOffset = imageBytes * index;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {8, 8, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, cover.Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &region);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    };
+    const auto emitCover = [&](std::uint64_t program) {
+        Require(recorder.EmitPass(), "emit recording refused a pass without GPU timing or occlusion queries");
+        const auto slot = recorder.CutForEmit();
+        recorder.PostEmitUnit(coverUnit(context, cover, slot, program));
+    };
+    const auto before = EmitRecording::Statistics();
+    {
+        const auto commands = recorder.Commands();
+        VkImageMemoryBarrier toGeneral{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toGeneral.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toGeneral.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toGeneral.image = cover.Image();
+        toGeneral.subresourceRange = range;
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+    }
+    constexpr std::uint32_t batches = 24;
+    for (std::uint32_t round = 0; round < batches; ++round) {
+        std::memset(readback.Bytes().data(), 0x5a, static_cast<std::size_t>(imageBytes * copies));
+        const auto batch = recorder.OpenSerial();
+        clear();
+        copy(0);
+        emitCover(0x1000 + round);
+        copy(1);
+        clear();
+        copy(2);
+        emitCover(0x2000 + round);
+        emitCover(0x3000 + round);
+        copy(3);
+        clear();
+        copy(4);
+        emitCover(0x4000 + round);
+        copy(5);
+        Require(recorder.OpenSerial() == batch, "the emit units and the record thread's commands were not recorded into one batch");
+        recorder.Sync();
+        const auto bytes = readback.Bytes();
+        for (std::uint32_t index = 0; index < copies; ++index) {
+            const auto expected = index % 2 == 0 ? std::byte{0x00} : std::byte{0xff};
+            const auto image = bytes.subspan(static_cast<std::size_t>(imageBytes * index), static_cast<std::size_t>(imageBytes));
+            Require(std::ranges::all_of(image, [&](std::byte value) { return value == expected; }), "copy " + std::to_string(index) + " of batch " + std::to_string(round) + " did not see the emit units in the order they were cut");
+        }
+    }
+    const auto after = EmitRecording::Statistics();
+    Require(after.units - before.units == 4 * batches && after.draws - before.draws == 4 * batches && after.failures == before.failures, "the emit units were not all recorded");
+    Require(!EmitRecording::Verify() || after.verified - before.verified == after.draws - before.draws, "APS5_VERIFY_EMIT compared fewer draws than were emitted");
+    std::cout << "emit recording tests passed" << (EmitRecording::Verify() ? " (verified)" : "") << "\n";
+    return true;
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {
@@ -11574,6 +11701,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--chunked-failure-only") {
             return chunkedFailureTests(device) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--emit-failure-only") {
+            return emitFailureTests(device) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-only") {
             descriptorPoolTests(device);
@@ -11665,6 +11795,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--chunked-recording-only") {
             return chunkedRecordingTests(device, recorder) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--emit-recording-only") {
+            return emitRecordingTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-pending-write-snapshot") {
             pendingWriteSnapshotBenchmark(recorder);
