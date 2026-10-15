@@ -21,6 +21,8 @@ ShaderRecompiler::BdaPlacement::Mode PlacementSetting();
 bool ParseDrawPlacement(const char* text);
 bool DrawPlacementEnabled();
 std::shared_ptr<ResidentMirror> PlacementOfImport(const Context& context, const HostImport& import);
+void CountPlacedBuild();
+std::uint64_t PlacedBuilds();
 VkDeviceAddress MirrorPristineAddress(const ResidentMirror& mirror);
 void RecordPlacementCopyBack(const Context& context, VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress table, bool verify);
 VkBuffer MirrorBuffer(const ResidentMirror& mirror);

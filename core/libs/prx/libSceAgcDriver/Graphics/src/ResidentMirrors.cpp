@@ -62,6 +62,7 @@ struct Statistics {
     std::atomic<std::uint64_t> made{0}, refused{0}, uses{0}, refreshes{0}, refreshedBlocks{0}, refreshedBytes{0}, midBatchSyncs{0}, midBatchBytes{0}, invalidatedBlocks{0};
     std::atomic<std::uint64_t> collectNs{0};
     std::atomic<std::uint64_t> deferred{0}, denied{0}, deniedUses{0}, verified{0}, verifiedBytes{0}, verifyDiffering{0};
+    std::atomic<std::uint64_t> placedBuilds{0};
 };
 
 struct Seen {
@@ -169,7 +170,7 @@ PlacementPipeline CopyBackPipeline(const Context& context) {
     entry.device = context.device;
     entry.destroyPipeline = context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline");
     entry.destroyLayout = context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
-    const auto code = ShaderRecompiler::BdaPlacement::BuildCopyBackShader();
+    const auto code = ShaderRecompiler::BdaPlacement::BuildCopyBackShader(context.bufferInt64Atomics);
     VkShaderModule module = VK_NULL_HANDLE;
     try {
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ShaderRecompiler::BdaPlacement::PushConstants)};
@@ -439,6 +440,14 @@ std::shared_ptr<ResidentMirror> PlacementOfImport(const Context& context, const 
     return mirrorOf(context, import, true);
 }
 
+void CountPlacedBuild() {
+    Stats().placedBuilds.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t PlacedBuilds() {
+    return Stats().placedBuilds.load(std::memory_order_relaxed);
+}
+
 VkDeviceAddress MirrorPristineAddress(const ResidentMirror& mirror) {
     Require(mirror.pristine != nullptr, "a BDA placement mirror has no pristine copy");
     return mirror.pristineAddress;
@@ -580,6 +589,16 @@ void SubmitMirrors(Recorder& recorder) {
         const auto generation = GuestMemory::CollectWrites(mirror->base, static_cast<std::size_t>(mirror->bytes));
         changed.assign(mirror->generations.size(), GuestMemory::BlockWritten);
         if (generation != 0) GuestMemory::ChangedBlocks(mirror->base, static_cast<std::size_t>(mirror->bytes), mirror->generations, changed);
+        if (mirror->pristine != nullptr) {
+            std::lock_guard lock(registry.mutex);
+            if (mirror->anyUnsynced) {
+                for (std::size_t block = 0; block < changed.size(); ++block) {
+                    if (mirror->unsynced[block] != 0) changed[block] = GuestMemory::BlockWritten;
+                }
+                std::fill(mirror->unsynced.begin(), mirror->unsynced.end(), std::uint8_t{0});
+                mirror->anyUnsynced = false;
+            }
+        }
         Stats().collectNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         const auto copies = blockCopies(*mirror, changed);
         if (!copies.empty()) {

@@ -1130,6 +1130,7 @@ void EmitProgram(SpirvEmitterState& state) {
         state.labels.emplace(block, label);
     }
     DefineGetBdaPointer(state);
+    PrepareBdaProvenance(state);
     DefineDot2F32F16Function(state);
     DefineFloatIdiomFunctions(state);
     for (const IrBlock* block : program.BlockOrder()) {

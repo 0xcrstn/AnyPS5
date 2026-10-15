@@ -55,7 +55,7 @@ inline constexpr std::uint32_t PageBytes = 1u << BdaAbi::WrittenPageShift;
 inline constexpr std::uint32_t DispatchX = BdaAbi::WrittenPageSlots;
 inline constexpr std::uint32_t DispatchY = BdaAbi::WrittenChunkPages;
 
-std::vector<std::uint32_t> BuildCopyBackShader();
+std::vector<std::uint32_t> BuildCopyBackShader(bool int64Atomics);
 
 }
 

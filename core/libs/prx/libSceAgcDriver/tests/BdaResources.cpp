@@ -1797,7 +1797,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         ShaderRecompiler::BdaAbi::Range range{};
         std::memcpy(&header, table.data(), sizeof(header));
         const auto translation = ShaderRecompiler::BdaTable::TranslationSetting();
-        const auto version = translation == ShaderRecompiler::BdaTable::Translation::Legacy ? ShaderRecompiler::BdaAbi::Version : ShaderRecompiler::BdaTable::RadixVersion;
+        const auto version = ShaderRecompiler::BdaTable::TableVersion(translation);
         Require(header.version == version && header.count == 1 && header.entryBytes == sizeof(range), "BDA header layout mismatch");
         std::memcpy(&range, table.data() + ShaderRecompiler::BdaTable::RangeBaseWord(translation) * sizeof(std::uint32_t), sizeof(range));
         Require(range.begin == snapshots[0].address && range.end == range.begin + source.size(), "64-bit guest address was truncated");

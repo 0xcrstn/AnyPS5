@@ -248,6 +248,7 @@ inline std::unique_ptr<CacheEntryRequest> ReadCacheEntry(std::span<const std::by
     target.registrationWordLimit = key.Next32();
     target.vertexSubgroups = key.NextBool();
     target.float16DenormPreserve = key.NextBool();
+    target.robustBufferAccess2 = key.NextBool();
     key.Next();
     key.Next();
     key.Next();

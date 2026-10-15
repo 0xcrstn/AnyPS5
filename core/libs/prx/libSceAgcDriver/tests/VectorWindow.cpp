@@ -1,4 +1,5 @@
 #include "Recompiler.hpp"
+#include "RewriteSwitch.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "Translation/InstructionTranslator.hpp"
@@ -272,10 +273,12 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     bool passed = true;
 
-    passed &= run("observable relative reads and writes index a function-scope window", [] {
+    passed &= run(WindowRegistersSetting() == RewriteMode::On ? "with APS5_WINDOW_REGISTERS=on, relative reads and writes select among SSA registers" : "observable relative reads and writes index a function-scope window", [] {
+        const bool registers = WindowRegistersSetting() == RewriteMode::On;
         const std::array<std::uint32_t, 12> code{MoveM0GroupX, MoveV4One, MoveV5Two, MoveV6Four, MovrelsV1V4,
             0xe0700000u, 0x80000100u, MovreldV4V0, MoveV1V5, 0xe0700004u, 0x80000100u, EndProgram};
         const auto shape = Scan(RecompileProgram(code));
+        if (registers) return shape.functionArrays == 0 && shape.accessChains == 0 && shape.selects >= 3;
         if (shape.functionArrays != 1 || shape.arrayLength != 3 || shape.accessChains < 2) std::fprintf(stderr, "  window shape: arrays %zu length %u access chains %zu selects %zu\n", shape.functionArrays, shape.arrayLength, shape.accessChains, shape.selects);
         return shape.functionArrays == 1 && shape.arrayLength == 3 && shape.accessChains >= 2;
     });
@@ -290,7 +293,7 @@ int main(int argc, char** argv) {
         const std::array<std::uint32_t, 14> code{MoveM0GroupX, MoveV2Zero, MoveV3Zero, WritelaneV4, FromS8Lane0, MovrelsV1V4, ReadlaneS8, FromV4Lane0, ImageSampleLz2d, SampleV8V2S0S8, AddV8V1V8, BufferStoreDword, StoreV8WithS12, EndProgram};
         const std::array<std::uint32_t, 16> userData{};
         const auto shape = Scan(RecompileProgram(code, userData));
-        return shape.functionArrays == 1;
+        return shape.functionArrays == (WindowRegistersSetting() == RewriteMode::On ? 0u : 1u);
     });
 
     if (passed) std::puts("Vector window shape and SSA control tests passed");
