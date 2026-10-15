@@ -1319,6 +1319,13 @@ if(BUILD_TESTING)
         set_tests_properties(agc_pending_key_stores agc_shadowed_key_stores PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_alias_handover COMMAND agc_driver_recorder_tests --alias-handover-only)
+    add_test(NAME agc_driver_alias_handover_memory COMMAND agc_driver_recorder_tests --alias-handover-memory-only)
+    set_tests_properties(agc_driver_alias_handover agc_driver_alias_handover_memory PROPERTIES SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_alias_handover agc_driver_alias_handover_memory PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 add_test_executable(agc_gpu_timing_report_tests EXCLUDE_FROM_ALL tests/GpuTimingReport.cpp)
