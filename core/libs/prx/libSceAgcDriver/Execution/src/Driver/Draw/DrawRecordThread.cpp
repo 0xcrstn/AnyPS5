@@ -951,8 +951,7 @@ void Driver::reportDrawRecords() {
             else std::snprintf(item, sizeof(item), " 0x%02x x%llu %.1fms", opcode, static_cast<unsigned long long>(waits), static_cast<double>(waitedNs) / 1e6);
             text += item;
         }
-        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s
-", text.empty() ? " none" : text.c_str());
+        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s\n", text.empty() ? " none" : text.c_str());
     }
     const auto seconds = std::chrono::duration<double>(now - lastReport).count();
     lastReport = now;
