@@ -252,6 +252,19 @@ public:
                 extensionsEnabled.insert(extensionsEnabled.end(), libraryExtensions.begin(), libraryExtensions.end());
                 address.pNext = &library;
             }
+            VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timelineFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            if (hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timelineFeatures};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                timelines = timelineFeatures.timelineSemaphore == VK_TRUE;
+            }
+            timelineFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            timelineFeatures.timelineSemaphore = VK_TRUE;
+            if (timelines) {
+                extensionsEnabled.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                timelineFeatures.pNext = address.pNext;
+                address.pNext = &timelineFeatures;
+            }
             VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
             if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness};
@@ -295,6 +308,7 @@ public:
 
     ~Device() { release(); }
     bool NullDescriptors() const { return nullDescriptors; }
+    bool Timelines() const { return timelines; }
     const Context& GetContext() const { return context; }
     bool Graphics() const { return graphics; }
     VkPhysicalDeviceProperties Properties() const {
@@ -329,6 +343,7 @@ private:
     Context context{};
     bool graphics = false;
     bool nullDescriptors = false;
+    bool timelines = false;
 };
 
 using Kind = Recorder::ReadKind;
@@ -1183,6 +1198,14 @@ void crossQueueLabelTests(const Device& device, Recorder& recorder) {
     const std::array<std::byte, 4> three{std::byte{3}, std::byte{0}, std::byte{0}, std::byte{0}};
     constexpr std::uint64_t a = 0x74000, b = 0x74100, c = 0x74200;
     recorder.Sync();
+    struct AsQueue {
+        std::uint32_t previous = AgcDriver::GuestMemory::GpuLockThreadTag();
+        explicit AsQueue(std::uint32_t queue) { AgcDriver::GuestMemory::TagGpuLockThread(queue); }
+        ~AsQueue() { AgcDriver::GuestMemory::TagGpuLockThread(previous); }
+        AsQueue(const AsQueue&) = delete;
+        AsQueue& operator=(const AsQueue&) = delete;
+    };
+    Recorder::MapGuestQueue(0x20, 1);
     Recorder other(device.GetContext(), false, 1);
     other.Activate();
     recorder.SetPeer(&other);
@@ -1195,11 +1218,15 @@ void crossQueueLabelTests(const Device& device, Recorder& recorder) {
             second.Sync();
             first.SetPeer(nullptr);
             second.SetPeer(nullptr);
+            Recorder::MapGuestQueue(0x20, 0);
         }
     } unpeer{recorder, other};
     Refusal refusal{};
     recorder.NoteLabel(a, one, 20, 0);
-    other.NoteLabel(a, two, 21, 0x20);
+    {
+        AsQueue compute(0x20);
+        other.NoteLabel(a, two, 21, 0x20);
+    }
     Require(!Recorder::LookupLabel(a, 4, 0, &refusal).has_value() && refusal == Refusal::Unordered, "a label pending unsubmitted on two physical queues is not refused as unordered");
     recorder.Submit();
     auto hit = Recorder::LookupLabel(a, 4, 0, &refusal);
@@ -1210,7 +1237,10 @@ void crossQueueLabelTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     other.Sync();
     Require(!Recorder::LookupLabel(a, 4, 0).has_value(), "the composed entries outlived their batches");
-    other.NoteLabel(b, two, 30, 0x20);
+    {
+        AsQueue compute(0x20);
+        other.NoteLabel(b, two, 30, 0x20);
+    }
     other.Submit();
     recorder.NoteLabel(b, three, 29, 0);
     hit = Recorder::LookupLabel(b, 4, 0, &refusal);
@@ -1222,12 +1252,71 @@ void crossQueueLabelTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     other.Sync();
     recorder.NoteLabel(c, one, 40, 0);
-    other.NoteLabel(c + 4, two, 41, 0x20);
+    {
+        AsQueue compute(0x20);
+        other.NoteLabel(c + 4, two, 41, 0x20);
+    }
     recorder.Submit();
     other.Submit();
     hit = Recorder::LookupLabel(c, 8, 0, &refusal);
     Require(hit.has_value() && hit->value == 0x0000000200000001ull && hit->queue == 0 && hit->stamp == 40 && refusal == Refusal::None, "a 64-bit label whose dwords are pending on two physical queues is not composed");
     Require(!recorder.PendingLabel(c, 8, 0).has_value(), "one physical queue's own table composed a dword it does not hold");
+}
+
+void crossQueueRecordTests(const Device& device, Recorder& recorder) {
+    if (!device.Timelines()) {
+        std::cout << "cross-queue record tests skipped: the device has no timeline semaphores\n";
+        return;
+    }
+    const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    constexpr std::uint64_t base = 0x75000;
+    recorder.Sync();
+    struct AsQueue {
+        std::uint32_t previous = AgcDriver::GuestMemory::GpuLockThreadTag();
+        explicit AsQueue(std::uint32_t queue) { AgcDriver::GuestMemory::TagGpuLockThread(queue); }
+        ~AsQueue() { AgcDriver::GuestMemory::TagGpuLockThread(previous); }
+        AsQueue(const AsQueue&) = delete;
+        AsQueue& operator=(const AsQueue&) = delete;
+    };
+    Recorder::MapGuestQueue(0x20, 1);
+    {
+        Recorder graphics(device.GetContext(), true, 0);
+        Recorder compute(device.GetContext(), true, 1);
+        graphics.Activate();
+        compute.Activate();
+        graphics.SetPeer(&compute);
+        compute.SetPeer(&graphics);
+        struct Unpeer {
+            Recorder& first;
+            Recorder& second;
+            ~Unpeer() {
+                first.Sync();
+                second.Sync();
+                first.SetPeer(nullptr);
+                second.SetPeer(nullptr);
+            }
+        } unpeer{graphics, compute};
+        AsQueue onGraphics(0);
+        const auto before = graphics.QueueOrderCounts();
+        graphics.NoteLabel(base, one, 60, 0);
+        compute.NoteLabel(base + 0x40, one, 61, 0);
+        auto counts = graphics.QueueOrderCounts();
+        Require(counts.foreignRecords == before.foreignRecords + 1 && graphics.Submissions() == 1 && compute.Submissions() == 0, "a record into the other physical queue did not submit the recording queue's earlier work first");
+        graphics.NoteLabel(base + 0x80, one, 62, 0);
+        graphics.Submit();
+        counts = graphics.QueueOrderCounts();
+        Require(counts.foreignWaits == before.foreignWaits + 1 && compute.Submissions() == 1 && counts.requiredWaits > before.requiredWaits && counts.waitedSubmits > before.waitedSubmits, "the recording queue's next batch did not submit the other queue's batch and wait for it");
+        {
+            AsQueue onCompute(0x20);
+            compute.NoteLabel(base + 0xc0, one, 63, 0x20);
+            compute.Submit();
+        }
+        Require(graphics.QueueOrderCounts().foreignRecords == counts.foreignRecords && compute.QueueOrderCounts().foreignRecords == 0, "a queue's record into its own physical queue counted as a cross-queue record");
+        graphics.Sync();
+        compute.Sync();
+    }
+    Recorder::MapGuestQueue(0x20, 0);
+    recorder.Activate();
 }
 
 void largeLabelTests(Recorder& recorder) {
@@ -11634,6 +11723,7 @@ int main(int argc, char** argv) {
             labelTests(recorder);
             lateLabelTests(recorder);
             crossQueueLabelTests(device, recorder);
+            crossQueueRecordTests(device, recorder);
             largeLabelTests(recorder);
             std::cout << "Completion label storage and ordering tests passed\n";
             return 0;

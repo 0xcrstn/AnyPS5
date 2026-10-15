@@ -292,6 +292,7 @@ struct Context {
     bool dmaBufImport = false;
     bool sparseBinding = false;
     std::uint32_t queueFamily = 0;
+    bool graphicsQueue = true;
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
     VkQueue sparseQueue = VK_NULL_HANDLE;
     std::mutex* sparseQueueMutex = nullptr;

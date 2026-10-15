@@ -1132,6 +1132,14 @@ Recorder* Recorder::Current() {
     return ForPhysicalQueue(PhysicalQueueOf(GuestMemory::GpuLockThreadTag()));
 }
 
+Recorder* Recorder::GraphicsRecorder() {
+    auto* current = Current();
+    if (current == nullptr || current->GraphicsCapable()) return current;
+    auto* graphics = ForPhysicalQueue(0);
+    Require(graphics != nullptr && graphics->GraphicsCapable(), "graphics work from a compute-only queue has no graphics recorder to go to");
+    return graphics;
+}
+
 Recorder* Recorder::ForPhysicalQueue(std::uint32_t physicalQueue) {
     Require(physicalQueue < PhysicalQueues, "recorder for an unknown physical queue");
     return Domain(physicalQueue).active;
@@ -1822,8 +1830,19 @@ void Recorder::recordKeyStores(bool forWriter) {
     if (forWriter) keyStoreRunsForWriter.fetch_add(1, std::memory_order_relaxed);
 }
 
+void Recorder::noteForeignRecord() {
+    auto* current = Current();
+    if (current == nullptr || current == this || current->peer != this) return;
+    current->Submit();
+    auto& serial = current->foreignProducers[this];
+    if (serial > submissions) return;
+    serial = submissions + 1;
+    ++current->queueOrder.foreignRecords;
+}
+
 void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
+    if (peer != nullptr) noteForeignRecord();
     if (open == nullptr) {
         auto batch = std::make_unique<Batch>();
         try {
@@ -4138,6 +4157,23 @@ void Recorder::Submit() {
         submission.signalSemaphoreCount = 1;
         submission.pSignalSemaphores = &timeline;
     }
+    if (!foreignProducers.empty()) {
+        Require(!submittingNow, "a physical queue's submit re-entered through a cross-queue record");
+        submittingNow = true;
+        struct Clear {
+            bool& flag;
+            ~Clear() { flag = false; }
+        } clear{submittingNow};
+        auto producers = std::move(foreignProducers);
+        foreignProducers.clear();
+        for (const auto& [producer, serial] : producers) {
+            Require(!producer->submittingNow, "two physical queues recorded into each other's open batches");
+            if (producer->submissions < serial) producer->Submit();
+            Require(producer->submissions >= serial, "a cross-queue record was not submitted on its physical queue");
+            RequireOrderAfter(*producer, serial);
+            ++queueOrder.foreignWaits;
+        }
+    }
     std::unique_lock crossQueueLock(CrossQueueSubmitMutex(), std::defer_lock);
     if (peer != nullptr) crossQueueLock.lock();
     if (peer != nullptr && peer->timeline != VK_NULL_HANDLE && peer->submissions != 0 && !skipPeerOnce && !OrderWaitsSuppressed().load(std::memory_order_acquire)) {
@@ -4177,6 +4213,7 @@ void Recorder::Submit() {
     batch->serial = ++submissions;
     batch->submitOrder.store(SubmitOrderCounter().fetch_add(1, std::memory_order_acq_rel) + 1, std::memory_order_release);
     if (crossQueueLock.owns_lock()) crossQueueLock.unlock();
+    if (!batch->completions.empty()) PokeSubmitSequence();
     batch->submittedAt = std::chrono::steady_clock::now();
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
@@ -4238,6 +4275,74 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
     return result;
 }
 
+struct SubmitSignal {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::uint64_t sequence = 0;
+};
+
+SubmitSignal& Submitted() {
+    static auto* signal = new SubmitSignal;
+    return *signal;
+}
+
+}
+
+Recorder::UnlockedWait::UnlockedWait(std::atomic<int>* count, VkDevice device, PFN_vkWaitSemaphoresKHR wait, VkSemaphore timeline, std::uint64_t serial) : count(count), device(device), wait(wait), timeline(timeline), serial(serial) {
+    count->fetch_add(1, std::memory_order_acq_rel);
+}
+
+Recorder::UnlockedWait::UnlockedWait(UnlockedWait&& other) noexcept : count(std::exchange(other.count, nullptr)), device(other.device), wait(other.wait), timeline(other.timeline), serial(other.serial) {}
+
+Recorder::UnlockedWait::~UnlockedWait() {
+    if (count != nullptr) count->fetch_sub(1, std::memory_order_acq_rel);
+}
+
+VkResult Recorder::UnlockedWait::Any(std::span<const UnlockedWait> waits, std::uint64_t timeoutNs) {
+    if (waits.empty()) return VK_SUCCESS;
+    std::vector<VkSemaphore> timelines;
+    std::vector<std::uint64_t> serials;
+    for (const auto& item : waits) {
+        Require(item.count != nullptr && item.device == waits.front().device, "an unlocked completion wait spans devices or was moved from");
+        timelines.push_back(item.timeline);
+        serials.push_back(item.serial);
+    }
+    VkSemaphoreWaitInfoKHR info{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
+    info.flags = VK_SEMAPHORE_WAIT_ANY_BIT_KHR;
+    info.semaphoreCount = static_cast<std::uint32_t>(timelines.size());
+    info.pSemaphores = timelines.data();
+    info.pValues = serials.data();
+    return waits.front().wait(waits.front().device, &info, timeoutNs);
+}
+
+std::optional<Recorder::UnlockedWait> Recorder::CompletionWait() const {
+    if (timeline == VK_NULL_HANDLE) return std::nullopt;
+    for (const auto& batch : inFlight) {
+        if (batch->completions.empty()) continue;
+        return UnlockedWait(&WaitersOf(id), context.device, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), timeline, batch->serial);
+    }
+    return std::nullopt;
+}
+
+std::uint64_t Recorder::SubmitSequence() {
+    auto& signal = Submitted();
+    std::lock_guard lock(signal.mutex);
+    return signal.sequence;
+}
+
+void Recorder::WaitSubmitSequence(std::uint64_t seen, std::chrono::microseconds timeout) {
+    auto& signal = Submitted();
+    std::unique_lock lock(signal.mutex);
+    signal.changed.wait_for(lock, timeout, [&] { return signal.sequence != seen; });
+}
+
+void Recorder::PokeSubmitSequence() {
+    auto& signal = Submitted();
+    {
+        std::lock_guard lock(signal.mutex);
+        ++signal.sequence;
+    }
+    signal.changed.notify_all();
 }
 
 void Recorder::WaitSerial(std::uint64_t serial) {

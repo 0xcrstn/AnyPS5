@@ -198,6 +198,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/QueueScheduler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WaitBroker.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/QueueTopology.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/QueueFamilyDispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DriverHeapTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
@@ -404,8 +405,8 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
-    add_test_executable(agc_queue_topology_tests tests/QueueTopology.cpp Execution/src/QueueTopology.cpp)
-    target_include_directories(agc_queue_topology_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    add_test_executable(agc_queue_topology_tests tests/QueueTopology.cpp Execution/src/QueueTopology.cpp Execution/src/QueueFamilyDispatch.cpp)
+    target_include_directories(agc_queue_topology_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
     target_link_libraries(agc_queue_topology_tests PRIVATE libc)
     configure_windows_unwind(agc_queue_topology_tests)
     add_test(NAME agc_queue_topology COMMAND agc_queue_topology_tests)
@@ -1831,6 +1832,7 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     configure_windows_unwind(${agcExecutionTest})
     list(APPEND agcExecutionTests ${agcExecutionTest})
 endforeach()
+target_link_libraries(agc_driver_completion_watcher_tests PRIVATE libkernel)
 foreach(agcExecutionTestName IN LISTS ANYPS5_AGC_EXECUTION_TESTS)
     if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/execution/${agcExecutionTestName}.cpp)
         message(FATAL_ERROR "ANYPS5_AGC_EXECUTION_TESTS names ${agcExecutionTestName}, which has no source in tests/execution")
@@ -2046,6 +2048,30 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_property(TEST agc_driver_same_family_missing_order APPEND PROPERTY ENVIRONMENT "APS5_QUEUE_TOPOLOGY=same-family;APS5_QUEUE_TOPOLOGY_VERIFY=1")
+    foreach(dedicatedTest IN ITEMS queue_topology_same_family same_family_missing_order label_publication_order completion_watcher)
+        add_test(NAME agc_driver_${dedicatedTest}_dedicated COMMAND agc_driver_${dedicatedTest}_tests)
+        set_tests_properties(agc_driver_${dedicatedTest}_dedicated PROPERTIES
+                ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_TOPOLOGY=dedicated;APS5_QUEUE_TOPOLOGY_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(agc_driver_${dedicatedTest}_dedicated PROPERTIES ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    add_test(NAME agc_driver_same_family_missing_order_dedicated_injected COMMAND agc_driver_same_family_missing_order_tests --missing-order)
+    set_tests_properties(agc_driver_same_family_missing_order_dedicated_injected PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_TOPOLOGY=dedicated;APS5_QUEUE_TOPOLOGY_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_same_family_missing_order_dedicated_injected PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_completion_watcher_off COMMAND agc_driver_completion_watcher_tests)
+    set_tests_properties(agc_driver_completion_watcher_off PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_COMPLETION_WATCHER=0" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_driver_completion_watcher PROPERTIES TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_completion_watcher_off PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_same_family_missing_order_injected COMMAND agc_driver_same_family_missing_order_tests --missing-order)
     set_tests_properties(agc_driver_same_family_missing_order_injected PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_TOPOLOGY=same-family;APS5_QUEUE_TOPOLOGY_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")

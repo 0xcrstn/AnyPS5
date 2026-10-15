@@ -100,6 +100,8 @@ public:
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.
     void ReapRecorded();
+    std::vector<Graphics::Recorder::UnlockedWait> CompletionWaits() const;
+    bool CompletionWaitsOnTimelines() const;
     bool ReapMayRetire() const;
     // Records a store of `bytes` at a guest address behind the recorded work, so the value appears
     // once that work completed; the batch is submitted by the queue worker's flush rules (or at once
