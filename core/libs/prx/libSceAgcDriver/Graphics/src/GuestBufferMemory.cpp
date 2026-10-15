@@ -3665,7 +3665,45 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             continue;
         }
         copyRegion(region, addressable);
+        notePrepareCopy(region);
     }
+}
+
+namespace {
+
+std::atomic<bool> prepareCopyRanges{false};
+std::atomic<bool> prepareCopyBytes{false};
+
+}
+
+void GuestBufferMemory::RecordPrepareCpuCopies(bool ranges, bool bytes) {
+    prepareCopyBytes.store(ranges && bytes, std::memory_order_release);
+    prepareCopyRanges.store(ranges, std::memory_order_release);
+}
+
+void GuestBufferMemory::notePrepareCopy(const Region& region) {
+    if (!prepareCopyRanges.load(std::memory_order_acquire) || (!region.hostBacked && !region.writable)) return;
+    const bool keep = prepareCopyBytes.load(std::memory_order_acquire);
+    const auto add = [&](std::uint64_t first, std::uint64_t last) {
+        if (last <= first) return;
+        if (prepareCopies.size() >= MaxPrepareCpuCopies) {
+            prepareCopiesUnbounded = true;
+            return;
+        }
+        CpuCopy copy{first, last, {}};
+        if (keep && region.buffer != nullptr) {
+            const auto bytes = region.buffer->Bytes();
+            const auto offset = static_cast<std::size_t>(first - region.begin);
+            const auto length = static_cast<std::size_t>(last - first);
+            if (offset <= bytes.size() && length <= bytes.size() - offset) copy.bytes.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.begin() + static_cast<std::ptrdiff_t>(offset + length));
+        }
+        prepareCopies.push_back(std::move(copy));
+    };
+    if (!region.sparse) {
+        add(region.begin, region.end);
+        return;
+    }
+    for (const auto& [first, last] : region.backed) add(std::max(first, region.begin), std::min(last, region.end));
 }
 
 void GuestBufferMemory::completeSpaceWrites() const {

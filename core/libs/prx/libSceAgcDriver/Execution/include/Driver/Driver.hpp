@@ -246,12 +246,14 @@ private:
     static void noteDrawRecordRecipe(DrawRecordResult& result, std::shared_ptr<const DrawRecipe> built, std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void reportDrawRecords();
     struct DrawInputs;
+    struct DispatchInputs;
     struct FrozenDraw;
     struct PreparedFrozenDraw;
     struct FrozenSink {
         bool inOrder = false;
         FrozenFallback refused = FrozenFallback::None;
         std::shared_ptr<DrawInputs> inputs;
+        std::shared_ptr<DispatchInputs> dispatchInputs;
         std::vector<PreparedRead> reads;
         std::uint64_t program = 0;
         bool Refuse(FrozenFallback reason) {
@@ -273,6 +275,14 @@ private:
     void noteDrawInputWriters(const DrawInputs& inputs, std::uint32_t queue);
     FrozenFallback frozenFallback(std::span<const std::uint32_t> packet);
     DrawVerdict freezeDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
+    static bool prepareDispatches();
+    static bool verifyPrepareDispatches();
+    static FrozenFallback dispatchHleFallback(const Registers& shader, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::uint64_t indirectArguments);
+    FrozenFallback dispatchFrozenFallback(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments);
+    void freezeDispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments, std::chrono::steady_clock::time_point begin);
+    static void recordDispatchInputs(DispatchInputs& inputs, const std::shared_ptr<VulkanDevice>& localDevice);
+    void noteDispatchInputWriters(const DispatchInputs& inputs, std::uint32_t queue);
+    static bool staleDispatchInputs(const DispatchInputs& adopted, const DispatchInputs& fresh, const std::function<bool(std::uint64_t, std::size_t)>& touchedEarlier);
     std::shared_ptr<PreparedFrozenDraw> prepareFrozen(const FrozenDraw& frozen, bool inOrder);
     void emitFrozen(const std::shared_ptr<FrozenDraw>& frozen, std::optional<std::shared_ptr<PreparedFrozenDraw>>& prepared, std::exception_ptr error);
     void drainFrozen(bool records);

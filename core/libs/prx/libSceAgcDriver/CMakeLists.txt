@@ -437,6 +437,17 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
+    add_test_executable(agc_prepare_dispatches_tests tests/PrepareDispatches.cpp Execution/src/RecordQueue.cpp)
+    target_include_directories(agc_prepare_dispatches_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_prepare_dispatches_tests PRIVATE libc)
+    configure_windows_unwind(agc_prepare_dispatches_tests)
+    add_test(NAME agc_prepare_dispatches COMMAND agc_prepare_dispatches_tests)
+    set_tests_properties(agc_prepare_dispatches PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_prepare_dispatches PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
     add_test_executable(agc_performance_trace_tests tests/PerformanceTrace.cpp Execution/src/TraceFile.cpp)
     target_include_directories(agc_performance_trace_tests PRIVATE ${LIBS_INCLUDE_DIR} ${agcZlibIncludeDir})
     target_link_libraries(agc_performance_trace_tests PRIVATE libc jpeg_turbo)
