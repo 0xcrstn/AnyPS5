@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -42,6 +43,13 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
 void ShaderResources::UseMirrors(Recorder& recorder) const {
     if (bda != nullptr) Graphics::UseMirrors(recorder, bda->Mirrors());
     if (!bufferMirrors.empty()) Graphics::UseMirrors(recorder, bufferMirrors);
+}
+
+void ShaderResources::PublishResidentReads(Recorder& recorder) const {
+    if (!AnyDeviceResident()) return;
+    for (const auto& [begin, end] : guestMemory.DeviceReads()) {
+        if (end > begin) PublishDeviceResident(recorder, begin, static_cast<std::size_t>(end - begin), ResidentSite::InPlace);
+    }
 }
 
 void ShaderResources::RefreshMirrorsForDirectUse(Recorder& recorder) const {

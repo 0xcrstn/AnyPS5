@@ -4518,6 +4518,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     };
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+    resources.PublishResidentReads(recorder);
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     recordStep(PhaseRecordCommands);
