@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_SHADERMEMORY_HPP
 
 #include "Recompiler.hpp"
+#include "Optimization/SrtWalker.hpp"
 #include <array>
 #include <bitset>
 #include <cstddef>
@@ -75,6 +76,14 @@ public:
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> Capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle = nullptr);
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> Capture(const ShaderRecompiler::PreparedShaderInvocation& invocation);
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation);
+    struct IncrementalState {
+        ShaderRecompiler::SrtTapeInstance instance;
+        std::shared_ptr<const void> plan;
+        std::uint64_t generation = 0;
+        std::uint64_t allocation = 0;
+    };
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation, IncrementalState& state);
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> TakeKeptWords();
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> Regions() const;
     // The page regions read since the previous call (or construction), a word read again
     // included, the initial regions excluded: one stage's own reads on the draw path's shared
@@ -117,6 +126,11 @@ private:
     static bool readWords(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count);
     static bool accessible(void* context, std::uint64_t address, std::uint64_t bytes);
     static bool pending(void* context, std::uint64_t address, std::uint64_t bytes);
+    static bool stable(void* context, std::uint64_t address, std::uint32_t word);
+    bool stableDirect(std::uint64_t address, std::uint32_t word);
+    bool pageUnchanged(std::uint64_t base);
+    void recordDirect(std::uint64_t address, std::uint32_t word);
+    void enableDirect();
     Page& page(std::uint64_t base);
     std::uint32_t fetchWord(std::uint64_t address, bool wordwise);
     bool readDirect(std::uint64_t address, std::uint32_t* value);
@@ -162,6 +176,11 @@ private:
     std::uint64_t lastDirectPending = 0;
     PendingGenerationProvider lastDirectProvider = nullptr;
     std::uint8_t lastDirectKind = 0;
+    ShaderRecompiler::SrtTapeInstance* tapeInstance = nullptr;
+    std::uint64_t stableSince = 0;
+    std::uint64_t stableAllocation = 0;
+    std::vector<std::pair<std::uint64_t, bool>> stablePages;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> keptWords;
 };
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a

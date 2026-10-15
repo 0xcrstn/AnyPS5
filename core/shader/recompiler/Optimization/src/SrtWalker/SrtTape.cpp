@@ -238,7 +238,7 @@ bool CompiledWalkEnabled() {
 
 class SrtTape::Runner {
 public:
-    Runner(const SrtTape& tape, const SrtRuntime& runtime, std::vector<std::uint64_t>& values, std::vector<std::uint8_t>& states) : tape(tape), runtime(runtime), values(values), states(states) {}
+    Runner(const SrtTape& tape, const SrtRuntime& runtime, std::vector<std::uint64_t>& values, std::vector<std::uint8_t>& states, SrtTapeInstance* instance) : tape(tape), runtime(runtime), values(values), states(states), instance(instance) {}
 
     bool Evaluate(const Operand& operand, std::uint64_t& result, int depth = 0) {
         if (operand.immediate) {
@@ -254,6 +254,34 @@ public:
     std::uint32_t nullRoots = 0;
 
 private:
+    void store(std::uint32_t slot, std::uint64_t value) {
+        values[slot] = value;
+        states[slot] = 1u;
+        if (instance == nullptr) return;
+        auto& kept = *instance;
+        if (kept.computedAt[slot] == 0 || kept.values[slot] != value) {
+            kept.values[slot] = value;
+            kept.changedAt[slot] = kept.runs;
+        }
+        kept.computedAt[slot] = kept.runs;
+    }
+
+    bool inputsUnchanged(std::uint32_t slot, const Instruction& instruction) const {
+        if (instance == nullptr || instance->computedAt[slot] == 0) return false;
+        for (std::size_t index = 0; index < instruction.count; ++index) {
+            const auto& argument = instruction.arguments[index];
+            if (!argument.immediate && instance->changedAt[argument.slot] > instance->computedAt[slot]) return false;
+        }
+        return true;
+    }
+
+    bool keep(std::uint32_t slot, const Instruction& instruction) {
+        if (!inputsUnchanged(slot, instruction)) return false;
+        ++instance->keptValues;
+        store(slot, instance->values[slot]);
+        return true;
+    }
+
     bool evaluate(std::uint32_t slot, int depth) {
         if (states[slot] != 0u) return true;
         if (depth > MaxDepth) return false;
@@ -270,12 +298,14 @@ private:
                 for (std::size_t index = 0; index < instruction.count; ++index) {
                     if (!Evaluate(instruction.arguments[index], arguments[index], depth + 1)) return false;
                 }
+                if (keep(slot, instruction)) return true;
                 if (!ApplySrtOperation(instruction.opcode, arguments, result)) return false;
                 break;
             }
             case Step::Extract64: {
                 std::uint64_t packed = 0;
                 if (!Evaluate(instruction.arguments[0], packed, depth + 1)) return false;
+                if (keep(slot, instruction)) return true;
                 result = static_cast<std::uint32_t>(packed >> (instruction.index * 32u));
                 break;
             }
@@ -283,6 +313,7 @@ private:
                 std::uint64_t lhs = 0;
                 std::uint64_t rhs = 0;
                 if (!Evaluate(instruction.arguments[0], lhs, depth + 1) || !Evaluate(instruction.arguments[1], rhs, depth + 1)) return false;
+                if (keep(slot, instruction)) return true;
                 const auto sum = static_cast<std::uint64_t>(static_cast<std::uint32_t>(lhs)) + static_cast<std::uint32_t>(rhs);
                 result = instruction.index == 0u ? static_cast<std::uint32_t>(sum) : static_cast<std::uint32_t>(sum >> 32u);
                 break;
@@ -304,8 +335,7 @@ private:
                     const auto stride = (static_cast<std::uint32_t>(high) >> 16u) & 0x3fffu;
                     const auto size = stride == 0u ? static_cast<std::uint64_t>(static_cast<std::uint32_t>(records)) : static_cast<std::uint64_t>(stride) * static_cast<std::uint32_t>(records);
                     if (aligned > size || size - aligned < sizeof(std::uint32_t)) {
-                        values[slot] = 0;
-                        states[slot] = 1u;
+                        store(slot, 0);
                         return true;
                     }
                     address = ((base & ~std::uint64_t {3}) + byteOffset) & ~std::uint64_t {3};
@@ -315,10 +345,15 @@ private:
                 }
                 if (base == 0 && !instruction.loaded) {
                     ++nullRoots;
-                    values[slot] = 0;
-                    states[slot] = 1u;
+                    store(slot, 0);
                     return true;
                 }
+                if (runtime.stableWord != nullptr && inputsUnchanged(slot, instruction) && runtime.stableWord(runtime.userContext, address, static_cast<std::uint32_t>(instance->values[slot]))) {
+                    ++instance->keptReads;
+                    store(slot, instance->values[slot]);
+                    return true;
+                }
+                if (instance != nullptr) ++instance->freshReads;
                 if (runtime.accessible != nullptr && instruction.loaded && !runtime.accessible(runtime.userContext, address, sizeof(std::uint32_t))) {
                     inaccessible = true;
                     return false;
@@ -334,8 +369,7 @@ private:
                 break;
             }
         }
-        values[slot] = result;
-        states[slot] = 1u;
+        store(slot, result);
         return true;
     }
 
@@ -343,6 +377,7 @@ private:
     const SrtRuntime& runtime;
     std::vector<std::uint64_t>& values;
     std::vector<std::uint8_t>& states;
+    SrtTapeInstance* instance;
 };
 
 std::shared_ptr<const SrtTape> SrtTape::Compile(const IrResourcePlan& plan, std::span<const std::uint32_t> sourceIndices) {
@@ -424,7 +459,21 @@ SrtTape::Outcome SrtTape::Run(const SrtRuntime& runtime, std::vector<DescriptorV
     auto& states = HostThreadLocal<std::vector<std::uint8_t>, TapeStatesTag>();
     values.resize(instructions.size());
     states.assign(instructions.size(), 0u);
-    Runner runner(*this, runtime, values, states);
+    auto* instance = runtime.tapeInstance;
+    if (instance != nullptr) {
+        if (instance->tape != this || instance->values.size() != instructions.size()) {
+            instance->tape = this;
+            instance->values.assign(instructions.size(), 0u);
+            instance->changedAt.assign(instructions.size(), 0u);
+            instance->computedAt.assign(instructions.size(), 0u);
+            instance->runs = 0;
+        }
+        ++instance->runs;
+        instance->keptReads = 0;
+        instance->freshReads = 0;
+        instance->keptValues = 0;
+    }
+    Runner runner(*this, runtime, values, states, instance);
     std::vector<std::uint8_t> active(sourceCount + imageCount, 1u);
     if (!blocks.empty()) {
         for (const auto& block : blocks) {
@@ -455,7 +504,10 @@ SrtTape::Outcome SrtTape::Run(const SrtRuntime& runtime, std::vector<DescriptorV
     const auto conditionNullRoots = runner.nullRoots;
     std::vector<DescriptorValue> evaluated;
     evaluated.reserve(sources.size());
-    const auto outcome = [&] { return runner.inaccessible ? Outcome::Inaccessible : Outcome::Failed; };
+    const auto outcome = [&] {
+        if (instance != nullptr) instance->tape = nullptr;
+        return runner.inaccessible ? Outcome::Inaccessible : Outcome::Failed;
+    };
     for (std::size_t sourceIndex = 0; sourceIndex < sources.size(); ++sourceIndex) {
         const auto& source = sources[sourceIndex];
         DescriptorValue value;

@@ -15,6 +15,22 @@ namespace ShaderRecompiler {
 using SrtMemoryReader = bool (*)(void* userData, std::uint64_t address, std::uint32_t* value);
 using SrtMemoryProbe = bool (*)(void* userData, std::uint64_t address, std::uint64_t bytes);
 using SrtMemoryBulkReader = bool (*)(void* userData, std::uint64_t address, std::uint32_t* values, std::uint64_t count);
+using SrtStableWord = bool (*)(void* userData, std::uint64_t address, std::uint32_t word);
+
+namespace Detail {
+class SrtTape;
+}
+
+struct SrtTapeInstance {
+    const Detail::SrtTape* tape = nullptr;
+    std::vector<std::uint64_t> values;
+    std::vector<std::uint64_t> changedAt;
+    std::vector<std::uint64_t> computedAt;
+    std::uint64_t runs = 0;
+    std::uint64_t keptReads = 0;
+    std::uint64_t freshReads = 0;
+    std::uint64_t keptValues = 0;
+};
 
 // The guest addresses a walk dereferenced (Detail::Evaluator::EvaluateRawRead): the leaf read of
 // each pure flat slot (IrResourcePlan::pureFlatSlots) as (flat offset, address), set by the
@@ -39,6 +55,8 @@ struct SrtRuntime {
     bool compiledWalk = false;
     SrtMemoryProbe pendingWrite = nullptr;
     SrtMemoryBulkReader readWords = nullptr;
+    SrtStableWord stableWord = nullptr;
+    SrtTapeInstance* tapeInstance = nullptr;
 };
 
 enum class SrtCompiledWalkRefusal : std::uint8_t { None, IncompletePlan, Opcode, Phi, VoidHandle, WideSource, Cycle, FlatOffset, UserData, IndirectImage, Count };

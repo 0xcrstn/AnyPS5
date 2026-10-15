@@ -41,6 +41,10 @@ std::string HexText(std::uint64_t value) {
 
 }
 
+void ThrowIncrementalMismatch(std::uint32_t queue, std::uint64_t submission, std::size_t packetOffset, std::size_t stage, std::uint64_t program) {
+    throw std::runtime_error("AGC driver: incremental bindings verify: queue " + std::to_string(queue) + " submission " + std::to_string(submission) + " packet at dword " + std::to_string(packetOffset) + ": stage " + std::to_string(stage) + " (program " + HexText(program) + ") kept values that differ from a full values capture of the same guest words");
+}
+
 void ThrowStageMismatch(std::uint32_t queue, std::uint64_t submission, std::size_t packetOffset, std::size_t stage, std::uint64_t program, SnapshotPart part) {
     const auto index = static_cast<std::size_t>(part) < SnapshotParts ? static_cast<std::size_t>(part) : 0;
     throw std::runtime_error("AGC driver: binding plan verify: queue " + std::to_string(queue) + " submission " + std::to_string(submission) + " packet at dword " + std::to_string(packetOffset) + ": stage " + std::to_string(stage) + " (program " + HexText(program) + ") differs from the full capture and materialize, first in: " + SnapshotPartNames[index]);
@@ -99,6 +103,80 @@ bool Driver::verifyBindingPlan() {
         return text != nullptr && std::strcmp(text, "0") != 0;
     }();
     return verify;
+}
+
+bool Driver::incrementalBindings() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_INCREMENTAL_BINDINGS");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool Driver::verifyIncrementalBindings() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_INCREMENTAL_BINDINGS");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+ShaderMemory::IncrementalState& Driver::incrementalBinding(const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::span<const std::uint32_t> userData) {
+    struct Way {
+        std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+        std::vector<std::uint32_t> userData;
+        ShaderMemory::IncrementalState state;
+        std::uint64_t used = 0;
+    };
+    constexpr std::size_t Ways = 4;
+    constexpr std::size_t Shaders = 1024;
+    struct Table {
+        std::unordered_map<const ShaderRecompiler::SourceHandle*, std::array<Way, Ways>> shaders;
+        std::uint64_t clock = 0;
+    };
+    static thread_local Table table;
+    auto found = table.shaders.find(handle.get());
+    if (found == table.shaders.end()) {
+        if (table.shaders.size() >= Shaders) table.shaders.clear();
+        found = table.shaders.try_emplace(handle.get()).first;
+    }
+    auto& ways = found->second;
+    Way* chosen = nullptr;
+    std::size_t best = 0;
+    Way* victim = &ways.front();
+    for (auto& way : ways) {
+        if (way.handle == nullptr) {
+            if (victim->handle != nullptr) victim = &way;
+            continue;
+        }
+        if (victim->handle != nullptr && way.used < victim->used) victim = &way;
+        if (way.handle != handle) continue;
+        std::size_t same = 0;
+        for (std::size_t index = 0; index < way.userData.size() && index < userData.size(); ++index) same += way.userData[index] == userData[index] ? 1u : 0u;
+        if (chosen == nullptr || same > best) {
+            chosen = &way;
+            best = same;
+        }
+    }
+    if (chosen == nullptr || (best == 0 && victim->handle == nullptr)) {
+        *victim = Way{};
+        victim->handle = handle;
+        chosen = victim;
+    }
+    chosen->used = ++table.clock;
+    chosen->userData.assign(userData.begin(), userData.end());
+    return chosen->state;
+}
+
+void Driver::noteIncrementalStage(const ShaderRecompiler::SrtTapeInstance& instance, bool verified, bool stale) {
+    std::lock_guard lock(bindingPlanMutex);
+    auto& counters = bindingPlanCounters;
+    ++counters.incrementalStages;
+    counters.keptReads += instance.keptReads;
+    counters.freshReads += instance.freshReads;
+    counters.keptValues += instance.keptValues;
+    if (verified) ++counters.incrementalVerified;
+    if (stale) ++counters.incrementalStale;
 }
 
 void Driver::planDrawDecode(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches, bool profile) {
@@ -201,6 +279,7 @@ void Driver::reportBindingPlan() {
     readsBefore = reads;
     const auto storage = ShaderRecompiler::GetMaterializeValuesCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[binding-plan-storage] process cumulative: %llu pooled results created, %llu storage reuses, %llu releases not retained; currently %llu bytes retained\n", static_cast<unsigned long long>(storage.storageCreated), static_cast<unsigned long long>(storage.storageReused), static_cast<unsigned long long>(storage.storageRefused), static_cast<unsigned long long>(storage.storageRetainedBytes));
+    if (counters.incrementalStages != 0) AgcDriver::ProfilePrint_nid_no_patch("[binding-plan-incremental] (10 s) %llu stages: %llu guest words kept, %llu read, %llu values kept; verify: %llu stages compared, %llu served stale words a CPU store had changed within the collect epoch\n", static_cast<unsigned long long>(counters.incrementalStages), static_cast<unsigned long long>(counters.keptReads), static_cast<unsigned long long>(counters.freshReads), static_cast<unsigned long long>(counters.keptValues), static_cast<unsigned long long>(counters.incrementalVerified), static_cast<unsigned long long>(counters.incrementalStale));
     counters = {};
     counters.lastReport = now;
 }

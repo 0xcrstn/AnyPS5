@@ -49,11 +49,13 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         return std::runtime_error(where.str() + error.what());
     };
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> planValues;
+    ShaderMemory::IncrementalState* incremental = nullptr;
     if (bindingPlan() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0) {
+        if (incrementalBindings() && invocation.Handle() != nullptr) incremental = &incrementalBinding(invocation.Handle(), invocation.Request().context.userData);
         planValues = [&] {
             const SampledReadScope sampling(evidenceReads);
             try {
-                return shaderMemory.CaptureValues(invocation);
+                return incremental != nullptr ? shaderMemory.CaptureValues(invocation, *incremental) : shaderMemory.CaptureValues(invocation);
             } catch (const std::exception& error) {
                 throw named(error);
             }
@@ -79,6 +81,33 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             throw named(error);
         }
         phaseTiming.Phase(DrawRowRecompile);
+        if (incremental != nullptr) {
+            const bool verified = verifyIncrementalBindings();
+            bool stale = false;
+            if (verified) {
+                const auto kept = shaderMemory.TakeKeptWords();
+                std::vector<ShaderRecompiler::MemoryRegion> code;
+                for (const auto& region : program.memory) {
+                    if (!region.bytes.empty()) code.push_back(region);
+                }
+                ShaderMemory reference(code, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+                const auto fresh = reference.CaptureValues(invocation);
+                const auto freshResult = invocation.MaterializeValues(*fresh);
+                if (!SameSnapshot(fresh->snapshot, values->snapshot) || !SameStageResult(*freshResult, *stageCapture.compiled)) {
+                    stale = std::any_of(kept.begin(), kept.end(), [](const std::pair<std::uint64_t, std::uint32_t>& word) {
+                        std::uint32_t now = 0;
+                        std::memcpy(&now, reinterpret_cast<const void*>(word.first), sizeof(now));
+                        return now != word.second;
+                    });
+                    if (!stale) {
+                        noteIncrementalStage(incremental->instance, true, false);
+                        ThrowIncrementalMismatch(submission.queue, submission.serial, currentPacketOffset(), i, program.binary.codeAddress);
+                    }
+                }
+                phaseTiming.Phase(DrawRowStageVerify);
+            }
+            noteIncrementalStage(incremental->instance, verified, stale);
+        }
         bool mismatch = false;
         auto part = SnapshotPart::None;
         if (verifyBindingPlan()) {
