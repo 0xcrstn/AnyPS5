@@ -4867,7 +4867,7 @@ bool MovedWordRing() {
 }
 
 std::atomic<bool>& InPlaceDrawInputsFlag() {
-    static std::atomic<bool> flag{std::getenv("APS5_IN_PLACE_DRAW_INPUTS") != nullptr && std::strcmp(std::getenv("APS5_IN_PLACE_DRAW_INPUTS"), "0") != 0};
+    static std::atomic<bool> flag{std::getenv("APS5_IN_PLACE_DRAW_INPUTS") == nullptr ? Coherence::InputLeases() : std::strcmp(std::getenv("APS5_IN_PLACE_DRAW_INPUTS"), "0") != 0};
     return flag;
 }
 
@@ -5138,8 +5138,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (statistics != nullptr) ++statistics->skipped;
                 continue;
             }
-            if (InPlaceDrawInputs()) {
-                recorder.NoteInPlaceDrawInput(item.address, item.size);
+            if (InPlaceDrawInputs() && recorder.NoteInPlaceDrawInput(item.address, item.size)) {
                 if (statistics != nullptr) {
                     ++statistics->inPlace;
                     statistics->inPlaceBytes += item.size;
@@ -5155,10 +5154,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         lap(&DrawBindingsStatistics::checkUs);
         if (override != moved.end() && InPlaceDrawInputs()) {
-            if (const auto* import = InPlaceDrawInput(context, recorder, begin, bytes, std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4))) {
+            const auto* import = InPlaceDrawInput(context, recorder, begin, bytes, std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4));
+            if (import != nullptr && recorder.NoteInPlaceDrawInput(begin, bytes)) {
                 selected.push_back(index);
                 result->snapshots.push_back({begin, nullptr, {}, import->buffer, begin - import->base, std::span<const std::byte>(reinterpret_cast<const std::byte*>(begin), bytes), true});
-                recorder.NoteInPlaceDrawInput(begin, bytes);
                 if (statistics != nullptr) {
                     ++statistics->inPlace;
                     statistics->inPlaceBytes += bytes;
