@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -7,10 +8,13 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <memory>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
-DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
+DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
@@ -205,7 +209,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
         phaseTiming.Phase(DrawRowDecode);
     }
-    ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    const auto shaderMemoryOwner = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    auto& shaderMemory = *shaderMemoryOwner;
     std::vector<ShaderRecompiler::RecompileResult> results;
     std::vector<Graphics::CompiledShader> stages;
     static const bool copyStageResults = std::getenv("APS5_COPY_DRAW_STAGE_RESULTS") != nullptr;
@@ -391,6 +396,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowLabels);
     };
     if (drawParameters.indirect && indirectCpu) {
+        if (drawRecordState().active && !settleDrawRecords(snapshots)) return DrawVerdict::Nothing;
 
         const auto indirect = *drawParameters.indirect;
         results.reserve(programs.size() + 2u);
@@ -489,6 +495,49 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowVectors);
         localDevice->PrewarmDrawPipeline(graphics, stages);
         phaseTiming.Phase(DrawRowPipelinePrepare);
+    }
+    if (drawRecordState().active) {
+        if (!settleDrawRecords(snapshots)) return DrawVerdict::Nothing;
+        if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value()) {
+            lockForDraw();
+            gpuLock.unlock();
+        }
+        noteDrawWriters(stages, submission.queue);
+        phaseTiming.Phase(DrawRowVectors);
+        struct Inputs {
+            std::shared_ptr<const DrawDecode> state;
+            std::shared_ptr<const DrawDecode> decode;
+            std::shared_ptr<DrawEntry> entry;
+            std::shared_ptr<ShaderMemory> shaderMemory;
+            Pm4::DrawParameters draw;
+            std::vector<DrawProgram> programs;
+            std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
+            std::vector<ShaderRecompiler::MemoryRegion> memory;
+            std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions;
+            std::vector<std::shared_ptr<DispatchVariant>> matched;
+            std::vector<std::shared_ptr<DispatchVariant>> fresh;
+            std::vector<StageCapture> stageCaptures;
+            std::vector<ShaderRecompiler::RecompileResult> results;
+            std::vector<Graphics::CompiledShader> stages;
+            std::vector<Graphics::GuestMemorySnapshot> snapshots;
+            std::shared_ptr<const DrawRecipe> recipe;
+            std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+            std::uint64_t drawKey = 0;
+        };
+        auto inputs = std::make_shared<Inputs>(Inputs{relocatedDecode, decode, entry, shaderMemoryOwner, drawParameters, std::move(programs), std::move(decodeReads), std::move(memory), std::move(matchedRegions), std::move(matched), std::move(fresh), std::move(stageCaptures), std::move(results), std::move(stages), std::move(snapshots), recipe, std::move(recipeStages), drawKey});
+        postDrawRecord(localDevice, submission.queue, [inputs, localDevice](DrawRecordResult& result) {
+            const auto& state = inputs->state->state;
+            if (inputs->recipe != nullptr) {
+                if (localDevice->DrawFromRecipe(state, inputs->draw, inputs->stages, inputs->snapshots, inputs->recipe) == RecipeOutcome::Recorded) return;
+                VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+            }
+            std::shared_ptr<const DrawRecipe> built;
+            localDevice->Draw(state, inputs->draw, inputs->stages, inputs->snapshots, inputs->recipeStages.empty() ? nullptr : &built);
+            if (built != nullptr) noteDrawRecordRecipe(result, std::move(built), inputs->drawKey, inputs->recipeStages);
+        });
+        phaseTiming.Phase(DrawRowGraphics);
+        timing.Mark("draw_and_resource_release");
+        return drawn();
     }
     lockForDraw();
     noteDrawWriters(stages, submission.queue);

@@ -155,6 +155,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawLookup.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPrecheck.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRecordThread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRelocate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTiming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/IndirectDraw.cpp
@@ -191,6 +192,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/MemoryReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ProcessMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/RecordQueue.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DriverHeapTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
@@ -368,6 +370,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_host_thread PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_host_thread PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_record_queue_tests tests/RecordQueue.cpp Execution/src/RecordQueue.cpp)
+    target_include_directories(agc_record_queue_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_record_queue_tests PRIVATE libc)
+    configure_windows_unwind(agc_record_queue_tests)
+    add_test(NAME agc_record_queue COMMAND agc_record_queue_tests)
+    set_tests_properties(agc_record_queue PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_record_queue PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

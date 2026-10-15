@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -138,6 +139,7 @@ void Driver::execute(const Submission& submission) {
         timing.Mark("device_lock");
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
+        if (deferDrawRecords(submission.queue) && !OverlapsDrawRecords(header == FlipPacketHeader || header == RenderingWaitPacketHeader ? 0u : opcode, Pm4::Predicated(header) && queue.predication.operation != 0)) waitDrawRecords();
         if (Pm4::Predicated(header) && queue.predication.operation != 0) {
             landPendingWaits(submission.queue);
             recordQueuedLabelsBeforeRead(submission.queue);
