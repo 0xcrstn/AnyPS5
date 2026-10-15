@@ -1739,13 +1739,6 @@ constexpr std::array<const char*, StagedOutcomeCount> StagedOutcomeNames{"templa
 void countStaged(StagedOutcome outcome);
 std::string drawIdentity(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
 
-bool stagedBuildsMatch(const ShaderResources& staged, const ShaderResources& serial) {
-    if (staged.GuestBufferViews() != serial.GuestBufferViews() || staged.SampledTextures() != serial.SampledTextures() || staged.StorageImages() != serial.StorageImages()) return false;
-    const auto left = staged.SetLayouts();
-    const auto right = serial.SetLayouts();
-    return std::ranges::equal(left.mainKey, right.mainKey) && std::ranges::equal(left.fragmentKey, right.fragmentKey) && staged.UsesAddressTable() == serial.UsesAddressTable() && staged.Reusable() == serial.Reusable();
-}
-
 std::shared_ptr<ShaderResources> completeStagedBuild(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, const std::shared_ptr<ShaderResources>& staged) {
     if (staged->Completed()) {
         countStaged(StagedOutcome::Completed);
@@ -1760,7 +1753,7 @@ std::shared_ptr<ShaderResources> completeStagedBuild(const Context& context, con
     countStaged(StagedOutcome::Adopted);
     if (VerifyStagedDrawBuilds()) {
         auto serial = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
-        const bool same = stagedBuildsMatch(*staged, *serial);
+        const bool same = staged->SameBuildAs(*serial);
         if (auto* recorder = Recorder::Current()) recorder->Keep(std::move(serial));
         if (!same) throw std::logic_error("APS5_VERIFY_STAGED_DRAW_BUILDS: a draw build staged on a preparation worker differs from the serial build in its buffer views, images, set layouts or reusability for the " + drawIdentity(state, draw, shaders));
         countStaged(StagedOutcome::Verified);

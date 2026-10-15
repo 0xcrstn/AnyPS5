@@ -141,6 +141,9 @@ public:
     ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, StagedDraw);
     void CompleteDraw(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
     bool StagedAddressLocked() const { return lockedBuild; }
+    bool UnlockedAddressBuild() const { return usesBda && unlockedPrepare; }
+    static bool VerifyUnlockedAddressBuilds();
+    bool SameBuildAs(const ShaderResources& other) const;
     bool Completed() const { return completed; }
     ~ShaderResources();
     ShaderResources(const ShaderResources&) = delete;

@@ -2020,6 +2020,16 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_property(TEST agc_driver_compute_pipeline_outside_gpu_mutex APPEND PROPERTY ENVIRONMENT "APS5_PIPELINE_PREWARM=0")
+    add_test(NAME agc_driver_global_loads_unlocked_verify COMMAND agc_driver_global_loads_tests)
+    add_test(NAME agc_driver_global_loads_locked COMMAND agc_driver_global_loads_tests)
+    set_tests_properties(agc_driver_global_loads_unlocked_verify PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_UNLOCKED_ADDRESS_BUILDS=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_driver_global_loads_locked PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_UNLOCKED_ADDRESS_BUILDS=0" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_global_loads_unlocked_verify agc_driver_global_loads_locked PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_dispatch_epoch_proofs_verify COMMAND agc_driver_dispatch_epoch_proofs_tests)
     set_tests_properties(agc_driver_dispatch_epoch_proofs agc_driver_dispatch_epoch_proofs_verify PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")

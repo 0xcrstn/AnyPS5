@@ -1229,6 +1229,14 @@ void ShaderResources::CompleteDraw(std::span<const CompiledShader> shaders, std:
 
 namespace {
 
+bool UnlockedAddressBuilds() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_UNLOCKED_ADDRESS_BUILDS");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
 // Whether a compute stage maps registered guest memory through BDA tables (see prepareAddressBindings).
 bool UsesAddressTables(const CompiledShader& compute) {
     Require(compute.program != nullptr, "missing compiled shader");
@@ -1253,11 +1261,27 @@ ShaderResources::ShaderResources(const Context& context, const CompiledShader& c
     // imports retires buffers to the recorder, refreshing mirrors waits for recorded work): that is
     // device-lock work, so their whole build waits for Complete(). Without tables the call only
     // checks the bindings.
-    lockedBuild = UsesAddressTables(compute);
-    if (lockedBuild) return;
+    if (UsesAddressTables(compute)) {
+        lockedBuild = !UnlockedAddressBuilds() || !prepareAddressBindings(shaders, snapshots, true);
+        if (lockedBuild) return;
+    } else {
+        prepareAddressBindings(shaders, snapshots);
+    }
     unlockedPrepare = true;
-    prepareAddressBindings(shaders, snapshots);
     buildPrepare(shaders, nullptr, 0, 0, 0);
+}
+
+bool ShaderResources::VerifyUnlockedAddressBuilds() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_UNLOCKED_ADDRESS_BUILDS");
+        return UnlockedAddressBuilds() && text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+bool ShaderResources::SameBuildAs(const ShaderResources& other) const {
+    if (GuestBufferViews() != other.GuestBufferViews() || textures != other.textures || StorageImages() != other.StorageImages()) return false;
+    return layoutKey == other.layoutKey && fragmentLayoutKey == other.fragmentLayoutKey && usesBda == other.usesBda && bdaReadOnly == other.bdaReadOnly && Reusable() == other.Reusable();
 }
 
 void ShaderResources::Complete() {

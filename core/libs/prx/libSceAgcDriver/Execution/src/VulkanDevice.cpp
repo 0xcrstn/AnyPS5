@@ -4232,6 +4232,11 @@ bool ProveDispatchTemplate(Graphics::ShaderResources& resources, const Graphics:
     return valid;
 }
 
+std::atomic<std::uint64_t>& UnlockedAddressCounts() {
+    static std::atomic<std::uint64_t> builds{0};
+    return builds;
+}
+
 std::string DispatchProofReport() {
     auto& totals = DispatchProofs();
     std::string text;
@@ -4277,6 +4282,10 @@ std::vector<std::uint64_t> VulkanDevice::DispatchProofVerdicts() {
 
 std::uint64_t VulkanDevice::DispatchProofsVerified() {
     return DispatchProofs().verified.load(std::memory_order_relaxed);
+}
+
+std::uint64_t VulkanDevice::UnlockedAddressBuilds() {
+    return UnlockedAddressCounts().load(std::memory_order_relaxed);
 }
 
 struct PreparedDispatch {
@@ -5463,8 +5472,22 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // (an address-based build also runs its stage A here, under the mutex: 'A locked').
         const auto before = profile ? resources->Timing() : Graphics::ShaderResources::BuildTiming{};
         const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool unlockedAddress = resources->UnlockedAddressBuild();
         resources->Complete();
         require(prepared->describedLayoutKey.empty() || std::ranges::equal(resources->SetLayouts().mainKey, prepared->describedLayoutKey), "the set layout described for the dispatch's pipeline differs from its build");
+        if (unlockedAddress) {
+            UnlockedAddressCounts().fetch_add(1, std::memory_order_relaxed);
+            if (Graphics::ShaderResources::VerifyUnlockedAddressBuilds()) {
+                auto locked = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared->dispatchThreads);
+                const bool same = resources->SameBuildAs(*locked);
+                RecorderFor(GuestMemory::GpuLockThreadTag()).Keep(std::move(locked));
+                if (!same) {
+                    char text[192];
+                    std::snprintf(text, sizeof(text), "Vulkan dispatch: APS5_VERIFY_UNLOCKED_ADDRESS_BUILDS: program 0x%llx's build with stage A on the preparation differs from a locked build", static_cast<unsigned long long>(programAddress));
+                    throw std::logic_error(text);
+                }
+            }
+        }
         if (profile) {
             const auto completeWall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - completeStart).count();
             timer.add(PhaseResourcesComplete, completeWall);
@@ -5574,6 +5597,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             const auto moved = MovedDispatchTemplates() ? MovedTemplateCounters() : MovedTemplateStatistics{};
             AgcDriver::ProfilePrint_nid_no_patch("[rescache] moved read-only buffers (dispatch, cumulative): %llu template hits rebound %llu moved buffers, %llu hits refused (a moved buffer not bindable as a build would bind it), %llu verified against a fresh build\n", static_cast<unsigned long long>(moved.hits), static_cast<unsigned long long>(moved.buffers), static_cast<unsigned long long>(moved.refused), static_cast<unsigned long long>(moved.verified));
         }
+        AgcDriver::ProfilePrint_nid_no_patch("[rescache] address-based dispatch builds with stage A off the GPU mutex (cumulative): %llu\n", static_cast<unsigned long long>(UnlockedAddressCounts().load(std::memory_order_relaxed)));
         if (Graphics::ParallelDispatchRevalidate()) AgcDriver::ProfilePrint_nid_no_patch("[rescache] dispatch template proofs from the preparation (cumulative), by verdict:%s; verified %llu\n", DispatchProofReport().c_str(), static_cast<unsigned long long>(DispatchProofs().verified.load(std::memory_order_relaxed)));
         AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call: %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu; compute pipelines created %llu (%llu under the GPU mutex)\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped), static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(computePipelinesCreatedLocked.load(std::memory_order_relaxed)));
         reportRecipes();
