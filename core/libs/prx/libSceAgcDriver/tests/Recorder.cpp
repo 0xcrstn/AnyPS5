@@ -1338,6 +1338,17 @@ void crossQueueRecordTests(const Device& device, Recorder& recorder) {
             compute.Submit();
         }
         Require(graphics.QueueOrderCounts().foreignRecords == counts.foreignRecords && compute.QueueOrderCounts().foreignRecords == 0, "a queue's record into its own physical queue counted as a cross-queue record");
+        {
+            Buffer keys(device.GetContext(), 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            {
+                AsQueue onCompute(0x20);
+                compute.QueueKeyStore(keys.Handle(), 0, 256, nullptr, base + 0x100, base + 0x200);
+            }
+            const auto ordered = graphics.QueueOrderCounts();
+            compute.Submit();
+            Require(graphics.QueueOrderCounts().foreignRecords == ordered.foreignRecords && graphics.QueueOrderCounts().foreignWaits == ordered.foreignWaits, "submitting the other queue's batch counted the key stores it closes as a cross-queue record");
+            compute.Sync();
+        }
         graphics.Sync();
         compute.Sync();
     }

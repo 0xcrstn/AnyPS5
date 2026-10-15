@@ -1873,6 +1873,7 @@ void Recorder::recordKeyStores(bool forWriter) {
 }
 
 void Recorder::noteForeignRecord() {
+    if (submitDepth != 0) return;
     auto* current = Current();
     if (current == nullptr || current == this || current->peer != this) return;
     current->Submit();
@@ -4122,6 +4123,11 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    ++submitDepth;
+    struct SubmitScope {
+        std::uint32_t& depth;
+        ~SubmitScope() { --depth; }
+    } submitScope{submitDepth};
     for (const auto& input : open->inPlaceInputs) {
         GuestMemory::CollectWritesUncached(input.begin, static_cast<std::size_t>(input.end - input.begin));
         if (GuestMemory::UnchangedSince(input.begin, static_cast<std::size_t>(input.end - input.begin), input.generation)) continue;
