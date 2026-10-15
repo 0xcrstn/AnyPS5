@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <list>
 #include <map>
 #include <memory>
@@ -187,6 +188,24 @@ private:
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
+    DrawVerdict drawNow(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
+    struct DrawRecordResult;
+    struct DrawRecordState {
+        bool active = false;
+        std::uint64_t overlapped = 0;
+        bool settled = false;
+        bool stale = false;
+    };
+    static DrawRecordState& drawRecordState();
+    static bool recordThread();
+    static void runDrawRecords();
+    bool deferDrawRecords(std::uint32_t queue) const;
+    bool settleDrawRecords(std::span<const Graphics::GuestMemorySnapshot> reads);
+    void finishDrawRecords();
+    void waitDrawRecords();
+    void postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::function<void(DrawRecordResult&)> record);
+    static void noteDrawRecordRecipe(DrawRecordResult& result, std::shared_ptr<const DrawRecipe> built, std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
+    void reportDrawRecords();
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
@@ -387,6 +406,7 @@ private:
     bool drawExactKeySeen = false;
     std::vector<std::uint64_t> drawStageDonorKeys;
     std::mutex drawCacheMutex;
+    std::shared_ptr<DrawRecordResult> drawRecordResult;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     std::optional<DrawKeySightings> drawKeySightings;
     Graphics::CacheSizing drawSizing{drawCacheLimits()};

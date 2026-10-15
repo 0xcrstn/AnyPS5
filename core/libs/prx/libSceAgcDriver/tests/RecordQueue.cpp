@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/RecordQueue.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <vector>
 
 using AgcDriver::RecordQueue;
+using namespace AgcDriver::DriverDetail;
 
 namespace {
 
@@ -145,6 +147,38 @@ void testNoReentrantRun() {
     Expect(!RecordQueue::Running(), "the run ends with the drain");
 }
 
+void testStalePreparation() {
+    const std::vector<PreparedRead> reads{{0x1000, 0x100}, {0x8000, 0x40}};
+    const auto noPending = [](std::uint64_t, std::size_t) { return false; };
+    const auto pendingAt8000 = [](std::uint64_t address, std::size_t bytes) { return address < 0x8040 && 0x8000 < address + bytes; };
+    DrawRecordEffects quiet{5, 5, {}};
+    Expect(StaleDrawPrepare(quiet, reads, pendingAt8000) == DrawPrepareStale::No, "a job that noted and stored nothing leaves the preparation valid");
+    DrawRecordEffects noted{5, 6, {}};
+    Expect(StaleDrawPrepare(noted, reads, noPending) == DrawPrepareStale::No, "noted writes elsewhere leave the preparation valid");
+    Expect(StaleDrawPrepare(noted, reads, pendingAt8000) == DrawPrepareStale::PendingWrite, "a pending write over a prepared read makes it stale");
+    Expect(StaleDrawPrepare(quiet, reads, pendingAt8000) == DrawPrepareStale::No, "older pending writes are not the job's");
+    DrawRecordEffects stored{5, 5, {{0x10f0, 0x1200}}};
+    Expect(StaleDrawPrepare(stored, reads, noPending) == DrawPrepareStale::Stored, "a driver store over a prepared read makes it stale");
+    DrawRecordEffects touching{5, 5, {{0x1100, 0x2000}, {0x0, 0x1000}}};
+    Expect(StaleDrawPrepare(touching, reads, noPending) == DrawPrepareStale::No, "stores that only touch a read leave it valid");
+    const std::vector<PreparedRead> empty{{0x1000, 0}};
+    Expect(StaleDrawPrepare(stored, empty, pendingAt8000) == DrawPrepareStale::No, "empty reads are never stale");
+    DrawRecordEffects failed{5, 6, {}};
+    Expect(StaleDrawPrepare(failed, reads, pendingAt8000) != DrawPrepareStale::No, "a job that did not finish counts as having noted writes");
+}
+
+void testOverlappingPackets() {
+    Expect(OverlapsDrawRecords(0x27, false) && OverlapsDrawRecords(0x2d, false) && OverlapsDrawRecords(0x35, false), "direct draws overlap a pending record");
+    Expect(OverlapsDrawRecords(0x24, false) && OverlapsDrawRecords(0x38, false), "indirect draws overlap a pending record (they settle themselves)");
+    Expect(OverlapsDrawRecords(0x69, false) && OverlapsDrawRecords(0x76, false) && OverlapsDrawRecords(0x79, false), "register writes overlap a pending record");
+    Expect(!OverlapsDrawRecords(0x3c, false) && !OverlapsDrawRecords(0x93, false), "memory waits wait for the records");
+    Expect(!OverlapsDrawRecords(0x49, false) && !OverlapsDrawRecords(0x37, false) && !OverlapsDrawRecords(0x40, false), "labels and stores wait for the records");
+    Expect(!OverlapsDrawRecords(0x15, false) && !OverlapsDrawRecords(0x16, false), "dispatches wait for the records");
+    Expect(!OverlapsDrawRecords(0x50, false) && !OverlapsDrawRecords(0x22, false) && !OverlapsDrawRecords(0x10, false), "copies, conditions and NOP payloads wait for the records");
+    Expect(!OverlapsDrawRecords(0x27, true) && !OverlapsDrawRecords(0x69, true), "a predicated packet waits for the records");
+    Expect(!OverlapsDrawRecords(0, false), "flips and rendering waits wait for the records");
+}
+
 }
 
 int main() {
@@ -153,6 +187,8 @@ int main() {
     testWaitFinished();
     testFailureKept();
     testNoReentrantRun();
+    testStalePreparation();
+    testOverlappingPackets();
     if (failures != 0) {
         std::fprintf(stderr, "%d record queue checks failed\n", failures);
         return 1;
