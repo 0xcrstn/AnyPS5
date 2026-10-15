@@ -5287,7 +5287,6 @@ std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std:
 std::vector<ShaderResources::SnapshotRequest> ShaderResources::PlanDrawSnapshots(std::span<const MovedBuffer> moved, const DrawIndexRanges* drawRanges) const {
     std::vector<SnapshotRequest> requests;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !(AddressBasedDrawSnapshots() && bdaReadOnly)) || !DrawSnapshotArena::Enabled()) return requests;
-    const auto reads = guestMemory.InPlaceReads();
     std::size_t totalSnapshotBytes = 0;
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
@@ -5300,7 +5299,7 @@ std::vector<ShaderResources::SnapshotRequest> ShaderResources::PlanDrawSnapshots
             size = override->size;
         } else {
             if (InPlaceDrawInputs() || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
-            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+            const bool direct = guestMemory.InPlaceCovers(item.address, item.size);
             if (!direct) continue;
         }
         if (override != moved.end() && InPlaceDrawInputs()) continue;
@@ -5377,7 +5376,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         statistics->*bucket += std::chrono::duration<double, std::micro>(now - lapStart).count();
         lapStart = now;
     };
-    const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
@@ -5389,6 +5387,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
             constexpr std::size_t MovedWordBufferSlots = 8;
+            std::lock_guard movedWordLock(movedWordMutex);
             const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
             const auto keep = [&](MovedWordBuffer entry) {
                 if (held != movedWordBuffers.end()) *held = std::move(entry);
@@ -5452,7 +5451,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             size = override->size;
         } else {
             if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
-            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+            const bool direct = guestMemory.InPlaceCovers(item.address, item.size);
             if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) {
                 if (statistics != nullptr) ++statistics->skipped;
                 continue;
@@ -5708,28 +5707,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             return result;
         }
     }
-    std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
-    std::array<std::map<VkDescriptorType, std::uint32_t>, 2> counts;
-    for (const auto& binding : bindings) {
-        const auto set = setOf(binding);
-        descriptions[set].push_back(binding.layout);
-        counts[set][binding.layout.descriptorType] += (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
-    }
-    const auto sizesOf = [&](std::size_t set) {
-        std::vector<VkDescriptorPoolSize> sizes;
-        for (const auto& [type, count] : counts[set]) {
-            if (count != 0) sizes.push_back({type, count});
-        }
-        return sizes;
-    };
-    const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
+    const auto& shape = DrawSetShapeOf();
     result->cache = context.descriptorCache;
-    if (!descriptions[0].empty() || splitSets) {
-        result->allocation = result->cache->Allocate(_layout, sizesOf(0), updateAfterBind, variableOf(0));
+    if (shape.used[0]) {
+        result->allocation = result->cache->Allocate(_layout, shape.sizes[0], updateAfterBind, shape.variable[0]);
         Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
-    if (!descriptions[1].empty() || splitSets) {
-        result->fragmentAllocation = result->cache->Allocate(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
+    if (shape.used[1]) {
+        result->fragmentAllocation = result->cache->Allocate(fragment.layout, shape.sizes[1], updateAfterBind, shape.variable[1]);
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     lap(&DrawBindingsStatistics::allocateUs);
@@ -5751,6 +5736,26 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     lap(&DrawBindingsStatistics::updateUs);
     return result;
+}
+
+const ShaderResources::DrawSetShape& ShaderResources::DrawSetShapeOf() const {
+    std::call_once(drawSetShapeOnce, [this] {
+        std::array<bool, 2> described{};
+        std::array<std::map<VkDescriptorType, std::uint32_t>, 2> counts;
+        for (const auto& binding : bindings) {
+            const auto set = setOf(binding);
+            described[set] = true;
+            counts[set][binding.layout.descriptorType] += (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+        }
+        for (std::size_t set = 0; set < 2; ++set) {
+            for (const auto& [type, count] : counts[set]) {
+                if (count != 0) drawSetShape.sizes[set].push_back({type, count});
+            }
+            if (tableBindings[set] != std::numeric_limits<std::size_t>::max()) drawSetShape.variable[set] = std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()));
+            drawSetShape.used[set] = described[set] || splitSets;
+        }
+    });
+    return drawSetShape;
 }
 
 ShaderResources::RecordBindings ShaderResources::ParseRecordBindings(const char* text) {
@@ -5909,8 +5914,7 @@ void ShaderResources::WriteBackBuffers() {
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
-    const auto reads = guestMemory.InPlaceReads();
-    return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+    return guestMemory.InPlaceOverlaps(address, bytes);
 }
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {

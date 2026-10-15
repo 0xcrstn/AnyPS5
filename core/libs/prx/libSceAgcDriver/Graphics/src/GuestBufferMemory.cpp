@@ -4938,6 +4938,34 @@ Recorder::BoundPlacement GuestBufferMemory::Placement() const {
     return result;
 }
 
+bool GuestBufferMemory::InPlaceCovers(std::uint64_t address, std::size_t bytes) const {
+    if (!uploaded || committed) return false;
+    const auto covers = [&](std::uint64_t begin, std::uint64_t end) { return address >= begin && address < end && bytes <= end - address; };
+    if (space != nullptr) {
+        for (const auto& region : space->base) {
+            if (region.direct != nullptr && covers(region.begin, region.end)) return true;
+        }
+    }
+    for (const auto& region : regions) {
+        if (region.direct != nullptr && covers(region.begin, inPlaceEnd(region))) return true;
+    }
+    return false;
+}
+
+bool GuestBufferMemory::InPlaceOverlaps(std::uint64_t address, std::size_t bytes) const {
+    if (!uploaded || committed) return false;
+    const auto overlaps = [&](std::uint64_t begin, std::uint64_t end) { return address < end && begin < address + bytes; };
+    if (space != nullptr) {
+        for (const auto& region : space->base) {
+            if (region.direct != nullptr && overlaps(region.begin, region.end)) return true;
+        }
+    }
+    for (const auto& region : regions) {
+        if (region.direct != nullptr && overlaps(region.begin, inPlaceEnd(region))) return true;
+    }
+    return false;
+}
+
 std::optional<GuestBufferMemory::SplitReads> GuestBufferMemory::SplitInPlaceReads() const {
     if (!uploaded || committed || space == nullptr || space->directReads == nullptr) return std::nullopt;
     SplitReads split{space->directReads, {}};
