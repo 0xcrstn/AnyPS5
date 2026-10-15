@@ -1102,6 +1102,28 @@ RecorderDomain& Recorder::Domain(std::uint32_t physicalQueue) {
     return domains[physicalQueue];
 }
 
+namespace {
+
+std::array<std::atomic<std::uint8_t>, Recorder::GuestQueues>& GuestQueueMap() {
+    static std::array<std::atomic<std::uint8_t>, Recorder::GuestQueues> map{};
+    return map;
+}
+
+}
+
+void Recorder::MapGuestQueue(std::uint32_t guestQueue, std::uint32_t physicalQueue) {
+    Require(guestQueue < GuestQueues && physicalQueue < PhysicalQueues, "guest queue mapped outside the known queues");
+    GuestQueueMap()[guestQueue].store(static_cast<std::uint8_t>(physicalQueue), std::memory_order_release);
+}
+
+std::uint32_t Recorder::PhysicalQueueOf(std::uint32_t guestQueue) {
+    return guestQueue < GuestQueues ? GuestQueueMap()[guestQueue].load(std::memory_order_acquire) : 0u;
+}
+
+RecorderDomain& Recorder::DomainOf(std::uint32_t guestQueue) {
+    return Domain(PhysicalQueueOf(guestQueue));
+}
+
 Recorder* Recorder::ForPhysicalQueue(std::uint32_t physicalQueue) {
     Require(physicalQueue < PhysicalQueues, "recorder for an unknown physical queue");
     return Domain(physicalQueue).active;
@@ -1255,7 +1277,7 @@ std::uint64_t Recorder::RecordedWorkSinceSubmit() {
 }
 
 void Recorder::CountRecordedWork() {
-    Domain(0).workSinceSubmit.fetch_add(1, std::memory_order_relaxed);
+    DomainOf(GuestMemory::GpuLockThreadTag()).workSinceSubmit.fetch_add(1, std::memory_order_relaxed);
 }
 
 Recorder* Recorder::Active() {
@@ -1326,9 +1348,10 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
     auto group = std::move(LabelGroupDwords());
     LabelGroupDwords().clear();
     if (trackerGeneration == 0) return;
-    std::lock_guard tableLock(Domain(0).labelTableMutex);
-    if (Domain(0).labelTableOwner == nullptr) return;
-    auto& recorded = Domain(0).labelTableOwner->labels;
+    auto& home = DomainOf(GuestMemory::GpuLockThreadTag());
+    std::lock_guard tableLock(home.labelTableMutex);
+    if (home.labelTableOwner == nullptr) return;
+    auto& recorded = home.labelTableOwner->labels;
     for (const auto& [dword, stamp] : group) {
         // Only an entry still ours (stamps are unique): a later note of the dword has its own group.
         // And only while its batch is unsubmitted: a submitted one (a drain or APS5_LABEL_SUBMIT_NOW
@@ -1338,7 +1361,7 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
         if (found != recorded.end() && found->second.stamp == stamp && found->second.batch != nullptr && !found->second.batch->submitted) found->second.generation = trackerGeneration;
     }
     // A poller that refused the group as unclosed re-consults the table on the next generation.
-    Domain(0).writeGeneration.fetch_add(1, std::memory_order_release);
+    home.writeGeneration.fetch_add(1, std::memory_order_release);
 }
 
 void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
@@ -1347,27 +1370,29 @@ void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte>
     // enter it in (no owner: the callback records it outright, by a CPU store when need be).
     QueuedLabelRanges().emplace_back(address, address + bytes.size());
     queuedLabelsNoted.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard tableLock(Domain(0).labelTableMutex);
-    if (Domain(0).labelTableOwner == nullptr) return;
-    auto& recorded = Domain(0).labelTableOwner->labels;
-    auto& table = SeparateQueuedLabels() ? Domain(0).labelTableOwner->queuedLabels : recorded;
+    auto& home = DomainOf(queue);
+    std::lock_guard tableLock(home.labelTableMutex);
+    if (home.labelTableOwner == nullptr) return;
+    auto& recorded = home.labelTableOwner->labels;
+    auto& table = SeparateQueuedLabels() ? home.labelTableOwner->queuedLabels : recorded;
     for (std::size_t offset = 0; offset + 4 <= bytes.size(); offset += 4) {
         std::uint32_t value = 0;
         std::memcpy(&value, bytes.data() + offset, 4);
         if (const auto found = recorded.find(address + offset); found != recorded.end() && found->second.batch != nullptr) queuedLabelsOverRecorded.fetch_add(1, std::memory_order_relaxed);
         table.insert_or_assign(address + offset, LabelEntry{value, queue, stamp, nullptr});
     }
-    Domain(0).labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
+    home.labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
 }
 
 void Recorder::ForgetQueuedLabels() {
     if (QueuedLabelRanges().empty()) return;
     auto ranges = std::move(QueuedLabelRanges());
     QueuedLabelRanges().clear();
-    std::lock_guard tableLock(Domain(0).labelTableMutex);
-    if (Domain(0).labelTableOwner == nullptr) return;
-    auto& recorded = Domain(0).labelTableOwner->labels;
-    auto& queued = Domain(0).labelTableOwner->queuedLabels;
+    auto& home = DomainOf(GuestMemory::GpuLockThreadTag());
+    std::lock_guard tableLock(home.labelTableMutex);
+    if (home.labelTableOwner == nullptr) return;
+    auto& recorded = home.labelTableOwner->labels;
+    auto& queued = home.labelTableOwner->queuedLabels;
     const auto tag = GuestMemory::GpuLockThreadTag();
     for (const auto& [begin, end] : ranges) {
         for (auto dword = begin; dword + 4 <= end; dword += 4) {
@@ -1376,7 +1401,7 @@ void Recorder::ForgetQueuedLabels() {
             if (found != recorded.end() && found->second.batch == nullptr) recorded.erase(found);
         }
     }
-    Domain(0).labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
+    home.labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
 }
 
 void Recorder::SetQueuedLabelRecorder(void (*recorder)()) {

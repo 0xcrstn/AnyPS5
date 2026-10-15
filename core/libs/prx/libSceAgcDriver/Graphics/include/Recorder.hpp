@@ -68,6 +68,10 @@ public:
     static constexpr std::uint32_t PhysicalQueues = 4;
     static RecorderDomain& Domain(std::uint32_t physicalQueue);
     static Recorder* ForPhysicalQueue(std::uint32_t physicalQueue);
+    static constexpr std::uint32_t GuestQueues = 256;
+    static void MapGuestQueue(std::uint32_t guestQueue, std::uint32_t physicalQueue);
+    static std::uint32_t PhysicalQueueOf(std::uint32_t guestQueue);
+    static RecorderDomain& DomainOf(std::uint32_t guestQueue);
     std::uint32_t PhysicalQueue() const { return physicalQueue; }
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
     explicit Recorder(const Context& context, bool timelineSemaphores = false);
