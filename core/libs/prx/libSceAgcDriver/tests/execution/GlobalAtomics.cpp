@@ -402,10 +402,8 @@ void RunAtomics(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::uint32_
     std::memcpy(guest.Data(), initial.data(), BlockBytes);
     FillInput();
     Output.fill(Sentinel);
-    const auto placedBefore = AgcDriver::Graphics::PlacedBuilds();
     Dispatch(device, waveSize, guest.Data());
     const auto wave = "global atomics: wave" + std::to_string(waveSize) + " ";
-    if (AgcDriver::Graphics::PlacementSetting() != ShaderRecompiler::BdaPlacement::Mode::Host) Require(AgcDriver::Graphics::PlacedBuilds() > placedBefore, wave + "dispatch with address atomics was not placed in device memory");
     for (std::uint32_t op = 0; op < OpCount; ++op) {
         for (std::uint32_t tid = 0; tid < Threads; ++tid) {
             const auto& row = RowOf(op, tid);
@@ -429,7 +427,9 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         GuestBlock writable(true);
-        RunAtomics(*device, writable, 32);
+        const auto placedBefore = AgcDriver::Graphics::PlacedBuilds();
+        for (std::uint32_t batch = 0; batch < 4u; ++batch) RunAtomics(*device, writable, 32);
+        if (AgcDriver::Graphics::PlacementSetting() != ShaderRecompiler::BdaPlacement::Mode::Host) Require(AgcDriver::Graphics::PlacedBuilds() > placedBefore, "global atomics: a dispatch with address atomics, repeated past the mirror reuse gate, was never placed in device memory");
         std::puts("global atomics tests passed");
         return 0;
     } catch (const std::exception& error) {
