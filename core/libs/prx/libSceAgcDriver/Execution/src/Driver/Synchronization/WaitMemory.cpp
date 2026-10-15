@@ -195,13 +195,16 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         ++outcomes.unprovenRefused;
         return false;
     };
+    const bool scheduleRecording = queueScheduler.Capturing() || queueScheduler.Mode() == SchedulerMode::Replay;
     const auto discharge = [&](WaitSource source) {
         observation.source = source;
-        if (observing && (source == WaitSource::Entry || source == WaitSource::Memory || source == WaitSource::HeldAtSubmit)) {
+        const bool fromMemory = source == WaitSource::Entry || source == WaitSource::Memory || source == WaitSource::HeldAtSubmit;
+        if ((observing || scheduleRecording) && fromMemory) {
             const bool readable = GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(awaited)), awaitedBytes);
             observation.value = !readable ? 0 : wideWait ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
-            if (timeline != LabelTimelineMode::Off) ++outcomes.lifts[static_cast<std::size_t>(Lift::Latched)];
+            if (observing && timeline != LabelTimelineMode::Off) ++outcomes.lifts[static_cast<std::size_t>(Lift::Latched)];
         }
+        if (scheduleRecording) queueScheduler.NoteWait(queue, observation.value, static_cast<std::uint32_t>(source));
         if (!requireMemory) dischargeWait(observation, packet);
     };
     const auto historyHit = [&]() -> bool {

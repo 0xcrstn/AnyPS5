@@ -2005,6 +2005,17 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_same_family_missing_order_dedicated_injected PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    set(agcScheduleCapture "${CMAKE_CURRENT_BINARY_DIR}/aps5-schedule-capture.txt")
+    add_test(NAME agc_driver_schedule_capture COMMAND agc_driver_same_family_missing_order_tests)
+    set_tests_properties(agc_driver_schedule_capture PROPERTIES FIXTURES_SETUP agc_schedule_capture
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_SCHEDULER=serial;APS5_QUEUE_SCHEDULER_CAPTURE=${agcScheduleCapture}" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_schedule_replay COMMAND agc_driver_same_family_missing_order_tests)
+    set_tests_properties(agc_driver_schedule_replay PROPERTIES FIXTURES_REQUIRED agc_schedule_capture
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_SCHEDULER=replay;APS5_QUEUE_SCHEDULER_REPLAY=${agcScheduleCapture};APS5_QUEUE_SCHEDULER_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_schedule_capture agc_driver_schedule_replay PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_completion_watcher_off COMMAND agc_driver_completion_watcher_tests)
     set_tests_properties(agc_driver_completion_watcher_off PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_COMPLETION_WATCHER=0" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
