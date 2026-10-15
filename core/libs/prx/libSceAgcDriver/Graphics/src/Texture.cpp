@@ -3444,11 +3444,12 @@ void StorageTexture::reconcilePending() {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         const bool any = anyLayerPending();
-        if (any == dirty) return;
-        dirty = any;
-        if (any) pending.textures.push_back(this);
-        else pending.textures.remove(this);
-        BumpPendingSerial();
+        if (any != dirty) {
+            dirty = any;
+            if (any) pending.textures.push_back(this);
+            else pending.textures.remove(this);
+            BumpPendingSerial();
+        }
     }
     settleProtection();
 }
