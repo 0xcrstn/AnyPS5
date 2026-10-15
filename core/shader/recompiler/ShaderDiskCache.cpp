@@ -1305,6 +1305,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
 constexpr std::string_view NeutralSwitches[] = {
     "APS5_COMPILE_TRACE",
     "APS5_SHADER_CACHE_V2",
+    "APS5_SPIRV_INTERN",
     "APS5_VERIFY_SHADER_CACHE",
     "APS5_VERIFY_SHADER_EMISSION",
     "APS5_PROFILE_DRAW",
