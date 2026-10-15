@@ -509,7 +509,7 @@ struct PageSpan {
     std::uint8_t load(std::uintptr_t address) const {
         const auto index = (address - base) / PageBytes;
         if (!present(index)) return 0;
-        return std::atomic_ref<const std::uint8_t>(pages[index]).load(std::memory_order_relaxed);
+        return std::atomic_ref<std::uint8_t>(const_cast<std::uint8_t&>(pages[index])).load(std::memory_order_relaxed);
     }
 
     void store(std::uintptr_t address, std::uint8_t value) {
@@ -529,11 +529,11 @@ struct PageSpan {
                 index = std::min<std::size_t>(stop, (index / ChunkBytes + 1) * ChunkBytes);
                 continue;
             }
-            if (index % 8 == 0 && index + 8 <= stop && std::atomic_ref<const std::uint64_t>(*reinterpret_cast<const std::uint64_t*>(pages + index)).load(std::memory_order_relaxed) == wide) {
+            if (index % 8 == 0 && index + 8 <= stop && std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(const_cast<std::uint8_t*>(pages + index))).load(std::memory_order_relaxed) == wide) {
                 index += 8;
                 continue;
             }
-            if (std::atomic_ref<const std::uint8_t>(pages[index]).load(std::memory_order_relaxed) != value) break;
+            if (std::atomic_ref<std::uint8_t>(const_cast<std::uint8_t&>(pages[index])).load(std::memory_order_relaxed) != value) break;
             ++index;
         }
         return std::min(limit, base + index * PageBytes);
@@ -1522,6 +1522,14 @@ DirtySetCounts DirtySetStatistics() {
 void BumpCollectEpoch() {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t ThreadCollectEpoch() {
+    return collectMemoEnabled() ? threadCollectEpoch : 0;
+}
+
+std::uint64_t UnwatchSerial() {
+    return unwatchSerial.load(std::memory_order_acquire);
 }
 
 std::uint64_t CollectEpochBumps() {

@@ -138,7 +138,7 @@ std::uint64_t Driver::drawIdentityKey(const QueueState& queue, const ShaderRegis
     return key == 0 ? 1 : key;
 }
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, const DrawRelocation* relocation, DrawAliasKeys* aliases) {
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape, const DrawRelocation* relocation, DrawAliasKeys* aliases) {
     const bool aliased = aliases != nullptr && relocation != nullptr && !relocation->words.empty();
     std::array<std::uint64_t, DrawAliasKeys::Stages> content{};
     bool readable = true;
@@ -149,15 +149,16 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     };
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
     static const bool verify = std::getenv("APS5_VERIFY_REGISTER_KEYS") != nullptr;
-    std::uint64_t shape = 0;
-    auto key = RegisterStateKey(queue, allUserWords, true, aliased ? &shape : nullptr);
+    std::uint64_t registerShape = 0;
+    auto key = RegisterStateKey(queue, allUserWords, true, &registerShape);
+    std::uint64_t shapeKey = registerShape;
     if (verify && key != RegisterStateKey(queue, allUserWords, false)) throw std::runtime_error("incremental register fingerprint disagrees with full state");
     const bool diagnose = aliased && drawMissDiagnosisEnabled();
     std::array<std::vector<std::uint32_t>, DrawAliasKeys::Stages> raw;
     DrawStructureParts parts;
     if (aliased) {
-        mixOther(shape);
-        parts.shape = shape;
+        mixOther(registerShape);
+        parts.shape = registerShape;
         forEachKeyedUserWord(queue, allUserWords, [&](std::uint32_t offset, std::uint32_t value) {
             mixOther(offset);
             if (std::find(relocation->unread.begin(), relocation->unread.end(), offset) != relocation->unread.end()) return;
@@ -175,6 +176,8 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
         key *= 0x100000001b3ull;
+        shapeKey ^= value;
+        shapeKey *= 0x100000001b3ull;
     };
     mix(deviceSerial);
     for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
@@ -204,6 +207,7 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         aliases->raw = std::move(raw);
         aliases->parts = std::move(parts);
     }
+    if (shape != nullptr) *shape = shapeKey;
     return key;
 }
 
@@ -249,14 +253,15 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
     if (std::memcmp(&s.viewport, &t.viewport, sizeof(VkViewport)) != 0 || std::memcmp(&s.scissor, &t.scissor, sizeof(VkRect2D)) != 0) return false;
     const auto& p = a.pixel;
     const auto& q = b.pixel;
-    if (p.interpolatorCount != q.interpolatorCount || p.interpolatorSettings != q.interpolatorSettings || p.wave32 != q.wave32 || p.inputAddr != q.inputAddr || p.hasPerspectiveCenterVgpr != q.hasPerspectiveCenterVgpr || p.perspectiveCentroid != q.perspectiveCentroid || p.posX != q.posX || p.posY != q.posY || p.posZ != q.posZ || p.posW != q.posW || p.frontFace != q.frontFace || p.ancillary != q.ancillary || p.sampleShading != q.sampleShading || p.noPerspective != q.noPerspective || p.linearCentroid != q.linearCentroid || p.pixelKillEnable != q.pixelKillEnable || p.depthExportEnable != q.depthExportEnable || p.sampleMaskExportEnable != q.sampleMaskExportEnable || p.earlyZ != q.earlyZ || p.executeOnNoop != q.executeOnNoop || p.conservativeZExport != q.conservativeZExport || p.orderedPixelShader != q.orderedPixelShader || p.stencilRefExportEnable != q.stencilRefExportEnable || p.targetOutputMode != q.targetOutputMode || p.targetExportMapping != q.targetExportMapping) return false;
+    if (p.interpolatorCount != q.interpolatorCount || p.interpolatorSettings != q.interpolatorSettings || p.wave32 != q.wave32 || p.inputAddr != q.inputAddr || p.hasPerspectiveCenterVgpr != q.hasPerspectiveCenterVgpr || p.perspectiveCentroid != q.perspectiveCentroid || p.posX != q.posX || p.posY != q.posY || p.posZ != q.posZ || p.posW != q.posW || p.frontFace != q.frontFace || p.frontFaceAllBits != q.frontFaceAllBits || p.ancillary != q.ancillary || p.sampleShading != q.sampleShading || p.noPerspective != q.noPerspective || p.linearCentroid != q.linearCentroid || p.pixelKillEnable != q.pixelKillEnable || p.depthExportEnable != q.depthExportEnable || p.sampleMaskExportEnable != q.sampleMaskExportEnable || p.earlyZ != q.earlyZ || p.executeOnNoop != q.executeOnNoop || p.conservativeZExport != q.conservativeZExport || p.orderedPixelShader != q.orderedPixelShader || p.stencilRefExportEnable != q.stencilRefExportEnable || p.targetOutputMode != q.targetOutputMode || p.targetExportMapping != q.targetExportMapping) return false;
     if (a.roles != b.roles || a.programs.size() != b.programs.size()) return false;
     for (std::size_t i = 0; i < a.programs.size(); ++i) {
         const auto& x = a.programs[i];
         const auto& y = b.programs[i];
         if (x.binary.stage != y.binary.stage || x.binary.codeAddress != y.binary.codeAddress || x.userDataBase != y.userDataBase || x.firstUserSgpr != y.firstUserSgpr || x.userData != y.userData || x.snapshot != y.snapshot || x.codeOffset != y.codeOffset || x.tailContinuation != y.tailContinuation) return false;
     }
-    if (p.targetExportPacking != q.targetExportPacking || p.dualSourceBlend != q.dualSourceBlend || p.alphaToCoverage != q.alphaToCoverage || p.rasterPrimitive != q.rasterPrimitive || p.ditheredAlphaToCoverage != q.ditheredAlphaToCoverage) return false;
+    if (p.targetExportPacking != q.targetExportPacking || p.dualSourceBlend != q.dualSourceBlend || p.alphaToCoverage != q.alphaToCoverage || p.rasterPrimitive != q.rasterPrimitive || p.ditheredAlphaToCoverage != q.ditheredAlphaToCoverage || p.quadPixelMask != q.quadPixelMask || p.quadSampleMask != q.quadSampleMask) return false;
+    if (s.samples != t.samples || s.quadSampleMask != t.quadSampleMask || s.pixelEarlyZ != t.pixelEarlyZ) return false;
     return true;
 }
 

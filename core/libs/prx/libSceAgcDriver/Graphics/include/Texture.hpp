@@ -23,8 +23,10 @@
 
 namespace AgcDriver::Graphics {
 
+class Buffer;
 class ResidentColor;
 class CommandBatch;
+class DeviceBuffer;
 class StorageTexture;
 struct HostImport;
 
@@ -39,6 +41,16 @@ std::uint64_t SampledTextureMemory();
 std::uint64_t StorageImageHostCopyBytes();
 bool ClearKeepsDenormals(const Context& context, VkFormat format);
 bool ClearColorForTexel(VkFormat format, std::uint32_t elementBytes, std::span<const std::uint32_t, 4> pattern, VkClearColorValue& clear);
+
+void SetAliasHandOverForTests(bool enabled);
+struct AliasHandOverCounts {
+    std::uint64_t handedOver = 0;
+    std::uint64_t deviceUnits = 0;
+    std::uint64_t superseded = 0;
+    std::uint64_t storedLater = 0;
+    std::uint64_t fallbacks = 0;
+};
+AliasHandOverCounts TakeAliasHandOverCounts();
 
 // A sampled texture's own VkImage with its memory, shared with the recorder while a recorded upload
 // still writes it (see the snapshot constructor), so the texture may go before the batch completes.
@@ -196,6 +208,8 @@ public:
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr);
     static void FlushAllPending(const char* reason, PublishScope scope = PublishScope::Whole);
     static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
+    static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
+    static std::size_t StoreSmallPending(const char* reason);
     static bool AnyPending();
     static void FlushDumpSelected(const char* reason);
     static std::optional<PublishScope> StoreAtFlipRequested(const char* value);
@@ -354,6 +368,23 @@ public:
 
 private:
     StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
+    struct HandOver {
+        std::weak_ptr<StorageTexture> image;
+        std::uint64_t version = 0;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> units;
+        bool device = false;
+        std::uint64_t takerVersion = 0;
+        bool held = false;
+    };
+    std::vector<HandOver> handOversUnder(const StorageTexture* alias, DccKeys& keys);
+    struct DeviceUnits {
+        std::shared_ptr<DeviceBuffer> buffer;
+        std::uint64_t base = 0;
+    };
+    void retileUnitsTo(const DeviceUnits& target, const std::vector<std::uint32_t>& units);
+    std::uint64_t uploadUnitsFrom(const DeviceUnits& source, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs);
+    void supersedeHandedFrom(std::uint32_t first, std::uint32_t count);
+    const std::vector<bool>& wholeUnitsOf();
     // The regions of every array layer, or of the tracked layers `layers` selects.
     std::vector<VkBufferImageCopy> CopyRegions(const std::vector<bool>* layers = nullptr) const;
     // Uploads the surface, or only the tracked layers `layers` selects (the direct path; the others
@@ -376,6 +407,17 @@ private:
     // Drops the saved guest bytes of the units over [address, address + bytes) (another image's fill
     // or copy supersedes them there); the other units' bytes stay valid.
     void forgetSavedOver(std::uint64_t address, std::size_t bytes);
+    // A write-back stored on the GPU over memory outside the write watch: the stored units' bytes are
+    // copied from its retile scratch into `savedBytes` behind the store and become `original` once
+    // the batch completed (`savedTicket` names that write-back per unit; anything that replaces or
+    // drops a unit's saved bytes first clears it).
+    std::vector<std::uint32_t> prepareStoredSave(const std::vector<bool>& layers, const std::vector<bool>& skippedLayer);
+    void commitStoredSave(const std::vector<std::uint32_t>& units);
+    void applyStoredSave(std::uint64_t ticket, const std::vector<std::uint32_t>& units);
+    void cancelStoredSave(std::uint32_t unit);
+    void cancelStoredSaves();
+    // Lets the batches holding the saves of the units `layers` selects (every unit for none) complete.
+    void awaitStoredSave(const std::vector<bool>* layers);
     bool guestBytesSettled() const;
     // Tracked units as 64 KiB write-stamp blocks (`blockUnits`: a thin tiled surface at a 64 KiB
     // aligned base; APS5_NO_BLOCK_TRACKING=1 tracks array layers as above instead): a fill of one
@@ -421,13 +463,20 @@ private:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> importReads;
     };
     PaddingSeeds paddingSeeds(const HostImport& import, std::vector<CopiedBytes> copied) const;
+    struct ImportSegment {
+        const HostImport* import;
+        std::uint64_t begin;
+        std::uint64_t end;
+    };
+    std::vector<ImportSegment> importSegments() const;
+    PaddingSeeds paddingSeeds(std::span<const ImportSegment> segments, const std::vector<CopiedBytes>& copied) const;
     // The direct upload and GPU-direct write-back of the runs through their windows (block units);
     // both return the bytes moved. The upload reads each unit from its unit shadow while fresh,
     // else from the import (`discard`: the image has no layout yet, a whole-surface first upload).
     // The write-back retiles into the import's unit shadow where a slab takes the piece
     // (`shadowed` receives those guest ranges, `imported` the pieces written to the import).
     std::uint64_t uploadWindows(const HostImport& import, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool discard = false);
-    std::uint64_t writeBackWindows(const HostImport& import, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported);
+    std::uint64_t writeBackWindows(std::span<const ImportSegment> segments, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported, Buffer* save = nullptr);
     // Per-layer validity (thin array surfaces whose layers are 64 KiB-aligned guest slices; every
     // other surface is one tracked layer): a layer's generation is the write generation its guest
     // bytes were last known to match the image at, and a pending layer holds results (a clear, a
@@ -438,7 +487,7 @@ private:
     void refreshGeneration();
     bool refreshProved();
     void takeRefreshProof(bool aliased);
-    bool otherPendingOverlaps() const;
+    bool otherPendingOverlaps(bool exceptHandOvers = false) const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);
@@ -577,6 +626,9 @@ private:
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     std::vector<bool> layerOriginal;
     std::map<std::uint64_t, std::uint64_t> keptAtUnwatch;
+    std::shared_ptr<Buffer> savedBytes;
+    std::vector<std::uint64_t> savedTicket;
+    std::uint64_t lastSaveTicket = 0;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;
@@ -597,6 +649,10 @@ private:
     // The generation at which a one-layer FillClear was refused as 'surface changed': the check
     // fails again until `generation` moves, so ClassifyFill skips the layer match meanwhile.
     std::uint64_t layerRefusedGeneration = ~0ull;
+    std::vector<bool> wholeUnits;
+    bool wholeUnitsKnown = false;
+    std::vector<HandOver> handedFrom;
+    std::vector<std::weak_ptr<StorageTexture>> handedTo;
 };
 
 // APS5_PROFILE_DRAW: what the image lookups on this thread did since the last reset, by outcome

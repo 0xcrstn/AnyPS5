@@ -8,6 +8,7 @@
 namespace AgcDriver::Graphics {
 
 void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
+    static const bool loopGuarded = std::getenv("APS5_LOOP_GUARD") != nullptr;
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
         std::uint32_t tables = 0;
@@ -24,6 +25,8 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         // Rect-list validation needs a fault buffer, but never accesses guest addresses.
         usesBda = usesBda || tables != 0;
         usesFaultBuffer = usesFaultBuffer || faults != 0;
+        const bool tableFaultsOnly = std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap; });
+        faultChecks = faultChecks || tables != 0 || (faults != 0 && (!tableFaultsOnly || shader.program->imageTableFaults != 0 || shader.program->poisonedSrtReads != 0 || loopGuarded));
     }
     mirrorReads = usesBda && context.recorder != nullptr && ResidentMirrorsEnabled() && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.program->bdaWrites; });
     if (usesBda) {

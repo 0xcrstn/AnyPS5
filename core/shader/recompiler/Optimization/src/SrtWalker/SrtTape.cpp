@@ -356,7 +356,7 @@ std::shared_ptr<const SrtTape> SrtTape::Compile(const IrResourcePlan& plan, std:
         return tape;
     };
     if (!plan.srtPlanComplete) return refuse(SrtCompiledWalkRefusal::IncompletePlan);
-    if (plan.requiresSpecializationMemory || std::ranges::any_of(plan.descriptorSources, [](const DescriptorSource& source) { return source.indirectImage.has_value(); })) return refuse(SrtCompiledWalkRefusal::IndirectImage);
+    if (plan.requiresSpecializationMemory || std::ranges::any_of(plan.descriptorSources, [](const DescriptorSource& source) { return source.tableColumn.has_value(); })) return refuse(SrtCompiledWalkRefusal::IndirectImage);
     tape->userDataBase = plan.userDataBase;
     tape->sourceCount = plan.descriptorSources.size();
     tape->imageCount = plan.info.images.size();

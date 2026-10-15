@@ -1,4 +1,5 @@
 #include "Recompiler.hpp"
+#include "StencilReplay.hpp"
 #include <algorithm>
 #include <cstring>
 #include <atomic>
@@ -111,7 +112,14 @@ RdnaProgram DecodeStageProgram(ShaderStageKind stage, std::span<const std::uint3
 
 ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
     const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
-    const auto* tessellation = request.graphics && request.graphics->tessellation ? &*request.graphics->tessellation : nullptr;
+    std::optional<TessellationConfiguration> tessellationCopy;
+    if (request.graphics && request.graphics->tessellation) {
+        tessellationCopy = *request.graphics->tessellation;
+        tessellationCopy->instancePatches = TessellationInstancePatches(request);
+        const auto& capabilities = request.target.supportedCapabilities;
+        tessellationCopy->drawParameters = std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDrawParameters)) != capabilities.end();
+    }
+    const auto* tessellation = tessellationCopy ? &*tessellationCopy : nullptr;
     return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request), mesh, tessellation);
 }
 
@@ -127,7 +135,7 @@ std::atomic<std::uint64_t> frontEndBuilds{0};
 
 struct PreparedControlFlow {
     PreparedControlFlow(const RecompileRequest& request, const SwappcInfo& swappcInfo)
-        : stage(request.shader.stage), swappc(swappcInfo), code(request.shader.code.begin(), request.shader.code.end()),
+        : stage(request.shader.stage), fallbacks(swappcInfo.linkedCallFallbacks.begin(), swappcInfo.linkedCallFallbacks.end()), swappc(WithFallbacks(swappcInfo, fallbacks)), code(request.shader.code.begin(), request.shader.code.end()),
           decoded(DecodeStageProgram(toShaderStageKind(request.shader.stage), code)), cfg(GraphBuilder{}.Build(decoded, &swappc)) {
         Structurizer{}.Structurize(cfg);
     }
@@ -138,10 +146,16 @@ struct PreparedControlFlow {
     bool Matches(const RecompileRequest& request, const SwappcInfo& swappcInfo) const {
         return stage == request.shader.stage && swappc.fetchCallAllowed == swappcInfo.fetchCallAllowed &&
                swappc.userDataBaseRegister == swappcInfo.userDataBaseRegister && swappc.userDataCount == swappcInfo.userDataCount &&
-               std::ranges::equal(code, request.shader.code);
+               std::ranges::equal(fallbacks, swappcInfo.linkedCallFallbacks) && std::ranges::equal(code, request.shader.code);
+    }
+
+    static SwappcInfo WithFallbacks(SwappcInfo info, const std::vector<std::uint32_t>& fallbacks) {
+        info.linkedCallFallbacks = fallbacks;
+        return info;
     }
 
     ShaderStage stage;
+    std::vector<std::uint32_t> fallbacks;
     SwappcInfo swappc;
     std::vector<std::uint32_t> code;
     RdnaProgram decoded;
@@ -150,7 +164,7 @@ struct PreparedControlFlow {
 
 std::shared_ptr<const PreparedControlFlow> ShaderPreparationContext::AcquireFrontend(const RecompileRequest& request) {
     const auto inputInfo = RequestInputInfo(request);
-    const SwappcInfo swappc{inputInfo.vertex != nullptr, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size())};
+    const SwappcInfo swappc{inputInfo.vertex != nullptr, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), 0u, request.context.linkedCallFallbacks};
     static const bool reuse = std::getenv("APS5_NO_PERF_FRONTEND_PAIR") == nullptr;
     if (reuse && frontend != nullptr && frontend->Matches(request, swappc)) {
         return frontend;
@@ -316,6 +330,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     // accepted only when its code matches word for word. Owned here because the request's span
     // points into a registration the driver may replace while the entry lives on.
     std::vector<std::uint32_t> code;
+    std::vector<std::uint32_t> linkedCallFallbacks;
     std::shared_ptr<const IrResourcePlan> plan;
     // A plan build that threw (an unsupported resource chain or control flow) is remembered and
     // rethrown: the front end ran every pass before failing, ~13 ms per dispatch of a shader the
@@ -547,6 +562,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
             source = std::make_shared<SourceEntry>();
             retainedCounters().sources.fetch_add(1, std::memory_order_relaxed);
             source->code.assign(request.shader.code.begin(), request.shader.code.end());
+            source->linkedCallFallbacks.assign(request.context.linkedCallFallbacks.begin(), request.context.linkedCallFallbacks.end());
             auto& bucket = sources[key];
             if (!bucket.empty()) {
                 // A second entry under one key is a code hash collision (or the unhashed key with
@@ -655,7 +671,8 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program,
     constexpr BindingAllocator bindingAllocator;
     bool registration = request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment);
     program.Metadata().bindingLayoutComplete = false;
-    auto bindings = bindingAllocator.Allocate(program, request.layout, registration);
+    const bool stencilReplay = request.shader.stage == ShaderStage::Fragment && std::ranges::any_of(program.Info().outputs, [](const StageOutput& output) { return output.kind == StageOutputKind::StencilRef; }) && std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityStencilExportEXT)) == request.target.supportedCapabilities.end();
+    auto bindings = bindingAllocator.Allocate(program, request.layout, registration, stencilReplay);
 
     SpirvTargetOptions targetOptions {};
     targetOptions.vulkanVersion = request.target.vulkanVersion;
@@ -678,20 +695,22 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program,
     if (registration && result.spirv.size() > request.target.registrationWordLimit) {
         registration = false;
         program.Metadata().bindingLayoutComplete = false;
-        bindings = bindingAllocator.Allocate(program, request.layout, false);
+        bindings = bindingAllocator.Allocate(program, request.layout, false, stencilReplay);
         targetOptions.registrationModules = false;
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
     }
     result.registrationModule = registration;
+    result.stencilReplaySafe = (request.shader.stage == ShaderStage::Vertex || stencilReplay) && StencilReplaySafe(program);
+    if (stencilReplay) {
+        result.stencilReferences = StencilReferenceValues(program);
+        result.stencilReferenceDword = bindings.layout.stencilReferenceDword;
+    }
 
     result.bdaAbiVersion = program.Info().usesDma || program.Info().usesFaultBuffer ? request.target.bdaAbiVersion : 0u;
     result.memoryOffsetDword = bindings.layout.memoryOffsetDword;
     result.shaderDataDwords = bindings.layout.ShaderDataDwords();
     result.imageMetadataDword = bindings.layout.ImageMetadataDword();
     result.runtimeImageCount = bindings.layout.runtimeImageCount;
-    for (std::uint32_t index = 0; index < program.Info().images.size(); ++index) {
-        if (program.Info().images[index].indirectRoot != ImageResource::NoIndirectImage) result.runtimeImageResources.push_back(index);
-    }
     result.hostSubgroupSize = HostSubgroupSize(request);
     result.vertexOffsetSgpr = program.Info().vertexOffsetSgpr;
     result.instanceOffsetSgpr = program.Info().instanceOffsetSgpr;
@@ -769,15 +788,24 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     }
     std::map<std::uint32_t, std::uint32_t> values;
     std::set<std::uint32_t> specializedIds;
+    std::set<std::uint32_t> pushTypes;
+    std::optional<std::uint32_t> replaySlotBytes;
     const auto& words = source.Words();
     if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid prepared specialization module");
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
         const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
         if (count == 0u || count > words.size() - cursor) throw std::runtime_error("truncated prepared specialization instruction");
+        if (!artifact.stencilReferences.empty() && op == spv::OpTypePointer && count == 4u && words[cursor + 2u] == spv::StorageClassPushConstant) pushTypes.insert(words[cursor + 3u]);
         if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId) {
             const auto found = supplied.find(words[cursor + 3u]);
-            if (found == supplied.end() || !values.emplace(words[cursor + 1u], found->second).second) throw std::runtime_error("missing or duplicate prepared specialization value");
+            if (found == supplied.end()) throw std::runtime_error("missing prepared specialization value");
+            auto value = found->second;
+            if (!artifact.stencilReferences.empty()) {
+                if (found->first == PipelineSpecialization::StencilReferenceOffset) replaySlotBytes = value / PushData::DwordCount * NativePushSlotSize;
+                if (found->first == PipelineSpecialization::StencilReferenceOffset || found->first == PipelineSpecialization::PushDataOffset) value %= PushData::DwordCount;
+            }
+            if (!values.emplace(words[cursor + 1u], value).second) throw std::runtime_error("duplicate prepared specialization value");
             specializedIds.insert(found->first);
         }
         cursor += count;
@@ -789,6 +817,10 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         if (op == spv::OpSpecConstant) {
             if (count != 4u || !values.contains(words[cursor + 2u])) throw std::runtime_error("invalid prepared specialization constant");
             materialized.insert(materialized.end(), {(4u << 16u) | spv::OpConstant, words[cursor + 1u], words[cursor + 2u], values.at(words[cursor + 2u])});
+        } else if (op == spv::OpMemberDecorate && count == 5u && words[cursor + 3u] == spv::DecorationOffset && pushTypes.contains(words[cursor + 1u])) {
+            if (!replaySlotBytes || words[cursor + 2u] != 0u || *replaySlotBytes >= NativePushConstantSize) throw std::runtime_error("invalid stencil replay push constant slot");
+            materialized.insert(materialized.end(), words.begin() + cursor, words.begin() + cursor + count - 1u);
+            materialized.push_back(*replaySlotBytes);
         } else if (!(op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId)) {
             materialized.insert(materialized.end(), words.begin() + cursor, words.begin() + cursor + count);
         }
@@ -1026,6 +1058,9 @@ RecompileResult materializeSkeleton(const CompiledVariant& variant, const Recomp
         .parameterExports = artifact.parameterExports,
         .fragmentParameters = artifact.fragmentParameters,
         .barycentricEmulation = artifact.barycentricEmulation,
+        .stencilReferences = artifact.stencilReferences,
+        .stencilReplaySafe = artifact.stencilReplaySafe,
+        .stencilReferenceDword = artifact.stencilReferenceDword,
         .variantId = artifact.variantId
     };
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
@@ -1036,6 +1071,7 @@ RecompileResult materializeSkeleton(const CompiledVariant& variant, const Recomp
     auto& moduleKey = HostThreadLocal<std::vector<std::uint32_t>, LocalModuleKeyStorage>();
     moduleKey.clear();
     if (variant.bindings.layout.UsesPushData()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u);
+    if (!artifact.stencilReferences.empty()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u + artifact.stencilReferenceDword);
     if (request.context.pixel) {
         for (const auto packing : request.context.pixel->targetExportPacking) moduleKey.push_back(static_cast<std::uint32_t>(packing));
         moduleKey.push_back(request.context.pixel->dualSourceBlend ? 1u : 0u);
@@ -1084,6 +1120,7 @@ RecompileResult materializeSkeleton(const CompiledVariant& variant, const Recomp
             auto constants = plan->bindings.specialization;
             std::size_t index = 0;
             if (variant.bindings.layout.UsesPushData()) constants.push_back({PipelineSpecialization::PushDataOffset, moduleKey[index++]});
+            if (!artifact.stencilReferences.empty()) constants.push_back({PipelineSpecialization::StencilReferenceOffset, moduleKey[index++]});
             if (request.context.pixel) {
                 for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) constants.push_back({PipelineSpecialization::ExportPackingBase + target, moduleKey[index++]});
                 constants.push_back({PipelineSpecialization::DualSourceBlend, moduleKey[index++]});
@@ -1136,8 +1173,13 @@ void fillMaterializedValues(RecompileResult& result, const CompiledVariant& vari
     }
     const DescriptorBindingPlan* bindingPlan = parts.bindings;
     const auto& runtimeSelectors = parts.runtimeSelectors;
-    DescriptorBindingBuilder{}.Populate(result, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));
+    const auto tables = ResourceMaterializer::ResolveImageTables(variant.info.info, snapshot, artifact.variantId);
+    DescriptorBindingBuilder{}.Populate(result, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
+    if (!artifact.stencilReferences.empty()) {
+        if (artifact.stencilReferenceDword * sizeof(std::uint32_t) != result.pushConstants.size() || result.pushConstants.size() + sizeof(std::uint32_t) > request.layout.pushConstantSizeBytes) throw std::runtime_error("stencil replay push constant lies outside the stage range");
+        result.pushConstants.resize(result.pushConstants.size() + sizeof(std::uint32_t));
+    }
     const auto& layout = variant.bindings.layout;
     if (artifact.registrationModule && request.shader.stage != ShaderStage::Fragment && layout.runtimeStateDwords != 0u) {
         const auto first = layout.RuntimeStateDword() + RuntimeAbi::StateVertexSelectors;
@@ -1153,6 +1195,20 @@ void fillMaterializedValues(RecompileResult& result, const CompiledVariant& vari
     }
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
     result.bdaWrites = variant.info.info.bdaWrites || variant.info.info.usesDma;
+    result.imageTablePoison.clear();
+    result.imageTableRanges.clear();
+    result.imageTableReadRanges.clear();
+    result.imageTableShader = 0;
+    result.imageTableFaults = 0;
+    if (!tables.map.empty()) {
+        result.imageTablePoison.reserve(tables.poison.size());
+        for (const auto& poison : tables.poison) result.imageTablePoison.push_back({poison.words, poison.dwordCount, poison.resource, static_cast<std::uint32_t>(poison.reason)});
+        result.imageTableRanges = snapshot.tables.ranges;
+        result.imageTableReadRanges.reserve(snapshot.tables.tables.size());
+        for (const auto& table : snapshot.tables.tables) result.imageTableReadRanges.push_back(table.readRanges);
+        result.imageTableShader = snapshot.tables.shader;
+        result.imageTableFaults = tables.faults;
+    }
 }
 
 RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false) {
@@ -1379,6 +1435,29 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     for (const auto stride : snapshot.uniformFill.groupStride) mix(stride);
     mix(snapshot.uniformFill.words);
     mix(snapshot.uniformFill.value);
+    const auto& tables = snapshot.tables;
+    mix(tables.shader);
+    mix(tables.tables.size());
+    for (const auto& table : tables.tables) {
+        mix(table.base);
+        mix(table.size);
+        mix(table.records);
+        mix(table.keys);
+        mix(table.fault);
+        mix(table.outside ? 1u : 0u);
+        mixWords(table.codes);
+        mix(table.readRanges.size());
+        for (const auto& [base, size] : table.readRanges) {
+            mix(base);
+            mix(size);
+        }
+    }
+    mixDescriptors(tables.words);
+    mix(tables.ranges.size());
+    for (const auto& [base, size] : tables.ranges) {
+        mix(base);
+        mix(size);
+    }
     for (const auto threads : partialThreads(request)) mix(threads);
     mix(request.layout.pushConstantOffsetBytes);
     if (request.context.pixel) {
@@ -1771,6 +1850,7 @@ bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& 
     const auto words = prepared.ShaderDataDwords();
     const bool usesPush = prepared.runtimeImageCount == 0u && words != 0u && words <= layout.pushConstantSizeBytes / 4u;
     if (prepared.UsesPushData() != usesPush) return false;
+    if (!handle.artifact->artifact.stencilReferences.empty() && (prepared.stencilReferenceDword >= layout.pushConstantSizeBytes / 4u || prepared.stencilReferenceDword != (usesPush ? words : 0u))) return false;
     if (!std::ranges::equal(key, handle.staticKey) || handle.source->code.size() != request.shader.code.size()) return false;
     return handle.source->code.data() == request.shader.code.data() || std::ranges::equal(handle.source->code, request.shader.code);
 }
@@ -1780,7 +1860,9 @@ std::span<const std::uint32_t> GetPreparedCode(const SourceHandle& handle) {
     return handle.source->code;
 }
 
-PreparedShaderInvocation::PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle) : request(request), handle(handle) {}
+PreparedShaderInvocation::PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle) : request(request), handle(handle) {
+    this->request.context.linkedCallFallbacks = handle->source->linkedCallFallbacks;
+}
 
 std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle) {
     struct PreparedKeyStorage {};

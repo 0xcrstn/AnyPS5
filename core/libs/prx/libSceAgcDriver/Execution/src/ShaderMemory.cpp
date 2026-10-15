@@ -238,13 +238,18 @@ bool FeedsDescriptorDirectly(const ShaderRecompiler::ResourceCapture& capture, s
     return false;
 }
 
+bool UsesImageTables(const ShaderRecompiler::IrResourcePlan& plan) {
+    return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const ShaderRecompiler::DescriptorSource& source) { return source.tableColumn.has_value(); }) ||
+        std::any_of(plan.info.images.begin(), plan.info.images.end(), [](const ShaderRecompiler::ImageResource& image) { return image.table != ShaderRecompiler::NoTable; }) ||
+        std::any_of(plan.info.samplers.begin(), plan.info.samplers.end(), [](const ShaderRecompiler::SamplerResource& sampler) { return sampler.table != ShaderRecompiler::NoTable; });
+}
+
 const std::vector<std::pair<std::uint64_t, std::uint32_t>>& DataLeaves(MemoEntry& entry) {
     if (entry.dataLeavesBuilt) return entry.dataLeaves;
     entry.dataLeavesBuilt = true;
     const auto& trace = entry.capture->readTrace;
     const auto& plan = *entry.capture->plan;
-    const auto& sources = plan.descriptorSources;
-    if (trace.leaves.empty() || std::any_of(sources.begin(), sources.end(), [](const ShaderRecompiler::DescriptorSource& source) { return source.indirectImage.has_value(); })) return entry.dataLeaves;
+    if (trace.leaves.empty() || UsesImageTables(plan)) return entry.dataLeaves;
     for (const auto& [slot, address] : trace.leaves) {
         if (slot >= plan.pureFlatSlots.size() || plan.pureFlatSlots[slot] == 0u || slot >= entry.capture->snapshot.flattenedSrt.size()) continue;
         if (std::binary_search(trace.otherReads.begin(), trace.otherReads.end(), address)) continue;
@@ -357,8 +362,7 @@ struct Relocation {
 bool RelocationFor(const MemoEntry& entry, std::span<const std::uint32_t> userData, Relocation& relocation) {
     const auto& use = entry.capture->userDataUse;
     relocation = {};
-    const auto& sources = entry.capture->plan->descriptorSources;
-    if (std::any_of(sources.begin(), sources.end(), [](const ShaderRecompiler::DescriptorSource& source) { return source.indirectImage.has_value(); })) return false;
+    if (UsesImageTables(*entry.capture->plan)) return false;
     for (std::size_t word = 0; word < userData.size(); ++word) {
         if (entry.userData[word] == userData[word] || !WordRead(use, word)) continue;
         if (AllWordsRead(use) || word >= ShaderRecompiler::SrtUserDataUse::TrackedWords || ((use.asValue >> word) & 1u) != 0u || ((use.asBase >> word) & 1u) == 0u) return false;
@@ -901,6 +905,46 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     return true;
 }
 
+bool ShaderMemory::overlapsInitial(std::uint64_t begin, std::uint64_t end) const {
+    if (initial.empty()) return false;
+    const auto after = initial.lower_bound(begin);
+    if (after != initial.end() && after->first < end) return true;
+    return after != initial.begin() && std::prev(after)->first + std::prev(after)->second.size() > begin;
+}
+
+bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count) {
+    auto& self = *static_cast<ShaderMemory*>(context);
+    while (count != 0) {
+        const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
+        const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(std::uint32_t));
+        const auto words = static_cast<std::size_t>(std::min<std::uint64_t>(count, PageWords - index));
+        const auto bytes = static_cast<std::uint64_t>(words) * sizeof(std::uint32_t);
+        Page* page = nullptr;
+        if (!self.direct && address % sizeof(std::uint32_t) == 0 && address <= std::numeric_limits<std::uint64_t>::max() - bytes && !self.overlapsInitial(address, address + bytes)) page = &self.page(base);
+        if (page != nullptr && page->valid.all()) {
+            std::memcpy(values, page->words.data() + index, bytes);
+            std::bitset<PageWords> mask;
+            mask.set();
+            mask >>= PageWords - words;
+            mask <<= index;
+            page->read |= mask;
+            page->recent |= mask;
+            self.readCount += words;
+            if (self.recording != nullptr) {
+                for (std::size_t word = 0; word < words; ++word) self.recording->push_back({address + word * sizeof(std::uint32_t), 0, values[word]});
+            }
+        } else {
+            for (std::size_t word = 0; word < words; ++word) {
+                if (!read(context, address + word * sizeof(std::uint32_t), values + word)) return false;
+            }
+        }
+        address += bytes;
+        values += words;
+        count -= words;
+    }
+    return true;
+}
+
 bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_t bytes) {
     auto& self = *static_cast<ShaderMemory*>(context);
     const bool result = self.probe(address, bytes);
@@ -933,6 +977,17 @@ bool ShaderMemory::probe(std::uint64_t address, std::uint64_t bytes) {
         address = pageEnd;
     }
     return true;
+}
+
+bool ShaderMemory::pending(void* context, std::uint64_t address, std::uint64_t bytes) {
+    const auto& self = *static_cast<const ShaderMemory*>(context);
+    if (self.pendingWrite == nullptr || bytes == 0) return false;
+    const auto policy = self.pendingWrite(address, static_cast<std::size_t>(bytes), {});
+    return policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue;
+}
+
+bool ShaderMemory::UsesImageTables(const ShaderRecompiler::IrResourcePlan& plan) {
+    return AgcDriver::UsesImageTables(plan);
 }
 
 ShaderMemory::KnownValueCounts ShaderMemory::KnownValues() {
@@ -1186,6 +1241,8 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.readMemory = &read;
     runtime.readSpecializationMemory = &read;
     runtime.accessible = &accessible;
+    runtime.pendingWrite = &pending;
+    runtime.readWords = &readWords;
     auto capture = invocation != nullptr ? (valuesOnly ? invocation->CaptureValues(runtime) : invocation->Capture(runtime)) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);

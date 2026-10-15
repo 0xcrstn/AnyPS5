@@ -5,7 +5,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData) {
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
         if (!registerKey) {
@@ -63,7 +63,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(pixel.interpolatorCount);
             for (std::uint32_t i = 0; i < pixel.interpolatorCount; ++i) mix(pixel.interpolatorSettings[i]);
             mix(pixel.inputAddr);
-            for (const bool flag : {pixel.wave32, pixel.hasPerspectiveCenterVgpr, pixel.perspectiveCentroid, pixel.posX, pixel.posY, pixel.posZ, pixel.posW, pixel.frontFace, pixel.ancillary, pixel.sampleShading, pixel.noPerspective, pixel.linearCentroid, pixel.pixelKillEnable, pixel.depthExportEnable, pixel.sampleMaskExportEnable, pixel.earlyZ, pixel.executeOnNoop}) mix(flag);
+            for (const bool flag : {pixel.wave32, pixel.hasPerspectiveCenterVgpr, pixel.perspectiveCentroid, pixel.posX, pixel.posY, pixel.posZ, pixel.posW, pixel.frontFace, pixel.frontFaceAllBits, pixel.ancillary, pixel.sampleShading, pixel.noPerspective, pixel.linearCentroid, pixel.pixelKillEnable, pixel.depthExportEnable, pixel.sampleMaskExportEnable, pixel.earlyZ, pixel.executeOnNoop}) mix(flag);
             mix(static_cast<std::uint64_t>(pixel.conservativeZExport));
             mix(pixel.orderedPixelShader);
             mix(pixel.stencilRefExportEnable);
@@ -74,6 +74,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(pixel.alphaToCoverage);
             mix(static_cast<std::uint64_t>(pixel.rasterPrimitive));
             mix(pixel.ditheredAlphaToCoverage);
+            mix(pixel.quadPixelMask);
+            for (const auto mask : pixel.quadSampleMask) mix(mask);
             std::lock_guard cacheLock(drawCacheMutex);
             ++drawEntryCounters.lookups;
             const auto found = drawCache.find(drawKey);
@@ -84,12 +86,13 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 drawSizing.Miss(drawKey, drawCache.size(), drawCacheVariantBytes);
                 ++drawEntryCounters.absent;
             }
+            maybeReportDrawCache(profile);
         }
         if (entry != nullptr) {
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             std::optional<DrawMiss> miss;
             std::vector<std::size_t> ranks(programs.size(), 0);
-            std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, partial = 0, dataPatched = 0, validatedRuns = 0, validatedWords = 0, nestedMoved = 0, nestedRefused = 0;
+            std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, partial = 0, dataPatched = 0, validatedRuns = 0, validatedWords = 0, nestedMoved = 0, nestedRefused = 0, dataStages = 0, dataWords = 0;
             double stageValidateUs = 0, patchUs = 0;
             auto& split = ThreadDrawValidateSplit();
             split = DrawValidateSplit{profile};
@@ -127,7 +130,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         appendEntryRegions(*variant, regions);
                         ++compared;
                         std::vector<std::pair<std::uint32_t, std::uint32_t>> live;
-                        const bool data = drawRelocationEnabled() && !variant->dataPositions.empty();
+                        const bool data = (drawRelocationEnabled() || drawStageDataHits()) && !variant->dataPositions.empty();
                         const auto validateStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, data ? &live : nullptr);
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, data ? &live : nullptr);
@@ -144,6 +147,12 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             result = patched != nullptr ? EntryOutcome::Equal : EntryOutcome::Differing;
                             if (patched != nullptr) {
                                 ++dataPatched;
+                                ++dataStages;
+                                dataWords += live.size();
+                                if (verifyDrawDataHits()) {
+                                    stageData[i].words = patched->words;
+                                    stageData[i].compiled = patched->compiled;
+                                }
                                 variant = std::move(patched);
                                 regions.clear();
                                 appendEntryRegions(*variant, regions);
@@ -195,6 +204,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             }
             if (drawHit) {
                 ++counters.hits;
+                counters.stageDataHits += dataStages;
+                counters.stageDataWords += dataWords;
                 if (registerKey) ++counters.registerKeyHits;
                 ++drawCacheHits;
                 bool rotate = false;
@@ -210,6 +221,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         auto rotated = std::make_shared<DrawEntry>();
                         rotated->decode = entry->decode;
                         rotated->stages = entry->stages;
+                        rotated->shape = entry->shape;
                         rotated->recipes.store(entry->recipes.load());
                         for (std::size_t i = 0; i < programs.size(); ++i) {
                             if (ranks[i] == 0) continue;
@@ -232,6 +244,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     verifyHit = true;
                     drawHit = false;
                 }
+                if (dataStages != 0 && verifyDrawDataHits()) drawHit = false;
             } else {
                 ++counters.misses[static_cast<std::size_t>(*miss)];
                 if (registerKey && entry->decode != nullptr) ++counters.decodePartial;
@@ -243,9 +256,21 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 phaseMs[DrawRowKeyLookupValidate] -= waited;
                 phaseMs[DrawRowValidateWait] += waited;
                 counters.validateUs += phaseMs[DrawRowKeyLookupValidate] * 1000;
-                if (std::chrono::steady_clock::now() - counters.lastReport > std::chrono::seconds(10)) {
-                    counters.lastReport = std::chrono::steady_clock::now();
-                    reportDrawCache(counters);
+            }
+        } else if (dataEntry != nullptr && graphics.stages.path == Graphics::ShaderPath::Vertex && dataEntry->stages.size() == programs.size() && dataEntry->decode->programs.size() == programs.size()) {
+            std::uint64_t imagesFlushed = 0, runsSynced = 0;
+            const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
+            std::optional<SampledReadScope> sampling;
+            for (std::size_t i = 0; i < programs.size(); ++i) {
+                if (roles[i] == Role::GeometryBack || programs[i].userData != dataEntry->decode->programs[i].userData) continue;
+                auto& candidates = dataCandidates[i];
+                for (const auto& variant : dataEntry->stages[i]) {
+                    if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
+                    std::vector<ShaderRecompiler::MemoryRegion> regions;
+                    appendEntryRegions(*variant, regions);
+                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
+                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
+                    if (result == EntryOutcome::Equal) candidates.emplace_back(variant, std::move(regions));
                 }
             }
         }

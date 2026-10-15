@@ -50,6 +50,7 @@
 #include <chrono>
 #include <charconv>
 #include <condition_variable>
+#include <future>
 #include <fstream>
 #include <cctype>
 #include <cstdlib>
@@ -106,6 +107,7 @@ bool CoreVulkanCapability(std::uint32_t capability) {
 }
 
 std::atomic<std::uint64_t> computePipelinesCreated{0};
+std::atomic<std::uint64_t> computePipelinesCreatedLocked{0};
 
 void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr) {
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -123,6 +125,7 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
     check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
     computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
+    if (GuestMemory::GpuMutex().HeldByThisThread()) computePipelinesCreatedLocked.fetch_add(1, std::memory_order_relaxed);
 }
 
 // Pipelines are shared by dispatches of one compiled variant and push-constant use (0: not shared).
@@ -317,6 +320,8 @@ struct VulkanDevice::State {
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
     bool float16DenormPreserve = false;
+    bool demoteToHelperInvocation = false;
+    bool earlyFragmentSampleMaskTestBeforeSampleCounting = false;
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
     bool descriptorIndexing = false;
@@ -388,8 +393,8 @@ struct VulkanDevice::State {
     // dispatch's find-or-insert and the verify switch's lookups touch the map, recipes hold weak
     // references to its objects.
     PipelineSingleflight<PipelineCompileKey, ComputePipelineObjects> computePipelines;
-    std::shared_ptr<ComputePipelineObjects> BuildComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, const Graphics::ShaderResources* resources = nullptr);
-    std::shared_ptr<ComputePipelineObjects> GetComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, const Graphics::ShaderResources* resources = nullptr, bool ahead = false, bool* created = nullptr);
+    std::shared_ptr<ComputePipelineObjects> BuildComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey = {});
+    std::shared_ptr<ComputePipelineObjects> GetComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey = {}, bool ahead = false, bool* created = nullptr);
     std::shared_ptr<ComputePipelineObjects> FindComputePipeline(const PipelineCompileKey& key, bool demand = true);
     mutable std::mutex compileQueueMutex;
     std::unique_ptr<PipelineCompileQueue> compileQueue;
@@ -764,6 +769,7 @@ struct VulkanDevice::State {
             copiedWriters->clear();
             resourceCache.Clear();
             Graphics::ClearCachedTextures(device);
+            Graphics::ClearSnapshotCopies(device);
             Graphics::ClearImageMirrors(device);
             Graphics::ClearHostImports(device);
             patternBuffers.clear();
@@ -1194,6 +1200,20 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->narrowSubgroupClock = NarrowSubgroupClock(driver.driverID, state->properties.deviceID, state->properties.deviceName);
         APS5_LOG_OUT("Shader clock driver=%d narrowSubgroupClock=%d", static_cast<int>(driver.driverID), state->narrowSubgroupClock ? 1 : 0);
     }
+    VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT demoteFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT};
+    if (hasExtension(VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &demoteFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        state->demoteToHelperInvocation = demoteFeatures.shaderDemoteToHelperInvocation == VK_TRUE;
+    }
+    demoteFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT};
+    demoteFeatures.shaderDemoteToHelperInvocation = VK_TRUE;
+    if (hasExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+        VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &maintenance5};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
+        state->earlyFragmentSampleMaskTestBeforeSampleCounting = maintenance5.earlyFragmentSampleMaskTestBeforeSampleCounting == VK_TRUE;
+    }
     std::vector<const char*> deviceExtensions;
     if (window != nullptr) deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
     if (window != nullptr && hasExtension(VK_EXT_HDR_METADATA_EXTENSION_NAME)) {
@@ -1250,6 +1270,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->capabilities.push_back(spv::CapabilityShaderViewportIndexLayerEXT);
         state->spirvExtensions.push_back("SPV_EXT_shader_viewport_index_layer");
         state->viewportIndexLayer = true;
+    }
+    if (state->demoteToHelperInvocation) {
+        deviceExtensions.push_back(VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME);
+        state->capabilities.push_back(spv::CapabilityDemoteToHelperInvocation);
+        state->spirvExtensions.push_back("SPV_EXT_demote_to_helper_invocation");
     }
     deviceExtensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
     state->capabilities.push_back(spv::CapabilitySignedZeroInfNanPreserve);
@@ -1465,6 +1490,14 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     enabled.tessellationShader = available.tessellationShader;
     state->tessellationShader = enabled.tessellationShader == VK_TRUE;
     if (state->tessellationShader) state->capabilities.push_back(3);
+    VkPhysicalDeviceShaderDrawParametersFeatures drawParametersFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};
+    {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &drawParametersFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+    }
+    const bool drawParameters = drawParametersFeatures.shaderDrawParameters == VK_TRUE;
+    drawParametersFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, nullptr, VK_TRUE};
+    if (drawParameters) state->capabilities.push_back(spv::CapabilityDrawParameters);
     APS5_LOG_OUT("Vulkan features tessellationAvailable=%u mesh=%u depthClip=%u depthRangeUnrestricted=%u pipelineLibrary=%u", static_cast<unsigned>(state->tessellationShader), static_cast<unsigned>(state->meshShader), static_cast<unsigned>(state->depthClipControl), static_cast<unsigned>(state->depthRangeUnrestricted), static_cast<unsigned>(state->graphicsPipelineLibrary));
     require(available.samplerAnisotropy && available.textureCompressionBC, "device lacks sampler anisotropy or BC texture compression support required for texture sampling");
     enabled.samplerAnisotropy = VK_TRUE;
@@ -1552,9 +1585,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
         state->descriptorIndexing = descriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing == VK_TRUE && descriptorIndexingFeatures.shaderStorageImageArrayNonUniformIndexing == VK_TRUE;
         state->storageBufferUpdateAfterBind = descriptorIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind == VK_TRUE;
-        state->descriptorBindingPartiallyBound = compileOnly && descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE;
-        state->descriptorBindingVariableDescriptorCount = compileOnly && descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount == VK_TRUE;
-        state->runtimeDescriptorArray = compileOnly && descriptorIndexingFeatures.runtimeDescriptorArray == VK_TRUE;
+        state->descriptorBindingPartiallyBound = descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE;
+        state->descriptorBindingVariableDescriptorCount = descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount == VK_TRUE;
+        state->runtimeDescriptorArray = descriptorIndexingFeatures.runtimeDescriptorArray == VK_TRUE;
         if (state->storageBufferUpdateAfterBind) {
             VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &state->descriptorIndexingProperties};
             state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
@@ -1648,6 +1681,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         imageAtomicInt64Features.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &imageAtomicInt64Features;
     }
+    if (state->demoteToHelperInvocation) {
+        demoteFeatures.pNext = byteFeatures.pNext;
+        byteFeatures.pNext = &demoteFeatures;
+    }
     VkPhysicalDeviceImageRobustnessFeaturesEXT imageRobustnessFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT, nullptr, VK_TRUE};
     if (imageRobustness) {
         imageRobustnessFeatures.pNext = byteFeatures.pNext;
@@ -1656,6 +1693,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (state->descriptorIndexing || state->storageBufferUpdateAfterBind || state->descriptorBindingPartiallyBound || state->descriptorBindingVariableDescriptorCount || state->runtimeDescriptorArray) {
         descriptorIndexingFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &descriptorIndexingFeatures;
+    }
+    if (drawParameters) {
+        drawParametersFeatures.pNext = byteFeatures.pNext;
+        byteFeatures.pNext = &drawParametersFeatures;
     }
     // Timeline semaphores let a queue worker wait for recorded batches without holding the GPU mutex
     // (see Recorder::WaitSerial). The instance is 1.1, so the KHR extension is used even on 1.2+
@@ -2322,6 +2363,10 @@ bool AliasCopy(const Graphics::Context& context, std::uint64_t destination, std:
 
 VulkanDevice::CopyVerification VulkanDevice::CopyVerifyCounts() {
     return {copiesVerified.load(std::memory_order_relaxed), copySourceChanged.load(std::memory_order_relaxed), copyDestinationChanged.load(std::memory_order_relaxed), copyReaderMissed.load(std::memory_order_relaxed)};
+}
+
+VulkanDevice::ComputePipelineCreation VulkanDevice::ComputePipelineCounts() {
+    return {computePipelinesCreated.load(std::memory_order_relaxed), computePipelinesCreatedLocked.load(std::memory_order_relaxed)};
 }
 
 VulkanDevice::CopyAliasing VulkanDevice::CopyAliasCounts() {
@@ -3510,6 +3555,11 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.descriptorIndexing = state->descriptorIndexing;
     context.descriptorIndexingLimits = state->descriptorIndexingProperties;
     context.imageInt64Atomics = state->imageInt64Atomics;
+    context.runtimeDescriptorArray = state->runtimeDescriptorArray;
+    context.partiallyBound = state->descriptorBindingPartiallyBound;
+    context.variableDescriptorCount = state->descriptorBindingVariableDescriptorCount;
+    context.imageTableCapacity = ImageTableCapacity(context);
+    context.samplerTableCapacity = SamplerTableCapacity(context);
     context.geometryShader = state->geometryShader;
     context.sampleRateShading = state->sampleRateShading;
     context.shaderClipDistance = state->shaderClipDistance;
@@ -3518,6 +3568,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.bufferInt64Atomics = state->bufferInt64Atomics;
     context.placeholderImages = state->placeholderImages.get();
     context.viewportIndexLayer = state->viewportIndexLayer;
+    context.demoteToHelperInvocation = state->demoteToHelperInvocation;
+    context.earlyFragmentSampleMaskTestBeforeSampleCounting = state->earlyFragmentSampleMaskTestBeforeSampleCounting;
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
@@ -3663,6 +3715,7 @@ struct PreparedDispatch {
     // The variant's pipeline objects, created here for a new variant (null: the dispatch looks
     // them up or creates them under the mutex).
     std::shared_ptr<ComputePipelineObjects> objects;
+    std::vector<std::uint32_t> describedLayoutKey;
 };
 
 struct RecipeHit {
@@ -4116,7 +4169,7 @@ std::uint64_t VulkanDevice::presync(std::span<const std::pair<std::uint64_t, std
 
 // The pipeline layout takes the resources' set layout: layouts built from the same bindings are
 // compatible, so the objects serve every dispatch of the variant.
-std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, const Graphics::ShaderResources* resources) {
+std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey) {
     auto objects = std::make_shared<ComputePipelineObjects>();
     objects->device = device;
     objects->destroyModule = DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
@@ -4139,18 +4192,15 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
     const Graphics::PipelineSpecialization specialization(shader);
     const auto subgroupSize = computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > maxComputeSubgroupSize) ? std::min(shader.hostSubgroupSize, maxComputeSubgroupSize) : 0u;
     if (const char* directory = std::getenv("APS5_DUMP_COMPUTE_PIPELINES"); directory != nullptr && *directory != '\0' && CaptureComputePipeline(shader.spirv.size())) {
-        require(resources != nullptr, "compute capture requires the dispatch resources");
+        require(!layoutKey.empty(), "compute capture requires the described set layout");
         ComputePipelineCapture capture;
         capture.spirv = shader.spirv.Copy();
         ComputeDescriptorSetLayout resourcesLayout;
-        resourcesLayout.flags = resources->LayoutUpdateAfterBind() ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
-        const auto layoutBindings = resources->LayoutBindings();
-        const auto bindingFlags = resources->LayoutBindingFlags();
-        require(layoutBindings.size() == bindingFlags.size(), "compute capture binding flag count differs from layout");
-        for (std::size_t index = 0; index < layoutBindings.size(); ++index) {
-            const auto& binding = layoutBindings[index];
-            require(binding.pImmutableSamplers == nullptr, "compute capture does not support immutable samplers");
-            resourcesLayout.bindings.push_back({binding.binding, binding.descriptorType, binding.descriptorCount, binding.stageFlags, bindingFlags[index]});
+        const bool updateAfterBind = layoutKey.size() % 4u == 1u;
+        resourcesLayout.flags = updateAfterBind ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
+        for (std::size_t index = 0; index + 4u <= layoutKey.size(); index += 4u) {
+            const auto type = static_cast<VkDescriptorType>(layoutKey[index + 1u]);
+            resourcesLayout.bindings.push_back({layoutKey[index], type, layoutKey[index + 2u], layoutKey[index + 3u], updateAfterBind && type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0u});
         }
         capture.sets.push_back(std::move(resourcesLayout));
         if (shader.workgroupMemoryDwords != 0) capture.sets.push_back({0, {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0}}});
@@ -4182,14 +4232,14 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
     return objects;
 }
 
-std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::GetComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, const Graphics::ShaderResources* resources, bool ahead, bool* created) {
-    if (key.first == 0) return BuildComputePipeline(context, shader, resourcesLayout, pushStages, programAddress, resources);
+std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::GetComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey, bool ahead, bool* created) {
+    if (key.first == 0) return BuildComputePipeline(context, shader, resourcesLayout, pushStages, programAddress, layoutKey);
     if (!ahead && PipelineCompileThreads() != 0) {
         std::lock_guard lock(compileQueueMutex);
         if (compileQueue != nullptr) compileQueue->Demand(key);
     }
     auto result = computePipelines.GetOrBuild(key, [&] {
-        auto objects = BuildComputePipeline(context, shader, resourcesLayout, pushStages, programAddress, resources);
+        auto objects = BuildComputePipeline(context, shader, resourcesLayout, pushStages, programAddress, layoutKey);
         objects->aheadUnused.store(ahead, std::memory_order_relaxed);
         return objects;
     });
@@ -4233,7 +4283,7 @@ void VulkanDevice::BuildComputePipelineAhead(const ShaderRecompiler::RecompileRe
             const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &request->shader, 0}}};
             const auto described = Graphics::DescribeSetLayouts(context, shaders);
             bool created = false;
-            compileState->GetComputePipeline(key, context, request->shader, described.layouts.main, stages, programAddress, nullptr, true, &created);
+            compileState->GetComputePipeline(key, context, request->shader, described.layouts.main, stages, programAddress, described.mainKey, true, &created);
             return created;
         };
     });
@@ -4306,10 +4356,15 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     const std::array<Graphics::CompiledShader, 1> shaders{{compute}};
     const auto pushStages = Graphics::PushConstantStages(shaders);
     const bool pushFits = pushStages == 0 || state->properties.limits.maxPushConstantsSize >= Graphics::ComputePushConstantBytes;
-    if (!LockedPipelines() && pushFits && built.Layout() != VK_NULL_HANDLE) {
-        const auto key = ComputePipelineKey(shader, pushStages);
-        prepared->objects = state->FindComputePipeline(key);
-        if (prepared->objects == nullptr) prepared->objects = state->GetComputePipeline(key, context, shader, built.Layout(), pushStages, programAddress, &built);
+    if (!LockedPipelines() && pushFits) {
+        if (built.Layout() != VK_NULL_HANDLE) {
+            const auto layouts = built.SetLayouts();
+            prepared->objects = computePipeline(context, shader, layouts.main, layouts.mainKey, pushStages, programAddress);
+        } else if (context.descriptorCache != nullptr) {
+            const auto described = Graphics::DescribeSetLayouts(context, shaders);
+            prepared->describedLayoutKey = described.mainKey;
+            prepared->objects = computePipeline(context, shader, described.layouts.main, described.mainKey, pushStages, programAddress);
+        }
     }
     if (profile) prepared->prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     return prepared;
@@ -4592,6 +4647,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recordStep(PhaseRecordCompletion);
 }
 
+std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, VkShaderStageFlags pushStages, std::uint64_t programAddress) {
+    const auto key = ComputePipelineKey(shader, pushStages);
+    if (auto found = state->FindComputePipeline(key)) return found;
+    return state->GetComputePipeline(key, context, shader, setLayout, pushStages, programAddress, layoutKey);
+}
+
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut) {
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
@@ -4675,6 +4736,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         const auto before = profile ? resources->Timing() : Graphics::ShaderResources::BuildTiming{};
         const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         resources->Complete();
+        require(prepared->describedLayoutKey.empty() || std::ranges::equal(resources->SetLayouts().mainKey, prepared->describedLayoutKey), "the set layout described for the dispatch's pipeline differs from its build");
         if (profile) {
             const auto completeWall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - completeStart).count();
             timer.add(PhaseResourcesComplete, completeWall);
@@ -4750,13 +4812,14 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         d.cacheReport = std::chrono::steady_clock::now();
         AgcDriver::ProfilePrint_nid_no_patch("[rescache] %llu hits, %llu misses, %llu invalidated, %zu entries (dispatch + draw); template hits: %llu refreshed the data buffers (revalidate %.1f ms), %llu had the same words; Find calls %llu, Touch calls %llu\n", static_cast<unsigned long long>(d.cacheHits), static_cast<unsigned long long>(d.cacheMisses), static_cast<unsigned long long>(d.cacheInvalidated), state->resourceCache.Size(), static_cast<unsigned long long>(d.templateRefreshed), d.templateRevalidateMs, static_cast<unsigned long long>(d.templateSameWords), static_cast<unsigned long long>(ResourceCache::Finds()), static_cast<unsigned long long>(ResourceCache::Touches()));
         AgcDriver::ProfilePrint_nid_no_patch("%s", state->resourceCache.Report().c_str());
-        AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call: %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped));
+        AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call: %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu; compute pipelines created %llu (%llu under the GPU mutex)\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped), static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(computePipelinesCreatedLocked.load(std::memory_order_relaxed)));
         reportRecipes();
     }
     timing.Mark("shader_resources");
     timer.phase(PhaseResources);
     if (objects == nullptr) {
-        objects = state->GetComputePipeline(pipelineKey, context, shader, resources->Layout(), pushStages, programAddress, resources.get());
+        const auto layouts = resources->SetLayouts();
+        objects = state->GetComputePipeline(pipelineKey, context, shader, layouts.main, pushStages, programAddress, layouts.mainKey);
         timing.Mark("pipeline_create");
         timer.phase(PhasePipeline);
     }

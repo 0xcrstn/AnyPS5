@@ -20,6 +20,7 @@ struct Binding {
     DescriptorRole role;
     std::vector<std::uint32_t> words;
     std::uint32_t count = 1;
+    std::vector<std::uint32_t> shapes;
 };
 
 std::vector<std::uint32_t> shaderKey(bool dataWords, bool movable, const std::vector<Binding>& bindings) {
@@ -31,6 +32,8 @@ std::vector<std::uint32_t> shaderKey(bool dataWords, bool movable, const std::ve
         if (emitted) key.insert(key.end(), binding.words.begin(), binding.words.end());
         for (int flags = 0; flags < 9; ++flags) key.push_back(0u);
         key.push_back(0u);
+        key.push_back(static_cast<std::uint32_t>(binding.shapes.size()));
+        key.insert(key.end(), binding.shapes.begin(), binding.shapes.end());
     }
     return key;
 }
@@ -85,6 +88,20 @@ void testDispatchKey() {
     changedData[3].words[0] += 1;
     check(ShaderResources::DiffContentKeys(noData, shaderKey(false, false, changedData), false, diff), "data words left out");
     expectOnly(diff, std::nullopt, "data words are not part of the key without dataWords");
+    std::vector<Binding> table{{DescriptorRole::ImageTable, {50, 51, 52, 53, 54, 55, 56, 57}, 1, {1}}, {DescriptorRole::SamplerTable, {60, 61, 62, 63}}};
+    const auto tableBase = shaderKey(true, false, table);
+    auto tableWord = table;
+    tableWord[0].words[2] += 1;
+    check(ShaderResources::DiffContentKeys(tableBase, shaderKey(true, false, tableWord), false, diff), "image table word");
+    expectOnly(diff, ContentKeyComponent::Image, "image table word");
+    auto tableShape = table;
+    tableShape[0].shapes[0] += 1;
+    check(ShaderResources::DiffContentKeys(tableBase, shaderKey(true, false, tableShape), false, diff), "image table shape");
+    expectOnly(diff, ContentKeyComponent::Image, "image table shape");
+    auto samplerWord = table;
+    samplerWord[1].words[1] += 1;
+    check(ShaderResources::DiffContentKeys(tableBase, shaderKey(true, false, samplerWord), false, diff), "sampler table word");
+    expectOnly(diff, ContentKeyComponent::Sampler, "sampler table word");
 }
 
 std::vector<std::uint32_t> withDevice(std::vector<std::uint32_t> key, std::uint32_t device) {
