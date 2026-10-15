@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreationTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -272,12 +273,17 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         VkResult created;
         LibraryBuildNote note{part, 0.0, 0.0, optimize, false, 0u};
         {
+            PipelineCreationTrace trace("pipeline.library_part", context.pipelineCreationFeedback, create.stageCount);
+            trace.Event().Number("part", part).Flag("prebuild", partsOnly).Flag("store_lock_held", !partsOnly).Flag("retain_lto", optimize).Hex("part_key", ShaderCompileTrace::HashOf(std::span<const std::byte>(key)));
+            trace.Chain(create);
             const auto waiting = std::chrono::steady_clock::now();
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
             note.lockWaitMs = millisecondsSince(waiting);
             const auto creating = std::chrono::steady_clock::now();
             created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
             note.createMs = millisecondsSince(creating);
+            trace.Created(created);
+            trace.Event().Real("cache_lock_wait_us", note.lockWaitMs * 1000.0);
         }
         if (partsOnly) lock.lock();
         Check(created, "vkCreateGraphicsPipelines library");
@@ -314,11 +320,16 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     VkPipeline pipeline = VK_NULL_HANDLE;
     {
         LibraryBuildNote note{PipelineLinkPart, 0.0, 0.0, false, false, 0u};
+        PipelineCreationTrace trace("pipeline.link", context.pipelineCreationFeedback, 0u);
+        trace.Event().Number("libraries", libraries.size()).Flag("store_lock_held", true);
+        trace.Chain(create);
         const auto waiting = std::chrono::steady_clock::now();
         auto pipelineCacheLock = context.LockPipelineCacheForUse();
         note.lockWaitMs = millisecondsSince(waiting);
         const auto creating = std::chrono::steady_clock::now();
-        Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &pipeline), "vkCreateGraphicsPipelines link");
+        const auto linkedResult = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &pipeline);
+        trace.Created(linkedResult);
+        Check(linkedResult, "vkCreateGraphicsPipelines link");
         note.createMs = millisecondsSince(creating);
         ThreadLibraryBuildNotes().push_back(note);
     }
@@ -332,19 +343,28 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         const auto cache = context.pipelineCache;
         const auto cacheSynchronization = context.pipelineCacheSynchronization;
         const auto libraryLayout = fullLayout;
-        enqueue(store, context.device, [slot, createPipelines, cache, cacheSynchronization, libraryLayout, libraries, &store, devicePointer = &device] {
-            if (slot->released.load()) return;
+        const bool feedback = context.pipelineCreationFeedback;
+        const auto enqueued = ShaderCompileTrace::Clock::now();
+        enqueue(store, context.device, [slot, createPipelines, cache, cacheSynchronization, libraryLayout, libraries, &store, devicePointer = &device, feedback, enqueued] {
+            PipelineCreationTrace trace("pipeline.lto", feedback, 0u);
+            trace.Event().Queued(enqueued).Number("libraries", libraries.size());
+            if (slot->released.load()) {
+                trace.Event().Flag("released_before_start", true);
+                return;
+            }
             VkPipelineLibraryCreateInfoKHR linked{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
             linked.libraryCount = static_cast<std::uint32_t>(libraries.size());
             linked.pLibraries = libraries.data();
             VkGraphicsPipelineCreateInfo create{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &linked};
             create.flags = VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
             create.layout = libraryLayout;
+            trace.Chain(create);
             VkPipeline result = VK_NULL_HANDLE;
             const auto pipelineCreationResult = [&] {
                 auto pipelineCacheLock = cacheSynchronization != nullptr ? cacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
                 return createPipelines(slot->device, cache, 1, &create, nullptr, &result);
             }();
+            trace.Created(pipelineCreationResult);
             if (pipelineCreationResult != VK_SUCCESS) return;
             slot->handle.store(result);
             if (slot->released.load()) {

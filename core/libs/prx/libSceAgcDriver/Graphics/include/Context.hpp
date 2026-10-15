@@ -219,6 +219,7 @@ struct Context {
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
+    bool pipelineCreationFeedback = false;
     bool graphicsPipelineLibrary = false;
     bool pipelineLinkTimeOptimization = true;
     std::uint32_t srgbDecodeFormats = 0;

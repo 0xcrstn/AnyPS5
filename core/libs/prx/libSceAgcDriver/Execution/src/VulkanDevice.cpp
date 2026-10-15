@@ -35,6 +35,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreationTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -109,7 +110,7 @@ bool CoreVulkanCapability(std::uint32_t capability) {
 std::atomic<std::uint64_t> computePipelinesCreated{0};
 std::atomic<std::uint64_t> computePipelinesCreatedLocked{0};
 
-void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr) {
+void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr, Graphics::PipelineCreationTrace* trace = nullptr) {
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.flags = flags;
     info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -122,8 +123,11 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     subgroup.requiredSubgroupSize = subgroupSize;
     if (subgroupSize != 0) info.stage.pNext = &subgroup;
     info.layout = layout;
+    if (trace != nullptr) trace->Chain(info);
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
-    check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
+    const auto created = create(device, cache, 1, &info, nullptr, pipeline);
+    if (trace != nullptr) trace->Created(created);
+    check(created, "vkCreateComputePipelines");
     computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
     if (GuestMemory::GpuMutex().HeldByThisThread()) computePipelinesCreatedLocked.fetch_add(1, std::memory_order_relaxed);
 }
@@ -339,6 +343,7 @@ struct VulkanDevice::State {
     bool pipelineLinkTimeOptimization = true;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
+    bool pipelineCreationFeedback = false;
     bool maintenance8 = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool storageImageWithoutFormat = false;
@@ -1754,6 +1759,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
         pipelineFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &pipelineFeatures;
+    }
+    if (ShaderCompileTrace::Enabled() && hasExtension(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME)) {
+        state->pipelineCreationFeedback = true;
+        deviceExtensions.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
     VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     if (hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
@@ -3573,6 +3584,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
+    context.pipelineCreationFeedback = state->pipelineCreationFeedback;
     context.srgbDecodeFormats = state->srgbDecodeFormats;
     context.sampleLocationSampleCounts = state->sampleLocationSampleCounts;
     context.sampleLocationGridSampleCounts = state->sampleLocationGridSampleCounts;
@@ -3632,6 +3644,8 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
 }
 
 void VulkanDevice::PrewarmDrawPipeline(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) {
+    ShaderCompileTrace::Event event("demand.graphics_pipeline");
+    event.Flag("gpu_mutex_held", GuestMemory::GpuMutex().HeldByThisThread()).Number("stages", shaders.size());
     Graphics::PrewarmPipeline(graphicsContext(), graphics, shaders);
 }
 
@@ -4225,7 +4239,9 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
         std::snprintf(text, sizeof(text), "compute pipeline creation for program 0x%llx (%zu SPIR-V words)", static_cast<unsigned long long>(programAddress), shader.spirv.size());
         return std::string(text);
     });
-    CreateComputePipeline(device, DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization);
+    Graphics::PipelineCreationTrace trace("pipeline.compute", context.pipelineCreationFeedback, 1u);
+    if (trace.Event().Active()) trace.Event().Hex("address", programAddress).Hex("variant", shader.PipelineVariantId()).Number("spirv_words", shader.spirv.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(shader.spirv.Words())).Hex("layout_key", ShaderCompileTrace::HashOf(layoutKey)).Number("specialization_constants", shader.specialization.size()).Flag("gpu_mutex_held", GuestMemory::GpuMutex().HeldByThisThread());
+    CreateComputePipeline(device, DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization, &trace);
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
     Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
@@ -4234,6 +4250,11 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
 
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::GetComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey, bool ahead, bool* created) {
     if (key.first == 0) return BuildComputePipeline(context, shader, resourcesLayout, pushStages, programAddress, layoutKey);
+    std::optional<ShaderCompileTrace::Event> demandEvent;
+    if (!ahead) {
+        demandEvent.emplace("demand.compute_pipeline");
+        demandEvent->Hex("address", programAddress).Hex("variant", key.first).Flag("gpu_mutex_held", GuestMemory::GpuMutex().HeldByThisThread());
+    }
     if (!ahead && PipelineCompileThreads() != 0) {
         std::lock_guard lock(compileQueueMutex);
         if (compileQueue != nullptr) compileQueue->Demand(key);
@@ -4244,6 +4265,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::GetComputePipeline(
         return objects;
     });
     if (created != nullptr) *created = result.created;
+    if (demandEvent.has_value()) demandEvent->Flag("created", result.created).Flag("joined", result.joined);
     if (!ahead && PipelineCompileThreads() != 0) {
         if (result.joined) aheadJoined.fetch_add(1, std::memory_order_relaxed);
         if (result.value->aheadUnused.exchange(false, std::memory_order_relaxed)) aheadUseful.fetch_add(1, std::memory_order_relaxed);

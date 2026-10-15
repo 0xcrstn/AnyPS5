@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/SlowReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreationTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -15,6 +17,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <list>
+#include <span>
+#include <string>
 #include <mutex>
 #include <string_view>
 #include <type_traits>
@@ -589,10 +593,27 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             if (!builds.empty()) described += "; " + builds;
             return described;
         });
-        if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
-        else {
+        const auto traceStages = [&](ShaderCompileTrace::Event& event) {
+            if (!event.Active()) return;
+            for (std::size_t index = 0; index < shaders.size(); ++index) {
+                const auto prefix = "stage" + std::to_string(index);
+                event.Text(prefix + "_kind", StageName(shaders[index].stage)).Hex(prefix + "_address", shaders[index].programAddress).Number(prefix + "_spirv_words", shaders[index].program->spirv.size()).Hex(prefix + "_spirv_hash", ShaderCompileTrace::HashOf(shaders[index].program->spirv.Words()));
+            }
+            event.Hex("layout_key", ShaderCompileTrace::HashOf(std::span<const std::byte>(keys.layout))).Flag("libraries", libraries).Flag("gpu_mutex_held", GuestMemory::GpuMutex().HeldByThisThread());
+        };
+        if (libraries) {
+            ShaderCompileTrace::Event linkEvent("pipeline.graphics_from_libraries");
+            traceStages(linkEvent);
+            pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+        } else {
+            PipelineCreationTrace trace("pipeline.graphics", context.pipelineCreationFeedback, pipelineInfo.stageCount);
+            traceStages(trace.Event());
+            trace.Chain(pipelineInfo);
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
-            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+            const auto created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline);
+            trace.Created(created);
+            trace.Unchain(pipelineInfo);
+            Check(created, "vkCreateGraphicsPipelines");
         }
         if (alternateAlpha) {
             blend.pAttachments = secondChannels.data();

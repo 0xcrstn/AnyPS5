@@ -506,6 +506,21 @@ target_link_libraries(agc_materialize_values_tests PRIVATE shader_recompiler_agc
 set_target_properties(agc_materialize_values_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_materialize_values_tests)
 
+add_test_executable(agc_compile_trace_tests EXCLUDE_FROM_ALL tests/CompileTrace.cpp)
+target_include_directories(agc_compile_trace_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_compile_trace_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_compile_trace_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_compile_trace_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_compile_trace_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_compile_trace COMMAND agc_compile_trace_tests)
+    set_tests_properties(agc_compile_trace PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_compile_trace PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_pipeline_compile_queue_tests EXCLUDE_FROM_ALL tests/PipelineCompileQueue.cpp)
 target_include_directories(agc_pipeline_compile_queue_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_pipeline_compile_queue_tests PRIVATE shader_recompiler_agc_driver libc)
