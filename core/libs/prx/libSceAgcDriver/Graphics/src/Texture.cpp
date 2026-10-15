@@ -4963,11 +4963,12 @@ void StorageTexture::supersedeHandedFrom(std::uint32_t first, std::uint32_t coun
             if (source == nullptr || source->version != handOver.version || theirs >= source->trackedLayers) return true;
             if (!source->layerPending[theirs]) return true;
             source->layerPending[theirs] = false;
+            source->layerOriginal[theirs] = false;
+            source->cancelStoredSave(theirs);
             ++dropped;
             return true;
         });
         if (dropped != 0) {
-            source->layerOriginal.assign(source->trackedLayers, false);
             source->reconcilePending();
             handOverSuperseded.fetch_add(dropped, std::memory_order_relaxed);
         }
