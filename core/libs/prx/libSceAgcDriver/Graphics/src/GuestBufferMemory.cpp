@@ -2100,7 +2100,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
     // back here and finishes lease batches below.
     std::vector<std::shared_ptr<ShaderResources>> templates;
     try {
-        SharedResourceCache().RemoveAddressTemplates(templates);
+        ResourceCache::RemoveLeaseHolders(templates);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] address template eviction failed: %s\n", error.what());
     }

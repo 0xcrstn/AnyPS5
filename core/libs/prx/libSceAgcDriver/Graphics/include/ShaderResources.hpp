@@ -283,6 +283,7 @@ public:
     bool KnownAddressWrites() const { return usesBda && bdaReadOnly && !guestMemory.HasCopiedWrites(); }
     bool HasPlacements() const;
     bool DispatchEffectsKnown() const { return tableStages.empty() && !guestMemory.HasCopiedWrites() && !HasPlacements(); }
+    bool WritesThroughPointers() const { return usesBda && !bdaReadOnly; }
     void UseMirrors(Recorder& recorder) const;
     void RecordPlacementCopyBack(Recorder& recorder, VkCommandBuffer commands) const;
     void PublishResidentReads(Recorder& recorder) const;
@@ -786,6 +787,9 @@ public:
     static CacheSizing::Limits DefaultLimits();
     ResourceCache();
     explicit ResourceCache(CacheSizing::Limits limits);
+    ~ResourceCache();
+    ResourceCache(const ResourceCache&) = delete;
+    ResourceCache& operator=(const ResourceCache&) = delete;
     std::shared_ptr<ShaderResources> Find(const Key& key);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
@@ -795,7 +799,7 @@ public:
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
     void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
-    void RemoveAddressTemplates(std::vector<std::shared_ptr<ShaderResources>>& evicted);
+    static void RemoveLeaseHolders(std::vector<std::shared_ptr<ShaderResources>>& evicted);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
@@ -813,6 +817,7 @@ public:
 
 private:
     void erase(const Key& key);
+    void removeLeaseHolders(std::vector<std::shared_ptr<ShaderResources>>& evicted);
     void evictOverLimit(std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteMiss(const Key& key);
     struct KeyHash {

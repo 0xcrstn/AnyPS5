@@ -3347,7 +3347,37 @@ CacheSizing::Limits ResourceCache::DefaultLimits() {
 
 ResourceCache::ResourceCache() : ResourceCache(DefaultLimits()) {}
 
-ResourceCache::ResourceCache(CacheSizing::Limits limits) : sizing(limits) {}
+namespace {
+
+struct CacheRegistry {
+    std::mutex mutex;
+    std::vector<ResourceCache*> caches;
+};
+
+CacheRegistry& Caches() {
+    static auto* registry = new CacheRegistry();
+    return *registry;
+}
+
+}
+
+ResourceCache::ResourceCache(CacheSizing::Limits limits) : sizing(limits) {
+    auto& registry = Caches();
+    std::lock_guard lock(registry.mutex);
+    registry.caches.push_back(this);
+}
+
+ResourceCache::~ResourceCache() {
+    auto& registry = Caches();
+    std::lock_guard lock(registry.mutex);
+    std::erase(registry.caches, this);
+}
+
+void ResourceCache::RemoveLeaseHolders(std::vector<std::shared_ptr<ShaderResources>>& evicted) {
+    auto& registry = Caches();
+    std::lock_guard lock(registry.mutex);
+    for (auto* cache : registry.caches) cache->removeLeaseHolders(evicted);
+}
 
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
@@ -3552,10 +3582,10 @@ void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::sh
     }
 }
 
-void ResourceCache::RemoveAddressTemplates(std::vector<std::shared_ptr<ShaderResources>>& evicted) {
+void ResourceCache::removeLeaseHolders(std::vector<std::shared_ptr<ShaderResources>>& evicted) {
     std::lock_guard lock(mutex);
     for (auto it = entries.begin(); it != entries.end();) {
-        if (!it->resources->AddressTemplate()) {
+        if (!it->resources->HoldsLease()) {
             ++it;
             continue;
         }

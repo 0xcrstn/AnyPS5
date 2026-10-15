@@ -4293,6 +4293,11 @@ void Recorder::FlushDeferredReleases() {
     ReleaseDeferredKeeps();
 }
 
+void Recorder::WaitDeferredReleases() {
+    FlushDeferredReleases();
+    while (deferredPending.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+}
+
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
     if (bytes == 0) return;
     const auto end = address + bytes;
