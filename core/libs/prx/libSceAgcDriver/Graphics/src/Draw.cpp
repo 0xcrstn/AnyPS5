@@ -456,8 +456,8 @@ struct DrawOutcome {
 
 // The resources of a draw: a recipe hit (reserved for the draw recipe step), a resource-cache
 // template hit, a build, or an address-based (BDA) build.
-enum DrawKind : std::size_t { KindRecipeHit, KindTemplateHit, KindBuild, KindBda, KindCount };
-constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "template hit", "build", "BDA"};
+enum DrawKind : std::size_t { KindRecipeHit, KindTemplateHit, KindBuild, KindBda, KindAddressHit, KindBdaWriter, KindCount };
+constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "template hit", "build", "BDA reading", "BDA template hit", "BDA writing"};
 
 struct DrawProfile {
     std::mutex mutex;
@@ -1759,7 +1759,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 if (verifyAddress && cached->AddressTemplate()) cached->VerifyAddressTemplate(ShaderResources(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots));
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
-                outcome.kind = KindTemplateHit;
+                outcome.kind = resolved.resources->AddressTemplate() ? KindAddressHit : KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
                 countCache(&DrawProfile::cacheMisses);
@@ -1776,7 +1776,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
-        outcome.kind = outcome.addressBased ? KindBda : KindBuild;
+        outcome.kind = !outcome.addressBased ? KindBuild : resolved.resources->WritesThroughPointers() ? KindBdaWriter : KindBda;
         if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
     }
     timer.phase(PhaseResources);
