@@ -19,6 +19,8 @@
 #include <future>
 #include <memory>
 #include <stdexcept>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <system_error>
 
@@ -980,11 +982,27 @@ int APS5_VABI scePthreadSetprio(Pthread thread, int prio) {
     return SCE_OK;
 }
 
+static std::mutex& OnceMutex() {
+    static auto* const mutex = new std::mutex();
+    return *mutex;
+}
+
+static std::condition_variable& OnceSettled() {
+    static auto* const settled = new std::condition_variable();
+    return *settled;
+}
+
+static void SettleOnce(int32_t* once, int32_t value) {
+    {
+        std::lock_guard lock(OnceMutex());
+        std::atomic_ref<int32_t>(*once).store(value, std::memory_order_release);
+    }
+    OnceSettled().notify_all();
+}
+
 static void APS5_VABI ResetOnce(void* once) {
     constexpr int32_t Never = 0;
-    std::atomic_ref<int32_t> state(*static_cast<int32_t*>(once));
-    state.store(Never, std::memory_order_release);
-    state.notify_all();
+    SettleOnce(static_cast<int32_t*>(once), Never);
 }
 
 int APS5_VABI scePthreadOnce(int32_t* once, void (APS5_VABI* init)(void)) {
@@ -995,7 +1013,8 @@ int APS5_VABI scePthreadOnce(int32_t* once, void (APS5_VABI* init)(void)) {
     std::atomic_ref<int32_t> state(*once);
     for (int32_t expected = Never; !state.compare_exchange_strong(expected, Running, std::memory_order_acq_rel); expected = Never) {
         if (expected != Running) return SCE_OK;
-        state.wait(Running, std::memory_order_acquire);
+        std::unique_lock lock(OnceMutex());
+        OnceSettled().wait(lock, [&] { return state.load(std::memory_order_acquire) != Running; });
     }
     CleanupHandler reset{};
     void* const mark = ThreadCancel::CleanupMark();
@@ -1008,8 +1027,7 @@ int APS5_VABI scePthreadOnce(int32_t* once, void (APS5_VABI* init)(void)) {
         throw;
     }
     ThreadCancel::CleanupRestore(mark);
-    state.store(Done, std::memory_order_release);
-    state.notify_all();
+    SettleOnce(once, Done);
     return SCE_OK;
 }
 

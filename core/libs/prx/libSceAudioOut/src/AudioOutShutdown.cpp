@@ -1,5 +1,7 @@
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include "prx/libc/include/Shutdown.hpp"
 #include "AudioOutShutdown.hpp"
 
@@ -8,13 +10,26 @@ namespace {
 std::atomic<std::uint32_t> inside{0};
 std::atomic<bool> stopping{false};
 
+std::mutex& InsideMutex() {
+    static auto* const mutex = new std::mutex();
+    return *mutex;
+}
+
+std::condition_variable& InsideChanged() {
+    static auto* const changed = new std::condition_variable();
+    return *changed;
+}
+
 void Leave() {
-    if (inside.fetch_sub(1) == 1) inside.notify_all();
+    if (inside.fetch_sub(1) != 1) return;
+    { std::lock_guard lock(InsideMutex()); }
+    InsideChanged().notify_all();
 }
 
 void Stop() {
     stopping.store(true);
-    for (auto count = inside.load(); count != 0; count = inside.load()) inside.wait(count);
+    std::unique_lock lock(InsideMutex());
+    InsideChanged().wait(lock, [] { return inside.load() == 0; });
 }
 
 }
