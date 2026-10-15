@@ -5363,7 +5363,7 @@ void verifyBdaReadFallbackFunctions() {
 
 void verifyFunctionLdsBound() {
     using namespace ShaderRecompiler;
-    const auto build = [](const auto& body, std::uint32_t allocation = FunctionLdsDwordLimit) {
+    const auto build = [](const auto& body, std::uint32_t allocation = FunctionLdsDwordLimit, std::uint32_t unbounded = FunctionLdsDwordLimit) {
         IrProgram program;
         program.Resources().stage = IrShaderStage::Pixel;
         for (const std::uint32_t offset : {0u, 256u, 512u, 0xfffffff0u}) {
@@ -5394,7 +5394,7 @@ void verifyFunctionLdsBound() {
         auto& active = program.CreateValue(IrOpcode::Void, IrType::U1);
         active.SetImmediateBool(true);
         body(program, block, emit, constant, active);
-        return std::pair{FunctionLdsDwords(program), AnalyzeProgramRequirements(program, allocation)};
+        return std::pair{FunctionLdsDwords(program), AnalyzeProgramRequirements(program, allocation, unbounded)};
     };
 
     const auto [laneSlots, laneRequirements] = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
@@ -5485,6 +5485,10 @@ void verifyFunctionLdsBound() {
     require(allocated.functionLdsDwords == 192u && allocated.functionLdsAddresses.size() == 3u, "function LDS: lane slots inside the allocation must keep their bounded size and constant slots");
     const auto truncated = build(laneSlotsWrite, 128u).second;
     require(truncated.functionLdsDwords == 128u && truncated.functionLdsAddresses.empty(), "function LDS: lane slots past the allocation must take the allocation and keep the lane term");
+    require(build(unboundedWrite, FunctionLdsDwordLimit, 96u).second.functionLdsDwords == 96u, "function LDS: an address without a bound and no declared allocation must take the parameter space");
+    const auto parameterSlots = build(laneSlotsWrite, FunctionLdsDwordLimit, 96u).second;
+    require(parameterSlots.functionLdsDwords == 192u && parameterSlots.functionLdsAddresses.size() == 3u, "function LDS: bounded lane slots must keep their size without a declared allocation");
+    require(build(unboundedWrite, 256u, 96u).second.functionLdsDwords == 96u, "function LDS: the unbounded fallback must not exceed the declared allocation");
     bool rejected = false;
     try {
         static_cast<void>(build(unboundedWrite, 0u));
