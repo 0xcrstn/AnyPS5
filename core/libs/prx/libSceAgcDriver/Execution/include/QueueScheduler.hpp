@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_QUEUESCHEDULER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_QUEUESCHEDULER_HPP
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -147,6 +148,8 @@ private:
     std::exception_ptr closed;
     bool isClosed = false;
     Statistics statistics;
+    std::atomic<std::uint64_t> concurrentTurns{0};
+    std::atomic<bool> closedFlag{false};
     std::FILE* capture = nullptr;
     std::vector<Position> replayTurns;
     std::size_t replayNext = 0;

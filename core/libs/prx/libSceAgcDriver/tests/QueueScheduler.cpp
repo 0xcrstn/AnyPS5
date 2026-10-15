@@ -205,6 +205,7 @@ void TestDagRunsConcurrently() {
     }
     for (auto& worker : workers) worker.join();
     Expect(together.load(), "dag mode serialized two streams");
+    Expect(scheduler.Take().turns == 2 && scheduler.Holder() == QueueScheduler::NoQueue, "dag turns taken without the scheduler mutex were not counted");
 }
 
 void TestVerifyInjection() {
