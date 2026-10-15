@@ -2056,7 +2056,7 @@ std::filesystem::path planOutputPath(std::size_t index) {
 std::filesystem::path planEntryPath(PlanFixture& fixture) {
     std::vector<std::byte> key;
     ShaderDiskCache::BuildPlanKey(fixture.Request(true), 32u, key);
-    return ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key);
+    return ShaderDiskCache::PlanEntryDirectory() / ShaderDiskCache::EntryName(key);
 }
 
 std::filesystem::path planFailurePath(PlanFixture& fixture) {
@@ -2064,7 +2064,7 @@ std::filesystem::path planFailurePath(PlanFixture& fixture) {
     ShaderDiskCache::BuildPlanKey(fixture.Request(true), 32u, planKey);
     std::vector<std::byte> key;
     ShaderDiskCache::BuildPlanFailureKey(planKey, key);
-    return ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key);
+    return ShaderDiskCache::PlanEntryDirectory() / ShaderDiskCache::EntryName(key);
 }
 
 std::filesystem::path refusalPath() {

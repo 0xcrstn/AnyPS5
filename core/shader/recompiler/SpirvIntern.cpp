@@ -43,8 +43,8 @@ ContentKey contentKey(const std::vector<std::uint32_t>& words) {
 bool SpirvInternEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_SPIRV_INTERN");
-        if (value == nullptr || *value == '\0' || std::string_view(value) == "0") return false;
-        if (std::string_view(value) == "1") return true;
+        if (value == nullptr || *value == '\0' || std::string_view(value) == "1") return true;
+        if (std::string_view(value) == "0") return false;
         throw std::invalid_argument("APS5_SPIRV_INTERN accepts only 0 or 1");
     }();
     return enabled;

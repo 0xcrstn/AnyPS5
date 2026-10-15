@@ -94,7 +94,7 @@ void TestObservationFloor() {
 }
 
 void TestModes() {
-    Expect(ParseLabelTimeline(nullptr) == LabelTimelineMode::Off && ParseLabelTimeline("on") == LabelTimelineMode::On && ParseLabelTimeline("verify") == LabelTimelineMode::Verify, "label timeline modes parse");
+    Expect(ParseLabelTimeline(nullptr) == LabelTimelineMode::On && ParseLabelTimeline("off") == LabelTimelineMode::Off && ParseLabelTimeline("verify") == LabelTimelineMode::Verify, "label timeline modes parse");
     Expect(Throws([] { ParseLabelTimeline("1"); }), "an unknown label timeline mode throws");
 }
 

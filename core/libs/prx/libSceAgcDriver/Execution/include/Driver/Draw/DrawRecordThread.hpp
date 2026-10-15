@@ -112,9 +112,31 @@ struct CommandProcessorReadCounters {
     std::uint64_t reads = 0;
     std::uint64_t ahead = 0;
     std::uint64_t verified = 0;
+    std::uint64_t registerState = 0;
 };
 
 CommandProcessorReadCounters CommandProcessorReadTotals();
+
+struct LabelRecordJobCounters {
+    std::uint64_t packets = 0;
+    std::uint64_t jobs = 0;
+    std::uint64_t labels = 0;
+    std::uint64_t endOfPipe = 0;
+};
+
+LabelRecordJobCounters LabelRecordJobTotals();
+
+inline bool RegisterStatePacket(std::uint32_t header) {
+    const auto opcode = (header >> 8u) & 0xffu;
+    if (opcode == 0x11 || opcode == 0x12) return true;
+    if (opcode != 0x10) return false;
+    switch ((header >> 2u) & 0x3fu) {
+    case 0x00: case 0x09: case 0x0b: case 0x0c: case 0x1a:
+        return true;
+    default:
+        return false;
+    }
+}
 
 inline bool OverlapsDrawRecords(std::uint32_t opcode, bool predicated, bool dispatches = false) {
     if (predicated) return false;

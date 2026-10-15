@@ -125,6 +125,10 @@ bool SplitsSets(const Context& context, std::span<const CompiledShader> shaders)
 // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.
 std::shared_ptr<CompileTicket> TryCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
+struct PipelineCacheProbeStatistics {
+    std::uint64_t hits = 0, misses = 0;
+};
+PipelineCacheProbeStatistics GraphicsPipelineCacheProbes();
 void ClearCachedPipelines(VkDevice device);
 bool HasStencil(VkFormat format);
 // Device limit checks of the viewport, which is dynamic state and so no longer checked by Pipeline.

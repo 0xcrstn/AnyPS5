@@ -1392,6 +1392,7 @@ public:
 
     [[nodiscard]] bool Enabled() const { return !directory.empty(); }
     [[nodiscard]] const std::filesystem::path& Directory() const { return directory; }
+    [[nodiscard]] const std::filesystem::path& PlanDirectory() const { return planDirectory; }
 
     bool Load(std::span<const std::byte> key, CompiledVariant& variant) {
         if (loadPrebuilt(key, variant)) return true;
@@ -1818,8 +1819,8 @@ std::uint64_t SourceVersion() {
 bool LayeredCache() {
     static const bool layered = [] {
         const char* value = std::getenv("APS5_SHADER_CACHE_V2");
-        if (value == nullptr || *value == '\0' || std::string_view(value) == "0") return false;
-        if (std::string_view(value) == "1") return true;
+        if (value == nullptr || *value == '\0' || std::string_view(value) == "1") return true;
+        if (std::string_view(value) == "0") return false;
         throw std::invalid_argument("APS5_SHADER_CACHE_V2 accepts only 0 or 1");
     }();
     return layered;
@@ -1977,6 +1978,10 @@ bool Enabled() {
 
 std::filesystem::path EntryDirectory() {
     return store().Directory();
+}
+
+std::filesystem::path PlanEntryDirectory() {
+    return store().PlanDirectory();
 }
 
 bool Load(std::span<const std::byte> key, CompiledVariant& variant) {

@@ -2576,13 +2576,22 @@ void verifyDescriptorPhis() {
         return request;
     };
     const auto countOps = [](std::span<const std::uint32_t> words, std::uint32_t opcode) {
-        std::size_t count = 0;
+        std::map<std::uint32_t, std::size_t> perFunction;
+        std::map<std::uint32_t, std::size_t> calls;
+        std::uint32_t entry = 0;
+        std::uint32_t current = 0;
         for (std::size_t cursor = 5; cursor < words.size();) {
             const auto length = words[cursor] >> 16u;
             require(length != 0 && length <= words.size() - cursor, "descriptor Phi: truncated SPIR-V instruction");
-            count += (words[cursor] & 0xffffu) == opcode ? 1u : 0u;
+            const auto op = words[cursor] & 0xffffu;
+            if (op == 15u) entry = words[cursor + 2];
+            if (op == 54u) current = words[cursor + 2];
+            if (op == 57u) ++calls[words[cursor + 3]];
+            if (op == opcode) ++perFunction[current];
             cursor += length;
         }
+        std::size_t count = 0;
+        for (const auto& [function, uses] : perFunction) count += function == entry ? uses : uses * calls[function];
         return count;
     };
     constexpr std::uint32_t OpImageSampleExplicitLod = 88;
@@ -5273,6 +5282,7 @@ void verifyBdaReadFallbackFunctions() {
             const auto reader = std::string("read_bda_dword_bytes") + (barrier ? "" : "_stop") + (coherent ? "_coherent" : "");
             const auto span = std::string("read_bda_span") + (barrier ? "" : "_stop") + (coherent ? "_coherent" : "");
             const auto loader = std::string("load_bda_span") + (coherent ? "_coherent" : "");
+            const auto spanReader = [&](const std::string& callee) { return callee == span || (callee.size() > span.size() + 1u && callee.starts_with(span + "_") && callee[span.size() + 1u] >= '0' && callee[span.size() + 1u] <= '9'); };
             std::string function;
             std::size_t compareExchanges = 0;
             std::size_t mainLookups = 0;
@@ -5309,7 +5319,7 @@ void verifyBdaReadFallbackFunctions() {
                 if (op == spv::OpFunctionCall && function == "main") {
                     const auto& callee = names[five[cursor + 3]];
                     if (callee == "probe_bda_pointer" || callee.starts_with("read_bda_dword_bytes")) ++mainProbes;
-                    if (callee == span) ++spanCalls;
+                    if (spanReader(callee)) ++spanCalls;
                 }
                 if ((op == spv::OpLoad || op == spv::OpAtomicLoad) && function == span) ++spanLoads;
                 if (op == spv::OpFunctionCall && function == span && names[five[cursor + 3]] == loader) ++spanLoaderCalls;
@@ -5353,7 +5363,7 @@ void verifyBdaReadFallbackFunctions() {
                 const auto op = adjacent[cursor] & 0xffffu;
                 if (op == spv::OpName) names[adjacent[cursor + 1]] = reinterpret_cast<const char*>(&adjacent[cursor + 2]);
                 if (op == spv::OpFunction) function = names[adjacent[cursor + 2]];
-                if (op == spv::OpFunctionCall && function == "main" && names[adjacent[cursor + 3]] == span) ++adjacentSpanCalls;
+                if (op == spv::OpFunctionCall && function == "main" && spanReader(names[adjacent[cursor + 3]])) ++adjacentSpanCalls;
                 cursor += length;
             }
             require(adjacentSpanCalls == 2u, "BDA read functions: five adjacent dwords of one address do not share two span reads");

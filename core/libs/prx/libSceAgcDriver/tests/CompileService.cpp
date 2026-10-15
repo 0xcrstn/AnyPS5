@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/CompileService.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ComputePipelineAheadRequest.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ComputePipelineRecipe.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -327,6 +328,28 @@ void FinishedJobsStayFinished() {
     }
 }
 
+void RecipeRoundTrip() {
+    auto words = std::make_shared<std::vector<std::uint32_t>>(std::initializer_list<std::uint32_t>{0x07230203u, 1, 2, 3, 4, 5});
+    auto source = Source(words);
+    source.runtimeAbiVersion = ShaderRecompiler::RuntimeAbi::Version;
+    const std::vector<std::uint32_t> layout{3, 7, 1, 32};
+    const auto file = EncodeComputeRecipe(source, true, 0x1234u);
+    auto stale = source;
+    stale.runtimeAbiVersion = ShaderRecompiler::RuntimeAbi::Version + 1u;
+    Require(!DecodeComputeRecipe(EncodeComputeRecipe(stale, true, 0x1234u)).has_value(), "a compute recipe of another runtime ABI was accepted");
+    const auto recipe = DecodeComputeRecipe(file);
+    Require(recipe.has_value() && recipe->programAddress == 0x1234u && recipe->pushes, "a compute recipe did not round-trip");
+    Require(ComputePipelineContentKey(*recipe->shader, recipe->pushes, layout) == ComputePipelineContentKey(source, true, layout), "a decoded recipe builds a different pipeline than its source");
+    Require(ComputePipelineRecipeHash(*recipe->shader, recipe->pushes, layout) == ComputePipelineRecipeHash(source, true, layout), "a decoded recipe has a different recipe hash");
+    auto corrupt = file;
+    corrupt[corrupt.size() / 2u] ^= std::byte{0x10};
+    Require(!DecodeComputeRecipe(corrupt).has_value(), "a corrupt compute recipe was accepted");
+    auto truncated = file;
+    truncated.resize(truncated.size() - 9u);
+    Require(!DecodeComputeRecipe(truncated).has_value(), "a truncated compute recipe was accepted");
+    Require(!DecodeComputeRecipe({}).has_value(), "an empty compute recipe was accepted");
+}
+
 std::atomic<bool> guardHeld{false};
 
 void WaitGuard() {
@@ -422,6 +445,7 @@ int main() {
         FinishedJobsStayFinished();
         RecipeVerification();
         ContentIndex();
+        RecipeRoundTrip();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "compile service test failed: %s\n", error.what());
         return 1;

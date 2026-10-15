@@ -15,6 +15,35 @@
 
 namespace AgcDriver::DriverDetail {
 
+Driver::EndOfPipeOutcome Driver::recordEndOfPipe(VulkanDevice* localDevice, std::uint32_t queue, std::span<const std::uint32_t> packet) {
+    EndOfPipeOutcome outcome;
+    const auto label = Pm4::DecodeLabelWrite(packet);
+    const bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
+    int reason = localDevice != nullptr ? 0 : 1;
+    if (label.has_value()) {
+        const auto bytes = label->Bytes();
+        const auto stamp = ++eventSerial;
+        reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, queue) : 4;
+        if (reason == 1) GuestMemory::Write(label->address, bytes, 4);
+        if (reason == 0 || reason == 1 || reason == 5) {
+            noteLabelStore(label->address, bytes, stamp, queue);
+            Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+        }
+        countLabelOutcome(reason);
+        ++immediateLabels;
+    } else {
+        ++noOpLabels;
+    }
+    if (reason == 0 || reason == 5) {
+        outcome.interruptDeferred = localDevice->AfterRecordedWork([queue] { AgcDriverDeliverEopInterrupt(queue); }, queue == 0);
+        if (outcome.interruptDeferred && workOpen) localDevice->SubmitRecorded(queue == 0);
+        outcome.wroteOnGpu = true;
+    } else if (reason == 1) {
+        outcome.wroteOnGpu = true;
+    }
+    return outcome;
+}
+
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -29,34 +58,18 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         const auto label = Pm4::DecodeLabelWrite(packet);
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
         if (label.has_value() || storesNothing) {
-            bumpEpoch(&EpochBumps::drains);
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-            std::lock_guard gpuLock(GuestMemory::GpuMutex());
-            const auto localDevice = device.Load();
-            recordDeferredLabels(localDevice.get(), submission.queue);
-            const bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
-            int reason = localDevice != nullptr ? 0 : 1;
-            if (label.has_value()) {
-                const auto bytes = label->Bytes();
-                const auto stamp = ++eventSerial;
-                reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue) : 4;
-                if (reason == 1) GuestMemory::Write(label->address, bytes, 4);
-                if (reason == 0 || reason == 1 || reason == 5) {
-                    noteLabelStore(label->address, bytes, stamp, submission.queue);
-                    Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
-                }
-                countLabelOutcome(reason);
-                ++immediateLabels;
+            if (freezeEndOfPipe(submission.queue, packet)) {
+                wroteOnGpu = true;
+                interruptDeferred = true;
             } else {
-                ++noOpLabels;
-            }
-            if (reason == 0 || reason == 5) {
-                const auto queueId = submission.queue;
-                interruptDeferred = localDevice->AfterRecordedWork([queueId] { AgcDriverDeliverEopInterrupt(queueId); }, submission.queue == 0);
-                if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0);
-                wroteOnGpu = true;
-            } else if (reason == 1) {
-                wroteOnGpu = true;
+                bumpEpoch(&EpochBumps::drains);
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                const auto localDevice = device.Load();
+                recordDeferredLabels(localDevice.get(), submission.queue);
+                const auto outcome = recordEndOfPipe(localDevice.get(), submission.queue, packet);
+                wroteOnGpu = outcome.wroteOnGpu;
+                interruptDeferred = outcome.interruptDeferred;
             }
         }
     }

@@ -1145,12 +1145,37 @@ bool Recorder::QueueOrderVerify() {
     return verify;
 }
 
+namespace {
+
+std::mutex& CrossQueueSubmitMutex() {
+    static auto* mutex = new std::mutex;
+    return *mutex;
+}
+
+std::atomic<std::uint64_t>& SubmitOrderCounter() {
+    static std::atomic<std::uint64_t> counter{0};
+    return counter;
+}
+
+std::atomic<bool>& OrderWaitsSuppressed() {
+    static std::atomic<bool> suppressed{false};
+    return suppressed;
+}
+
+}
+
+void Recorder::SuppressOrderWaitsForTest(bool suppress) {
+    OrderWaitsSuppressed().store(suppress, std::memory_order_release);
+}
+
 void Recorder::RequireOrderAfter(const Recorder& producer, std::uint64_t serial) {
     Require(&producer != this, "a recorder cannot be ordered after itself");
     Require(producer.timeline != VK_NULL_HANDLE, "ordering after another physical queue needs its timeline semaphore");
     if (serial == 0) return;
-    auto& wait = orderWaits[producer.timeline];
-    wait = std::max(wait, serial);
+    if (!OrderWaitsSuppressed().load(std::memory_order_acquire)) {
+        auto& wait = orderWaits[producer.timeline];
+        wait = std::max(wait, serial);
+    }
     auto& required = requiredOrder[producer.timeline];
     required = std::max(required, serial);
     ++queueOrder.requiredWaits;
@@ -1321,21 +1346,66 @@ void Recorder::Activate() {
     GuestMemory::SetFlushHook(&FlushForAccess);
 }
 
+std::optional<bool> Recorder::LaterLabel(const LabelEntry& first, const LabelEntry& second) {
+    const auto order = [](const LabelEntry& entry) -> std::uint64_t { return entry.batch != nullptr ? entry.batch->submitOrder.load(std::memory_order_acquire) : 0; };
+    const auto firstOrder = order(first);
+    const auto secondOrder = order(second);
+    if (firstOrder != 0 && secondOrder != 0) return secondOrder > firstOrder;
+    if (firstOrder != 0) return true;
+    if (secondOrder != 0) return false;
+    return std::nullopt;
+}
+
 std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) {
-    std::optional<LabelHit> found;
     if (refusal != nullptr) *refusal = LabelRefusal::None;
+    if ((bytes != 4 && bytes != 8) || address % 4 != 0) return std::nullopt;
+    std::array<std::unique_lock<std::mutex>, PhysicalQueues> tableLocks;
+    std::array<const Recorder*, PhysicalQueues> owners{};
+    std::uint32_t ownerCount = 0;
     for (std::uint32_t queue = 0; queue < PhysicalQueues; ++queue) {
         auto& table = Domain(queue);
-        std::lock_guard tableLock(table.labelTableMutex);
-        if (table.labelTableOwner == nullptr) continue;
-        LabelRefusal reason = LabelRefusal::None;
-        auto hit = table.labelTableOwner->lookupLabel(address, bytes, afterStamp, &reason);
-        if (refusal != nullptr && reason != LabelRefusal::None) *refusal = reason;
-        if (!hit.has_value()) continue;
-        Require(!found.has_value(), "a label is pending on two physical queues; composing their label tables is not implemented");
-        found = hit;
+        tableLocks[queue] = std::unique_lock(table.labelTableMutex);
+        owners[queue] = table.labelTableOwner;
+        if (owners[queue] != nullptr) ++ownerCount;
     }
-    return found;
+    if (ownerCount == 0) return std::nullopt;
+    const auto tag = GuestMemory::GpuLockThreadTag();
+    std::array<const LabelEntry*, 2> chosen{};
+    bool queued = false;
+    for (std::size_t offset = 0; offset < bytes; offset += 4) {
+        const LabelEntry* winner = nullptr;
+        bool winnerQueued = false;
+        for (const auto* owner : owners) {
+            if (owner == nullptr) continue;
+            const auto pick = owner->pickLabelLocked(address + offset, tag);
+            if (pick.foreign) return std::nullopt;
+            if (pick.entry == nullptr) continue;
+            if (winner == nullptr) {
+                winner = pick.entry;
+                winnerQueued = pick.queued;
+                continue;
+            }
+            if (winner->behindCompletion || pick.entry->behindCompletion) {
+                if (refusal != nullptr) *refusal = LabelRefusal::BehindCompletion;
+                return std::nullopt;
+            }
+            const auto later = LaterLabel(*winner, *pick.entry);
+            if (!later.has_value()) {
+                if (refusal != nullptr) *refusal = LabelRefusal::Unordered;
+                return std::nullopt;
+            }
+            if (*later) {
+                winner = pick.entry;
+                winnerQueued = pick.queued;
+            }
+        }
+        if (winner == nullptr) return std::nullopt;
+        chosen[offset / 4] = winner;
+        queued = queued || winnerQueued;
+    }
+    auto hit = evaluateLabel(std::span<const LabelEntry* const>(chosen.data(), bytes / 4), afterStamp, refusal);
+    if (hit.has_value() && queued) queuedLabelHits.fetch_add(1, std::memory_order_relaxed);
+    return hit;
 }
 
 bool Recorder::WideLabelIn(std::uint64_t address, std::size_t bytes) {
@@ -3729,34 +3799,51 @@ bool Recorder::CompletionLabelIn(std::uint64_t address, std::size_t bytes) const
     return false;
 }
 
+Recorder::LabelPick Recorder::pickLabelLocked(std::uint64_t dword, std::uint32_t tag) const {
+    LabelPick pick;
+    if (const auto own = queuedLabels.find(dword); own != queuedLabels.end() && own->second.queue == tag) {
+        pick.entry = &own->second;
+        pick.queued = true;
+    } else if (const auto found = labels.find(dword); found != labels.end()) {
+        if (found->second.batch == nullptr && found->second.queue != tag) {
+            pick.foreign = true;
+            return pick;
+        }
+        pick.entry = &found->second;
+        pick.queued = found->second.batch == nullptr;
+    }
+    return pick;
+}
+
 std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const {
     if (refusal != nullptr) *refusal = LabelRefusal::None;
     if ((labels.empty() && queuedLabels.empty()) || (bytes != 4 && bytes != 8) || address % 4 != 0) return std::nullopt;
-    LabelHit hit{0, 0, 0, false, std::numeric_limits<std::uint64_t>::max()};
+    std::array<const LabelEntry*, 2> entries{};
     bool queued = false;
-    bool candidate = false;
     const auto tag = GuestMemory::GpuLockThreadTag();
+    for (std::size_t offset = 0; offset < bytes; offset += 4) {
+        const auto pick = pickLabelLocked(address + offset, tag);
+        if (pick.foreign || pick.entry == nullptr) return std::nullopt;
+        entries[offset / 4] = pick.entry;
+        queued = queued || pick.queued;
+    }
+    auto hit = evaluateLabel(std::span<const LabelEntry* const>(entries.data(), bytes / 4), afterStamp, refusal);
+    if (hit.has_value() && queued) queuedLabelHits.fetch_add(1, std::memory_order_relaxed);
+    return hit;
+}
+
+std::optional<Recorder::LabelHit> Recorder::evaluateLabel(std::span<const LabelEntry* const> entries, std::uint64_t afterStamp, LabelRefusal* refusal) {
+    if (refusal != nullptr) *refusal = LabelRefusal::None;
+    LabelHit hit{0, 0, 0, false, std::numeric_limits<std::uint64_t>::max()};
+    bool candidate = false;
     const auto refuse = [&](LabelRefusal reason, std::uint64_t LateStatistics::*counter, const LabelEntry& entry) {
         if (refusal != nullptr) *refusal = entry.behindCompletion ? LabelRefusal::BehindCompletion : reason;
         if (counter != nullptr) ++(lateCounts.*counter);
         return std::nullopt;
     };
-    for (std::size_t offset = 0; offset < bytes; offset += 4) {
-        const auto dword = address + offset;
-        const LabelEntry* entry = nullptr;
-        // A queued label is only good for its own queue's wait (see NoteQueuedLabel), where it is
-        // that queue's newest store of the dword; everyone else sees the recorded entry.
-        if (const auto own = queuedLabels.find(dword); own != queuedLabels.end() && own->second.queue == tag) {
-            entry = &own->second;
-            queued = true;
-        } else if (const auto found = labels.find(dword); found != labels.end()) {
-            entry = &found->second;
-            if (entry->batch == nullptr) {
-                if (entry->queue != tag) return std::nullopt;
-                queued = true;
-            }
-        }
-        if (entry == nullptr) return std::nullopt;
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        const auto offset = index * 4;
+        const LabelEntry* entry = entries[index];
         if (entry->stamp <= afterStamp) {
             // The late rule (see NoteLabel): counted in both modes, so a control run shows the population.
             if (!candidate) ++lateCounts.candidates;
@@ -3775,7 +3862,6 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
         }
     }
     if (!hit.late) hit.generation = 0;
-    if (queued) queuedLabelHits.fetch_add(1, std::memory_order_relaxed);
     return hit;
 }
 
@@ -3976,7 +4062,9 @@ void Recorder::Submit() {
         submission.signalSemaphoreCount = 1;
         submission.pSignalSemaphores = &timeline;
     }
-    if (peer != nullptr && peer->timeline != VK_NULL_HANDLE && peer->submissions != 0 && !skipPeerOnce) {
+    std::unique_lock crossQueueLock(CrossQueueSubmitMutex(), std::defer_lock);
+    if (peer != nullptr) crossQueueLock.lock();
+    if (peer != nullptr && peer->timeline != VK_NULL_HANDLE && peer->submissions != 0 && !skipPeerOnce && !OrderWaitsSuppressed().load(std::memory_order_acquire)) {
         auto& wait = orderWaits[peer->timeline];
         wait = std::max(wait, peer->submissions);
         ++queueOrder.peerWaits;
@@ -4011,6 +4099,8 @@ void Recorder::Submit() {
     skipPeerOnce = false;
     batch->submitted = true;
     batch->serial = ++submissions;
+    batch->submitOrder.store(SubmitOrderCounter().fetch_add(1, std::memory_order_acq_rel) + 1, std::memory_order_release);
+    if (crossQueueLock.owns_lock()) crossQueueLock.unlock();
     batch->submittedAt = std::chrono::steady_clock::now();
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();

@@ -1176,6 +1176,60 @@ void lateLabelTests(Recorder& recorder) {
     Require(!Recorder::LookupLabel(a, 4, 5).has_value() && !Recorder::LookupLabel(b, 8, 5).has_value() && !recorder.PendingLabelIn(0x70000, 0x400), "(7) entries outlived their batch");
 }
 
+void crossQueueLabelTests(const Device& device, Recorder& recorder) {
+    using Refusal = Recorder::LabelRefusal;
+    const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    const std::array<std::byte, 4> two{std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0}};
+    const std::array<std::byte, 4> three{std::byte{3}, std::byte{0}, std::byte{0}, std::byte{0}};
+    constexpr std::uint64_t a = 0x74000, b = 0x74100, c = 0x74200;
+    recorder.Sync();
+    Recorder other(device.GetContext(), false, 1);
+    other.Activate();
+    recorder.SetPeer(&other);
+    other.SetPeer(&recorder);
+    struct Unpeer {
+        Recorder& first;
+        Recorder& second;
+        ~Unpeer() {
+            first.Sync();
+            second.Sync();
+            first.SetPeer(nullptr);
+            second.SetPeer(nullptr);
+        }
+    } unpeer{recorder, other};
+    Refusal refusal{};
+    recorder.NoteLabel(a, one, 20, 0);
+    other.NoteLabel(a, two, 21, 0x20);
+    Require(!Recorder::LookupLabel(a, 4, 0, &refusal).has_value() && refusal == Refusal::Unordered, "a label pending unsubmitted on two physical queues is not refused as unordered");
+    recorder.Submit();
+    auto hit = Recorder::LookupLabel(a, 4, 0, &refusal);
+    Require(hit.has_value() && hit->value == 2 && hit->queue == 0x20 && hit->stamp == 21 && refusal == Refusal::None, "the unsubmitted batch, which runs after the submitted one, does not decide the label");
+    other.Submit();
+    hit = Recorder::LookupLabel(a, 4, 0, &refusal);
+    Require(hit.has_value() && hit->value == 2 && refusal == Refusal::None, "the later of two submitted batches does not decide the label");
+    recorder.Sync();
+    other.Sync();
+    Require(!Recorder::LookupLabel(a, 4, 0).has_value(), "the composed entries outlived their batches");
+    other.NoteLabel(b, two, 30, 0x20);
+    other.Submit();
+    recorder.NoteLabel(b, three, 29, 0);
+    hit = Recorder::LookupLabel(b, 4, 0, &refusal);
+    Require(hit.has_value() && hit->value == 3 && hit->stamp == 29 && refusal == Refusal::None, "a batch submitted later does not win over a newer stamp on a batch submitted earlier");
+    recorder.Submit();
+    hit = Recorder::LookupLabel(b, 4, 0, &refusal);
+    Require(hit.has_value() && hit->value == 3, "the submission order does not decide between two submitted batches");
+    Require(!Recorder::LookupLabel(b, 4, 29, &refusal).has_value() && refusal != Refusal::None, "the late rule does not apply to the winning entry");
+    recorder.Sync();
+    other.Sync();
+    recorder.NoteLabel(c, one, 40, 0);
+    other.NoteLabel(c + 4, two, 41, 0x20);
+    recorder.Submit();
+    other.Submit();
+    hit = Recorder::LookupLabel(c, 8, 0, &refusal);
+    Require(hit.has_value() && hit->value == 0x0000000200000001ull && hit->queue == 0 && hit->stamp == 40 && refusal == Refusal::None, "a 64-bit label whose dwords are pending on two physical queues is not composed");
+    Require(!recorder.PendingLabel(c, 8, 0).has_value(), "one physical queue's own table composed a dword it does not hold");
+}
+
 void largeLabelTests(Recorder& recorder) {
     constexpr std::uint64_t slot = 0x71000, small = slot + 0x10, outside = slot - 4, wide = 0x72000;
     const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
@@ -3917,9 +3971,10 @@ void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
         ShaderResources::DrawBindingsStatistics statistics;
         const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, {}, &statistics);
         Require(bindings != nullptr && bindings->snapshots.size() == 1, "an input read over most of its bytes was not snapshotted");
-        const char* rangesOnly = std::getenv("APS5_SNAPSHOT_READ_RANGES");
-        if (rangesOnly != nullptr && std::string(rangesOnly) == "1") {
-            Require(statistics.limited == 1 && statistics.copiedBytes == 12000u && statistics.overHalfReadBytes == 0, "with APS5_SNAPSHOT_READ_RANGES=1 an input read over most of its bytes did not copy only its 12000 read bytes");
+        const char* rangesText = std::getenv("APS5_SNAPSHOT_READ_RANGES");
+        const bool rangesOnly = rangesText == nullptr || (std::string(rangesText) != "0" && std::string(rangesText) != "off");
+        if (rangesOnly) {
+            Require(statistics.limited == 1 && statistics.copiedBytes == 12000u && statistics.overHalfReadBytes == 0, "with APS5_SNAPSHOT_READ_RANGES on an input read over most of its bytes did not copy only its 12000 read bytes");
         } else {
             Require(statistics.limited == 0 && statistics.copiedBytes == elementBytes, "an input read over most of its bytes was not copied whole");
             Require(statistics.wholeCopies[static_cast<std::size_t>(ShaderResources::WholeCopy::OverHalf)] == 1 && statistics.overHalfReadBytes == 12000u, "a whole copy of an input read over most of its bytes did not count its 12000 read bytes under over half");
@@ -4722,6 +4777,7 @@ int coherenceFaultTests(const Device& device, Recorder& recorder) {
     Coherence::SetFaultsModeForTests(Coherence::Mode::New);
     Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix, &GuestArena::GuestArenaOpenAccessForRead_nid_postfix});
     Coherence::SetMaterializer([](Coherence::Interval range) { StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin)); });
+    GuestArena::GuestArenaSetResolveHostWrites_nid_postfix(true);
     Coherence::ResetForTests();
     TextureDetiler detiler(base);
     auto context = base;
@@ -4827,6 +4883,14 @@ int coherenceFaultTests(const Device& device, Recorder& recorder) {
     gpu.lock();
     Require(loaded == 0x77, "a native load of an unpublished shadow unit read the stale host bytes");
     Require(!AnyShadowedOverlaps(address + unit, unit), "a native load left the shadow unit unpublished");
+
+    paint({0.0f, 1.0f, 1.0f, 1.0f});
+    gpu.unlock();
+    GuestArena::GuestArenaSetProtection_nid_postfix(address, unit, PAGE_READONLY);
+    GuestArena::GuestArenaSetProtection_nid_postfix(address, unit, PAGE_READWRITE);
+    gpu.lock();
+    Require(StorageTexture::FindPending(address, unit) == nullptr, "reprotecting memory under a protected pending image did not store the image first");
+    Require(holds(0, unit, {0, 255, 255, 255}, 0, 0), "reprotecting memory under a protected pending image lost the image's results");
 
     recorder.Sync();
     const auto counters = Coherence::CurrentCounters();
@@ -5039,6 +5103,16 @@ int coherenceResidencyTests(const Device& device, Recorder& recorder) {
     const auto loaded = *reinterpret_cast<volatile std::uint8_t*>(address + 0x8000);
     gpu.lock();
     Require(loaded == 0xa5 && !AnyDeviceResidentOverlaps(address, bytes), "a native load read host bytes under device-resident results");
+
+    {
+        auto shadow = std::make_shared<Buffer>(base, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::memset(shadow->Bytes().data(), 0x3c, bytes);
+        const auto generation = CollectWritesUncached(address, bytes);
+        NoteDeviceResident(base.device, address + 16, address + 0x1010, shadow, address, import->buffer, import->base, generation);
+        Require(!AnyDeviceResidentOverlaps(address, bytes), "device-resident results the guards cannot cover whole were kept on the device");
+        recorder.Sync();
+        Require(alias[16] == 0x3c && alias[0x100f] == 0x3c && alias[15] != 0x3c && alias[0x1010] != 0x3c, "device-resident results the guards cannot cover were not published in place of a copy-back");
+    }
 
     recorder.Sync();
     const auto counters = Coherence::CurrentCounters();
@@ -10866,6 +10940,46 @@ std::uint64_t revalidations(const ParallelResolveCounts& counts, ShaderResources
     return counts.revalidations[static_cast<std::size_t>(verdict)];
 }
 
+bool stagedDrawBuildTests(const Device& device, Recorder& recorder) {
+    if (!StagedDrawBuilds()) {
+        std::cout << "skipped, the staged draw build test needs APS5_PARALLEL_RESOLVE=1 and APS5_STAGED_DRAW_BUILDS not 0\n";
+        return false;
+    }
+    return withResolveScene(device, recorder, [&](ResolveScene& scene) {
+        const auto& context = scene.context;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto before = ParallelResolveStatistics();
+        const auto first = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        const auto staged = ParallelResolveStatistics();
+        if (staged.stagedBuilt == before.stagedBuilt) {
+            std::cout << "skipped, the scene's first draw was not staged as a template miss\n";
+            return false;
+        }
+        Require(staged.stagedAdopted == before.stagedAdopted, "a staged draw build was adopted before its encode");
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *first);
+        scene.check("a draw whose build was staged on the side rendered other pixels");
+        const auto adopted = ParallelResolveStatistics();
+        Require(adopted.stagedAdopted - before.stagedAdopted == 1, "the staged draw build was not adopted at encode");
+        Require(!VerifyStagedDrawBuilds() || adopted.stagedVerified - before.stagedVerified == 1, "APS5_VERIFY_STAGED_DRAW_BUILDS checked no adopted build");
+        const auto second = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        const auto repeated = ParallelResolveStatistics();
+        const bool cached = repeated.resourcesResolved == adopted.resourcesResolved + 1;
+        Require(cached != (repeated.stagedBuilt == adopted.stagedBuilt + 1), "a draw repeating an adopted build was neither served by its cached template nor staged again");
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *second);
+        scene.check("a draw repeating an adopted build rendered other pixels");
+        Require(cached || ParallelResolveStatistics().stagedAdopted - adopted.stagedAdopted == 1, "a second staged build of the same draw was not adopted");
+        const auto discarded = ResolveDraw(context, scene.state, scene.indexed, scene.shaders);
+        static_cast<void>(discarded);
+        scene.clear();
+        Draw(context, scene.state, scene.indexed, scene.shaders);
+        scene.check("a serial draw after an unused staged build rendered other pixels");
+        std::cout << "staged draw build tests passed" << (VerifyStagedDrawBuilds() ? " (verified)" : "") << "\n";
+        return true;
+    });
+}
+
 bool parallelRevalidateTests(const Device& device, Recorder& recorder) {
     if (!ParallelRevalidateRequested()) {
         std::cout << "skipped, the parallel revalidate test needs APS5_PARALLEL_RESOLVE=1 and APS5_PARALLEL_REVALIDATE=1\n";
@@ -11421,6 +11535,9 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--parallel-revalidate-only") {
             return parallelRevalidateTests(device, recorder) ? 0 : 77;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--staged-draw-builds-only") {
+            return stagedDrawBuildTests(device, recorder) ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {
             pendingWriteSnapshotTests(device, recorder);
             return 0;
@@ -11487,6 +11604,7 @@ int main(int argc, char** argv) {
             directCompletionLabelTests(recorder);
             labelTests(recorder);
             lateLabelTests(recorder);
+            crossQueueLabelTests(device, recorder);
             largeLabelTests(recorder);
             std::cout << "Completion label storage and ordering tests passed\n";
             return 0;

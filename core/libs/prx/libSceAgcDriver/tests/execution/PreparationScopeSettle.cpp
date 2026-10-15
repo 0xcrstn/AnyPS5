@@ -75,11 +75,21 @@ struct PixelHeader {
 class HeldPreparationThreads {
 public:
     HeldPreparationThreads() {
-        for (unsigned index = 0; index < std::thread::hardware_concurrency() + 2u; ++index) {
+        const auto workers = AgcDriver::DriverDetail::RegistrationPreparationThreads();
+        for (unsigned index = 0; index < workers; ++index) {
             AgcDriver::DriverDetail::SubmitRegistrationPreparation([state = state] {
                 std::unique_lock lock(state->mutex);
+                ++state->held;
+                state->changed.notify_all();
                 state->changed.wait(lock, [&] { return state->released; });
             });
+        }
+        std::unique_lock lock(state->mutex);
+        const bool held = state->changed.wait_for(lock, std::chrono::seconds(30), [&] { return state->held == workers; });
+        lock.unlock();
+        if (!held) {
+            Release();
+            throw std::runtime_error("the registration preparation threads did not all start the held tasks");
         }
     }
 
@@ -99,6 +109,7 @@ private:
     struct State {
         std::mutex mutex;
         std::condition_variable changed;
+        unsigned held = 0;
         bool released = false;
     };
     std::shared_ptr<State> state = std::make_shared<State>();

@@ -127,6 +127,8 @@ void ReleaseDeviceOwned(std::uint64_t protection);
 bool ProtectionLive(std::uint64_t protection);
 void NoteLockedFault(Interval range);
 void SetLeaseWaiter(Materializer waiter);
+using FaultPriority = bool (*)();
+void SetFaultPriority(FaultPriority priority);
 std::uint64_t AcquireReadLease(Interval range, Version version);
 std::uint64_t ProtectResident(Interval range, Version version);
 void RetireReadLease(std::uint64_t lease);

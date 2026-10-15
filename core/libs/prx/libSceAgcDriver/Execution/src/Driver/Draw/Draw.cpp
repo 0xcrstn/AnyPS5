@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -687,7 +688,8 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         sink->inputs = std::make_shared<DrawInputs>(DrawInputs{relocatedDecode, decode, entry, shaderMemoryOwner, drawParameters, std::move(programs), std::move(decodeReads), std::move(memory), std::move(matchedRegions), std::move(matched), std::move(fresh), std::move(stageCaptures), std::move(results), std::move(stages), std::move(snapshots), recipe, std::move(recipeStages), drawKey});
         if (!sink->inOrder && recipe == nullptr && parallelResolve()) {
             auto& prepared = *sink->inputs;
-            prepared.resolved = localDevice->ResolveDraw(prepared.state->state, prepared.draw, prepared.stages);
+            prepared.resolved = localDevice->ResolveDraw(prepared.state->state, prepared.draw, prepared.stages, prepared.snapshots);
+            for (const auto& [begin, end] : Graphics::StagedDrawReads(*prepared.resolved)) sink->reads.push_back({begin, static_cast<std::size_t>(end - begin)});
         }
         phaseTiming.Phase(DrawRowGraphics);
         timing.Mark("draw_and_resource_release");

@@ -387,6 +387,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::Reference: return Invoke(EmitReference, ctx, inst);
         case IrOpcode::ReferenceU32: return Invoke(EmitReferenceU32, ctx, inst);
         case IrOpcode::UnlinkedCall: return Invoke(EmitUnlinkedCall, ctx, inst);
+        case IrOpcode::CheckDenormalFree: return Invoke(EmitCheckDenormalFree, ctx, inst);
         case IrOpcode::GetUserData: return Invoke(EmitGetUserData, ctx, inst);
         case IrOpcode::GetShaderBase: return Invoke(EmitGetShaderBase, ctx, inst);
         case IrOpcode::ShaderClock: return Invoke(EmitShaderClock, ctx, inst);
@@ -1119,6 +1120,18 @@ void EmitReference(SpirvValueEmitContext& context) {
 
 void EmitReferenceU32(SpirvValueEmitContext& context) {
     EmitVoid(context);
+}
+
+void EmitCheckDenormalFree(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t value) {
+    auto& state = ctx.state;
+    if (state.faultBufferVariable == 0) ctx.Fail(inst, "checks a denormal-flush proof without a fault buffer");
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto exponentZero = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, value, ConstantU32(state, 0x7f800000u)), ConstantU32(state, 0u));
+    const auto nonZero = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, value, ConstantU32(state, 0x7fffffffu)), ConstantU32(state, 0u));
+    EmitIfCondition(state, Binary(state, spv::OpLogicalAnd, boolean, exponentZero, nonZero), [&] {
+        RecordBdaFaultWords(state, value, ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, 0u), BdaAbi::FaultReason::FlushProofMismatch);
+    });
 }
 
 void EmitUnlinkedCall(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t low, std::uint32_t high, std::uint32_t programCounter) {

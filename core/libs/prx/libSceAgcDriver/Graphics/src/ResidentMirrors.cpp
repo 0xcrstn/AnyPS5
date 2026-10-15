@@ -13,6 +13,8 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -252,7 +254,12 @@ void reportMirrors() {
 }
 
 bool ResidentMirrorsEnabled() {
-    static const bool enabled = std::getenv("APS5_RESIDENT_MIRRORS") != nullptr && BudgetBytes() != 0;
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_RESIDENT_MIRRORS");
+        if (text == nullptr || std::string_view(text) == "1") return BudgetBytes() != 0;
+        if (std::string_view(text) == "0") return false;
+        throw std::runtime_error("APS5_RESIDENT_MIRRORS must be 0 or 1");
+    }();
     return enabled;
 }
 

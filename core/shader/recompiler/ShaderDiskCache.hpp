@@ -16,7 +16,7 @@
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-inline constexpr std::uint32_t FormatVersion = 37;
+inline constexpr std::uint32_t FormatVersion = 38;
 
 enum class LoadStatus {
     Loaded,
@@ -81,6 +81,7 @@ void BuildPlanFailureKey(std::span<const std::byte> planKey, std::vector<std::by
 
 [[nodiscard]] bool Enabled();
 [[nodiscard]] std::filesystem::path EntryDirectory();
+[[nodiscard]] std::filesystem::path PlanEntryDirectory();
 
 [[nodiscard]] bool Load(std::span<const std::byte> key, CompiledVariant& variant);
 [[nodiscard]] bool Reload(std::span<const std::byte> key, CompiledVariant& variant);

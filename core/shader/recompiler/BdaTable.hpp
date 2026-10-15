@@ -37,7 +37,7 @@ inline constexpr std::uint32_t SearchLimit = 4;
 inline constexpr std::uint32_t NodeBit = 0x80000000u;
 
 inline Translation ParseTranslation(const char* value) {
-    if (value == nullptr) return Translation::Legacy;
+    if (value == nullptr) return Translation::Radix;
     const std::string_view text(value);
     if (text == "legacy") return Translation::Legacy;
     if (text == "radix") return Translation::Radix;
@@ -51,7 +51,7 @@ inline Translation TranslationSetting() {
 }
 
 inline Relative ParseRelative(const char* value) {
-    if (value == nullptr) return Relative::Off;
+    if (value == nullptr) return Relative::On;
     const std::string_view text(value);
     if (text == "off") return Relative::Off;
     if (text == "on") return Relative::On;
@@ -83,8 +83,8 @@ inline BdaAbi::FaultReason RelativeMismatchReason() {
 inline bool InlineFastPathSetting() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_BDA_INLINE_FAST_PATH");
-        if (value == nullptr || std::string_view(value) == "off") return false;
-        if (std::string_view(value) == "on") return true;
+        if (value == nullptr || std::string_view(value) == "on") return true;
+        if (std::string_view(value) == "off") return false;
         throw std::runtime_error("APS5_BDA_INLINE_FAST_PATH must be off or on, not \"" + std::string(value) + "\"");
     }();
     return enabled;

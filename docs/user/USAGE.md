@@ -178,6 +178,24 @@ HDR output is available on Windows only. Titles see it when the monitor showing 
 
 Recompiled shaders and the Vulkan pipeline cache are kept in a `shader_cache/` directory beside the output executable, so later runs skip recompilation. Set `ANYPS5_SHADER_CACHE_DIR` to use another directory, or set `ANYPS5_NO_SHADER_CACHE` to any non-empty value other than `0` to disable both caches. Shaders are stored in a subdirectory named after the recompiler's source version; subdirectories of other versions unused for 14 days are removed the first time a run looks up a shader. The pipeline cache is one `vk-pipelines-*.bin` file per GPU and driver version. Deleting the directory is safe: it is rebuilt on the next run.
 
+The cache is kept in layers: resource plans live in a `plans-<version>/` subdirectory named after the recompiler's front end only, so a build that changed only the SPIR-V emitter keeps them, and a new driver starts from the pipeline cache an earlier driver with the same pipeline cache UUID wrote. `APS5_SHADER_CACHE_V2=0` keeps everything under the full source version and starts every driver version with an empty pipeline cache. `APS5_VERIFY_SHADER_CACHE=1` prepares a fresh plan for every cached one and stops the title when they differ. The creation recipes of compute pipelines are kept in `pipeline-recipes/` for prewarming (see Shader compilation).
+
+### Shader compilation
+
+Vulkan pipelines are compiled on a scheduler that runs the work a queue is waiting for first. Each switch below is on unless it is set to `0` (`legacy` for the scheduler); switches that depend on another one are off when that one is off.
+
+- `APS5_COMPILE_SCHEDULER`: the priority compile scheduler. A pipeline a draw or dispatch needs now goes ahead of pipelines compiled ahead of use, and one worker is kept for it. `APS5_COMPILE_WORKERS` (a quarter of the logical processors, 2 to 8) sets the number of compile threads and `APS5_COMPILE_BUDGET_MIB` (2048) the memory that speculative compiles may reserve. `legacy`, or `APS5_LOCKED_PIPELINES`, builds pipelines on the thread that needs them.
+- `APS5_COMPILE_PARK`: a draw or dispatch whose pipeline is still compiling gives up its queue's turn instead of blocking the queue worker, and continues when the pipeline is ready.
+- `APS5_PIPELINE_COMPILE_AHEAD`: the compute pipelines of dispatches queued behind the one running are compiled ahead, after the pipelines a queue is waiting for.
+- `APS5_PIPELINE_CONTENT_DEDUP`: compute shaders whose pipelines would be identical share one pipeline.
+- `APS5_PIPELINE_PREWARM`: the compute pipelines of earlier runs are compiled again when the device starts, before the title asks for them (needs `APS5_PIPELINE_CONTENT_DEDUP`).
+- `APS5_SPIRV_INTERN`: identical compiled shaders are kept in memory once.
+- `APS5_PIPELINE_CACHE_PROBES`: before a draw or dispatch waits for its pipeline to compile, the driver is asked to create it from the Vulkan pipeline cache only; a pipeline an earlier run compiled is then used at once (needs `VK_EXT_pipeline_creation_cache_control`).
+- `APS5_SHARED_BUFFER_HELPERS`: formatted buffer accesses of all buffers share one function per access shape instead of one per buffer, which keeps compute shaders with many buffers smaller before specialization.
+- `APS5_OUTLINE_IMAGE_MODES`: an image access that depends on the image's run-time format calls one function per image instead of repeating every format's code at each access, which keeps very large compute shaders several times smaller.
+
+Off by default: `APS5_VERIFY_COMPILE_JOBS=1` checks that every shared or prewarmed pipeline was built from the recipe the draw or dispatch asks for, and `APS5_VERIFY_SHADER_EMISSION=1` compiles each shader in its alternative forms and stops the title when their interfaces differ. `APS5_COMPILE_TRACE=<file>` (or `1`) writes one JSON line per compile step with its timing.
+
 ### Storing GPU results at each flip
 
 GPU results in storage images and render targets stay on the GPU until something reads their memory. A title that frees such an image after waiting for its GPU work and reuses the memory can have its new data overwritten when the results are stored later ([TechnicalDebt](../dev/TechnicalDebt.md)). `APS5_STORE_AT_FLIP=1` stores every pending result when a display buffer is flipped, at the cost of one write-back per pending image and frame. `APS5_STORE_AT_FLIP=shadow` stores them the same way but leaves the stores in the device-local unit shadows, which reach guest memory when a read the driver sees (a CPU access through the flush hook, a copy, a scanout) asks for them: a title's own CPU loads do not see them. Any other value stops the title at its first flip.
@@ -186,7 +204,19 @@ A title's own CPU reads of that memory are not seen, so a title that waits for a
 
 ### Guest-memory coherence checks
 
-Three switches take `0` (the default), `1` or `verify`; any other value stops the title when the GPU device is created.
+Each switch below takes `0`, `1` or `verify`. Any other value stops the title when the GPU device is created.
+- **Off by default:** `APS5_COHERENCE_AUDIT`, `APS5_COHERENCE_ORDERING`, `APS5_COHERENCE_DIRECTORY`.
+- **On by default (`1`):** `APS5_COHERENCE_FAULTS`, `APS5_COHERENCE_INPUT_LEASES`, `APS5_COHERENCE_RESIDENCY`, `APS5_COHERENCE_LAZY_RELEASE`, `APS5_DEFERRED_POINTER_STORES`. Set one to `0` to turn it off.
+
+The protection switches take effect once the GPU device installs the access guards, on Windows only. On other systems they stay inactive, except that `verify` stops the title.
+
+`APS5_DEFERRED_POINTER_STORES=1` (the default):
+- **Before any address-based shader:** only the unit shadows over its heaps are published, so the storage images pending there are no longer retiled to guest memory first.
+- **Pointer writers:** a shader that may store through pointers is tracked until it completes. A flip or address-based store of an image older than such a shader over its memory waits for a later flip. Any other store of that image first waits for the shader, so its stores are never overwritten by older results.
+- **Readers:** a shader that only reads through pointers can still see host bytes under an image whose newer results are pending.
+- **`0`:** stores every pending image over the heaps before each address-based shader, at the cost of tens of GB per 10 s in heavy scenes.
+- **`verify`:** stops the title when such an image would still be written back before the shader completed.
+- **Report:** a `[pointer-stores]` line every 10 s counts the deferred stores, the waited write-backs, and the pointer shaders that ran with pending images over their heaps.
 
 `APS5_COHERENCE_AUDIT=1` keeps a version for every GPU writer the driver records (address-based shaders that may store through pointers, and written buffer elements) and checks every store of an older GPU result into guest memory (a pending storage image, a unit shadow) against it. The first stale store prints a `[coherence] stale publication` line with the writers and stores that touched those bytes; later ones are counted on a `[coherence]` line every 10 s. An address-based shader that reads host memory under a pending image or an unpublished unit shadow prints `[coherence] stale read`. `verify` stops the title at the first stale store instead. Rendering is unchanged; the checks cost CPU time.
 
@@ -205,41 +235,43 @@ Three switches take `0` (the default), `1` or `verify`; any other value stops th
 - **File reads:** kernel file reads into such memory resolve it first.
 - **Refused ranges:** ranges the protection refuses (pinned or resident pages) keep the default behaviour.
 - **`verify`:** stops the title at a refused or partly covered range, and at a driver access to such memory made while it holds the GPU lock.
-- **Limits:** unmapping or reprotecting such memory before the driver stored it stops the title. Windows only. Each pending image costs a protection change, so expect a slowdown.
-- **Deadlock risk:** a driver thread that holds the GPU lock and touches protected memory directly, while a title thread is resolving the same pages, deadlocks. The driver does not yet resolve such ranges before taking the lock, and `verify` does not catch it. The same applies to `APS5_COHERENCE_INPUT_LEASES` and `APS5_COHERENCE_RESIDENCY`.
+- **Mapping changes:** unmapping, decommitting, reprotecting or pinning such memory first stores the GPU results over the whole pages involved, then proceeds.
+- **Limits:** Windows only. Each pending image costs a protection change.
+- **Driver accesses:** a driver thread that holds the GPU lock and touches such memory does not wait for a title thread already resolving it. It stores the results itself and releases the guard, and the title thread's resolution then finds nothing left to do.
+- **During resolution:** the range is read-only while it is resolved. Other threads' loads see the bytes from before, and their stores wait.
 
 `APS5_COHERENCE_INPUT_LEASES=1` protects the guest memory that a recorded dispatch reads in place through host imports, from recording until its batch completes. A native store into that memory waits until the recorded work has run, so the dispatch reads the bytes it was given rather than a later write. The protection covers every 4 KiB page the reads touch, so reads beside the stored bytes wait as well. Address-based heaps are not leased, because their reach is the whole heap. `verify` stops the title when a lease is refused. Windows only. Each dispatch costs a protection change, and the title's stores into memory the GPU still reads wait for the GPU.
 
-`APS5_COHERENCE_RESIDENCY=1` protects the guest memory under device-resident buffer results (`APS5_LAZY_STAGING_OUT`) the same way. The title's first load or store there publishes those results into guest memory and waits for them before it proceeds. A CPU store over such results then keeps the device bytes around it instead of reaching the unsupported publish after a CPU store. `verify` stops the title when the protection is refused or does not cover whole pages. Windows only.
+`APS5_COHERENCE_RESIDENCY=1` protects the guest memory under device-resident buffer results the same way. While it is active, `APS5_LAZY_STAGING_OUT` defaults to on, so buffer results a dispatch wrote through a staged copy stay on the device instead of being copied back after every use. Results whose pages the guards cannot cover whole are copied back at once, as before. `APS5_LAZY_STAGING_OUT=0` copies everything back. The title's first load or store there publishes those results into guest memory and waits for them before it proceeds. A CPU store over such results then keeps the device bytes around it instead of reaching the unsupported publish after a CPU store. `verify` stops the title when the protection is refused or does not cover whole pages. Windows only.
 
 `APS5_COHERENCE_LAZY_RELEASE=1` makes labels and flips store only the pending results whose memory the native protection does not cover. Protected results stay on the GPU until something reads them, and the title's own CPU accesses resolve them when they happen. Every `APS5_STORE_AT_FLIP` value then behaves the same, and `APS5_STORE_AT_LABEL=1` still stores everything. `verify` stops the title when a label or flip leaves results that are neither stored nor protected. The switch needs `APS5_COHERENCE_FAULTS`, and `APS5_COHERENCE_RESIDENCY` too when `APS5_LAZY_STAGING_OUT` is on; without them the title stops at start.
 
 ### GPU queue waits and scheduling
 
-A `WAIT_REG_MEM` on one queue may be satisfied by a label another queue recorded but the GPU has not stored yet. By default any label recorded after the waiting submission arrived counts (`APS5_WAIT_FLOOR=submission`). That rule is too loose: a later wait in the same submission can be satisfied by a value overwritten before it could have seen it. `APS5_WAIT_FLOOR=activation` counts only labels recorded after the waiting queue's previous wait. `APS5_VERIFY_WAIT_OBSERVATIONS=1` stops the title when a wait is satisfied by a value it could not have observed.
+A `WAIT_REG_MEM` on one queue may be satisfied by a label another queue recorded but the GPU has not stored yet. Only labels recorded after the wait became active count, that is after the waiting queue's previous wait (`APS5_WAIT_FLOOR=activation`, the default). `APS5_WAIT_FLOOR=submission` with `APS5_LABEL_TIMELINE=off` restores the older rule, which counts every label recorded after the waiting submission arrived; it is too loose, since a later wait in the same submission can then be satisfied by a value overwritten before it could have seen it. `APS5_VERIFY_WAIT_OBSERVATIONS=1` stops the title when a wait is satisfied by a value it could not have observed.
 
 With `APS5_COHERENCE_ORDERING=1` or `verify`, a label also waits behind the write-backs its batch still owes, so a title's own CPU loads never see a label before the results it releases. `APS5_LABEL_PUBLICATION=ordered` or `early` names the same choice; a value that contradicts `APS5_COHERENCE_ORDERING` stops the title.
 
 In runs with `APS5_PROFILE_DRAW` (as `run.ps1 -Perf` and `-Debug` set it), `APS5_TRACE_WAIT_CHAIN=1` prints a `[waitchain]` line per queue every 10 s. The line splits the time each blocked wait spent into: producer label not recorded yet, recorded but not submitted, submitted but not finished on the GPU, finished but not stored for the CPU, and stored but not seen yet. A `[labels]` line gives the same latencies over all labels. Slow-wait reports name the label that satisfied the wait.
 
 `APS5_QUEUE_SCHEDULER` chooses how the GPU queues' workers take turns:
-- `off` (the default) runs them as before.
+- `dag` (the default) runs the queues concurrently and lets a packet whose shader is still compiling wait without holding any lock.
 - `serial` runs one packet at a time across all queues; the oldest runnable submission goes next, and a queue waiting on a label gives up its turn. It is a reference for comparing results, not a fast mode.
-- `dag` runs the queues concurrently, as `off` does, and lets a packet whose shader is still compiling wait without holding any lock.
+- `off` runs the queues concurrently without the scheduler's bookkeeping, as before it existed.
 
 `APS5_QUEUE_SCHEDULER_VERIFY=1` stops the title when a queue runs a packet out of order or while it is waiting for a compile. With `APS5_PROFILE_DRAW`, a `[scheduler]` line every 10 s counts turns, hand-overs and parked packets whenever the scheduler or its verify mode is on.
 
-`APS5_LABEL_TIMELINE=on` lets a wait be satisfied by another queue's recorded label only with a proof: the label was recorded after the wait became active and covers every awaited byte, or it is the newest value and nothing wrote over it since. Anything else waits for guest memory. `verify` stops the title instead of waiting. A compare function the driver does not know stops the title in both modes. The `[waitchain]` line counts waits by proof.
+`APS5_LABEL_TIMELINE=on` (the default) lets a wait be satisfied by another queue's recorded label only with a proof: the label was recorded after the wait became active and covers every awaited byte, or it is the newest value and nothing wrote over it since. Anything else waits for guest memory. `verify` stops the title instead of waiting; `off` accepts such labels without a proof, as before. A compare function the driver does not know stops the title in both modes. The `[waitchain]` line counts waits by proof.
 
-`APS5_WAIT_BROKER=1` makes a blocked wait sleep until a label is recorded or a batch's results reach guest memory, instead of polling on a timer. It still checks again after at most `APS5_WAIT_BROKER_MAX_US` (default 2000), since stores made by the title's own CPU code wake nobody.
+The wait broker (on by default, `APS5_WAIT_BROKER=0` turns it off) makes a blocked wait sleep until a label is recorded or a batch's results reach guest memory, instead of polling on a timer. It still checks again after at most `APS5_WAIT_BROKER_MAX_US` (default 2000), since stores made by the title's own CPU code wake nobody.
 
 `APS5_QUEUE_TOPOLOGY` chooses the Vulkan queues the driver runs on. The log lists every queue family when the device is created.
-- `serial` (the default) runs everything on one queue.
-- `same-family` takes a second queue from the graphics family and records every guest queue other than 0 on it, with its own command recorder. A wait on a label the other queue recorded submits the producer first and makes the waiting queue's next batch wait for it on the GPU. Every batch also waits for the batches the other queue had already submitted. Experimental. `APS5_QUEUE_TOPOLOGY_VERIFY=1` stops the title when a batch is submitted without waiting for a producer it depends on.
+- `same-family` (the default when the graphics family has two queues and the device has timeline semaphores; otherwise the driver logs why and runs serial) takes a second queue from the graphics family and records every guest queue other than 0 on it, with its own command recorder. A wait on a label the other queue recorded submits the producer first and makes the waiting queue's next batch wait for it on the GPU. Every batch also waits for the batches the other queue had already submitted. `APS5_QUEUE_TOPOLOGY_VERIFY=1` stops the title when a batch is submitted without waiting for a producer it depends on.
+- `serial` runs everything on one queue.
 - `dedicated` checks that a compute-only family has a free queue, then stops the title: ownership transfers between queue families are not implemented.
-- An unavailable topology stops the title, naming the families that exist.
+- A topology set explicitly but unavailable stops the title, naming the families that exist.
 
-`APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. `0` (the default) turns it off. The `[labels]` line counts these submits.
+`APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. The default is 2000; `0` turns it off. The `[labels]` line counts these submits.
 
 ### Draw and dispatch recording
 
@@ -264,15 +296,17 @@ Off by default: `APS5_CHUNKED_RECORDING=1` records a render pass's draws into se
 
 ### Address-based shader experiments
 
-These switches change how recompiled shaders reach guest memory through addresses. Each accepts the values shown; any other value stops the title at start. `verify` runs the old and the new form side by side and stops the title with a description of the first difference.
+These switches change how recompiled shaders reach guest memory through addresses and how they handle floating point. Each accepts the values shown; any other value stops the title at start. The optimized form is the default (the value marked as such below); the other value turns it off. `verify` runs the old and the new form side by side and stops the title with a description of the first difference.
 
-- `APS5_BDA_ABI=legacy|radix|verify`: how a guest address is found in the table of mapped ranges (a binary search, or an indexed table).
-- `APS5_BDA_RELATIVE=off|on|verify`: whether a shader reuses the last range it found for later accesses inside it. `APS5_BDA_RANGE_CACHE=1` is the same as `on`, and with `APS5_VERIFY_BDA_RANGE_CACHE=1` the same as `verify`; setting both switches to different values stops the title.
-- `APS5_BDA_INLINE_FAST_PATH=off|on`: with `APS5_BDA_RELATIVE=on`, asks the GPU driver to inline that reuse check at each access while the full lookup stays a separate function. The generated code is otherwise identical, so it has no verify mode.
-- `APS5_BDA_SPAN_HELPERS=off|on|verify`: whether wide reads use a reader specialized for the dwords they use.
-- `APS5_BDA_WRITE_NOTES=off|on|verify`: whether a shader skips recording a written page it already recorded.
-- `APS5_LAZY_LOG2_REPAIR=off|on|verify`, `APS5_LAZY_TRIG_SERIES=off|on|verify`: whether log2, sin and cos evaluate only the correction they select.
-- `APS5_BDA_PLACEMENT=host|device|verify`: whether compute shaders that store through addresses (without atomics or coherent accesses) work on device-local copies of the host memory they write, copied back after each dispatch.
+- `APS5_BDA_ABI=legacy|radix|verify` (default `radix`): how a guest address is found in the table of mapped ranges (a binary search, or an indexed table).
+- `APS5_BDA_RELATIVE=off|on|verify` (default `on`): whether a shader reuses the last range it found for later accesses inside it. `APS5_BDA_RANGE_CACHE=1` is the same as `on`, and with `APS5_VERIFY_BDA_RANGE_CACHE=1` the same as `verify`; setting both switches to different values stops the title.
+- `APS5_BDA_INLINE_FAST_PATH=off|on` (default `on`): with `APS5_BDA_RELATIVE=on`, asks the GPU driver to inline that reuse check at each access while the full lookup stays a separate function. The generated code is otherwise identical, so it has no verify mode.
+- `APS5_BDA_SPAN_HELPERS=off|on|verify` (default `on`): whether wide reads use a reader specialized for the dwords they use.
+- `APS5_BDA_WRITE_NOTES=off|on|verify` (default `on`): whether a shader skips recording a written page it already recorded.
+- `APS5_FLUSH_PROOFS=off|on|verify` (default `on`): whether denormal flushes are also removed where a value provably cannot be denormal: loop values that only ever carry flushed values through min, max or selects, NaN-propagation selects, products with constants of magnitude one or more, truncation and rounding, square roots and reciprocal square roots. `verify` keeps the flushes and stops the title when such a value is ever denormal.
+- `APS5_LAZY_LOG2_REPAIR=off|on|verify`, `APS5_LAZY_TRIG_SERIES=off|on|verify` (default `off`): whether log2, sin and cos evaluate only the correction they select.
+- `APS5_BDA_PLACEMENT=host|device|verify` (default `device`): whether compute shaders that store through addresses (without atomics or coherent accesses) work on device-local copies of the host memory they write, copied back after each dispatch.
+- `APS5_RESIDENT_MIRRORS=0|1` (default `1`): whether address-based shaders that only read host memory read device-local copies of it, refreshed from the host before each batch and after GPU writes in it.
 - `APS5_SHADER_MANIFEST=<folder>` writes one line per compiled shader with its address and instruction counts; `APS5_SHADER_MANIFEST_SPIRV=all` (or comma-separated hexadecimal addresses) also writes the shaders. `APS5_SPIRV_GUEST_LINES=1` tags shaders with guest program counters for GPU profilers.
 
 ### Tracing system library calls

@@ -112,6 +112,41 @@ void DrawSnapshotArena::SetDeviceTwins(bool twins) {
     DeviceTwinsFlag().store(twins, std::memory_order_relaxed);
 }
 
+bool DrawSnapshotArena::ParseWorkerHits(const char* text) {
+    if (text == nullptr) return true;
+    const std::string_view value(text);
+    if (value == "1" || value == "on" || value == "verify") return true;
+    if (value == "0" || value == "off") return false;
+    throw std::invalid_argument("APS5_WORKER_ARENA_HITS must be 0, 1, off, on or verify, not \"" + std::string(value) + "\"");
+}
+
+namespace {
+
+std::atomic<int>& workerHitsOverride() {
+    static std::atomic<int> enabled{-1};
+    return enabled;
+}
+
+}
+
+bool DrawSnapshotArena::WorkerHits() {
+    static const bool parsed = ParseWorkerHits(std::getenv("APS5_WORKER_ARENA_HITS"));
+    const auto forced = workerHitsOverride().load(std::memory_order_relaxed);
+    return forced >= 0 ? forced != 0 : parsed;
+}
+
+bool DrawSnapshotArena::VerifyWorkerHits() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_WORKER_ARENA_HITS");
+        return text != nullptr && std::string_view(text) == "verify";
+    }();
+    return verify;
+}
+
+void DrawSnapshotArena::SetWorkerHits(bool enabled) {
+    workerHitsOverride().store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 bool DrawSnapshotArena::WorkerCopies() {
     return WorkerCopiesFlag().load(std::memory_order_relaxed);
 }
@@ -154,7 +189,7 @@ void DrawSnapshotArena::ReportActive(double elapsedSeconds) {
         entryCount = arena->entries.size();
     }
     std::fprintf(stderr, "[draw-arena] (%.3f s) %llu takes (%.1f MiB requested): %llu hits (%.1f%%), %llu stale, %llu copies (%.1f MiB copied, %llu exact, %llu unindexed); partial %llu copies (%llu extended in place, %.1f MiB left uncopied); refused: size %llu, budget %llu; chunks %zu (%zu in flight, %.0f MiB, %llu created, %llu recycled), %zu entries; verify %llu checked, %llu differing; device twins%s: %llu views, %llu prologue copies (%.1f MiB), %llu refused; placed words: %llu (%.1f KiB), %llu reused, %llu refused\n", elapsedSeconds, static_cast<unsigned long long>(taken.takes), static_cast<double>(taken.requestedBytes) / 1048576.0, static_cast<unsigned long long>(taken.hits), 100.0 * static_cast<double>(taken.hits) / takes, static_cast<unsigned long long>(taken.stale), static_cast<unsigned long long>(taken.copies), static_cast<double>(taken.copiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.exactSegments), static_cast<unsigned long long>(taken.unindexed), static_cast<unsigned long long>(taken.partialCopies), static_cast<unsigned long long>(taken.extendedCopies), static_cast<double>(taken.uncopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.refusedSize), static_cast<unsigned long long>(taken.refusedBudget), chunkCount, busy, static_cast<double>(heldBytes) / 1048576.0, static_cast<unsigned long long>(taken.chunksCreated), static_cast<unsigned long long>(taken.chunksRecycled), entryCount, static_cast<unsigned long long>(taken.verified), static_cast<unsigned long long>(taken.verifyDiffering), DeviceTwins() ? "" : " (off)", static_cast<unsigned long long>(taken.twinViews), static_cast<unsigned long long>(taken.twinCopies), static_cast<double>(taken.twinCopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.twinsRefused), static_cast<unsigned long long>(taken.placed), static_cast<double>(taken.placedBytes) / 1024.0, static_cast<unsigned long long>(taken.placedReuses), static_cast<unsigned long long>(taken.placeRefused));
-    if (WorkerCopies()) std::fprintf(stderr, "[draw-arena] worker copies: %llu prefilled (%.1f MiB), %llu already served, %llu adopted at the encode, %llu refused there\n", static_cast<unsigned long long>(taken.prefilled), static_cast<double>(taken.prefilledBytes) / 1048576.0, static_cast<unsigned long long>(taken.prefillsServed), static_cast<unsigned long long>(taken.adopted), static_cast<unsigned long long>(taken.adoptRefused));
+    if (WorkerCopies()) std::fprintf(stderr, "[draw-arena] worker copies: %llu prefilled (%.1f MiB), %llu already served, %llu adopted at the encode, %llu refused there; worker hits: %llu adopted at the encode, %llu verified\n", static_cast<unsigned long long>(taken.prefilled), static_cast<double>(taken.prefilledBytes) / 1048576.0, static_cast<unsigned long long>(taken.prefillsServed), static_cast<unsigned long long>(taken.adopted), static_cast<unsigned long long>(taken.adoptRefused), static_cast<unsigned long long>(taken.workerHits), static_cast<unsigned long long>(taken.workerHitsVerified));
 }
 
 DrawSnapshotArena::Counters DrawSnapshotArena::TakeCounters() {
@@ -375,6 +410,10 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::Reuse(Recorder& record
 }
 
 bool DrawSnapshotArena::served(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges* ranges) const {
+    return servedEntry(address, bytes, registryGeneration, ranges).has_value();
+}
+
+std::optional<DrawSnapshotArena::Served> DrawSnapshotArena::servedEntry(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges* ranges) const {
     auto found = entries.upper_bound(address);
     for (std::size_t depth = 0; depth < LookupDepth && found != entries.begin(); ++depth) {
         --found;
@@ -391,9 +430,26 @@ bool DrawSnapshotArena::served(std::uint64_t address, std::size_t bytes, std::ui
         }
         if (GuestMemory::CollectWrites(begin, static_cast<std::size_t>(entry.end - begin)) == 0) continue;
         const bool unchanged = ranges == nullptr ? GuestMemory::UnchangedSince(address, bytes, entry.generation) : std::all_of(ranges->begin(), ranges->end(), [&](const auto& range) { return range.first == range.second || GuestMemory::UnchangedSince(address + range.first, static_cast<std::size_t>(range.second - range.first), entry.generation); });
-        if (unchanged) return true;
+        if (unchanged) return Served{entry.chunk, entry.chunkSerial, entry.offset + (address - begin), entry.limited};
     }
-    return false;
+    return std::nullopt;
+}
+
+std::optional<DrawSnapshotArena::View> DrawSnapshotArena::adoptHit(Recorder& recorder, const Prefill& prefill, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration) {
+    if (prefill.arena != identity || prefill.address != address || prefill.bytes != bytes || prefill.chunk >= chunks.size() || chunks[prefill.chunk]->serial != prefill.serial || prefill.registryGeneration != registryGeneration) return std::nullopt;
+    auto result = view(recorder, prefill.chunk, prefill.offset, bytes, false, 0, 0, prefill.limited);
+    ++counters.hits;
+    ++counters.workerHits;
+    if (VerifyWorkerHits()) {
+        ++counters.workerHitsVerified;
+        const bool same = !prefill.ranges.has_value() ? std::memcmp(result.bytes.data(), reinterpret_cast<const void*>(address), bytes) == 0 : std::all_of(prefill.ranges->begin(), prefill.ranges->end(), [&](const auto& range) { return std::memcmp(result.bytes.data() + range.first, reinterpret_cast<const void*>(address + range.first), static_cast<std::size_t>(range.second - range.first)) == 0; });
+        if (!same) {
+            char what[192];
+            std::snprintf(what, sizeof(what), "APS5_VERIFY_WORKER_ARENA_HITS: the arena hit a worker found for 0x%llx+0x%zx no longer matches guest memory at the encode", static_cast<unsigned long long>(address), bytes);
+            throw std::runtime_error(what);
+        }
+    }
+    return result;
 }
 
 std::optional<DrawSnapshotArena::Prefill> DrawSnapshotArena::PrepareCopy(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, std::optional<CopyRanges> ranges) {
@@ -402,9 +458,22 @@ std::optional<DrawSnapshotArena::Prefill> DrawSnapshotArena::PrepareCopy(std::ui
     {
         std::lock_guard lock(mutex);
         if (bytes == 0 || bytes > ChunkBytes() || (ranges.has_value() && DeviceTwins())) return std::nullopt;
-        if (served(address, bytes, registryGeneration, nullptr) || (ranges.has_value() && served(address, bytes, registryGeneration, &*ranges))) {
+        auto hit = servedEntry(address, bytes, registryGeneration, nullptr);
+        if (!hit && ranges.has_value()) hit = servedEntry(address, bytes, registryGeneration, &*ranges);
+        if (hit) {
             ++counters.prefillsServed;
-            return std::nullopt;
+            if (!WorkerHits()) return std::nullopt;
+            prefill.hit = true;
+            prefill.arena = identity;
+            prefill.chunk = hit->chunk;
+            prefill.serial = hit->serial;
+            prefill.offset = hit->offset;
+            prefill.address = address;
+            prefill.bytes = bytes;
+            prefill.registryGeneration = registryGeneration;
+            prefill.limited = hit->limited;
+            if (hit->limited) prefill.ranges = std::move(ranges);
+            return prefill;
         }
         auto first = address;
         auto last = address + bytes;

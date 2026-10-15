@@ -687,3 +687,18 @@ void RunBdaWriteNoteTests(const Context& context) {
     Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::WriteNoteMismatch && report.address == guest + 4 && noted == 1u, "APS5_BDA_WRITE_NOTES=verify did not fail on an injected cache entry");
     SetBdaTestWriteNotes(ShaderRecompiler::BdaWriteNotesSetting());
 }
+
+void RunFlushProofCheckTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    Buffer unused(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    for (const auto [value, denormal] : {std::pair{0x00000001u, true}, std::pair{0x807fffffu, true}, std::pair{0x00400000u, true}, std::pair{0x00000000u, false}, std::pair{0x80000000u, false}, std::pair{0x00800000u, false}, std::pair{0x3f800000u, false}, std::pair{0x7fc00000u, false}}) {
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        Pipeline pipeline(context, MakeFlushCheckTestShader(value), {&unused, &fault, &unused});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        if (denormal) Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::FlushProofMismatch && static_cast<std::uint32_t>(report.address) == value, "APS5_FLUSH_PROOFS=verify did not stop on a denormal reaching a proven flush");
+        else Require(report.state == Abi::FaultState::Empty, "APS5_FLUSH_PROOFS=verify stopped on a value that is not denormal");
+    }
+}
