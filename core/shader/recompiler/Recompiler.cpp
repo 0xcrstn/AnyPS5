@@ -50,8 +50,8 @@
 #include "SpirvBackend/include/SpirvBackend/SpirvEmitter.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
-#include "SpirvBackend/SpirvModuleShape.hpp"
 #endif
+#include "SpirvBackend/SpirvModuleShape.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvInputOutput.hpp"
 #include "Translation/include/Translation/InstructionTranslator.hpp"
 #include "Translation/include/Translation/ShaderInputInfoBuilder.hpp"

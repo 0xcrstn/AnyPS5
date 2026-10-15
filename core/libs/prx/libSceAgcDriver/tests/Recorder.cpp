@@ -10825,7 +10825,7 @@ bool parallelResolveTests(const Device& device, Recorder& recorder) {
     indexed.indexAddress = indices;
     const auto before = ParallelResolveStatistics();
     for (int round = 0; round < 3; ++round) {
-        for (const auto* draw : {&triangle, &indexed}) {
+        for (const auto* draw : std::initializer_list<const AgcDriver::Pm4::DrawParameters*>{&triangle, &indexed}) {
             clear();
             const auto resolved = ResolveDraw(context, state, *draw, shaders);
             Require(resolved != nullptr, "the resolve returned nothing");

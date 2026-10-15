@@ -3808,8 +3808,7 @@ void Recorder::Submit() {
                 std::snprintf(message, sizeof(message), "APS5_VERIFY_IN_PLACE_DRAW_INPUTS: a CPU store reached the draw input 0x%llx+0x%llx bound in place before its batch completed", static_cast<unsigned long long>(input.begin), static_cast<unsigned long long>(input.end - input.begin));
                 if (StrictInPlaceDrawInputs()) throw std::runtime_error(message);
                 const auto changed = InPlaceInputsChangedAfterSubmit().fetch_add(1, std::memory_order_relaxed) + 1;
-                if (changed <= 20 || changed % 1000 == 0) std::fprintf(stderr, "[in-place-inputs] %s (%llu so far; after the submit, so possibly after the GPU read)
-", message, static_cast<unsigned long long>(changed));
+                if (changed <= 20 || changed % 1000 == 0) std::fprintf(stderr, "[in-place-inputs] %s (%llu so far; after the submit, so possibly after the GPU read)\n", message, static_cast<unsigned long long>(changed));
             }
         });
         open->inPlaceInputs.clear();

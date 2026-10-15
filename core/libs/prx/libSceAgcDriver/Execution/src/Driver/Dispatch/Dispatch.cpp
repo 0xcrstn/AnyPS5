@@ -48,7 +48,7 @@ FrozenFallback Driver::dispatchHleFallback(const Registers& shader, std::span<co
     if (indirectArguments == 0 && (packet[4] & 0x2u) != 0) partialGroups = Pm4::PartialGroupThreads({packet[1], packet[2], packet[3]}, {readRegister(shader, 0x207), readRegister(shader, 0x208), readRegister(shader, 0x209)});
     if (partialGroups != std::array<std::uint32_t, 3>{}) return FrozenFallback::None;
     if (MatchDwordPatternFill(packet, code, userData, compute) || MatchConstantDwordFill(packet, code, userData, compute) || MatchMemoryValueBufferFill(packet, code, userData, compute) || matchesFillKernel(code, userData, compute)) return FrozenFallback::FillHle;
-    if (indirectArguments == 0 && (matchesCopyKernel(code, userData, compute) || MatchStreamCopyKernel(code, userData, compute))) return FrozenFallback::CopyHle;
+    if (indirectArguments == 0 && (matchesCopyKernel(code, userData, compute) || MatchesStreamCopyKernel(code, userData, compute))) return FrozenFallback::CopyHle;
     return FrozenFallback::None;
 }
 

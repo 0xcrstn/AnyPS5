@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CompileService.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SlowReport.hpp"
@@ -203,7 +204,7 @@ std::size_t PositiveSetting(const char* name, std::size_t fallback, std::size_t 
     std::size_t value = 0;
     const auto end = text + std::strlen(text);
     const auto parsed = std::from_chars(text, end, value);
-    require(parsed.ec == std::errc{} && parsed.ptr == end && value != 0 && value <= maximum, std::string(name) + " must be an integer from 1 through " + std::to_string(maximum));
+    require(parsed.ec == std::errc{} && parsed.ptr == end && value != 0 && value <= maximum, (std::string(name) + " must be an integer from 1 through " + std::to_string(maximum)).c_str());
     return value;
 }
 

@@ -233,6 +233,7 @@ function(add_shader_recompiler target runtimeTarget)
             BuildRectListShaders
             BdaPlacement::BuildCopyBackShader
             BdaPlacement::ParseMode
+            BdaPlacement::Pass
             BdaTable::Build
             BdaTable::RangeBaseWord
             BdaTable::TranslationSetting
