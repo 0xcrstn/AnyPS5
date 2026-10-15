@@ -568,10 +568,11 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             localDevice = std::move(current);
         }
 
-        recordLabelsForPacket(localDevice.get(), submission.queue);
+        if (frozenSink() == nullptr) recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(DrawRowLabels);
     };
     if (drawParameters.indirect && indirectCpu) {
+        if (auto* sink = frozenSink(); sink != nullptr && sink->Refuse(FrozenFallback::ArgumentRead)) return DrawVerdict::Nothing;
         if (drawRecordState().active && !settleDrawRecords(snapshots, true)) return DrawVerdict::Nothing;
 
         const auto indirect = *drawParameters.indirect;
@@ -585,7 +586,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             }
             programResults[i] = &results[resultIndex[i]];
         }
-        recordQueuedLabelsBeforeRead(submission.queue);
+        if (frozenSink() == nullptr) recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
         std::vector<Pm4::DrawArguments> records;
