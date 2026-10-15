@@ -251,7 +251,7 @@ public:
     // blit-submit times after the flip packet; noted in-place reads checked
     // (APS5_FLIP_READ_CHECK=1) and found overwritten before the blit's fence.
     struct PresentStatistics {
-        std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten, acquireDrops;
+        std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten, acquireDrops, computeWaits;
         double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs;
     };
     static PresentStatistics PresentCounts();

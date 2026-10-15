@@ -3488,6 +3488,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     SubmitRecorded(false);
     std::chrono::steady_clock::time_point lastSubmittedAt{};
     const std::uint64_t batchesAtBlit = state->recorder ? state->recorder->NewestSubmitted(&lastSubmittedAt) : 0;
+    const std::uint64_t computeAtBlit = state->computeRecorder && state->computeRecorder->HasTimeline() ? state->computeRecorder->Submissions() : 0;
     CaptureTrace::Log("blit dump=%d batch=%llu slot=%zu image=%u direct=%d", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(batchesAtBlit), state->presentCursor, index, direct);
     timing.Mark("pixel_upload");
     APS5_LOG_OUT_DEBUG("present source=%s bytes=%zu", pixels.empty() ? "clear" : "pixels", pixels.size());
@@ -3622,6 +3623,18 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     submit.pCommandBuffers = &commands;
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &rendered;
+    VkTimelineSemaphoreSubmitInfoKHR producerWait{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+    const VkSemaphore computeTimeline = computeAtBlit != 0 ? state->computeRecorder->Timeline() : VK_NULL_HANDLE;
+    const VkPipelineStageFlags computeStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if (computeTimeline != VK_NULL_HANDLE) {
+        producerWait.waitSemaphoreValueCount = 1;
+        producerWait.pWaitSemaphoreValues = &computeAtBlit;
+        submit.pNext = &producerWait;
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &computeTimeline;
+        submit.pWaitDstStageMask = &computeStage;
+        ++presentCounters.computeWaits;
+    }
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
