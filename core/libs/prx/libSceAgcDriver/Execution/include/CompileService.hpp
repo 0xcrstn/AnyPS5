@@ -272,7 +272,7 @@ public:
                 found->second.ticket->cancelRequested.store(true, std::memory_order_relaxed);
                 return true;
             }
-            if (found->second.ticket->Settled()) return false;
+            if (found->second.finished || found->second.ticket->Settled()) return false;
             cancelled = found->second.ticket;
             jobs.erase(found);
             ++stats.cancelled;
@@ -288,7 +288,7 @@ public:
             std::lock_guard lock(mutex);
             for (auto it = jobs.begin(); it != jobs.end();) {
                 const auto& ticket = it->second.ticket;
-                if (it->second.running || ticket->Settled() || ticket->Priority() == CompilePriority::Demand || ticket->Priority() == CompilePriority::Upcoming) {
+                if (it->second.running || it->second.finished || ticket->Settled() || ticket->Priority() == CompilePriority::Demand || ticket->Priority() == CompilePriority::Upcoming) {
                     ++it;
                     continue;
                 }
@@ -316,7 +316,7 @@ public:
             if (!closed) {
                 closed = true;
                 for (auto it = jobs.begin(); it != jobs.end();) {
-                    if (it->second.running || it->second.ticket->Settled() || it->second.ticket->Priority() == CompilePriority::Demand) {
+                    if (it->second.running || it->second.finished || it->second.ticket->Settled() || it->second.ticket->Priority() == CompilePriority::Demand) {
                         ++it;
                         continue;
                     }
@@ -336,7 +336,7 @@ public:
     void Forget(const std::string& key) {
         std::lock_guard lock(mutex);
         const auto found = jobs.find(key);
-        if (found != jobs.end() && found->second.ticket->Settled()) jobs.erase(found);
+        if (found != jobs.end() && (found->second.finished || found->second.ticket->Settled())) jobs.erase(found);
     }
 
     Statistics Counters() const {
@@ -344,7 +344,7 @@ public:
         auto result = stats;
         result.queued = 0;
         for (const auto& [key, job] : jobs) {
-            if (!job.running && !job.ticket->Settled()) ++result.queued;
+            if (waitingLocked(job)) ++result.queued;
         }
         result.running = runningJobs;
         result.reservedBytes = reserved;
@@ -360,7 +360,12 @@ private:
         std::uint64_t sequence = 0;
         ShaderCompileTrace::Clock::time_point enqueued{};
         bool running = false;
+        bool finished = false;
     };
+
+    static bool waitingLocked(const Job& job) {
+        return !job.running && !job.finished && !job.ticket->Settled();
+    }
 
     void promoteLocked(const CompileTicket& ticket, CompilePriority priority) {
         auto current = ticket.priority.load(std::memory_order_relaxed);
@@ -399,7 +404,7 @@ private:
         const std::size_t speculativeSlots = limits.workers - std::min(limits.demandReservedWorkers, limits.workers - 1);
         for (auto it = jobs.begin(); it != jobs.end();) {
             auto& job = it->second;
-            if (job.running || job.ticket->Settled()) {
+            if (!waitingLocked(job)) {
                 ++it;
                 continue;
             }
@@ -494,6 +499,7 @@ private:
                 if (!demand) --runningSpeculative;
                 if (const auto found = jobs.find(ticket->key); found != jobs.end() && found->second.ticket == ticket) {
                     found->second.running = false;
+                    found->second.finished = true;
                     found->second.dependencies.clear();
                     if (result == CompileState::Cancelled) jobs.erase(found);
                 }
@@ -509,7 +515,7 @@ private:
     std::size_t runnableOrQueuedLocked() const {
         std::size_t count = runningJobs;
         for (const auto& [key, job] : jobs) {
-            if (!job.running && !job.ticket->Settled()) ++count;
+            if (waitingLocked(job)) ++count;
         }
         return count;
     }
