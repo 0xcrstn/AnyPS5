@@ -479,7 +479,7 @@ private:
     std::atomic<std::uint64_t> packetsDone{0};
 
     std::atomic<std::uint64_t> eventSerial{0};
-    QueueScheduler queueScheduler{QueueScheduler::ConfiguredMode(), QueueScheduler::ConfiguredVerify()};
+    QueueScheduler queueScheduler{QueueScheduler::ConfiguredMode(), QueueScheduler::ConfiguredVerify(), QueueScheduler::ConfiguredRecording()};
     std::thread batchAgeThread;
     std::mutex batchAgeMutex;
     std::condition_variable batchAgeChanged;
