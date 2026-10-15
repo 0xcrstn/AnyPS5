@@ -12,7 +12,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-inline constexpr const char* LabelRefusalNames[6] = {"none", "trust-off", "queued", "overwritten", "unclosed", "behind-completion"};
+inline constexpr const char* LabelRefusalNames[7] = {"none", "trust-off", "queued", "overwritten", "unclosed", "behind-completion", "unordered"};
 
 inline constexpr std::chrono::microseconds PollTryInterval{1000};
 
@@ -33,7 +33,7 @@ struct PollStats {
     std::uint64_t ticks = 0, tableHits = 0, tries = 0, triesFailed = 0, submits = 0, reaps = 0, reapsWithWork = 0;
 
     std::uint64_t reapsBehindCompletion = 0, reapsOther = 0;
-    std::array<std::uint64_t, 6> refusals{};
+    std::array<std::uint64_t, 7> refusals{};
     double longestTryHoldUs = 0;
     double tryHoldUs = 0;
 };

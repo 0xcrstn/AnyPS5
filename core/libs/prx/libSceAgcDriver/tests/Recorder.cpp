@@ -1176,6 +1176,60 @@ void lateLabelTests(Recorder& recorder) {
     Require(!Recorder::LookupLabel(a, 4, 5).has_value() && !Recorder::LookupLabel(b, 8, 5).has_value() && !recorder.PendingLabelIn(0x70000, 0x400), "(7) entries outlived their batch");
 }
 
+void crossQueueLabelTests(const Device& device, Recorder& recorder) {
+    using Refusal = Recorder::LabelRefusal;
+    const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    const std::array<std::byte, 4> two{std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0}};
+    const std::array<std::byte, 4> three{std::byte{3}, std::byte{0}, std::byte{0}, std::byte{0}};
+    constexpr std::uint64_t a = 0x74000, b = 0x74100, c = 0x74200;
+    recorder.Sync();
+    Recorder other(device.GetContext(), false, 1);
+    other.Activate();
+    recorder.SetPeer(&other);
+    other.SetPeer(&recorder);
+    struct Unpeer {
+        Recorder& first;
+        Recorder& second;
+        ~Unpeer() {
+            first.Sync();
+            second.Sync();
+            first.SetPeer(nullptr);
+            second.SetPeer(nullptr);
+        }
+    } unpeer{recorder, other};
+    Refusal refusal{};
+    recorder.NoteLabel(a, one, 20, 0);
+    other.NoteLabel(a, two, 21, 0x20);
+    Require(!Recorder::LookupLabel(a, 4, 0, &refusal).has_value() && refusal == Refusal::Unordered, "a label pending unsubmitted on two physical queues is not refused as unordered");
+    recorder.Submit();
+    auto hit = Recorder::LookupLabel(a, 4, 0, &refusal);
+    Require(hit.has_value() && hit->value == 2 && hit->queue == 0x20 && hit->stamp == 21 && refusal == Refusal::None, "the unsubmitted batch, which runs after the submitted one, does not decide the label");
+    other.Submit();
+    hit = Recorder::LookupLabel(a, 4, 0, &refusal);
+    Require(hit.has_value() && hit->value == 2 && refusal == Refusal::None, "the later of two submitted batches does not decide the label");
+    recorder.Sync();
+    other.Sync();
+    Require(!Recorder::LookupLabel(a, 4, 0).has_value(), "the composed entries outlived their batches");
+    other.NoteLabel(b, two, 30, 0x20);
+    other.Submit();
+    recorder.NoteLabel(b, three, 29, 0);
+    hit = Recorder::LookupLabel(b, 4, 0, &refusal);
+    Require(hit.has_value() && hit->value == 3 && hit->stamp == 29 && refusal == Refusal::None, "a batch submitted later does not win over a newer stamp on a batch submitted earlier");
+    recorder.Submit();
+    hit = Recorder::LookupLabel(b, 4, 0, &refusal);
+    Require(hit.has_value() && hit->value == 3, "the submission order does not decide between two submitted batches");
+    Require(!Recorder::LookupLabel(b, 4, 29, &refusal).has_value() && refusal != Refusal::None, "the late rule does not apply to the winning entry");
+    recorder.Sync();
+    other.Sync();
+    recorder.NoteLabel(c, one, 40, 0);
+    other.NoteLabel(c + 4, two, 41, 0x20);
+    recorder.Submit();
+    other.Submit();
+    hit = Recorder::LookupLabel(c, 8, 0, &refusal);
+    Require(hit.has_value() && hit->value == 0x0000000200000001ull && hit->queue == 0 && hit->stamp == 40 && refusal == Refusal::None, "a 64-bit label whose dwords are pending on two physical queues is not composed");
+    Require(!recorder.PendingLabel(c, 8, 0).has_value(), "one physical queue's own table composed a dword it does not hold");
+}
+
 void largeLabelTests(Recorder& recorder) {
     constexpr std::uint64_t slot = 0x71000, small = slot + 0x10, outside = slot - 4, wide = 0x72000;
     const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
@@ -11458,6 +11512,7 @@ int main(int argc, char** argv) {
             directCompletionLabelTests(recorder);
             labelTests(recorder);
             lateLabelTests(recorder);
+            crossQueueLabelTests(device, recorder);
             largeLabelTests(recorder);
             std::cout << "Completion label storage and ordering tests passed\n";
             return 0;
