@@ -2697,7 +2697,7 @@ ShaderResources::EpochProofVerdict ShaderResources::AdoptEpochProof(const EpochP
     if (result.verdict != EpochProofVerdict::Held) return result.verdict;
     const auto start = std::chrono::steady_clock::now();
     if (!reusable || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return EpochProofVerdict::Disabled;
-    if (addressTemplate && !guestMemory.AddressSpaceCurrent()) return EpochProofVerdict::Stamps;
+    if (addressTemplate && (!guestMemory.AddressSpaceCurrent() || !guestMemory.SlabReadsCurrent())) return EpochProofVerdict::Stamps;
     std::lock_guard lock(proofMutex);
     if (proofBasis != result.basis) return EpochProofVerdict::Basis;
     if (!epochProofScalarsHold()) return EpochProofVerdict::Stamps;
@@ -3090,7 +3090,7 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
-    if (addressTemplate && !guestMemory.AddressSpaceCurrent()) return false;
+    if (addressTemplate && (!guestMemory.AddressSpaceCurrent() || !guestMemory.SlabReadsCurrent())) return false;
     std::unique_lock<std::recursive_mutex> proofLock(proofMutex, std::defer_lock);
     if (EpochProofsOffThread()) proofLock.lock();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

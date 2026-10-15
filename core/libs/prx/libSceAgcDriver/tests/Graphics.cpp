@@ -6776,7 +6776,8 @@ void storeAtFlipTests() {
     Require(!StorageTexture::StoreAtFlipRequested(nullptr).has_value(), "an unset APS5_STORE_AT_FLIP stored at each flip");
     Require(StorageTexture::StoreAtFlipRequested("1") == PublishScope::Whole, "APS5_STORE_AT_FLIP=1 did not store and publish at each flip");
     Require(StorageTexture::StoreAtFlipRequested("shadow") == PublishScope::None, "APS5_STORE_AT_FLIP=shadow published the stores at each flip");
-    for (const char* value : {"0", "", "true", "11", "Shadow"}) expectFailure([&] { StorageTexture::StoreAtFlipRequested(value); }, "expected 1 or shadow");
+    Require(!StorageTexture::StoreAtFlipRequested("none").has_value(), "APS5_STORE_AT_FLIP=none stored at each flip");
+    for (const char* value : {"0", "", "true", "11", "Shadow", "None"}) expectFailure([&] { StorageTexture::StoreAtFlipRequested(value); }, "expected 1, shadow or none");
 }
 
 void storeAtLabelTests() {

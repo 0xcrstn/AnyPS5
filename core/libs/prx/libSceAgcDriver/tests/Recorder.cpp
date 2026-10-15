@@ -2861,8 +2861,28 @@ void stagingReuseTests(const Device& device, Recorder& recorder) {
     Require(guestAll(element, element + 64, 0xa1), "a use without copy-back stored its results");
     const auto partial = address + 4 * 65536;
     const auto partialFirst = run(partial, 2 * elementBytes, 0, 0, 0, true);
-    const auto partialSecond = run(partial, 2 * elementBytes, 0, 0, 0, true);
-    Require(partialFirst.copied == 1 && partialSecond.copied == 1 && partialSecond.skipped == 0, "a staged region the shader writes only in part skipped its copy-in");
+    const auto partialSecond = run(partial, 2 * elementBytes, 0, 64, 0xe5e5e5e5u, true);
+    const char* reuseReads = std::getenv("APS5_STAGING_REUSE_READS");
+    if (reuseReads != nullptr && std::string_view(reuseReads) == "0") {
+        Require(partialFirst.copied == 1 && partialSecond.copied == 1 && partialSecond.skipped == 0, "APS5_STAGING_REUSE_READS=0: a staged region the shader writes only in part skipped its copy-in");
+    } else {
+        const auto reusedBefore = StagingCounters().reusedComplete;
+        Require(partialFirst.copied == 1 && partialSecond.copied == 0 && partialSecond.skipped == 1, "an unchanged staged region the shader writes only in part was copied in again");
+        Require(all(partialSecond.seen, 0x11), "a reused partly written shadow does not hold the guest bytes");
+        const auto partialThird = run(partial, 2 * elementBytes, 0, 0, 0, true);
+        Require(partialThird.skipped == 1 && partialThird.seen[0] == 0xe5 && partialThird.seen[63] == 0xe5 && partialThird.seen[64] == 0x11, "a reused partly written shadow lost the previous use's results");
+        guest[partial - address + elementBytes + 100] = 0xf6;
+        const auto partialFourth = run(partial, 2 * elementBytes, 0, 0, 0, true);
+        Require(partialFourth.copied == 1 && partialFourth.skipped == 0, "a CPU store into the unwritten part of a staged region did not copy it in again");
+        Require(AgcDriver::GuestMemory::MarkWritten(partial + elementBytes + 512, 16) != 0, "a GPU write into the unwritten part was not stamped");
+        const auto partialFifth = run(partial, 2 * elementBytes, 0, 0, 0, true);
+        Require(partialFifth.copied == 1 && partialFifth.skipped == 0, "a driver store into the unwritten part of a staged region did not copy it in again");
+        const auto partialSixth = run(partial, 2 * elementBytes, 0, 0, 0, true);
+        recorder.Sync();
+        const auto counters = StagingCounters();
+        Require(partialSixth.skipped == 1 && counters.reusedComplete >= reusedBefore + 2, "partly written shadows were not counted as reused");
+        if (reuseReads != nullptr && std::string_view(reuseReads) == "verify") Require(counters.reuseVerified >= 2, "APS5_STAGING_REUSE_READS=verify did not compare the reused shadows");
+    }
     std::cout << "Staging reuse tests passed\n";
 }
 
@@ -5407,7 +5427,7 @@ int coherenceLazyReleaseTests(const Device& device, Recorder& recorder) {
     const auto* words = static_cast<const std::uint8_t*>(block);
     paint(covered, {1.0f, 0.0f, 0.0f, 1.0f}, true);
     Require(Coherence::CurrentCounters().liveProtections == 1, "the covered image was not protected: " + Coherence::Report());
-    const std::array<std::optional<PublishScope>, 3> flips{std::nullopt, PublishScope::Whole, PublishScope::None};
+    const std::array<std::optional<PublishScope>, 2> flips{std::nullopt, PublishScope::None};
     std::uint8_t shade = 0x20;
     for (const auto& flip : flips) {
         const auto value = static_cast<float>(shade) / 255.0f;
@@ -5433,6 +5453,14 @@ int coherenceLazyReleaseTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     const auto counters = Coherence::CurrentCounters();
     Require(counters.uncoveredReleases == 0 && counters.liveProtections == 0 && counters.faultsResolved == 1, "lazy release: " + Coherence::Report());
+    paint(covered, {0.0f, 1.0f, 0.0f, 1.0f}, true);
+    paint(uncovered, {0.0f, 0.0f, 1.0f, 1.0f}, false);
+    Require(Coherence::CurrentCounters().liveProtections == 1, "the repainted covered image was not protected: " + Coherence::Report());
+    Require(StorageTexture::PresentThenStore(PublishScope::Whole, [] { return true; }), "the full flip did not present");
+    recorder.Sync();
+    Require(StorageTexture::FindPending(address, unit) == nullptr && StorageTexture::FindPending(address + unit, unit) == nullptr, "APS5_STORE_AT_FLIP=1 left an image pending under lazy release");
+    Require(words[0] == 0 && words[1] == 0xff && words[unit] == 0 && words[unit + 2] == 0xff, "APS5_STORE_AT_FLIP=1 did not store every pending image under lazy release");
+    Require(Coherence::CurrentCounters().liveProtections == 0 && Coherence::CurrentCounters().faultsResolved == 1, "the full flip left a protection or resolved a fault: " + Coherence::Report());
     std::cout << "coherence lazy release: ok\n";
     return 0;
 #endif
@@ -5580,6 +5608,149 @@ int deferredPointerStoreTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     Require(words[unit] == 0 && words[unit + 2] == 0xff && words[unit + 3] == 0xff, "a flip with no pointer writer in flight did not store the image");
     std::cout << "deferred pointer stores: ok\n";
+    return 0;
+}
+
+int bdaShadowReadTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& base = device.GetContext();
+    if (!base.bufferDeviceAddress) {
+        std::cout << "skipped, buffer device addresses are unavailable\n";
+        return 77;
+    }
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 4 * unit;
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared slab-read section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    struct Release {
+        void* block;
+        ~Release() {
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+#else
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "unit shadows are on without write watching");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+#endif
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the slab-read block refused or compared: not tested\n";
+        return 77;
+    }
+    CollectWritesUncached(address, bytes);
+    auto* words = static_cast<std::uint8_t*>(block);
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address + unit;
+    resource.width = 128;
+    resource.height = 128;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == unit, "the slab-read image does not fill its 64 KiB block");
+    auto image = StorageTexture::Create(context, detiler, resource, 0);
+    const auto paint = [&](std::array<float, 4> color) {
+        image->Refresh();
+        const VkClearColorValue value{{color[0], color[1], color[2], color[3]}};
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+    };
+    auto output = std::make_shared<Buffer>(base, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    struct Use {
+        std::shared_ptr<GuestBufferMemory> memory;
+        std::shared_ptr<BdaResources> bda;
+        std::shared_ptr<AddressProgram> program;
+        std::uint32_t loaded = 0;
+    };
+    const auto reader = [&](std::uint64_t at) {
+        Use use;
+        use.memory = std::make_shared<GuestBufferMemory>(base);
+        use.memory->AcquireRegistered();
+        use.memory->SetPointerAccess(false, {});
+        use.memory->Upload(true);
+        use.bda = std::make_shared<BdaResources>(base, *use.memory);
+        std::memset(output->Bytes().data(), 0, output->Bytes().size());
+        const auto code = MakeBdaDwordReadTestShader(at, 1, false, true);
+        use.program = std::make_shared<AddressProgram>(base, code, std::array<VkDescriptorBufferInfo, 3>{use.bda->Table(), use.bda->Fault(), VkDescriptorBufferInfo{output->Handle(), 0, 16}});
+        use.program->Record(recorder);
+        recorder.Keep(use.memory);
+        recorder.Keep(use.bda);
+        recorder.Keep(use.program);
+        recorder.Sync();
+        use.bda->CheckFault();
+        std::memcpy(&use.loaded, output->Bytes().data(), sizeof(use.loaded));
+        return use;
+    };
+    std::unique_lock gpu(GpuMutex());
+    const auto mode = BdaShadowReads();
+    const auto before = BdaResources::SlabReadCounters();
+    paint({1.0f, 0.0f, 0.0f, 1.0f});
+    const auto red = reader(address + unit + 16);
+    if (mode == ShadowReads::Off) {
+        Require(red.loaded == 0x11111111u, "APS5_BDA_SHADOW_READS=0: a read-only address-based build stored or published the pending image");
+        std::cout << "address-based reads of unit shadows (off): ok\n";
+        return 0;
+    }
+    Require(red.loaded == 0xff0000ffu, "a read-only address-based build read stale bytes under a pending image: " + std::to_string(red.loaded) + ", " + std::to_string(red.memory->SlabReads().size()) + " slab reads, pending " + std::to_string(StorageTexture::FindPending(address + unit, unit) != nullptr) + ShadowReport());
+    Require(StorageTexture::FindPending(address + unit, unit) == nullptr, "a read-only address-based build left the image it reads pending");
+    Require(mode == ShadowReads::Verify || (words[unit + 16] == 0x11 && words[unit + 19] == 0x11), "a read-only address-based build stored the image into guest memory instead of reading its unit shadow: " + std::to_string(red.memory->SlabReads().size()) + " slab reads, " + ShadowReport());
+    Require(!red.memory->SlabReads().empty() && BdaResources::SlabReadCounters().builds == before.builds + 1, "a read-only address-based build did not read the unit shadow's slab");
+    Require(red.memory->SlabReadsCurrent(), "a slab-backed read was not current right after its build");
+    const auto again = reader(address + unit + 64);
+    Require(again.loaded == 0xff0000ffu && (mode == ShadowReads::Verify || words[unit + 64] == 0x11), "a second read-only build did not read the same unit shadow");
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint32_t*>(words + unit + 128) = 0x22222222u;
+    gpu.lock();
+    CollectWritesUncached(address + unit, unit);
+    Require(!red.memory->SlabReadsCurrent(), "a CPU store into a slab-backed unit left its reads current");
+    const auto stale = reader(address + unit + 128);
+    Require(stale.loaded == 0x22222222u, "a read-only address-based build read a unit shadow older than a CPU store");
+    if (mode == ShadowReads::Verify) Require(BdaResources::SlabReadCounters().verified >= before.verified + 1, "APS5_BDA_SHADOW_READS=verify did not compare the slab-backed reads");
+    std::cout << "address-based reads of unit shadows: ok\n";
     return 0;
 }
 
@@ -12098,6 +12269,13 @@ int main(int argc, char** argv) {
             }
             unitShadowTests(device, recorder);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--bda-shadow-reads-only") {
+            if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, unit shadows or host imports are unavailable\n";
+                return 77;
+            }
+            return bdaShadowReadTests(device, recorder);
         }
         if (argc == 2 && std::string_view(argv[1]) == "--deferred-pointer-stores-only") {
             if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {

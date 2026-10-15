@@ -3994,6 +3994,15 @@ bool StorageTexture::StoreForPointerAccess(std::uint64_t address, std::size_t by
     return stored || published;
 }
 
+bool StorageTexture::ShadowForPointerReads(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt) {
+    const auto previous = std::exchange(pointerExempt, exempt);
+    struct Restore {
+        std::span<const std::pair<std::uint64_t, std::uint64_t>> previous;
+        ~Restore() { pointerExempt = previous; }
+    } restore{previous};
+    return FlushPending(address, bytes, nullptr, "address-based heap", PublishScope::None);
+}
+
 void StorageTexture::AuditPointerReads(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt) {
     if (!Coherence::Tracking()) return;
     std::vector<std::pair<Coherence::Interval, Coherence::Version>> stale;
@@ -4091,17 +4100,18 @@ bool StorageTexture::AnyPending() {
 }
 
 std::optional<PublishScope> StorageTexture::StoreAtFlipRequested(const char* value) {
-    if (value == nullptr) return std::nullopt;
+    if (value == nullptr || std::strcmp(value, "none") == 0) return std::nullopt;
     if (std::strcmp(value, "1") == 0) return PublishScope::Whole;
     if (std::strcmp(value, "shadow") == 0) return PublishScope::None;
-    throw std::runtime_error(std::string("APS5_STORE_AT_FLIP=") + value + ": expected 1 or shadow");
+    throw std::runtime_error(std::string("APS5_STORE_AT_FLIP=") + value + ": expected 1, shadow or none");
 }
 
 bool StorageTexture::PresentThenStore(std::optional<PublishScope> storeAtFlip, const std::function<bool()>& present) {
-    if (Coherence::LazyRelease()) {
+    if (Coherence::LazyRelease() && storeAtFlip != PublishScope::Whole) {
         FlushDumpSelected("flip");
         const bool presented = present();
         static_cast<void>(FlushUnprotected("flip"));
+        if (storeAtFlip == PublishScope::None) static_cast<void>(PublishUnprotectedShadows(PublishReason::Flip, true));
         Coherence::CheckReleaseCovered(AnyUnprotectedPending(), AnyUnprotectedShadow(), "flip");
         return presented;
     }

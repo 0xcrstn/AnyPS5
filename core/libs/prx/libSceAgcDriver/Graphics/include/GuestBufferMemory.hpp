@@ -22,11 +22,16 @@ namespace AgcDriver::Graphics {
 
 void ShutdownGuestBufferWorkers();
 
+enum class ShadowReads { Off, On, Verify };
+ShadowReads BdaShadowReads();
+
 struct StagingStats {
     std::uint64_t staged = 0;
     std::uint64_t copiedInBytes = 0;
     std::uint64_t skipped = 0;
     std::uint64_t skippedBytes = 0;
+    std::uint64_t reusedComplete = 0;
+    std::uint64_t reuseVerified = 0;
 };
 StagingStats StagingCounters();
 
@@ -109,6 +114,7 @@ std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 // imported); see GuestBufferMemory.cpp.
 struct ImageMirror;
 struct StagingShadow;
+struct ShadowSlab;
 class Recorder;
 
 template<typename TRange>
@@ -355,6 +361,15 @@ public:
     Recorder::BoundPlacement Placement() const;
     VkDescriptorBufferInfo MirroredDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment, std::vector<std::shared_ptr<ResidentMirror>>& mirrors) const;
     std::vector<ShaderRecompiler::BdaAbi::Range> MirroredRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::vector<std::shared_ptr<ResidentMirror>>& mirrors) const;
+    struct SlabRead {
+        std::uint64_t begin;
+        std::uint64_t end;
+        VkDeviceSize offset;
+        std::shared_ptr<ShadowSlab> slab;
+    };
+    std::vector<ShaderRecompiler::BdaAbi::Range> ShadowedRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges) const;
+    std::span<const SlabRead> SlabReads() const { return slabReads; }
+    bool SlabReadsCurrent() const;
     std::vector<ShaderRecompiler::BdaAbi::Range> PlacedRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::vector<std::shared_ptr<ResidentMirror>>& mirrors, std::vector<ShaderRecompiler::BdaPlacement::Entry>& entries) const;
     struct SplitReads {
         std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> space;
@@ -418,6 +433,8 @@ private:
         bool unstaged = false;
         std::shared_ptr<StagingShadow> shadow {};
         mutable bool shadowBegun = false;
+        mutable std::uint64_t copiedIn = 0;
+        mutable bool reusedComplete = false;
         mutable bool lazyResident = false;
     };
 
@@ -429,7 +446,7 @@ private:
     // imports changed under the space (`resolve`: the direct regions are re-resolved by UploadFinish).
     void dissolveSpace(bool resolve);
     void completeSpaceWrites() const;
-    void storePointerHeaps() const;
+    void storePointerHeaps(bool refresh = false) const;
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address) const;
@@ -472,7 +489,7 @@ private:
     bool writesCover(std::uint64_t begin, std::uint64_t end) const;
     bool shadowReusable(const Region& region) const;
     bool takeShadow(Region& region, bool addressable);
-    static void settleShadow(const Region& region, std::uint64_t generation);
+    static void settleShadow(const Region& region, std::uint64_t generation, bool complete = false);
     void takeHeapReferences();
     Context context;
     bool stagingAllowed = false;
@@ -493,6 +510,7 @@ private:
     bool regionsSorted = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     bool pointerWrites = false;
+    mutable std::vector<SlabRead> slabReads;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pointerExempt;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pointerHeaps;
     mutable Coherence::ProducerToken pointerToken;
