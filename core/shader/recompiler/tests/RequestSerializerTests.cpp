@@ -45,8 +45,8 @@ void Require(bool condition) {
     if (!condition) std::abort();
 }
 
-void InsertQuadMaskDefaults(std::vector<std::uint8_t>& bytes) {
-    bytes.insert(bytes.begin() + 261u, {0x0fu, 0xffu, 0xffu, 0u, 0u, 0xffu, 0xffu, 0u, 0u, 0xffu, 0xffu, 0u, 0u, 0xffu, 0xffu, 0u, 0u});
+void InsertPixelTailDefaults(std::vector<std::uint8_t>& bytes) {
+    bytes.insert(bytes.begin() + 261u, {0x0fu, 0xffu, 0xffu, 0u, 0u, 0xffu, 0xffu, 0u, 0u, 0xffu, 0xffu, 0u, 0u, 0xffu, 0xffu, 0u, 0u, 0u, 0u, 0u, 0u});
 }
 
 std::vector<std::uint8_t> DecodeBase64(std::string_view text) {
@@ -206,9 +206,9 @@ int main() {
             Require(request.graphics->draw.indexAddress == 0xabcdef3400u && request.graphics->draw.indexCount == 57u && request.graphics->draw.indexElementBytes == 4u && request.graphics->draw.instanceCount == 9u);
             Require(request.target.float16DenormPreserve == preserve);
             auto upgraded = bytes;
-            upgraded[4] = 29u;
+            upgraded[4] = 30u;
             if (fixture.pixel) upgraded.insert(upgraded.begin() + 258u, {0u, 0u, 0u});
-            if (fixture.pixel) InsertQuadMaskDefaults(upgraded);
+            if (fixture.pixel) InsertPixelTailDefaults(upgraded);
             if (fixture.tessellation) upgraded.insert(upgraded.end() - 35u, 5u, 0u);
             upgraded.insert(upgraded.end(), sizeof(std::uint64_t), 0u);
             Require(serializer.Serialize(request) == EncodeBase64(upgraded));
@@ -245,9 +245,9 @@ int main() {
                     layerRejected = std::string_view(error.what()) == "RequestSerializer: truncated data";
                 }
                 Require(layerRejected);
-                layered[4] = 29u;
+                layered[4] = 30u;
                 layered.insert(layered.begin() + 259u, {0u, 0u});
-                InsertQuadMaskDefaults(layered);
+                InsertPixelTailDefaults(layered);
                 if (fixture.tessellation) layered.insert(layered.end() - 35u, 5u, 0u);
                 layered.insert(layered.end(), sizeof(std::uint64_t), 0u);
                 Require(serializer.Serialize(layerReplay.request) == EncodeBase64(layered));
@@ -270,9 +270,9 @@ int main() {
             Require(replay.request.context.pixel->rasterPrimitive == ShaderRecompiler::RasterPrimitive::Rectangle);
             Require(replay.request.context.vertex->paClVsOutCntl == 0x00050a05u);
             Require(replay.request.target.float16DenormPreserve == preserve);
-            bytes[4] = 29u;
+            bytes[4] = 30u;
             bytes.insert(bytes.begin() + 259u, {0u, 0u});
-            InsertQuadMaskDefaults(bytes);
+            InsertPixelTailDefaults(bytes);
             bytes.insert(bytes.end(), sizeof(std::uint64_t), 0u);
             Require(serializer.Serialize(replay.request) == EncodeBase64(bytes));
 
@@ -394,9 +394,9 @@ int main() {
                 Require(request.graphics->draw.indexAddress == 0xabcdef3400u && request.graphics->draw.indexCount == 57u && request.graphics->draw.indexElementBytes == 4u && request.graphics->draw.instanceCount == 9u);
                 Require(request.target.float16DenormPreserve == preserve);
                 auto upgraded = bytes;
-                upgraded[4] = 29u;
+                upgraded[4] = 30u;
                 if (fixture.pixel) upgraded.insert(upgraded.begin() + 259u, {0u, 0u});
-                if (fixture.pixel) InsertQuadMaskDefaults(upgraded);
+                if (fixture.pixel) InsertPixelTailDefaults(upgraded);
                 upgraded.insert(upgraded.end(), sizeof(std::uint64_t), 0u);
                 Require(serializer.Serialize(request) == EncodeBase64(upgraded));
             }
@@ -410,9 +410,9 @@ int main() {
         const auto replay = serializer.Deserialize(encoded);
         Require(replay.request.target.float16DenormPreserve == preserve);
         auto bytes = DecodeBase64(encoded);
-        Require(bytes.size() >= 8u && bytes[4] == 29u && bytes[5] == 0u && bytes[6] == 0u && bytes[7] == 0u);
+        Require(bytes.size() >= 8u && bytes[4] == 30u && bytes[5] == 0u && bytes[6] == 0u && bytes[7] == 0u);
         auto future = bytes;
-        future[4] = 30u;
+        future[4] = 31u;
         bool futureRejected = false;
         try {
             static_cast<void>(serializer.Deserialize(EncodeBase64(future)));
