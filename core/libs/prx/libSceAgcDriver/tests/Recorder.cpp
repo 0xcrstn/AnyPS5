@@ -2430,15 +2430,12 @@ bool lazyStagingOutTests(const Device& device, Recorder& recorder) {
     before = totals();
     stage(element, 0x28282828u, nullptr);
     guest[element - address + 100] = 0x77;
-    bool refused = false;
-    try {
-        AgcDriver::GuestMemory::Read(element + 1000, read, 1);
-    } catch (const std::runtime_error& error) {
-        refused = std::string_view(error.what()).find("after another writer changed the range") != std::string_view::npos;
-    }
+    AgcDriver::GuestMemory::Read(element + 1000, read, 1);
+    sync();
     now = totals();
-    Require(refused && now.refusedStoredOver - before.refusedStoredOver == 1 && now.live == 1 && now.liveBytes == elementBytes, "an ambiguous CPU store did not preserve the resident results and refuse publication");
-    Require(guest[element - address + 100] == 0x77 && guest[element - address] == (verify ? 0x28 : 0x17), "a refused publication overwrote the CPU store");
+    Require(now.refusedStoredOver - before.refusedStoredOver == 1 && now.refusedStoredOverBytes - before.refusedStoredOverBytes == 4096 && now.live == 0, "a CPU store over resident results did not keep its page out of their publication");
+    Require(guest[element - address + 100] == 0x77 && guest[element - address] == (verify ? 0x28 : 0x17), "the publication overwrote the page of a newer CPU store");
+    Require(guestAll(element + 4096, element + elementBytes, 0x28), "the pages no newer store touched were not published");
     AgcDriver::Graphics::ClearDeviceResident(context.device);
     before = totals();
     stage(element, 0x38383838u, nullptr);

@@ -17,6 +17,7 @@ namespace AgcDriver::Graphics {
 namespace {
 
 constexpr std::size_t SiteCount = static_cast<std::size_t>(ResidentSite::Count);
+constexpr std::uint64_t StorePageBytes = 4096;
 constexpr const char* SiteNames[SiteCount] = {"hook", "scanout", "in-place", "copy-in", "address-based", "indirect", "copy", "label", "upload", "completion", "eviction", "retire"};
 
 std::uint64_t residentBudget() {
@@ -135,18 +136,55 @@ std::uint64_t rangeEnd(std::uint64_t address, std::size_t bytes) {
     return address + bytes;
 }
 
-std::uint64_t publishPieces(Recorder& recorder, const std::vector<Piece>& pieces, ResidentSite site) {
-    if (pieces.empty()) return 0;
-    const auto& context = recorder.GetContext();
+std::vector<Piece> unstoredPieces(const std::vector<Piece>& pieces, VkDevice device) {
+    std::vector<Piece> kept;
+    kept.reserve(pieces.size());
     for (const auto& piece : pieces) {
-        Require(piece.device == context.device, "publishing device-resident buffer results through another device is not implemented");
+        Require(piece.device == device, "publishing device-resident buffer results through another device is not implemented");
         const auto bytes = static_cast<std::size_t>(piece.end - piece.begin);
         static_cast<void>(GuestMemory::CollectWritesUncached(piece.begin, bytes));
-        if (piece.generation == 0 || GuestMemory::StoredOver(piece.begin, bytes, piece.generation)) {
-            Stats().refusedStoredOver.fetch_add(1, std::memory_order_relaxed);
-            Stats().refusedStoredOverBytes.fetch_add(bytes, std::memory_order_relaxed);
-            Require(false, "publishing device-resident buffer results after another writer changed the range is not implemented");
+        if (piece.generation != 0 && !GuestMemory::StoredOver(piece.begin, bytes, piece.generation)) {
+            kept.push_back(piece);
+            continue;
         }
+        std::uint64_t dropped = 0;
+        bool extend = false;
+        for (auto from = piece.begin; from < piece.end;) {
+            const auto to = std::min(piece.end, (from / StorePageBytes + 1) * StorePageBytes);
+            if (piece.generation == 0 || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), piece.generation)) {
+                dropped += to - from;
+                extend = false;
+            } else if (extend) {
+                kept.back().end = to;
+            } else {
+                auto part = piece;
+                part.begin = from;
+                part.end = to;
+                kept.push_back(std::move(part));
+                extend = true;
+            }
+            from = to;
+        }
+        Stats().refusedStoredOver.fetch_add(1, std::memory_order_relaxed);
+        Stats().refusedStoredOverBytes.fetch_add(dropped, std::memory_order_relaxed);
+        static std::atomic<std::uint32_t> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[gpu] device-resident buffer results 0x%llx+0x%llx were stored over while resident: the newer stores keep 0x%llx bytes, the rest is published\n", static_cast<unsigned long long>(piece.begin), static_cast<unsigned long long>(piece.end - piece.begin), static_cast<unsigned long long>(dropped));
+    }
+    return kept;
+}
+
+std::uint64_t publishPieces(Recorder& recorder, const std::vector<Piece>& taken, ResidentSite site) {
+    if (taken.empty()) return 0;
+    const auto& context = recorder.GetContext();
+    const auto pieces = unstoredPieces(taken, context.device);
+    if (pieces.empty()) {
+        auto& registry = Resident();
+        {
+            std::lock_guard lock(registry.mutex);
+            for (const auto& piece : taken) cutLocked(registry, piece.begin, piece.end, nullptr);
+        }
+        recorder.RefreshPendingWrites();
+        return 0;
     }
     const bool verify = LazyStagingVerify();
     const auto commands = recorder.Commands();
@@ -195,7 +233,7 @@ std::uint64_t publishPieces(Recorder& recorder, const std::vector<Piece>& pieces
     auto& registry = Resident();
     {
         std::lock_guard lock(registry.mutex);
-        for (const auto& piece : pieces) cutLocked(registry, piece.begin, piece.end, nullptr);
+        for (const auto& piece : taken) cutLocked(registry, piece.begin, piece.end, nullptr);
     }
     recorder.RefreshPendingWrites();
     return total;
