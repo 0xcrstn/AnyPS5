@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <exception>
 #include <mutex>
@@ -64,7 +65,7 @@ extern "C" [[noreturn]] void LibcAwaitExit_nid_postfix() {
         std::lock_guard lock(shutdownMutex);
         if (shutdownThread == std::this_thread::get_id()) throw std::runtime_error("libc: exit thread cannot wait for itself");
     }
-    for (;;) exitRequested.wait(true);
+    for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
 }
 
 extern "C" void LibcRegisterShutdown_nid_postfix(void (*callback)()) {
