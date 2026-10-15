@@ -460,6 +460,7 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::TextureDetiler> detiler;
     std::unique_ptr<Graphics::Recorder> recorder;
     QueueTopology topology = QueueTopology::Serial;
+    bool topologyForced = false;
     VkQueue computeQueue = VK_NULL_HANDLE;
     VkCommandPool computePool = VK_NULL_HANDLE;
     std::unique_ptr<Graphics::Recorder> computeRecorder;
@@ -1727,7 +1728,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             }
         }
         APS5_LOG_OUT("Vulkan queue families: %s; graphics family %u, sparse family %d", DescribeQueueFamilies(topologyFamilies).c_str(), family, state->sparseFamily == VK_QUEUE_FAMILY_IGNORED ? -1 : static_cast<int>(state->sparseFamily));
-        const auto topology = ParseQueueTopology(std::getenv("APS5_QUEUE_TOPOLOGY"));
+        const char* requestedTopology = std::getenv("APS5_QUEUE_TOPOLOGY");
+        state->topologyForced = requestedTopology != nullptr;
+        const auto topology = requestedTopology != nullptr ? ParseQueueTopology(requestedTopology) : family < topologyFamilies.size() && topologyFamilies[family].count >= 2 ? QueueTopology::SameFamily : QueueTopology::Serial;
         const auto plan = PlanQueueTopology(topology, topologyFamilies, family, state->sparseFamily);
         for (std::uint32_t guest = 0; guest < Graphics::Recorder::GuestQueues; ++guest) Graphics::Recorder::MapGuestQueue(guest, 0);
         if (plan.topology == QueueTopology::Dedicated) {
@@ -2075,6 +2078,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->recorder->Activate();
     state->context = buildContext();
     state->contextReady = true;
+    if (state->topology == QueueTopology::SameFamily && !state->topologyForced && !(state->timelineSemaphores && state->recorder->HasTimeline())) {
+        APS5_LOG_OUT("Vulkan queue topology serial: %s", "the device has no timeline semaphores to order a second queue");
+        state->topology = QueueTopology::Serial;
+    }
     if (state->topology == QueueTopology::SameFamily) {
         require(state->timelineSemaphores && state->recorder->HasTimeline(), "APS5_QUEUE_TOPOLOGY=same-family needs timeline semaphores to order the two queues");
         auto compute = state->context;

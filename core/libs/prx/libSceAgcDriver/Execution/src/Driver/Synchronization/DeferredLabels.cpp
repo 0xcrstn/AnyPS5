@@ -71,7 +71,7 @@ std::chrono::microseconds Driver::labelFlushDeadline() {
 std::chrono::microseconds Driver::batchAgeBound() {
     static const std::chrono::microseconds bound = [] {
         const char* value = std::getenv("APS5_BATCH_AGE_US");
-        if (value == nullptr) return std::chrono::microseconds(0);
+        if (value == nullptr) return std::chrono::microseconds(2000);
         char* end = nullptr;
         const auto parsed = std::strtoll(value, &end, 10);
         if (end == value || *end != '\0' || parsed < 0 || parsed > 1000000) throw std::runtime_error(std::string("APS5_BATCH_AGE_US: expected 0 to 1000000 microseconds, got ") + value);

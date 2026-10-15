@@ -216,30 +216,30 @@ Three switches take `0` (the default), `1` or `verify`; any other value stops th
 
 ### GPU queue waits and scheduling
 
-A `WAIT_REG_MEM` on one queue may be satisfied by a label another queue recorded but the GPU has not stored yet. By default any label recorded after the waiting submission arrived counts (`APS5_WAIT_FLOOR=submission`). That rule is too loose: a later wait in the same submission can be satisfied by a value overwritten before it could have seen it. `APS5_WAIT_FLOOR=activation` counts only labels recorded after the waiting queue's previous wait. `APS5_VERIFY_WAIT_OBSERVATIONS=1` stops the title when a wait is satisfied by a value it could not have observed.
+A `WAIT_REG_MEM` on one queue may be satisfied by a label another queue recorded but the GPU has not stored yet. Only labels recorded after the wait became active count, that is after the waiting queue's previous wait (`APS5_WAIT_FLOOR=activation`, the default). `APS5_WAIT_FLOOR=submission` with `APS5_LABEL_TIMELINE=off` restores the older rule, which counts every label recorded after the waiting submission arrived; it is too loose, since a later wait in the same submission can then be satisfied by a value overwritten before it could have seen it. `APS5_VERIFY_WAIT_OBSERVATIONS=1` stops the title when a wait is satisfied by a value it could not have observed.
 
 With `APS5_COHERENCE_ORDERING=1` or `verify`, a label also waits behind the write-backs its batch still owes, so a title's own CPU loads never see a label before the results it releases. `APS5_LABEL_PUBLICATION=ordered` or `early` names the same choice; a value that contradicts `APS5_COHERENCE_ORDERING` stops the title.
 
 In runs with `APS5_PROFILE_DRAW` (as `run.ps1 -Perf` and `-Debug` set it), `APS5_TRACE_WAIT_CHAIN=1` prints a `[waitchain]` line per queue every 10 s. The line splits the time each blocked wait spent into: producer label not recorded yet, recorded but not submitted, submitted but not finished on the GPU, finished but not stored for the CPU, and stored but not seen yet. A `[labels]` line gives the same latencies over all labels. Slow-wait reports name the label that satisfied the wait.
 
 `APS5_QUEUE_SCHEDULER` chooses how the GPU queues' workers take turns:
-- `off` (the default) runs them as before.
+- `dag` (the default) runs the queues concurrently and lets a packet whose shader is still compiling wait without holding any lock.
 - `serial` runs one packet at a time across all queues; the oldest runnable submission goes next, and a queue waiting on a label gives up its turn. It is a reference for comparing results, not a fast mode.
-- `dag` runs the queues concurrently, as `off` does, and lets a packet whose shader is still compiling wait without holding any lock.
+- `off` runs the queues concurrently without the scheduler's bookkeeping, as before it existed.
 
 `APS5_QUEUE_SCHEDULER_VERIFY=1` stops the title when a queue runs a packet out of order or while it is waiting for a compile. With `APS5_PROFILE_DRAW`, a `[scheduler]` line every 10 s counts turns, hand-overs and parked packets whenever the scheduler or its verify mode is on.
 
-`APS5_LABEL_TIMELINE=on` lets a wait be satisfied by another queue's recorded label only with a proof: the label was recorded after the wait became active and covers every awaited byte, or it is the newest value and nothing wrote over it since. Anything else waits for guest memory. `verify` stops the title instead of waiting. A compare function the driver does not know stops the title in both modes. The `[waitchain]` line counts waits by proof.
+`APS5_LABEL_TIMELINE=on` (the default) lets a wait be satisfied by another queue's recorded label only with a proof: the label was recorded after the wait became active and covers every awaited byte, or it is the newest value and nothing wrote over it since. Anything else waits for guest memory. `verify` stops the title instead of waiting; `off` accepts such labels without a proof, as before. A compare function the driver does not know stops the title in both modes. The `[waitchain]` line counts waits by proof.
 
-`APS5_WAIT_BROKER=1` makes a blocked wait sleep until a label is recorded or a batch's results reach guest memory, instead of polling on a timer. It still checks again after at most `APS5_WAIT_BROKER_MAX_US` (default 2000), since stores made by the title's own CPU code wake nobody.
+The wait broker (on by default, `APS5_WAIT_BROKER=0` turns it off) makes a blocked wait sleep until a label is recorded or a batch's results reach guest memory, instead of polling on a timer. It still checks again after at most `APS5_WAIT_BROKER_MAX_US` (default 2000), since stores made by the title's own CPU code wake nobody.
 
 `APS5_QUEUE_TOPOLOGY` chooses the Vulkan queues the driver runs on. The log lists every queue family when the device is created.
-- `serial` (the default) runs everything on one queue.
-- `same-family` takes a second queue from the graphics family and records every guest queue other than 0 on it, with its own command recorder. A wait on a label the other queue recorded submits the producer first and makes the waiting queue's next batch wait for it on the GPU. Every batch also waits for the batches the other queue had already submitted. Experimental. `APS5_QUEUE_TOPOLOGY_VERIFY=1` stops the title when a batch is submitted without waiting for a producer it depends on.
+- `same-family` (the default when the graphics family has two queues and the device has timeline semaphores; otherwise the driver logs why and runs serial) takes a second queue from the graphics family and records every guest queue other than 0 on it, with its own command recorder. A wait on a label the other queue recorded submits the producer first and makes the waiting queue's next batch wait for it on the GPU. Every batch also waits for the batches the other queue had already submitted. `APS5_QUEUE_TOPOLOGY_VERIFY=1` stops the title when a batch is submitted without waiting for a producer it depends on.
+- `serial` runs everything on one queue.
 - `dedicated` checks that a compute-only family has a free queue, then stops the title: ownership transfers between queue families are not implemented.
-- An unavailable topology stops the title, naming the families that exist.
+- A topology set explicitly but unavailable stops the title, naming the families that exist.
 
-`APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. `0` (the default) turns it off. The `[labels]` line counts these submits.
+`APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. The default is 2000; `0` turns it off. The `[labels]` line counts these submits.
 
 ### Address-based shader experiments
 

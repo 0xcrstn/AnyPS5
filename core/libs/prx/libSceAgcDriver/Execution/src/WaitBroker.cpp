@@ -14,7 +14,7 @@ WaitBroker& WaitBroker::Instance() {
 bool WaitBroker::Enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_WAIT_BROKER");
-        return value != nullptr && std::strcmp(value, "0") != 0;
+        return value == nullptr || std::strcmp(value, "0") != 0;
     }();
     return enabled;
 }
