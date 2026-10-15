@@ -93,6 +93,36 @@ std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 
+enum StoragePhase : std::size_t { UploadPendingCpu, UploadCollect, UploadResident, UploadCapture, UploadBaseline, UploadPublish, UploadRecord, WriteBackCollect, WriteBackBlocks, WriteBackPublish, WriteBackRecord, WriteBackSettle, FlushScan, FlushWriteBacks, FlushPublish, StoragePhaseCount };
+constexpr std::array<const char*, StoragePhaseCount> StoragePhaseNames{"upload: pending CPU writes", "upload: collect", "upload: device-resident publish", "upload: guest-byte capture", "upload: baseline copy", "upload: shadow publish", "upload: record", "write-back: uncached collect", "write-back: block decisions", "write-back: shadow publish", "write-back: record", "write-back: settle", "flush: registry scan", "flush: write-backs", "flush: shadow publish"};
+std::array<std::atomic<std::uint64_t>, StoragePhaseCount> storagePhaseNs{};
+std::array<std::atomic<std::uint64_t>, StoragePhaseCount> storagePhaseCounts{};
+
+struct StorageLap {
+    bool profile;
+    std::chrono::steady_clock::time_point at = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    void operator()(StoragePhase phase) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        storagePhaseNs[phase].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - at).count()), std::memory_order_relaxed);
+        storagePhaseCounts[phase].fetch_add(1, std::memory_order_relaxed);
+        at = now;
+    }
+};
+
+std::string StoragePhaseReport() {
+    std::string text;
+    char entry[96];
+    for (std::size_t phase = 0; phase < StoragePhaseCount; ++phase) {
+        const auto ns = storagePhaseNs[phase].exchange(0, std::memory_order_relaxed);
+        const auto count = storagePhaseCounts[phase].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        std::snprintf(entry, sizeof(entry), "%s%s %llux %.1f", text.empty() ? " " : ", ", StoragePhaseNames[phase], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e6);
+        text += entry;
+    }
+    return text.empty() ? std::string(" none") : text;
+}
+
 std::atomic<bool> handOverOff{false};
 std::atomic<std::uint64_t> handedOverUnits{0}, handOverDeviceUnits{0}, handOverSuperseded{0}, handOverStoredLater{0}, handOverFallbacks{0};
 
@@ -156,6 +186,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu%s\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), ResidentReport().c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[storage] phases (10 s, count x ms, on the thread that ran them):%s\n", StoragePhaseReport().c_str());
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.cpuUploadCauses.clear();
@@ -2431,8 +2462,10 @@ constexpr std::uint64_t GenerationBaselineBytes = 1ull << 20;
 void StorageTexture::upload(const std::vector<bool>* layers) {
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    StorageLap lap{profile};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
+    lap(UploadPendingCpu);
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
@@ -2440,6 +2473,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
     auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    lap(UploadCollect);
     const bool handingOver = handOverUpload != nullptr;
     const auto stampLayers = [&](bool selectedOnly) {
         const bool whole = !selectedOnly || layers == nullptr;
@@ -2457,6 +2491,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             GuestMemory::ReadCommitted(layerBegin(layer), std::span<std::byte>(generationBaseline).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
         }
         refreshGeneration();
+        lap(UploadBaseline);
     };
     uploadedKeys = ProvedClearKeys(descriptor, guestBytes, keyProof);
     filledKeys = DccKeys::Uncompressed;
@@ -2473,6 +2508,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         } else {
             captureGuestBytes(nullptr);
         }
+        lap(UploadCapture);
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
         static const bool recordClear = std::getenv("APS5_NO_RECORDED_CLEAR") == nullptr;
@@ -2514,6 +2550,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
         if (batch) batch->SubmitAndWait();
         else recorder->EndGpuTiming(timing, guestBytes);
+        lap(UploadRecord);
         countStorageUpload(0, guestBytes);
         ++version;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadClear, start);
@@ -2537,12 +2574,14 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 Require(false, "uploading device-resident buffer results needs an active recorder");
             }
         }
+        lap(UploadResident);
         if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             layerOriginal.assign(trackedLayers, false);
             cancelStoredSaves();
         } else {
             captureGuestBytes(layers);
         }
+        lap(UploadCapture);
         stampLayers(true);
         // A whole-surface upload of a block-unit image goes through the windows too when a unit
         // shadow holds part of the surface (the detile then reads the slabs; a new image has no
@@ -2585,6 +2624,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 partialUploads.fetch_add(1, std::memory_order_relaxed);
                 partialUploadBytes.fetch_add(uploadedBytes, std::memory_order_relaxed);
             }
+            lap(UploadRecord);
             ++Profile().storageDirectUploads;
             ++version;
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
@@ -2592,6 +2632,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         }
         // Units another image's results shadow reach the import before the detile reads it in place.
         PublishShadow(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), PublishScope::Whole, PublishReason::Upload);
+        lap(UploadPublish);
         forgetBorrowed(0, trackedLayers);
         std::uint64_t uploadedBytes = layers == nullptr ? guestBytes : 0;
         if (layers != nullptr) {
@@ -2641,6 +2682,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             singlePassMoves.fetch_add(1, std::memory_order_relaxed);
             if (batch) batch->SubmitAndWait();
             else recorder->EndGpuTiming(timing, uploadedBytes);
+            lap(UploadRecord);
             countStorageUpload(1, uploadedBytes);
             ++Profile().storageDirectUploads;
             ++version;
@@ -2678,6 +2720,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
         if (batch) batch->SubmitAndWait();
         else recorder->EndGpuTiming(timing, uploadedBytes);
+        lap(UploadRecord);
         countStorageUpload(1, uploadedBytes);
         ++Profile().storageDirectUploads;
         ++version;
@@ -2691,6 +2734,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     original.resize(static_cast<std::size_t>(guestBytes));
     accountHostCopies();
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+    lap(UploadCapture);
     {
             Buffer staging(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (uploadedKeys == DccKeys::Uncompressed) std::memcpy(staging.Bytes().data(), original.data(), original.size());
@@ -2732,6 +2776,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             batch.SubmitAndWait();
             APS5_LOG_CHARS_OUT("StorageTexture upload done");
     }
+    lap(UploadRecord);
     if (profile) {
         const char* cause = uploadedKeys != DccKeys::Uncompressed ? DccKeysName(uploadedKeys) : "no import";
         countCpuUploadCause(cause, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
@@ -3597,6 +3642,7 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
     if (published != nullptr) *published = false;
+    StorageLap lap{LookupOutcomes::Profiled()};
     const auto exemptRanges = std::exchange(pointerExempt, {});
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
     // another thread releases outside the GPU mutex once the batch completed.
@@ -3648,6 +3694,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) pending.flushing.push_back(texture.get());
         if (!flush.empty()) BumpPendingSerial();
     }
+    lap(FlushScan);
     if (flush.empty()) {
         // Units shadowed over the range (another image's results retiled into the import's unit
         // shadow, or an earlier flush's) still reach the import as the scope asks.
@@ -3682,12 +3729,14 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         }
     }
     flushReason = previousReason;
+    lap(FlushWriteBacks);
     if (failure) std::rethrow_exception(failure);
     // The stores above went into the unit shadows where slabs took them: the consumer reads the
     // import, so they are published under the same hold, after every store.
     if (scope != PublishScope::None) {
         const auto units = PublishShadow(address, bytes, scope, PublishReasonFor(reason));
         if (published != nullptr) *published = units != 0;
+        lap(FlushPublish);
     }
     return true;
 }
@@ -5389,7 +5438,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // bypasses the per-packet collect memo (a Refresh collect earlier in the same packet would
     // satisfy it); the unselected layers keep their own generations and are collected by their
     // own refreshes. One tracker lock then reads the span's stamps against the layers' generations.
+    StorageLap lap{profile};
     GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+    lap(WriteBackCollect);
     std::vector<std::uint64_t> generations(spanBlocks, 0);
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!layers[layer]) continue;
@@ -5445,6 +5496,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers[layer]) forgetKeptAtUnwatch(layer);
     }
+    lap(WriteBackBlocks);
     // Debug aid: APS5_TRACE_FLUSH also names the blocks a write-back leaves to the CPU.
     static const bool traceKept = std::getenv("APS5_TRACE_FLUSH") != nullptr;
     if (traceKept && skippedAny) {
@@ -5531,6 +5583,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
             const auto storedBytes = writeBackWindows(segments, keep, firstStored, lastStored, shadowed, imported, saveUnits.empty() ? nullptr : savedBytes.get());
+            lap(WriteBackRecord);
             countStorageWriteBack(storedBytes, true);
             if (profile) Profile().storageGpu += timer.lap();
             forgetStored();
@@ -5539,6 +5592,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             uploadedKeys = DccKeys::Uncompressed;
             for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
             settle(true);
+            lap(WriteBackSettle);
             commitStoredSave(saveUnits);
             ++Profile().storageDirectWriteBacks;
             return;
@@ -5547,6 +5601,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // keep a neighbour's shadowed results in the rest of their bytes, which reach the import
         // first (this write-back's stamps then make those units stale).
         PublishShadow(firstStored, static_cast<std::size_t>(lastStored - firstStored), PublishScope::PartialUnits, PublishReason::Upload);
+        lap(WriteBackPublish);
         // The surface lives in host-imported memory: the retiler writes into device scratch and the
         // untouched blocks are copied into the imported bytes in place, recorded behind the work that
         // produced the image; nothing crosses to the CPU.
@@ -5646,6 +5701,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             recorder->MarkShaderReadsCovered();
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
         }
+        lap(WriteBackRecord);
         countStorageWriteBack(storedBytes, true);
         if (profile) Profile().storageGpu += timer.lap();
         // The guest bytes now differ from `original`; other caches of the range see the write.
@@ -5661,6 +5717,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // newer than this value when its own range is collected. No CPU wrote the pages here
         // (MarkWritten made the only stamps), so the memoized collect is exact.
         settle(true);
+        lap(WriteBackSettle);
         commitStoredSave(saveUnits);
         ++Profile().storageDirectWriteBacks;
         return;
