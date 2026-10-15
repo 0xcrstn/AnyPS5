@@ -2522,6 +2522,30 @@ const char* ResolveRedoName(ResolveRedo redo) {
     return names.at(static_cast<std::size_t>(redo));
 }
 
+bool ParallelTargetsRequested() {
+    static const bool requested = [] {
+        const char* text = std::getenv("APS5_PARALLEL_TARGETS");
+        if (text == nullptr || std::strcmp(text, "0") == 0) return false;
+        if (ParallelResolveRequested()) return true;
+        std::fprintf(stderr, "[record-thread] APS5_PARALLEL_TARGETS ignored: it needs APS5_PARALLEL_RESOLVE\n");
+        return false;
+    }();
+    return requested;
+}
+
+bool VerifyParallelTargets() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_PARALLEL_TARGETS");
+        return ParallelTargetsRequested() && text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+const char* TargetVerdictName(TargetVerdict verdict) {
+    constexpr std::array<const char*, static_cast<std::size_t>(TargetVerdict::Count)> names{"held", "adopted", "disabled", "threw", "no pipeline", "not resident", "multisampled", "array slice", "attachment proxy", "not cached", "no view yet", "no depth surface", "no framebuffer yet", "resident differs", "depth view differs", "pipeline differs"};
+    return names.at(static_cast<std::size_t>(verdict));
+}
+
 ResolveStamp ResolveStamp::Now() {
     ResolveStamp stamp;
     const auto set = [&stamp](ResolveSerial serial, std::uint64_t value) { stamp.values[static_cast<std::size_t>(serial)] = value; };
@@ -2591,6 +2615,13 @@ struct ResolvedDraw {
     std::uint64_t cacheSerial = 0;
     std::shared_ptr<ShaderResources> resources;
     std::optional<ShaderResources::MovedReadOnlyPlan> plan;
+    struct Targets {
+        TargetVerdict verdict = TargetVerdict::Disabled;
+        std::vector<std::shared_ptr<StorageTexture>> residents;
+        std::vector<VkImageView> views;
+        VkImageView depthView = VK_NULL_HANDLE;
+        std::shared_ptr<Framebuffer> framebuffer;
+    } targets;
     std::shared_ptr<Pipeline> pipeline;
     std::vector<std::uint8_t> proxied;
     ShaderResources::EpochProofResult epochProof;
@@ -2600,6 +2631,7 @@ namespace {
 
 constexpr std::size_t ResolveRefusalCount = static_cast<std::size_t>(ResolveRefusal::Count);
 constexpr std::size_t ResolveRedoCount = static_cast<std::size_t>(ResolveRedo::Count);
+constexpr std::size_t TargetVerdictCount = static_cast<std::size_t>(TargetVerdict::Count);
 constexpr std::size_t ResolveSerialCount = static_cast<std::size_t>(ResolveSerial::Count);
 constexpr std::size_t EpochVerdictCount = static_cast<std::size_t>(ShaderResources::EpochProofVerdict::Count);
 
@@ -2615,6 +2647,8 @@ struct ResolveCounters {
     std::atomic<std::uint64_t> resourcesAdopted{0};
     std::atomic<std::uint64_t> pipelinesAdopted{0};
     std::atomic<std::uint64_t> verified{0};
+    std::array<std::atomic<std::uint64_t>, TargetVerdictCount> targets{};
+    std::atomic<std::uint64_t> targetsVerified{0};
     std::array<std::atomic<std::uint64_t>, ResolveRefusalCount> inputRefusals{};
     std::array<std::atomic<std::uint64_t>, ResolveRefusalCount> resourceRefusals{};
     std::array<std::atomic<std::uint64_t>, ResolveRedoCount> redos{};
@@ -2640,6 +2674,48 @@ std::string drawIdentity(const State& state, const Pm4::DrawParameters& draw, st
 
 [[noreturn]] void resolveDiffers(const char* what, const std::string& identity) {
     throw std::logic_error(std::string("APS5_VERIFY_PARALLEL_RESOLVE: the worker's resolve differs from the serial resolve in ") + what + " for the " + identity);
+}
+
+[[noreturn]] void targetsDiffer(const char* what, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    throw std::logic_error(std::string("APS5_VERIFY_PARALLEL_TARGETS: the worker's targets differ from the serial targets in ") + what + " for the " + drawIdentity(state, draw, shaders));
+}
+
+void resolveTargets(const Context& context, const State& state, ResolvedDraw& resolved) {
+    auto& targets = resolved.targets;
+    const auto refuse = [&targets](TargetVerdict verdict) {
+        targets = {};
+        targets.verdict = verdict;
+    };
+    if (resolved.pipeline == nullptr) return refuse(TargetVerdict::NoPipeline);
+    static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
+    if (!residentTargets || context.detiler == nullptr) return refuse(TargetVerdict::NotResident);
+    try {
+        targets.residents.reserve(state.colors.size());
+        targets.views.reserve(state.colors.size());
+        for (const auto& color : state.colors) {
+            if (color.samples > 1) return refuse(TargetVerdict::Multisampled);
+            if (color.tileMode == ColorTileMode::Linear) return refuse(TargetVerdict::NotResident);
+            if (color.arrayLastSlice != 0) return refuse(TargetVerdict::ArraySlice);
+            if (AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED) return refuse(TargetVerdict::Proxied);
+            auto resident = PeekStorageSurface(context, SurfaceForTarget(color));
+            if (resident == nullptr || !resident->Attachable() || (color.dccAddress != 0 && resident->Descriptor().dccAddress != color.dccAddress)) return refuse(TargetVerdict::NotCached);
+            const auto view = resident->FindAttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice);
+            if (view == VK_NULL_HANDLE) return refuse(TargetVerdict::NoView);
+            targets.views.push_back(view);
+            targets.residents.push_back(std::move(resident));
+        }
+        auto views = targets.views;
+        if (state.depth) {
+            targets.depthView = PeekDepthSurfaceView(context, *state.depth);
+            if (targets.depthView == VK_NULL_HANDLE) return refuse(TargetVerdict::NoDepth);
+            views.push_back(targets.depthView);
+        }
+        targets.framebuffer = resolved.pipeline->FindFramebuffer(views, targets.residents, state.renderExtent, state.renderLayers);
+        if (targets.framebuffer == nullptr) return refuse(TargetVerdict::NoFramebuffer);
+        targets.verdict = TargetVerdict::Held;
+    } catch (const std::exception&) {
+        refuse(TargetVerdict::Threw);
+    }
 }
 
 void requireSameInputs(const DrawInputs& serial, const DrawInputs& resolved, const std::string& identity) {
@@ -2793,6 +2869,10 @@ const char* redoAt(std::size_t index) {
     return ResolveRedoName(static_cast<ResolveRedo>(index));
 }
 
+const char* targetVerdictAt(std::size_t index) {
+    return TargetVerdictName(static_cast<TargetVerdict>(index));
+}
+
 const char* serialAt(std::size_t index) {
     return ResolveSerialName(static_cast<ResolveSerial>(index));
 }
@@ -2836,6 +2916,9 @@ void reportParallelResolve() {
     static std::uint64_t lastRevalidationsVerified = 0;
     if (ParallelRevalidateRequested()) pieces += "; template proofs from the workers by verdict:" + countList(counters.revalidations, lastRevalidations, epochVerdictAt, 1) + ", verified " + verifiedSince(counters.revalidationsVerified, lastRevalidationsVerified);
     const auto perDraw = [](std::uint64_t ns, std::uint64_t count) { return count != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(count) : 0.0; };
+    static std::array<std::uint64_t, TargetVerdictCount> lastTargets{};
+    static std::uint64_t lastTargetsVerified = 0;
+    if (ParallelTargetsRequested()) pieces += "; targets from the workers by verdict:" + countList(counters.targets, lastTargets, targetVerdictAt, 1) + ", verified " + verifiedSince(counters.targetsVerified, lastTargetsVerified);
     AgcDriver::ProfilePrint_nid_no_patch("[parallel-resolve] %.3f s: %llu resolved on workers (%.2f us each): inputs %llu, templates %llu, pipelines %llu; %llu encodes (%.2f us each): inputs adopted %llu, templates adopted %llu, pipelines adopted %llu, verified %llu; inputs resolved in encode by reason:%s; templates resolved in encode by reason:%s; redone in encode by reason:%s; serials moved between resolve and encode:%s%s\n", seconds, static_cast<unsigned long long>(delta[0]), perDraw(delta[1], delta[0]), static_cast<unsigned long long>(delta[2]), static_cast<unsigned long long>(delta[3]), static_cast<unsigned long long>(delta[4]), static_cast<unsigned long long>(delta[5]), perDraw(delta[6], delta[5]), static_cast<unsigned long long>(delta[7]), static_cast<unsigned long long>(delta[8]), static_cast<unsigned long long>(delta[9]), static_cast<unsigned long long>(delta[10]), inputs.c_str(), resources.c_str(), redos.c_str(), moved.c_str(), pieces.c_str());
 }
 
@@ -2913,6 +2996,10 @@ void drawBody(const Context& context, const State& state, const Pm4::DrawParamet
     forgetContinuedTargets();
     std::vector<TargetBinding> targets(state.colors.size());
     std::vector<VkImageView> targetViews;
+    const auto* earlyTargets = early != nullptr && ParallelTargetsRequested() ? &early->targets : nullptr;
+    auto targetVerdict = earlyTargets != nullptr ? earlyTargets->verdict : TargetVerdict::Disabled;
+    if (targetVerdict == TargetVerdict::Held && earlyTargets->residents.size() != state.colors.size()) targetVerdict = TargetVerdict::ResidentDiffers;
+    std::size_t adoptedViews = 0;
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
@@ -2956,6 +3043,12 @@ void drawBody(const Context& context, const State& state, const Pm4::DrawParamet
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
+            if (targetVerdict == TargetVerdict::Held && !binding.proxied && earlyTargets->residents[index] == binding.resident) {
+                targetViews.push_back(earlyTargets->views[index]);
+                ++adoptedViews;
+                if (VerifyParallelTargets() && binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice) != targetViews.back()) targetsDiffer("an attachment view", state, draw, shaders);
+                continue;
+            }
             targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
             continue;
         }
@@ -2998,6 +3091,8 @@ void drawBody(const Context& context, const State& state, const Pm4::DrawParamet
     const auto targetsEpoch = continuedTargetsEnabled() ? GuestMemory::CollectEpoch() : 0;
     const auto targetsGeneration = targetsEpoch != 0 ? GuestMemory::TrackerGeneration() : 0;
     if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth));
+    if (targetVerdict == TargetVerdict::Held && adoptedViews != state.colors.size()) targetVerdict = TargetVerdict::ResidentDiffers;
+    if (targetVerdict == TargetVerdict::Held && state.depth && targetViews.back() != earlyTargets->depthView) targetVerdict = TargetVerdict::DepthDiffers;
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
@@ -3190,7 +3285,16 @@ void drawBody(const Context& context, const State& state, const Pm4::DrawParamet
         owners.push_back(binding.resident);
         persistent.push_back(binding.multisampled ? 1u : 0u);
     }
-    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, state.renderLayers, persistent);
+    if (targetVerdict == TargetVerdict::Held && pipeline != early->pipeline) targetVerdict = TargetVerdict::PipelineDiffers;
+    auto framebuffer = targetVerdict == TargetVerdict::Held ? earlyTargets->framebuffer : pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, state.renderLayers, persistent);
+    if (targetVerdict == TargetVerdict::Held) {
+        targetVerdict = TargetVerdict::Adopted;
+        if (VerifyParallelTargets()) {
+            if (pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, state.renderLayers, persistent) != framebuffer) targetsDiffer("the framebuffer", state, draw, shaders);
+            resolveCounters().targetsVerified.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (earlyTargets != nullptr) resolveCounters().targets[static_cast<std::size_t>(targetVerdict)].fetch_add(1, std::memory_order_relaxed);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
@@ -3610,6 +3714,7 @@ std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const St
                 resolved->proxied.clear();
             }
         }
+        if (ParallelTargetsRequested()) resolveTargets(context, state, *resolved);
     }
     counters.inputRefusals[static_cast<std::size_t>(resolved->inputsRefusal)].fetch_add(1, std::memory_order_relaxed);
     counters.resourceRefusals[static_cast<std::size_t>(resolved->resourcesRefusal)].fetch_add(1, std::memory_order_relaxed);
@@ -3635,6 +3740,8 @@ ParallelResolveCounts ParallelResolveStatistics() {
     counts.resourcesAdopted = counters.resourcesAdopted.load();
     counts.pipelinesAdopted = counters.pipelinesAdopted.load();
     counts.verified = counters.verified.load();
+    for (std::size_t i = 0; i < TargetVerdictCount; ++i) counts.targets[i] = counters.targets[i].load();
+    counts.targetsVerified = counters.targetsVerified.load();
     for (std::size_t i = 0; i < ResolveRefusalCount; ++i) {
         counts.inputRefusals[i] = counters.inputRefusals[i].load();
         counts.resourceRefusals[i] = counters.resourceRefusals[i].load();

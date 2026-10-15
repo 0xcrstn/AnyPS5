@@ -230,6 +230,7 @@ bool Driver::parallelResolve() {
         }
         if (Graphics::ParallelRevalidateRequested()) std::fprintf(stderr, "[record-thread] parallel revalidate: preparation workers check template epoch proofs against the dirty log; the record thread adopts them after a stamp compare%s\n", Graphics::VerifyParallelRevalidate() ? " and verifies each against the serial Revalidate" : "");
         std::fprintf(stderr, "[record-thread] parallel resolve: preparation workers resolve draw inputs, templates and pipelines; the record thread encodes%s\n", Graphics::VerifyParallelResolve() ? " and verifies every adopted decision against the serial resolve" : "");
+        if (Graphics::ParallelTargetsRequested()) std::fprintf(stderr, "[record-thread] parallel targets: preparation workers look up resident target images, views and framebuffers; the record thread proves the targets and adopts the views and framebuffer for the same images%s\n", Graphics::VerifyParallelTargets() ? ", verifying each against the serial lookup" : "");
         return true;
     }();
     return enabled;

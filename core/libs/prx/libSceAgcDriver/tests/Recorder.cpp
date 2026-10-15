@@ -9819,6 +9819,60 @@ bool parallelResolveTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+std::uint64_t targetVerdicts(const ParallelResolveCounts& counts, TargetVerdict verdict) {
+    return counts.targets[static_cast<std::size_t>(verdict)];
+}
+
+bool parallelTargetsTests(const Device& device, Recorder& recorder) {
+    if (!ParallelTargetsRequested()) {
+        std::cout << "skipped, the parallel targets test needs APS5_PARALLEL_RESOLVE=1 and APS5_PARALLEL_TARGETS=1\n";
+        return false;
+    }
+    return withResolveScene(device, recorder, [&](ResolveScene& scene) {
+        const auto& context = scene.context;
+        scene.clear();
+        Draw(context, scene.state, scene.triangle, scene.shaders);
+        scene.check("the serial draw that made the resident target rendered other pixels");
+        const auto before = ParallelResolveStatistics();
+        const auto continued = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *continued);
+        scene.check("a draw adopting the worker's target views and framebuffer rendered other pixels");
+        const auto adopted = ParallelResolveStatistics();
+        if (adopted.pipelinesResolved == before.pipelinesResolved) {
+            std::cout << "skipped, the scene's pipeline was not resolved on the side\n";
+            return false;
+        }
+        Require(targetVerdicts(adopted, TargetVerdict::Adopted) - targetVerdicts(before, TargetVerdict::Adopted) == 1, "the resident target found on the side was not adopted at encode");
+        scene.clear();
+        Draw(context, scene.state, scene.triangle, scene.shaders);
+        const auto passBefore = recorder.OpenPassSerial();
+        const auto reusesBefore = ContinuedPassTargetReuses();
+        const auto acrossPasses = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        recorder.Sync();
+        Require(passBefore != 0 && recorder.OpenPassSerial() != passBefore, "the serial draw left no render pass open, or a sync kept it open");
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *acrossPasses);
+        scene.check("a draw whose render pass ended between resolve and encode rendered other pixels");
+        const auto passes = ParallelResolveStatistics();
+        Require(ContinuedPassTargetReuses() == reusesBefore, "a draw reused the continued-pass targets of a pass that had ended");
+        Require(targetVerdicts(passes, TargetVerdict::Adopted) - targetVerdicts(adopted, TargetVerdict::Adopted) == 1, "a target proved again in encode after its pass ended was not adopted for the same image");
+        const auto evicted = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        recorder.Sync();
+        FlushCachedTextures(context.device);
+        ClearCachedTextures(context.device);
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *evicted);
+        scene.check("a draw whose resident target was replaced between resolve and encode rendered other pixels");
+        const auto replaced = ParallelResolveStatistics();
+        Require(targetVerdicts(replaced, TargetVerdict::ResidentDiffers) - targetVerdicts(passes, TargetVerdict::ResidentDiffers) == 1 && targetVerdicts(replaced, TargetVerdict::Adopted) == targetVerdicts(passes, TargetVerdict::Adopted), "the views and framebuffer of a replaced resident target were adopted");
+        const auto expected = VerifyParallelTargets() ? targetVerdicts(replaced, TargetVerdict::Adopted) - targetVerdicts(before, TargetVerdict::Adopted) : 0;
+        Require(replaced.targetsVerified - before.targetsVerified == expected, "APS5_VERIFY_PARALLEL_TARGETS did not check exactly the adopted targets");
+        std::cout << "parallel targets tests passed" << (VerifyParallelTargets() ? " (verified)" : "") << "\n";
+        return true;
+    });
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {
@@ -9920,6 +9974,9 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {
             pendingWriteSnapshotTests(device, recorder);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--parallel-targets-only") {
+            return parallelTargetsTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-pending-write-snapshot") {
             pendingWriteSnapshotBenchmark(recorder);

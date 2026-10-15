@@ -1130,6 +1130,16 @@ std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, con
     return cachedStorageTexture(context, {}, resource, 0);
 }
 
+std::shared_ptr<StorageTexture> PeekStorageSurface(const Context& context, const GuestTextureResource& resource) {
+    static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if (disabled || resource.dimension == TextureDimension::k2DMsaa || resource.mipCount > AllocatedLevels(resource) || ExtendedChains().any.load(std::memory_order_acquire)) return nullptr;
+    const StorageKey key{context.device, SurfaceKey(context, resource)};
+    auto& cache = StorageTextures();
+    std::lock_guard lock(cache.mutex);
+    const auto it = findStorage(cache, key);
+    return it != cache.entries.end() ? it->texture : nullptr;
+}
+
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress) {
     GuestTextureResource resource{};
     resource.dccAddress = dccAddress;

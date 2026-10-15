@@ -140,6 +140,11 @@ inline std::uint32_t ChangedSerials(const ResolveStamp& resolved, const ResolveS
     return changed;
 }
 
+bool ParallelTargetsRequested();
+bool VerifyParallelTargets();
+enum class TargetVerdict : std::uint8_t { Held, Adopted, Disabled, Threw, NoPipeline, NotResident, Multisampled, ArraySlice, Proxied, NotCached, NoView, NoDepth, NoFramebuffer, ResidentDiffers, DepthDiffers, PipelineDiffers, Count };
+const char* TargetVerdictName(TargetVerdict verdict);
+
 enum class ResolveRefusal : std::uint8_t { None, Unsupported, NoRecorder, NeedsSync, NotInPlace, ZeroFill, Threw, Uncacheable, TemplateMiss, MovedRefused, NoInputs, Count };
 enum class ResolveRedo : std::uint8_t { None, Device, NotRecordable, InputPending, InputImport, IndexData, CacheChanged, PipelineState, Count };
 const char* ResolveRefusalName(ResolveRefusal refusal);
@@ -165,6 +170,8 @@ struct ParallelResolveCounts {
     std::uint64_t resourcesAdopted = 0;
     std::uint64_t pipelinesAdopted = 0;
     std::uint64_t verified = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(TargetVerdict::Count)> targets{};
+    std::uint64_t targetsVerified = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(ResolveRefusal::Count)> inputRefusals{};
     std::array<std::uint64_t, static_cast<std::size_t>(ResolveRefusal::Count)> resourceRefusals{};
     std::array<std::uint64_t, static_cast<std::size_t>(ResolveRedo::Count)> redos{};
