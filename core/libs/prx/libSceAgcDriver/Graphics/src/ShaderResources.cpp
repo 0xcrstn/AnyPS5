@@ -5004,7 +5004,51 @@ std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std:
     return merged;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindingsStatistics* statistics, const DrawIndexRanges* drawRanges) const {
+std::vector<ShaderResources::SnapshotRequest> ShaderResources::PlanDrawSnapshots(std::span<const MovedBuffer> moved, const DrawIndexRanges* drawRanges) const {
+    std::vector<SnapshotRequest> requests;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !(AddressBasedDrawSnapshots() && bdaReadOnly)) || !DrawSnapshotArena::Enabled()) return requests;
+    const auto reads = guestMemory.InPlaceReads();
+    std::size_t totalSnapshotBytes = 0;
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        if (override != moved.end() && !override->words.empty()) continue;
+        std::uint64_t address = item.address;
+        std::size_t size = item.size;
+        if (override != moved.end()) {
+            address = override->address;
+            size = override->size;
+        } else {
+            if (InPlaceDrawInputs() || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+            if (!direct) continue;
+        }
+        if (override != moved.end() && InPlaceDrawInputs()) continue;
+        const auto begin = address - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+        if (override == moved.end() && (bytes > maxDrawSnapshotBytes || totalSnapshotBytes + bytes > maxDrawSnapshotBytes)) continue;
+        totalSnapshotBytes += bytes;
+        std::optional<DrawSnapshotArena::CopyRanges> ranges;
+        const auto& readAnalysis = override != moved.end() ? override->readAnalysis : item.readAnalysis;
+        if (!PartialSnapshotsDisabled() && readAnalysis.has_value()) {
+            if (auto readRanges = GuestReadRanges(readAnalysis->words, &readAnalysis->ranges, size, nullptr, drawRanges)) {
+                std::size_t covered = 0;
+                for (const auto& [from, to] : *readRanges) covered += static_cast<std::size_t>(to - from);
+                if (covered * 2 <= bytes || (SnapshotReadRangesOnly() && covered < bytes)) {
+                    for (auto& [from, to] : *readRanges) {
+                        from += item.adjustment;
+                        to += item.adjustment;
+                    }
+                    ranges = std::move(*readRanges);
+                }
+            }
+        }
+        requests.push_back({begin, bytes, std::move(ranges)});
+    }
+    return requests;
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindingsStatistics* statistics, const DrawIndexRanges* drawRanges, std::span<const DrawSnapshotArena::Prefill> prefills) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !(AddressBasedDrawSnapshots() && bdaReadOnly))) return {};
     auto lapStart = statistics != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto lap = [&](double DrawBindingsStatistics::*bucket) {
@@ -5149,7 +5193,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             return adjusted;
         };
         if (DrawSnapshotArena::Enabled()) {
-            if (const auto view = recorder.SnapshotArena().Take(recorder, begin, bytes, registryGeneration, prepareRanges)) {
+            const auto prefill = std::find_if(prefills.begin(), prefills.end(), [&](const DrawSnapshotArena::Prefill& entry) { return entry.address == begin && entry.bytes == bytes; });
+            if (const auto view = prefill != prefills.end() ? recorder.SnapshotArena().TakePrefilled(recorder, begin, bytes, registryGeneration, prepareRanges, *prefill) : recorder.SnapshotArena().Take(recorder, begin, bytes, registryGeneration, prepareRanges)) {
                 lap(view->copied ? &DrawBindingsStatistics::copyUs : &DrawBindingsStatistics::lookupUs);
                 if (statistics != nullptr && view->copied) {
                     ++statistics->copied;

@@ -2055,6 +2055,11 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
 // resident targets with their views, the indirect records (null for a direct draw), how the
 // completion work is handled (`listed`, `completion`, `waited`: see Draw) and, from a recipe, the
 // push constant block (else assembled from the stages).
+std::optional<ShaderResources::DrawIndexRanges> drawIndexRanges(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawInputs& inputs) {
+    if (state.stages.mesh || state.stages.tessellation || state.stages.path != ShaderPath::Vertex || draw.instanceCount == 0 || static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount - 1u > std::numeric_limits<std::uint32_t>::max() || inputs.minIndex > inputs.maxIndex) return std::nullopt;
+    return ShaderResources::DrawIndexRanges{inputs.minIndex, inputs.maxIndex, draw.firstInstance, draw.firstInstance + draw.instanceCount - 1u, shaders.empty() || shaders.front().program == nullptr ? -1 : shaders.front().program->vertexOffsetSgpr, draw.vertexFold, shaders.empty() || shaders.front().program == nullptr ? -1 : shaders.front().program->instanceOffsetSgpr, draw.instanceFold, draw.firstUserSgpr, draw.userData};
+}
+
 struct RecordedDraw {
     Recorder* recorder = nullptr;
     std::shared_ptr<ShaderResources> resources;
@@ -2066,6 +2071,7 @@ struct RecordedDraw {
     std::vector<std::shared_ptr<StorageTexture>> proxies;
     const IndirectRecord* indirect = nullptr;
     std::span<const ShaderResources::MovedBuffer> moved;
+    std::span<const DrawSnapshotArena::Prefill> prefills;
     bool listed = false;
     bool completion = false;
     bool waited = false;
@@ -2305,9 +2311,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     parts.lap(RecordStores);
     std::optional<ShaderResources::DrawIndexRanges> drawRanges;
-    if (args == nullptr && !state.stages.mesh && !state.stages.tessellation && state.stages.path == ShaderPath::Vertex && draw.instanceCount != 0 && static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount - 1u <= std::numeric_limits<std::uint32_t>::max() && inputs.minIndex <= inputs.maxIndex) drawRanges = ShaderResources::DrawIndexRanges{inputs.minIndex, inputs.maxIndex, draw.firstInstance, draw.firstInstance + draw.instanceCount - 1u, shaders.empty() || shaders.front().program == nullptr ? -1 : shaders.front().program->vertexOffsetSgpr, draw.vertexFold, shaders.empty() || shaders.front().program == nullptr ? -1 : shaders.front().program->instanceOffsetSgpr, draw.instanceFold, draw.firstUserSgpr, draw.userData};
+    if (args == nullptr) drawRanges = drawIndexRanges(state, draw, shaders, inputs);
     resources.PublishResidentReads(*recorder);
-    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.profile ? &outcome.bindings : nullptr, drawRanges ? &*drawRanges : nullptr);
+    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.profile ? &outcome.bindings : nullptr, drawRanges ? &*drawRanges : nullptr, record.prefills);
     parts.lap(RecordBindings);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
@@ -2658,6 +2664,7 @@ struct ResolvedDraw {
     std::shared_ptr<Pipeline> pipeline;
     std::vector<std::uint8_t> proxied;
     ShaderResources::EpochProofResult epochProof;
+    std::vector<DrawSnapshotArena::Prefill> prefills;
 };
 
 namespace {
@@ -3335,6 +3342,7 @@ void drawBody(const Context& context, const State& state, const Pm4::DrawParamet
         record.recorder = recorder;
         record.resources = resources;
         record.moved = resolved.moved;
+        if (early != nullptr) record.prefills = early->prefills;
         record.pipeline = pipeline;
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;
@@ -3748,6 +3756,18 @@ std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const St
             }
         }
         if (ParallelTargetsRequested()) resolveTargets(context, state, *resolved);
+        if (DrawSnapshotArena::WorkerCopies() && DrawSnapshotArena::Enabled() && context.recorder != nullptr && resolved->inputsRefusal == ResolveRefusal::None && resolved->resources != nullptr && resolved->plan.has_value() && !draw.indirect) {
+            try {
+                const auto ranges = drawIndexRanges(state, draw, shaders, resolved->inputs);
+                const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+                auto& arena = context.recorder->SnapshotArena();
+                for (auto& request : resolved->resources->PlanDrawSnapshots(resolved->plan->moved, ranges ? &*ranges : nullptr)) {
+                    if (auto prefill = arena.PrepareCopy(request.begin, request.bytes, registryGeneration, std::move(request.ranges))) resolved->prefills.push_back(std::move(*prefill));
+                }
+            } catch (const std::exception&) {
+                resolved->prefills.clear();
+            }
+        }
     }
     counters.inputRefusals[static_cast<std::size_t>(resolved->inputsRefusal)].fetch_add(1, std::memory_order_relaxed);
     counters.resourceRefusals[static_cast<std::size_t>(resolved->resourcesRefusal)].fetch_add(1, std::memory_order_relaxed);
