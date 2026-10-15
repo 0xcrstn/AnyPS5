@@ -873,11 +873,21 @@ void addressTemplateTests(const Context& context) {
         const ResourceCache::Key key{0x41u, 0x54u};
         cache.Insert(key, resources);
         std::vector<std::shared_ptr<ShaderResources>> evicted;
-        cache.RemoveAddressTemplates(evicted);
-        Require(evicted.size() == 1 && evicted[0] == resources && cache.Find(key) == nullptr, "the pin waiter's eviction left an address template in the resource cache");
+        ResourceCache::RemoveLeaseHolders(evicted);
+        Require(std::find(evicted.begin(), evicted.end(), resources) != evicted.end() && cache.Find(key) == nullptr, "the pin waiter's eviction left a template holding the address space in a resource cache");
         change(guest + piece, true);
         Require(!resources->Revalidate(stages), "an address template proved current after the registry changed");
         change(guest + piece, false);
+    }
+    {
+        ResourceCache cache;
+        const ResourceCache::Key key{0x50u, 0x49u, 0x4eu};
+        auto held = std::make_shared<ShaderResources>(importing, stages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>{});
+        Require(held->HoldsLease(), "an address template does not hold the address space");
+        cache.Insert(key, std::move(held));
+        change(guest, false);
+        Require(cache.Find(key) == nullptr, "freeing a registered range left the template pinning it in the resource cache");
+        change(guest, true);
     }
     pixel.bdaWrites = true;
     Require(ShaderResources::NeverReusable(stages), "an address-based draw that writes through pointers is offered the resource cache");
