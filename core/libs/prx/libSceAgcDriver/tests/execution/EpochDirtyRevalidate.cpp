@@ -214,8 +214,9 @@ int main(int argc, char** argv) {
         const auto skipsBeforeInvalidation = AgcDriver::Graphics::ShaderResources::EpochSkips();
         const auto verificationsBeforeInvalidation = AgcDriver::GuestMemory::DirtySetStatistics().verifyChecks;
         AgcDriver::Graphics::StorageTexture::BumpPendingSerial();
-        run.Sample({0xff, 0x00, 0xff, 0x00}, "after another pending-source invalidation");
-        Require(AgcDriver::Graphics::ShaderResources::EpochSkips() == skipsBeforeInvalidation && AgcDriver::GuestMemory::DirtySetStatistics().verifyChecks == verificationsBeforeInvalidation, "a pending-source invalidation did not reject the epoch proof");
+        run.Sample({0xff, 0x00, 0xff, 0x00}, "after a pending-registry change no surface of the template saw");
+        if (mode == "on") Require(AgcDriver::Graphics::ShaderResources::EpochSkips() > skipsBeforeInvalidation, "a pending-registry change that reached no surface of the template rejected its epoch proof");
+        if (mode == "verify") Require(AgcDriver::GuestMemory::DirtySetStatistics().verifyChecks > verificationsBeforeInvalidation, "a pending-registry change that reached no surface of the template rejected its epoch proof");
         run.SetTexel({0x00, 0xff, 0x00, 0xff});
         AgcDriver::GuestMemory::BumpCollectEpoch();
         run.Sample({0x00, 0xff, 0x00, 0xff}, "after a CPU store and an ordering point");
