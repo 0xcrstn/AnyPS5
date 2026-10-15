@@ -243,6 +243,7 @@ private:
     void finishDrawRecords();
     void waitDrawRecords();
     void waitDrawRecordsAt(std::uint32_t opcode);
+    bool overlapCommandProcessorRead(std::span<const std::uint32_t> packet);
     void postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::string identity, std::function<void(DrawRecordResult&)> record);
     static void noteDrawRecordRecipe(DrawRecordResult& result, std::shared_ptr<const DrawRecipe> built, std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void reportDrawRecords();

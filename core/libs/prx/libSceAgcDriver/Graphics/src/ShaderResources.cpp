@@ -40,6 +40,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -4839,6 +4840,18 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
 }
 
 namespace {
+bool SnapshotReadRangesOnly() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_SNAPSHOT_READ_RANGES");
+        if (text == nullptr) return false;
+        const std::string_view value(text);
+        if (value == "0" || value == "off") return false;
+        if (value == "1" || value == "on") return true;
+        throw std::invalid_argument("APS5_SNAPSHOT_READ_RANGES must be 0, 1, off or on, not \"" + std::string(value) + "\"");
+    }();
+    return enabled;
+}
+
 bool PartialSnapshotsDisabled() {
     static const bool disabled = std::getenv("APS5_NO_PARTIAL_DRAW_SNAPSHOTS") != nullptr;
     return disabled;
@@ -5123,7 +5136,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 else if (readAnalysis.has_value()) readRanges = GuestReadRanges(readAnalysis->words, &readAnalysis->ranges, size, &wholeCopy, drawRanges);
                 if (readRanges.has_value()) {
                     for (const auto& [from, to] : *readRanges) covered += static_cast<std::size_t>(to - from);
-                    limitedCopy = covered * 2 <= bytes;
+                    limitedCopy = covered * 2 <= bytes || (SnapshotReadRangesOnly() && covered < bytes);
                     wholeCopy = WholeCopy::OverHalf;
                 }
                 analysed = true;
@@ -5149,6 +5162,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     } else {
                         ++statistics->wholeCopies[static_cast<std::size_t>(wholeCopy)];
                         statistics->wholeBytes[static_cast<std::size_t>(wholeCopy)] += view->copiedBytes;
+                        if (wholeCopy == WholeCopy::OverHalf) statistics->overHalfReadBytes += covered;
                     }
                 } else if (statistics != nullptr) {
                     ++statistics->reused;
@@ -5205,6 +5219,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     } else {
                         ++statistics->wholeCopies[static_cast<std::size_t>(wholeCopy)];
                         statistics->wholeBytes[static_cast<std::size_t>(wholeCopy)] += bytes;
+                        if (wholeCopy == WholeCopy::OverHalf) statistics->overHalfReadBytes += covered;
                     }
                 }
             } else {

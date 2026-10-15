@@ -102,6 +102,20 @@ private:
     Provisional provisional;
 };
 
+enum class CommandProcessorReads : std::uint8_t { Drain, Overlap, Verify };
+
+CommandProcessorReads ParseCommandProcessorReads(const char* text);
+CommandProcessorReads CommandProcessorReadsMode();
+void SetCommandProcessorReadsMode(CommandProcessorReads mode);
+
+struct CommandProcessorReadCounters {
+    std::uint64_t reads = 0;
+    std::uint64_t ahead = 0;
+    std::uint64_t verified = 0;
+};
+
+CommandProcessorReadCounters CommandProcessorReadTotals();
+
 inline bool OverlapsDrawRecords(std::uint32_t opcode, bool predicated, bool dispatches = false) {
     if (predicated) return false;
     if (dispatches && (opcode == 0x15 || opcode == 0x16)) return true;
