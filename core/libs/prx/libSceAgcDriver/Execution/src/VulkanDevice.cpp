@@ -2258,6 +2258,19 @@ void VulkanDevice::ReapRecorded() {
     if (state->computeRecorder) state->computeRecorder->Reap();
 }
 
+std::vector<Graphics::Recorder::UnlockedWait> VulkanDevice::CompletionWaits() const {
+    std::vector<Graphics::Recorder::UnlockedWait> waits;
+    for (const auto* recorder : {state->recorder.get(), state->computeRecorder.get()}) {
+        if (recorder == nullptr) continue;
+        if (auto wait = recorder->CompletionWait()) waits.push_back(std::move(*wait));
+    }
+    return waits;
+}
+
+bool VulkanDevice::CompletionWaitsOnTimelines() const {
+    return state->recorder && state->recorder->HasTimeline() && (!state->computeRecorder || state->computeRecorder->HasTimeline());
+}
+
 bool VulkanDevice::ReapMayRetire() const {
     if (state->computeRecorder && state->computeRecorder->ReapMayRetire()) return true;
     return state->recorder == nullptr || state->recorder->ReapMayRetire();

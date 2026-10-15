@@ -139,7 +139,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 };
 
                 while (!ready()) {
-                    if (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
+                    if (completionWatcher() || !completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
                         const auto idleEpochAtCheck = idleEpoch.load(std::memory_order_acquire);
                         const bool storeIdleResults = idleResultsPending();
                         if (storeIdleResults) {

@@ -241,6 +241,8 @@ The wait broker (on by default, `APS5_WAIT_BROKER=0` turns it off) makes a block
 
 `APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. The default is 2000; `0` turns it off. The `[labels]` line counts these submits.
 
+A completion watcher thread waits on the GPU for the oldest submitted batch with completion actions (end-of-pipe interrupts, labels stored behind write-backs, write-backs) and runs them as soon as the GPU finishes it, so a title's CPU code waiting on an event queue or on such a label is woken without the queue workers polling. `APS5_COMPLETION_WATCHER=0` turns it off; idle workers then poll for finished batches as before. The `[labels]` line counts the watcher's reaps and GPU waits.
+
 ### Address-based shader experiments
 
 These switches change how recompiled shaders reach guest memory through addresses. Each accepts the values shown; any other value stops the title at start. `verify` runs the old and the new form side by side and stops the title with a description of the first difference.

@@ -277,6 +277,28 @@ public:
     // it touches only the immutable timeline semaphore (the caller keeps the device alive). Requires
     // HasTimeline(); the debug switch APS5_NO_TIMELINE makes the device create the recorder without one.
     void WaitSerial(std::uint64_t serial);
+    class UnlockedWait {
+    public:
+        UnlockedWait(UnlockedWait&& other) noexcept;
+        UnlockedWait(const UnlockedWait&) = delete;
+        UnlockedWait& operator=(const UnlockedWait&) = delete;
+        UnlockedWait& operator=(UnlockedWait&&) = delete;
+        ~UnlockedWait();
+        static VkResult Any(std::span<const UnlockedWait> waits, std::uint64_t timeoutNs);
+
+    private:
+        friend class Recorder;
+        UnlockedWait(std::atomic<int>* count, VkDevice device, PFN_vkWaitSemaphoresKHR wait, VkSemaphore timeline, std::uint64_t serial);
+        std::atomic<int>* count;
+        VkDevice device;
+        PFN_vkWaitSemaphoresKHR wait;
+        VkSemaphore timeline;
+        std::uint64_t serial;
+    };
+    std::optional<UnlockedWait> CompletionWait() const;
+    static std::uint64_t SubmitSequence();
+    static void WaitSubmitSequence(std::uint64_t seen, std::chrono::microseconds timeout);
+    static void PokeSubmitSequence();
     // Under the mutex: finishes (completions, release) the in-flight batches up to `serial`, from the
     // front only; tolerates batches another thread finished meanwhile. Later batches stay in flight.
     void FinishUpTo(std::uint64_t serial);
