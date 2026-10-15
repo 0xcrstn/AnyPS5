@@ -157,7 +157,13 @@ bool ParallelResolveRequested();
 bool VerifyParallelResolve();
 bool ParallelRevalidateRequested();
 bool VerifyParallelRevalidate();
-std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+bool ParallelDispatchRevalidate();
+bool VerifyParallelDispatchRevalidate();
+bool EpochProofsOffThread();
+bool StagedDrawBuilds();
+bool VerifyStagedDrawBuilds();
+std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {});
+std::span<const std::pair<std::uint64_t, std::uint64_t>> StagedDrawReads(const ResolvedDraw& resolved);
 std::vector<std::pair<std::uint64_t, std::size_t>> ResolvedSnapshotReads(const ResolvedDraw& resolved);
 void EncodeDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const ResolvedDraw& resolved, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
 
@@ -181,6 +187,9 @@ struct ParallelResolveCounts {
     std::array<std::uint64_t, static_cast<std::size_t>(ResolveSerial::Count)> moved{};
     std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::EpochProofVerdict::Count)> revalidations{};
     std::uint64_t revalidationsVerified = 0;
+    std::uint64_t stagedBuilt = 0;
+    std::uint64_t stagedAdopted = 0;
+    std::uint64_t stagedVerified = 0;
 };
 ParallelResolveCounts ParallelResolveStatistics();
 

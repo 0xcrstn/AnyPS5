@@ -8,7 +8,7 @@
 
 namespace AgcDriver::Graphics {
 
-void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
+bool ShaderResources::prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool unlocked) {
     static const bool loopGuarded = std::getenv("APS5_LOOP_GUARD") != nullptr;
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
@@ -31,20 +31,45 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
     }
     bdaReadOnly = usesBda && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.program->bdaWrites; });
     mirrorReads = bdaReadOnly && context.recorder != nullptr && ResidentMirrorsEnabled();
-    placeWrites = usesBda && !bdaReadOnly && context.recorder != nullptr && PlacementSetting() != ShaderRecompiler::BdaPlacement::Mode::Host && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Compute && !shader.program->bdaAtomics && !shader.program->bdaCoherent; });
+    placeWrites = usesBda && !bdaReadOnly && context.recorder != nullptr && PlacementSetting() != ShaderRecompiler::BdaPlacement::Mode::Host && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return (shader.stage == ShaderRecompiler::ShaderStage::Compute || DrawPlacementEnabled()) && !shader.program->bdaSpinWait; });
     if (usesBda) {
         Require(context.bufferDeviceAddress, "buffer device address is not enabled");
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-        guestMemory.AcquireRegistered();
+        if (unlocked && !guestMemory.AcquireCachedSpace()) return false;
+        if (!unlocked) guestMemory.AcquireRegistered();
         const auto snapshotsStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         for (const auto& snapshot : snapshots) guestMemory.AddSnapshot(snapshot);
         if (profile) GuestBufferMemory::CountAddressBuild(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - snapshotsStart).count());
     }
+    return true;
 }
 
 void ShaderResources::UseMirrors(Recorder& recorder) const {
     if (bda != nullptr) Graphics::UseMirrors(recorder, bda->Mirrors());
     if (!bufferMirrors.empty()) Graphics::UseMirrors(recorder, bufferMirrors);
+}
+
+std::vector<DispatchFreeze::Reach> ShaderResources::ReachableRanges() const {
+    return guestMemory.ReachableRanges(usesBda);
+}
+
+bool ShaderResources::HasPlacements() const {
+    return bda != nullptr && bda->HasPlacements();
+}
+
+void ShaderResources::UseMirrors(Recorder& recorder, std::span<const std::size_t> movedAllocations) const {
+    if (movedAllocations.empty()) {
+        UseMirrors(recorder);
+        return;
+    }
+    if (bda != nullptr) Graphics::UseMirrors(recorder, bda->Mirrors());
+    std::vector<std::shared_ptr<ResidentMirror>> used;
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& mirror = allocations[index].mirror;
+        if (mirror == nullptr || std::find(movedAllocations.begin(), movedAllocations.end(), index) != movedAllocations.end()) continue;
+        if (std::find(used.begin(), used.end(), mirror) == used.end()) used.push_back(mirror);
+    }
+    if (!used.empty()) Graphics::UseMirrors(recorder, used);
 }
 
 void ShaderResources::RecordPlacementCopyBack(Recorder&, VkCommandBuffer commands) const {
@@ -68,7 +93,14 @@ void ShaderResources::RefreshMirrorsForDirectUse(Recorder& recorder) const {
 }
 
 VkDescriptorBufferInfo ShaderResources::descriptor(Allocation& allocation) {
-    if (allocation.guest) return allocation.written ? guestMemory.Descriptor(allocation.address, allocation.size, allocation.adjustment) : guestMemory.MirroredDescriptor(allocation.address, allocation.size, allocation.adjustment, bufferMirrors);
+    if (allocation.guest) {
+        allocation.mirror = nullptr;
+        if (allocation.written) return guestMemory.Descriptor(allocation.address, allocation.size, allocation.adjustment);
+        const auto info = guestMemory.MirroredDescriptor(allocation.address, allocation.size, allocation.adjustment, bufferMirrors);
+        const auto found = std::find_if(bufferMirrors.begin(), bufferMirrors.end(), [&](const std::shared_ptr<ResidentMirror>& mirror) { return MirrorBuffer(*mirror) == info.buffer; });
+        if (found != bufferMirrors.end()) allocation.mirror = *found;
+        return info;
+    }
     if (allocation.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
         Require(context.emptyBuffer != VK_NULL_HANDLE, "no placeholder buffer for a null V#");
         return {context.emptyBuffer, 0, allocation.size};

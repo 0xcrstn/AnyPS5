@@ -12,6 +12,7 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -107,8 +108,11 @@ struct SpirvEmitterState {
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
+    bool robustBufferAccess2 = false;
+    RewriteMode bufferSelects = RewriteMode::Off;
     bool sharedFloatFunctions = true;
     bool outlineImageModes = false;
+    bool sharedBufferHelpers = true;
     struct OutlinedImageModes {
         MemoryInfo memory;
         std::vector<std::uint64_t> shape;
@@ -128,6 +132,11 @@ struct SpirvEmitterState {
     std::uint32_t storageBufferU8Variable = 0;
     std::vector<std::uint32_t> memoryByteOffsets;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
+    std::map<std::array<std::uint64_t, 5>, std::array<std::uint32_t, 6>> runtimeDescriptors;
+    std::map<std::array<std::uint32_t, 3>, std::pair<std::uint32_t, std::uint32_t>> runtimeBufferLengths;
+    std::uint32_t helperBufferElement = 0;
+    std::uint32_t helperBufferByteOffset = 0;
+    std::uint32_t helperBufferMisalignment = 0;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedGpuBufferFunctions;
     std::uint32_t bufferFormatTable = 0;
     std::uint32_t bdaPagetableVariable = 0;
@@ -148,10 +157,17 @@ struct SpirvEmitterState {
     bool bdaInlineFastPath = false;
     std::map<std::array<std::uint32_t, 3>, std::uint32_t> bdaResolveFunctions;
     std::array<std::uint32_t, 4> bdaCapability {};
+    RewriteMode bdaProvenance = RewriteMode::Off;
+    std::unordered_map<const IrValue*, std::vector<std::pair<const IrValue*, const IrValue*>>> bdaRootsBefore;
+    std::unordered_map<const IrValue*, std::vector<std::pair<const IrValue*, const IrValue*>>> bdaRootsAfter;
+    std::unordered_map<const IrBlock*, std::vector<std::pair<const IrValue*, const IrValue*>>> bdaRootsAtStart;
+    std::map<std::tuple<const IrValue*, const IrValue*, std::uint32_t>, std::array<std::uint32_t, 4>> bdaRootCapabilities;
     RewriteMode lazyLog2Repair = RewriteMode::Off;
     RewriteMode lazyTrigSeries = RewriteMode::Off;
     RewriteMode bdaSpanHelpers = RewriteMode::Off;
     RewriteMode bdaWriteNotes = RewriteMode::Off;
+    RewriteMode ballotReuse = RewriteMode::Off;
+    std::map<std::array<std::uint32_t, 3>, std::uint32_t> blockBallots;
     std::uint32_t rewriteMismatchInjection = 0;
     std::uint64_t bdaWriteNoteInjection = 0;
     std::map<std::array<std::uint32_t, 4>, std::uint32_t> bdaSpecializedSpanFunctions;

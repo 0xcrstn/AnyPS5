@@ -25,8 +25,10 @@ struct SpirvTargetOptions {
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
+    bool robustBufferAccess2 = false;
     std::optional<bool> sharedFloatFunctions;
     std::optional<bool> outlineImageModes;
+    std::optional<bool> sharedBufferHelpers;
 };
 
 void PrepareRewriteVerification(IrProgram& program);

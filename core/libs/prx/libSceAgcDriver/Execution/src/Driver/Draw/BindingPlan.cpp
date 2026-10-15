@@ -89,7 +89,7 @@ void ThrowStageMismatch(std::uint32_t queue, std::uint64_t submission, std::size
 
 bool SameStageResult(const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b) {
     if (!(a.spirv == b.spirv) || a.variantId != b.variantId || a.specializationId != b.specializationId || a.pushConstants != b.pushConstants || a.poisonedSrtReads != b.poisonedSrtReads) return false;
-    if (a.workgroupMemoryDwords != b.workgroupMemoryDwords || a.bdaWrites != b.bdaWrites || a.bdaAtomics != b.bdaAtomics || a.bdaCoherent != b.bdaCoherent || a.shaderDataUserWords != b.shaderDataUserWords || a.bufferBaseSlots != b.bufferBaseSlots) return false;
+    if (a.workgroupMemoryDwords != b.workgroupMemoryDwords || a.bdaWrites != b.bdaWrites || a.bdaAtomics != b.bdaAtomics || a.bdaCoherent != b.bdaCoherent || a.bdaSpinWait != b.bdaSpinWait || a.shaderDataUserWords != b.shaderDataUserWords || a.bufferBaseSlots != b.bufferBaseSlots) return false;
     if (a.bindings.size() != b.bindings.size() || a.vertexAttributes.size() != b.vertexAttributes.size() || a.specialization.size() != b.specialization.size()) return false;
     for (std::size_t index = 0; index < a.bindings.size(); ++index) {
         if (!SameBinding(a.bindings[index], b.bindings[index])) return false;
@@ -129,7 +129,7 @@ SnapshotPart FirstSnapshotDifference(const ShaderRecompiler::ResourceCapture& fu
 bool Driver::bindingPlan() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_BINDING_PLAN");
-        return text != nullptr && std::strcmp(text, "0") != 0;
+        return text == nullptr || std::strcmp(text, "0") != 0;
     }();
     return enabled;
 }
@@ -145,7 +145,7 @@ bool Driver::verifyBindingPlan() {
 bool Driver::incrementalBindings() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_INCREMENTAL_BINDINGS");
-        return text != nullptr && std::strcmp(text, "0") != 0;
+        return text == nullptr || std::strcmp(text, "0") != 0;
     }();
     return enabled;
 }
@@ -220,7 +220,7 @@ void Driver::noteIncrementalStage(const ShaderRecompiler::SrtTapeInstance& insta
 bool Driver::incrementalPlans() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_INCREMENTAL_PLANS");
-        return text != nullptr && std::strcmp(text, "0") != 0;
+        return text == nullptr || std::strcmp(text, "0") != 0;
     }();
     return enabled;
 }

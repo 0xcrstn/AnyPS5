@@ -139,7 +139,7 @@ constexpr std::size_t fieldCount() {
     }
 }
 
-static_assert(fieldCount<ShaderInfo>() == 25, "ShaderInfo changed: update the info encoder");
+static_assert(fieldCount<ShaderInfo>() == 26, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 13, "BufferResource changed: update the info encoder");
 static_assert(fieldCount<ImageResource>() == 38, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
@@ -809,6 +809,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
     writer.Value(info.bdaWrites);
     writer.Value(info.bdaAtomics);
     writer.Value(info.bdaCoherent);
+    writer.Value(info.bdaSpinWait);
     writer.Value(info.usesFaultBuffer);
     writer.Value(info.dispatchThreadLimit);
     writer.Value(info.rasterPrimitive);
@@ -916,6 +917,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
     reader.Value(info.bdaWrites);
     reader.Value(info.bdaAtomics);
     reader.Value(info.bdaCoherent);
+    reader.Value(info.bdaSpinWait);
     reader.Value(info.usesFaultBuffer);
     reader.Value(info.dispatchThreadLimit);
     reader.Value(info.rasterPrimitive);
@@ -1392,6 +1394,7 @@ public:
 
     [[nodiscard]] bool Enabled() const { return !directory.empty(); }
     [[nodiscard]] const std::filesystem::path& Directory() const { return directory; }
+    [[nodiscard]] const std::filesystem::path& PlanDirectory() const { return planDirectory; }
 
     bool Load(std::span<const std::byte> key, CompiledVariant& variant) {
         if (loadPrebuilt(key, variant)) return true;
@@ -1818,8 +1821,8 @@ std::uint64_t SourceVersion() {
 bool LayeredCache() {
     static const bool layered = [] {
         const char* value = std::getenv("APS5_SHADER_CACHE_V2");
-        if (value == nullptr || *value == '\0' || std::string_view(value) == "0") return false;
-        if (std::string_view(value) == "1") return true;
+        if (value == nullptr || *value == '\0' || std::string_view(value) == "1") return true;
+        if (std::string_view(value) == "0") return false;
         throw std::invalid_argument("APS5_SHADER_CACHE_V2 accepts only 0 or 1");
     }();
     return layered;
@@ -1977,6 +1980,10 @@ bool Enabled() {
 
 std::filesystem::path EntryDirectory() {
     return store().Directory();
+}
+
+std::filesystem::path PlanEntryDirectory() {
+    return store().PlanDirectory();
 }
 
 bool Load(std::span<const std::byte> key, CompiledVariant& variant) {

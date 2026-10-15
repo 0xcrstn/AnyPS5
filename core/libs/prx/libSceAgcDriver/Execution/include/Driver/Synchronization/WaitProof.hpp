@@ -34,8 +34,8 @@ struct Proof {
 };
 
 inline LabelTimelineMode ParseLabelTimeline(const char* value) {
-    if (value == nullptr || std::string(value) == "off") return LabelTimelineMode::Off;
-    if (std::string(value) == "on") return LabelTimelineMode::On;
+    if (value == nullptr || std::string(value) == "on") return LabelTimelineMode::On;
+    if (std::string(value) == "off") return LabelTimelineMode::Off;
     if (std::string(value) == "verify") return LabelTimelineMode::Verify;
     throw std::runtime_error(std::string("APS5_LABEL_TIMELINE: unknown mode ") + value + " (off, on or verify)");
 }

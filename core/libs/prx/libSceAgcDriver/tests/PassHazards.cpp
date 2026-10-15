@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -34,8 +35,9 @@ struct Use {
     Images attachments;
     bool anyReads = false;
     bool anyWrites = false;
+    bool knownAddressWrites = false;
 
-    PassAccess View() const { return {reads, writes, images, attachments, anyReads, anyWrites}; }
+    PassAccess View() const { return {reads, writes, images, attachments, anyReads, anyWrites, knownAddressWrites}; }
 };
 
 void testRangeSet() {
@@ -184,12 +186,62 @@ void testAttachments() {
 
 }
 
+void testKnownAddressWrites() {
+    PassHazards hazards;
+    hazards.BeginPass();
+    Use readOnly;
+    readOnly.anyReads = true;
+    readOnly.anyWrites = true;
+    readOnly.knownAddressWrites = true;
+    Use reader;
+    reader.reads = {{0x100, 0x104}};
+    hazards.Add(reader.View());
+    Expect(hazards.Check(readOnly.View(), true) == PassHazard::UnknownWrite, "a read-only address-based draw still counts as an unknown writer");
+    Expect(hazards.CheckKnownAddressWrites(readOnly.View(), true) == PassHazard::None, "without its known writes it only reads");
+    hazards.Add(readOnly.View());
+    Expect(hazards.Check(reader.View(), true) == PassHazard::UnknownWrite, "a read after it counts its unknown writes");
+    Expect(hazards.CheckKnownAddressWrites(reader.View(), true) == PassHazard::None, "a read after a read-only address-based draw");
+    Use writer;
+    writer.writes = {{0x100, 0x104}};
+    Expect(hazards.CheckKnownAddressWrites(writer.View(), true) == PassHazard::UnknownRead, "a write after its unknown reads still breaks");
+    Use unknownWriter;
+    unknownWriter.anyWrites = true;
+    hazards.Add(unknownWriter.View());
+    Expect(hazards.CheckKnownAddressWrites(reader.View(), true) == PassHazard::UnknownWrite, "a real unknown writer keeps breaking");
+    hazards.Clear();
+    Expect(hazards.Empty() && hazards.CheckKnownAddressWrites(reader.View(), true) == PassHazard::None, "a barrier clears the unknown writes");
+    Expect(ParseReadOnlyAddressPasses(nullptr) == ReadOnlyAddressPasses::On && ParseReadOnlyAddressPasses("1") == ReadOnlyAddressPasses::On, "on by default");
+    Expect(ParseReadOnlyAddressPasses("0") == ReadOnlyAddressPasses::Off && ParseReadOnlyAddressPasses("verify") == ReadOnlyAddressPasses::Verify, "off and verify");
+    bool threw = false;
+    try {
+        static_cast<void>(ParseReadOnlyAddressPasses("yes"));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Expect(threw, "an unknown value throws");
+    Expect(ParseDepthPassMerge(nullptr) == DepthPassMerge::On && ParseDepthPassMerge("0") == DepthPassMerge::Off && ParseDepthPassMerge("verify") == DepthPassMerge::Verify, "APS5_DEPTH_PASS_MERGE values");
+    PassHazards passes;
+    passes.BeginPass();
+    Use depthPass;
+    depthPass.attachments = {{image(9), true}};
+    passes.Add(depthPass.View());
+    passes.BeginPass();
+    Use sampler;
+    sampler.images = {{image(9), false}};
+    Expect(passes.Check(sampler.View(), false) == PassHazard::Image, "sampling a depth image an earlier pass wrote is a hazard");
+    Use otherDepth;
+    otherDepth.attachments = {{image(10), true}};
+    Expect(passes.Check(otherDepth.View(), false) == PassHazard::None, "a pass on another depth image has no hazard");
+    Expect(passes.Check(depthPass.View(), false) == PassHazard::Image, "a later pass writing the same depth image needs the barrier");
+}
+
 int main() {
     testRangeSet();
     testRanges();
     testUnknown();
     testImages();
     testAttachments();
+    testKnownAddressWrites();
     if (failures != 0) {
         std::fprintf(stderr, "%d pass hazard checks failed\n", failures);
         return 1;

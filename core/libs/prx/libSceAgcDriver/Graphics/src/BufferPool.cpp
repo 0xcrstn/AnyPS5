@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -28,6 +29,7 @@ constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
 }
 
 BufferPool::BufferPool(const Context& context) : device(context.device), unmap(context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")), destroyBuffer(context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")), freeMemory(context.Function<PFN_vkFreeMemory>("vkFreeMemory")), allocateMemory(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")), mapMemory(context.Function<PFN_vkMapMemory>("vkMapMemory")), maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 6u))) {
+    memoryProperties = context.memory;
     smallTier.budget = smallBudget;
     largeTier.budget = LargeBudget();
     deviceTier.budget = DeviceTierEnabled() ? DeviceBudget(context.memory) : 0;
@@ -42,7 +44,7 @@ BufferPool::~BufferPool() {
     for (auto& [memory, block] : slabBlocks) freeBlock(*block);
 }
 
-VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation) {
+VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, DeviceMemoryKind kind) {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     auto result = allocateMemory(device, &allocation, nullptr, &memory);
     const auto initialResult = result;
@@ -57,6 +59,8 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         }
     }
     if (result == VK_SUCCESS) {
+        const auto heap = allocation.memoryTypeIndex < memoryProperties.memoryTypeCount ? memoryProperties.memoryTypes[allocation.memoryTypeIndex].heapIndex : 0u;
+        DeviceMemoryPlacements::Track(memory, kind, (memoryProperties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0, allocation.allocationSize);
         if (attempts == 2) std::fprintf(stderr, "[bufferpool] %s recovered: allocation=%llu reclaimed=%llu initialResult=%d attempts=%u\n", operation, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<int>(initialResult), attempts);
         return memory;
     }
@@ -109,7 +113,7 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
     if ((context.memory.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
         void* mapping = nullptr;
         const auto mapped = mapMemory(device, block->memory, 0, VK_WHOLE_SIZE, 0, &mapping);
-        if (mapped != VK_SUCCESS) freeMemory(device, block->memory, nullptr);
+        if (mapped != VK_SUCCESS) { DeviceMemoryPlacements::Untrack(block->memory); freeMemory(device, block->memory, nullptr); }
         Check(mapped, "vkMapMemory buffer slab");
         block->mapping = static_cast<std::byte*>(mapping);
     }
@@ -127,6 +131,7 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
 
 void BufferPool::freeBlock(SlabBlock& block) noexcept {
     if (block.mapping != nullptr) unmap(device, block.memory);
+    DeviceMemoryPlacements::Untrack(block.memory);
     freeMemory(device, block.memory, nullptr);
 }
 
@@ -184,6 +189,7 @@ VkDeviceSize BufferPool::destroy(const BufferAllocation& allocation) noexcept {
     // Device-local allocations (see DeviceBuffer) are never mapped.
     if (allocation.mapping != nullptr) unmap(device, allocation.memory);
     destroyBuffer(device, allocation.buffer, nullptr);
+    DeviceMemoryPlacements::Untrack(allocation.memory);
     freeMemory(device, allocation.memory, nullptr);
     return allocation.allocationBytes;
 }
@@ -225,6 +231,10 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
         if (now - lastReport > std::chrono::seconds(10)) {
             lastReport = now;
             AgcDriver::ProfilePrint_nid_no_patch("[bufferpool] small: %llu hits, %llu misses (%llu of a size evicted earlier), %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses (%llu of a size evicted earlier), %llu evictions, %zu retained (%.0f MiB of %llu)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu)\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.missesEvicted), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.missesEvicted), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.budget >> 20u), sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u));
+            static UploadCounters previous{};
+            const auto uploads = UploadTotals();
+            AgcDriver::ProfilePrint_nid_no_patch("[uploads] device-local upload buffers%s: %llu placed (%.1f MiB), %llu left in host memory (no large device-local host-visible heap); verify%s: %llu writes (%.1f MiB) read back\n", UploadPlacementSetting() == UploadPlacement::Host ? " (off)" : "", static_cast<unsigned long long>(uploads.placed - previous.placed), static_cast<double>(uploads.placedBytes - previous.placedBytes) / 1048576.0, static_cast<unsigned long long>(uploads.hostFallbacks - previous.hostFallbacks), UploadPlacementSetting() == UploadPlacement::Verify ? "" : " (off)", static_cast<unsigned long long>(uploads.verified - previous.verified), static_cast<double>(uploads.verifiedBytes - previous.verifiedBytes) / 1048576.0);
+            previous = uploads;
         }
     }
     auto& tier = tierFor(capacity, properties);

@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/TextureDetile_spv.h"
@@ -10,6 +12,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -102,18 +105,58 @@ TextureDetiler::TextureDetiler(const Context& context) : context(context) {
     }
 }
 
+TextureDetiler::TextureDetiler(const Context& context, Retired) : context(context) {
+}
+
 TextureDetiler::~TextureDetiler() {
+    if (recorded && retireToRecorders()) return;
     release();
 }
 
+bool TextureDetiler::retireToRecorders() {
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::vector<Recorder*> busy;
+    Recorder::ForEachActive([&](Recorder& recorder) {
+        if (!recorder.Idle()) busy.push_back(&recorder);
+    });
+    if (busy.empty()) return false;
+    std::shared_ptr<TextureDetiler> retired(new TextureDetiler(context, Retired{}));
+    retired->adopt(*this);
+    for (auto* recorder : busy) recorder->Keep(retired);
+    return true;
+}
+
+void TextureDetiler::adopt(TextureDetiler& other) noexcept {
+    descriptorLayout = std::exchange(other.descriptorLayout, VK_NULL_HANDLE);
+    pipelineLayout = std::exchange(other.pipelineLayout, VK_NULL_HANDLE);
+    module = std::exchange(other.module, VK_NULL_HANDLE);
+    pipelines = std::exchange(other.pipelines, {});
+    descriptorSets = std::exchange(other.descriptorSets, {});
+    cmaskDescriptorLayout = std::exchange(other.cmaskDescriptorLayout, VK_NULL_HANDLE);
+    cmaskPipelineLayout = std::exchange(other.cmaskPipelineLayout, VK_NULL_HANDLE);
+    cmaskPipeline = std::exchange(other.cmaskPipeline, VK_NULL_HANDLE);
+    cmaskDescriptorSets = std::exchange(other.cmaskDescriptorSets, {});
+    cmaskErrors = std::move(other.cmaskErrors);
+    imageDescriptorLayout = std::exchange(other.imageDescriptorLayout, VK_NULL_HANDLE);
+    imagePipelineLayout = std::exchange(other.imagePipelineLayout, VK_NULL_HANDLE);
+    imageModule = std::exchange(other.imageModule, VK_NULL_HANDLE);
+    imageDescriptorSets = std::exchange(other.imageDescriptorSets, {});
+}
+
 void TextureDetiler::release() noexcept {
-    for (const auto pool : cmaskDescriptorSets.pools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+    for (const auto& ring : cmaskDescriptorSets) {
+        for (const auto pool : ring.pools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+    }
     if (cmaskPipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, cmaskPipeline, nullptr);
     if (cmaskPipelineLayout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, cmaskPipelineLayout, nullptr);
     if (cmaskDescriptorLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, cmaskDescriptorLayout, nullptr);
     cmaskErrors.reset();
-    for (const auto pool : descriptorSets.pools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
-    for (const auto pool : imageDescriptorSets.pools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+    for (const auto& ring : descriptorSets) {
+        for (const auto pool : ring.pools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+    }
+    for (const auto& ring : imageDescriptorSets) {
+        for (const auto pool : ring.pools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+    }
     if (imageModule) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, imageModule, nullptr);
     if (imagePipelineLayout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, imagePipelineLayout, nullptr);
     if (imageDescriptorLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, imageDescriptorLayout, nullptr);
@@ -312,7 +355,7 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
         cmaskErrors = std::make_unique<Buffer>(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         std::memset(cmaskErrors->Bytes().data(), 0, 4);
     }
-    const auto set = allocateFrom(cmaskDescriptorSets, cmaskDescriptorLayout, {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 * 2}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64}}, "vkCreateDescriptorPool CMASK clear", "vkAllocateDescriptorSets CMASK clear", "vkResetDescriptorPool CMASK clear");
+    const auto set = allocateFrom(cmaskDescriptorSets[ringQueue()], cmaskDescriptorLayout, {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 * 2}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64}}, "vkCreateDescriptorPool CMASK clear", "vkAllocateDescriptorSets CMASK clear", "vkResetDescriptorPool CMASK clear");
     const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     const auto descriptorOffset = cmaskOffset - cmaskOffset % alignment;
     const auto base = cmaskOffset - descriptorOffset;

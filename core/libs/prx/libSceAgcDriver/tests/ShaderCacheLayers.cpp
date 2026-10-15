@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -13,9 +14,16 @@ void Require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
-void Versions() {
-    Require(!Cache::LayeredCache(), "the layered cache is on without APS5_SHADER_CACHE_V2");
-    Require(Cache::PlanSourceVersion() == Cache::SourceVersion(), "plans use a separate source version without APS5_SHADER_CACHE_V2");
+void Versions(bool layered) {
+    if (layered) {
+        Require(Cache::LayeredCache(), "the layered cache is off by default");
+        Require(Cache::PlanSourceVersion() != Cache::SourceVersion(), "plans of the layered cache use the full source version");
+        Require(ShaderRecompiler::SpirvInternEnabled(), "SPIR-V interning is off by default");
+    } else {
+        Require(!Cache::LayeredCache(), "the layered cache is on with APS5_SHADER_CACHE_V2=0");
+        Require(Cache::PlanSourceVersion() == Cache::SourceVersion(), "plans use a separate source version with APS5_SHADER_CACHE_V2=0");
+        Require(!ShaderRecompiler::SpirvInternEnabled(), "SPIR-V interning is on with APS5_SPIRV_INTERN=0");
+    }
 }
 
 void PlanComparison() {
@@ -66,9 +74,9 @@ void Interning() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
-        Versions();
+        Versions(!(argc > 1 && std::string_view(argv[1]) == "off"));
         PlanComparison();
         PlanEntries();
         Interning();

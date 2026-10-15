@@ -333,7 +333,7 @@ std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const
     return addresses;
 }
 
-SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program, std::uint32_t functionLdsAllocationDwords) {
+SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program, std::uint32_t functionLdsAllocationDwords, std::uint32_t functionLdsUnboundedDwords) {
     SpirvRequirements requirements {};
     for (const IrBlock* block : program.BlockOrder()) {
         for (const IrValue* inst : block->Instructions()) {
@@ -467,10 +467,11 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program, std::uint
         }
     }
     if (requirements.functionLds) {
-        if (functionLdsAllocationDwords == 0u || functionLdsAllocationDwords > FunctionLdsDwordLimit) {
+        if (functionLdsAllocationDwords == 0u || functionLdsAllocationDwords > FunctionLdsDwordLimit || functionLdsUnboundedDwords == 0u || functionLdsUnboundedDwords > FunctionLdsDwordLimit) {
             throw std::runtime_error("function LDS allocation must be between 1 and " + std::to_string(FunctionLdsDwordLimit) + " dwords");
         }
-        requirements.functionLdsDwords = std::min(FunctionLdsDwords(program), functionLdsAllocationDwords);
+        const auto bounded = FunctionLdsDwords(program);
+        requirements.functionLdsDwords = std::min(bounded < FunctionLdsDwordLimit ? bounded : functionLdsUnboundedDwords, functionLdsAllocationDwords);
         requirements.functionLdsAddresses = FunctionLdsLaneAddresses(program);
         if (!requirements.functionLdsAddresses.empty()) {
             std::uint64_t needed = 0;

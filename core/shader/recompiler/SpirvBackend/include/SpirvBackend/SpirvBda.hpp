@@ -27,6 +27,9 @@ void ValidateBdaTarget(const IrProgram& program, const SpirvTargetOptions& targe
 bool BdaInvocationsMayStop(const IrProgram& program);
 void StopBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition);
 std::uint32_t BdaInstructionPc(SpirvEmitterState& state, const IrValue& inst);
+void PrepareBdaProvenance(SpirvEmitterState& state);
+void EmitBdaRootBefore(SpirvValueEmitContext& ctx, const IrValue& inst, bool firstInBlock);
+void EmitBdaRootAfter(SpirvValueEmitContext& ctx, const IrValue& inst);
 std::uint32_t EmitBdaRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t bits);
 std::uint32_t EmitBdaReadBytes(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t bytes);
 void EmitBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t value, std::uint32_t bits = 32u);

@@ -14,7 +14,7 @@ namespace ShaderRecompiler::BdaPlacement {
 enum class Mode : std::uint32_t { Host, Device, Verify };
 
 inline Mode ParseMode(const char* value) {
-    if (value == nullptr) return Mode::Host;
+    if (value == nullptr) return Mode::Device;
     const std::string_view text(value);
     if (text == "host") return Mode::Host;
     if (text == "device") return Mode::Device;
@@ -55,7 +55,7 @@ inline constexpr std::uint32_t PageBytes = 1u << BdaAbi::WrittenPageShift;
 inline constexpr std::uint32_t DispatchX = BdaAbi::WrittenPageSlots;
 inline constexpr std::uint32_t DispatchY = BdaAbi::WrittenChunkPages;
 
-std::vector<std::uint32_t> BuildCopyBackShader();
+std::vector<std::uint32_t> BuildCopyBackShader(bool int64Atomics);
 
 }
 

@@ -1,7 +1,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -94,6 +96,35 @@ void BufferPlacementTests() {
     choose("no physical device retains cached preference", 15, coherent, 0);
 }
 
+void UploadPlacementTests() {
+    constexpr auto coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    constexpr auto device = coherent | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    Context context = mockContext(true);
+    context.memory.memoryTypeCount = 3;
+    context.memory.memoryTypes[0] = {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0};
+    context.memory.memoryTypes[1] = {coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 1};
+    context.memory.memoryTypes[2] = {device, 0};
+    Expect(SelectUploadProperties(context.memory, UploadPlacement::Host) == coherent, "host placement keeps host memory");
+    Expect(SelectUploadProperties(context.memory, UploadPlacement::Device) == device, "a large device-local host-visible heap takes uploads");
+    Expect(SelectUploadProperties(context.memory, UploadPlacement::Verify) == device, "verify places uploads like device");
+    context.memory.memoryHeaps[0].size = 256 * MiB;
+    Expect(SelectUploadProperties(context.memory, UploadPlacement::Device) == coherent, "a 256 MiB BAR window is not used");
+    context.memory.memoryHeaps[0].size = 4096 * MiB;
+    context.memory.memoryTypes[2] = {device, 1};
+    Expect(SelectUploadProperties(context.memory, UploadPlacement::Device) == coherent, "a type on a host heap is not device-local");
+    context.memory.memoryTypeCount = 2;
+    Expect(SelectUploadProperties(context.memory, UploadPlacement::Device) == coherent, "no such type keeps host memory");
+    Expect(ParseUploadPlacement(nullptr) == UploadPlacement::Device && ParseUploadPlacement("1") == UploadPlacement::Device && ParseUploadPlacement("device") == UploadPlacement::Device, "on by default");
+    Expect(ParseUploadPlacement("0") == UploadPlacement::Host && ParseUploadPlacement("host") == UploadPlacement::Host && ParseUploadPlacement("verify") == UploadPlacement::Verify, "off and verify");
+    bool threw = false;
+    try {
+        static_cast<void>(ParseUploadPlacement("rebar"));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Expect(threw, "an unknown upload placement throws");
+}
+
 void LivePlacementTests() {
     const auto live = [](DeviceMemoryKind kind, bool host) { return DeviceMemoryPlacements::Live(kind, host); };
     const auto expectLive = [&](const char* what, DeviceMemoryKind kind, bool host, std::uint64_t bytes, std::uint64_t allocations) {
@@ -133,6 +164,7 @@ int main() {
         Choose("usage already over the budget", true, 2952 * MiB, 3633 * MiB, both, HostType);
         Choose("no host type allowed", true, 3000 * MiB, 3000 * MiB, 1u << DeviceType, DeviceType);
         BufferPlacementTests();
+        UploadPlacementTests();
         LivePlacementTests();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

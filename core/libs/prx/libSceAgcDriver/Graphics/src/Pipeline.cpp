@@ -183,6 +183,26 @@ void ValidateSampleMask(const Context& context, const State& state, std::span<co
 
 namespace {
 
+thread_local bool probingPipelineCache = false;
+std::atomic<std::uint64_t> pipelineCacheProbeHits{0};
+std::atomic<std::uint64_t> pipelineCacheProbeMisses{0};
+
+struct PipelineCompileRequired {};
+
+struct PipelineCacheProbe {
+    PipelineCacheProbe() { probingPipelineCache = true; }
+    ~PipelineCacheProbe() { probingPipelineCache = false; }
+    PipelineCacheProbe(const PipelineCacheProbe&) = delete;
+    PipelineCacheProbe& operator=(const PipelineCacheProbe&) = delete;
+};
+
+void CreateProbedPipeline(const Context& context, const VkGraphicsPipelineCreateInfo& info, VkPipeline* pipeline) {
+    auto pipelineCacheLock = context.LockPipelineCacheForUse();
+    const auto created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &info, nullptr, pipeline);
+    if (probingPipelineCache && created == VK_PIPELINE_COMPILE_REQUIRED_EXT) throw PipelineCompileRequired{};
+    Check(created, "vkCreateGraphicsPipelines");
+}
+
 bool VerifyPipelineModes() {
     static const bool verify = std::getenv("APS5_VERIFY_PIPELINE_MODES") != nullptr;
     return verify;
@@ -573,6 +593,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         pipelineInfo.renderPass = renderPass;
         if (dynamicRendering) pipelineInfo.pNext = &rendering;
         timing.Mark("modules_and_state");
+        if (probingPipelineCache && prebuilding) throw PipelineCompileRequired{};
+        if (probingPipelineCache && !libraries) pipelineInfo.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
         if (prebuilding && !libraries) {
             for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
             _modules.clear();
@@ -613,7 +635,16 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         if (libraries) {
             ShaderCompileTrace::Event linkEvent("pipeline.graphics_from_libraries");
             traceStages(linkEvent);
-            pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+            if (probingPipelineCache) {
+                try {
+                    const ReadyPipelineLibraryParts ready;
+                    pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+                } catch (const PipelineLibraryPartsMissing&) {
+                    throw PipelineCompileRequired{};
+                }
+            } else {
+                pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+            }
             if (VerifyPipelineModes()) {
                 VkPipeline monolithic = VK_NULL_HANDLE;
                 VkResult created;
@@ -632,21 +663,23 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             PipelineCreationTrace trace("pipeline.graphics", context.pipelineCreationFeedback, pipelineInfo.stageCount);
             traceStages(trace.Event());
             trace.Chain(pipelineInfo);
-            auto pipelineCacheLock = context.LockPipelineCacheForUse();
-            const auto created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline);
+            VkResult created;
+            {
+                auto pipelineCacheLock = context.LockPipelineCacheForUse();
+                created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline);
+            }
             trace.Created(created);
             trace.Unchain(pipelineInfo);
+            if (probingPipelineCache && created == VK_PIPELINE_COMPILE_REQUIRED_EXT) throw PipelineCompileRequired{};
             Check(created, "vkCreateGraphicsPipelines");
         }
         if (alternateAlpha) {
             blend.pAttachments = secondChannels.data();
-            auto pipelineCacheLock = context.LockPipelineCacheForUse();
-            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &secondChannel), "vkCreateGraphicsPipelines");
+            CreateProbedPipeline(context, pipelineInfo, &secondChannel);
         }
         if (state.depthBiasPerFace) {
             raster.cullMode = VK_CULL_MODE_FRONT_BIT;
-            auto pipelineCacheLock = context.LockPipelineCacheForUse();
-            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &backFaces), "vkCreateGraphicsPipelines");
+            CreateProbedPipeline(context, pipelineInfo, &backFaces);
         }
         for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         _modules.clear();
@@ -1329,6 +1362,24 @@ std::shared_ptr<CompileTicket> TryCachedPipeline(const Context& context, const S
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
     }
+    if (context.pipelineCacheProbes && context.pipelineCache != VK_NULL_HANDLE) {
+        lock.unlock();
+        std::shared_ptr<Pipeline> probed;
+        try {
+            const PipelineCacheProbe probe;
+            probed = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+        } catch (const PipelineCompileRequired&) {
+        }
+        lock.lock();
+        if (probed != nullptr) {
+            pipelineCacheProbeHits.fetch_add(1, std::memory_order_relaxed);
+            publishPipeline(store, context, hash, key, probed);
+            return nullptr;
+        }
+        pipelineCacheProbeMisses.fetch_add(1, std::memory_order_relaxed);
+        if (const auto found = store.index.find(hash); found != store.index.end() && found->second->key == key && alive(*found->second, context)) return nullptr;
+        if (const auto building = store.pending.find(hash); building != store.pending.end()) return building->second.key == key ? building->second.ticket : nullptr;
+    }
     auto inputs = ownBuildInputs(context, state, vertexInput, resources, shaders, attachmentLayout);
     std::size_t words = 0;
     for (const auto& program : inputs->programs) words += program.spirv.WordCount();
@@ -1375,6 +1426,10 @@ std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, const State
     if (found == store.index.end() || found->second->key != key || !alive(*found->second, context)) return nullptr;
     store.entries.splice(store.entries.end(), store.entries, found->second);
     return found->second->pipeline;
+}
+
+PipelineCacheProbeStatistics GraphicsPipelineCacheProbes() {
+    return {pipelineCacheProbeHits.load(std::memory_order_relaxed), pipelineCacheProbeMisses.load(std::memory_order_relaxed)};
 }
 
 void ClearCachedPipelines(VkDevice device) {

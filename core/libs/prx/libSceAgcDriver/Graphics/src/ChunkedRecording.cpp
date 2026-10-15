@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/ChunkedRecording.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DefaultSwitch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include <algorithm>
@@ -101,7 +103,10 @@ ChunkedRecording::ChunkedRecording(const Context& context) : context(context) {
     poolInfo.queueFamilyIndex = context.queueFamily;
     beginCommandBuffer = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer");
     endCommandBuffer = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer");
-    worker = std::thread([this] { run(); });
+    worker = std::thread([this] {
+        const Coherence::DriverAccessScope driverAccess;
+        run();
+    });
 }
 
 ChunkedRecording::~ChunkedRecording() {
@@ -119,7 +124,7 @@ ChunkedRecording::~ChunkedRecording() {
 bool ChunkedRecording::Enabled() {
     static const bool enabled = [] {
         if (std::getenv("APS5_CHUNKED_RECORDING") == nullptr) return false;
-        if (std::getenv("APS5_RECORD_THREAD") == nullptr || std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr) {
+        if (!DefaultOnSwitch("APS5_RECORD_THREAD") || std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr) {
             std::fprintf(stderr, "[chunked-recording] APS5_CHUNKED_RECORDING ignored: it needs APS5_RECORD_THREAD (without APS5_LOCKED_DRAW_PREPARE)\n");
             return false;
         }

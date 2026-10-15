@@ -1,5 +1,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/DenormalFlushEliminator.hpp"
+#include "Optimization/InterpolationFactsAnnotator.hpp"
+#include "Recompiler.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -62,7 +64,23 @@ struct Builder {
     }
 
     std::uint32_t eliminate() {
-        return DenormalFlushEliminator{}.Eliminate(program).removedFlushes;
+        return DenormalFlushEliminator{}.Eliminate(program, RewriteMode::Off).removedFlushes;
+    }
+
+    DenormalFlushEliminationStats eliminate(RewriteMode proofs) {
+        return DenormalFlushEliminator{}.Eliminate(program, proofs);
+    }
+
+    IrValue& asFloat(IrValue& bits) {
+        return emit(IrOpcode::BitCastF32U32, IrType::F32, {&bits});
+    }
+
+    IrValue& asBits(IrValue& value) {
+        return emit(IrOpcode::BitCastU32F32, IrType::U32, {&value});
+    }
+
+    IrValue& isNan(IrValue& bits) {
+        return emit(IrOpcode::UGreaterThan32, IrType::Bool, {&emit(IrOpcode::BitwiseAnd32, IrType::U32, {&bits, &constant(0x7fffffffu)}), &constant(0x7f800000u)});
     }
 };
 
@@ -250,6 +268,153 @@ int main() {
             return !next.HasUses();
         };
         return loop(true) && !loop(false);
+    });
+
+    passed &= run("with proofs, a max carried around a loop of flushed values needs no flush", [] {
+        const auto removed = [](RewriteMode proofs) {
+            Builder b;
+            IrBlock& head = *b.block;
+            IrBlock& body = b.newBlock();
+            IrBlock& exit = b.newBlock();
+            head.AddBranch(&body);
+            body.AddBranch(&body);
+            body.AddBranch(&exit);
+            auto& initial = b.flush(b.unknown());
+            b.block = &body;
+            auto& carried = b.program.CreateValue(IrOpcode::Phi, IrType::U32);
+            body.AppendInstruction(&carried);
+            auto& step = b.asFloat(b.flush(b.unknown()));
+            auto& maximum = b.asBits(b.emit(IrOpcode::FPMax32, IrType::F32, {&b.asFloat(carried), &step}));
+            carried.AddPhiOperand(&head, &initial);
+            carried.AddPhiOperand(&body, &maximum);
+            auto& flushed = b.flush(maximum);
+            b.block = &exit;
+            b.keep(flushed);
+            return proofs == RewriteMode::Off ? b.eliminate() : b.eliminate(proofs).removedFlushes;
+        };
+        return removed(RewriteMode::Off) == 0u && removed(RewriteMode::On) == 1u;
+    });
+
+    passed &= run("with proofs, a loop that brings in an unknown value keeps its flush", [] {
+        Builder b;
+        IrBlock& head = *b.block;
+        IrBlock& body = b.newBlock();
+        IrBlock& exit = b.newBlock();
+        head.AddBranch(&body);
+        body.AddBranch(&body);
+        body.AddBranch(&exit);
+        auto& initial = b.flush(b.unknown());
+        b.block = &body;
+        auto& carried = b.program.CreateValue(IrOpcode::Phi, IrType::U32);
+        body.AppendInstruction(&carried);
+        auto& maximum = b.asBits(b.emit(IrOpcode::FPMax32, IrType::F32, {&b.asFloat(carried), &b.asFloat(b.unknown())}));
+        carried.AddPhiOperand(&head, &initial);
+        carried.AddPhiOperand(&body, &maximum);
+        auto& flushed = b.flush(maximum);
+        b.block = &exit;
+        b.keep(flushed);
+        return b.eliminate(RewriteMode::On).removedFlushes == 0u && flushed.HasUses();
+    });
+
+    passed &= run("with proofs, a NaN-propagation select needs no flush when its non-NaN value is free of denormals", [] {
+        const auto chain = [](bool provable) {
+            Builder b;
+            auto& source = b.unknown();
+            auto& result = provable ? b.flush(b.unknown()) : b.unknown();
+            auto& canonical = b.emit(IrOpcode::SelectU32, IrType::U32, {&b.isNan(result), &b.constant(0xffc00000u), &result});
+            auto& quieted = b.emit(IrOpcode::BitwiseOr32, IrType::U32, {&source, &b.constant(0x00400000u)});
+            auto& propagated = b.emit(IrOpcode::SelectU32, IrType::U32, {&b.isNan(source), &quieted, &canonical});
+            auto& flushed = b.flush(propagated);
+            b.keep(flushed);
+            return b.eliminate(RewriteMode::On).removedFlushes == 1u && !flushed.HasUses();
+        };
+        return chain(true) && !chain(false);
+    });
+
+    passed &= run("with proofs, a select on a NaN test of another value keeps its flush", [] {
+        Builder b;
+        auto& source = b.unknown();
+        auto& other = b.unknown();
+        auto& propagated = b.emit(IrOpcode::SelectU32, IrType::U32, {&b.isNan(other), &source, &b.flush(b.unknown())});
+        auto& flushed = b.flush(propagated);
+        b.keep(flushed);
+        return b.eliminate(RewriteMode::On).removedFlushes == 0u && flushed.HasUses();
+    });
+
+    passed &= run("with proofs, a product with a constant of magnitude at least one needs no flush, a smaller one does", [] {
+        Builder b;
+        const auto product = [&](IrValue& value, std::uint32_t factor) -> IrValue& {
+            auto& scale = b.program.CreateValue(IrOpcode::Void, IrType::F32);
+            scale.SetImmediateU32(factor);
+            return b.flush(b.asBits(b.emit(IrOpcode::FPMul32, IrType::F32, {&b.asFloat(value), &scale})));
+        };
+        auto& doubled = product(b.flush(b.unknown()), 0x40000000u);
+        auto& negatedOne = product(b.flush(b.unknown()), 0xbf800000u);
+        auto& halved = product(b.flush(b.unknown()), 0x3f000000u);
+        auto& unknownDoubled = product(b.unknown(), 0x40000000u);
+        for (auto* value : {&doubled, &negatedOne, &halved, &unknownDoubled}) b.keep(*value);
+        return b.eliminate(RewriteMode::On).removedFlushes == 2u && !doubled.HasUses() && !negatedOne.HasUses() && halved.HasUses() && unknownDoubled.HasUses();
+    });
+
+    passed &= run("with proofs, truncation, rounding and square roots of flushed values need no flush", [] {
+        Builder b;
+        const auto result = [&](IrOpcode opcode, IrValue& bits) -> IrValue& { return b.flush(b.asBits(b.emit(opcode, IrType::F32, {&b.asFloat(bits)}))); };
+        auto& truncated = result(IrOpcode::FPTrunc32, b.unknown());
+        auto& rounded = result(IrOpcode::FPRoundEven32, b.unknown());
+        auto& root = result(IrOpcode::FPSqrt, b.flush(b.unknown()));
+        auto& reciprocalRoot = result(IrOpcode::FPRecipSqrt32, b.flush(b.unknown()));
+        auto& unknownRoot = result(IrOpcode::FPSqrt, b.unknown());
+        for (auto* value : {&truncated, &rounded, &root, &reciprocalRoot, &unknownRoot}) b.keep(*value);
+        return b.eliminate(RewriteMode::On).removedFlushes == 4u && unknownRoot.HasUses() && !root.HasUses();
+    });
+
+    passed &= run("in verify mode the flush stays and a denormal check of its source is inserted", [] {
+        Builder b;
+        auto& source = b.asBits(b.emit(IrOpcode::FPTrunc32, IrType::F32, {&b.asFloat(b.unknown())}));
+        auto& flushed = b.flush(source);
+        b.keep(flushed);
+        const auto stats = b.eliminate(RewriteMode::Verify);
+        bool checked = false;
+        for (const auto* inst : b.block->Instructions()) checked |= inst->Opcode() == IrOpcode::CheckDenormalFree && inst->Argument(0)->Resolve() == &source;
+        return stats.removedFlushes == 0u && stats.checkedFlushes == 1u && flushed.HasUses() && checked && b.program.Info().usesFaultBuffer;
+    });
+
+    const auto interpolation = [](Builder& b, std::uint32_t mode) -> IrValue& {
+        auto& half = b.emit(IrOpcode::ConvertF32F16, IrType::F32, {&b.unknown()});
+        auto& unknown = b.asFloat(b.unknown());
+        auto& one = b.program.CreateValue(IrOpcode::Void, IrType::F32);
+        one.SetImmediateU32(0x3f800000u);
+        auto& result = b.emit(IrOpcode::FPInterpolateF16, IrType::F32, {&half, &unknown, &one, &b.constant(mode)});
+        b.keep(b.asBits(result));
+        return result;
+    };
+
+    passed &= run("interpolation facts mark proven inputs and flushed inputs in the mode", [&] {
+        Builder b;
+        auto& result = interpolation(b, 2u << InterpolationRound16Shift);
+        const auto stats = InterpolationFactsAnnotator{}.Annotate(b.program, RewriteMode::On);
+        const auto mode = result.Argument(3)->Resolve()->ImmediateU32();
+        return stats.specializedOperations == 1u && stats.provenInputs == 2u && mode == ((2u << InterpolationRound16Shift) | InterpolationFlushedExact | (5u << InterpolationNormalShift));
+    });
+
+    passed &= run("interpolation facts off leave the mode unchanged", [&] {
+        Builder b;
+        auto& result = interpolation(b, InterpolationFlush32);
+        const auto stats = InterpolationFactsAnnotator{}.Annotate(b.program, RewriteMode::Off);
+        return stats.specializedOperations == 0u && result.Argument(3)->Resolve()->ImmediateU32() == InterpolationFlush32;
+    });
+
+    passed &= run("interpolation facts verify keeps the mode and checks each proven input that is not a constant", [&] {
+        Builder b;
+        auto& result = interpolation(b, InterpolationFlush32);
+        const auto stats = InterpolationFactsAnnotator{}.Annotate(b.program, RewriteMode::Verify);
+        std::uint32_t checks = 0;
+        for (const auto* inst : b.block->Instructions()) {
+            if (inst->Opcode() != IrOpcode::CheckDenormalFree) continue;
+            ++checks;
+            if (inst->Argument(0)->Resolve()->Argument(0)->Resolve() != result.Argument(0)->Resolve()) return false;
+        }
+        return stats.checkedInputs == 1u && checks == 1u && result.Argument(3)->Resolve()->ImmediateU32() == InterpolationFlush32 && b.program.Info().usesFaultBuffer;
     });
 
     return passed ? 0 : 1;

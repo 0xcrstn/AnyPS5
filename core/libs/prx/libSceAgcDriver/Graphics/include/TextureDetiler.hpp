@@ -56,8 +56,12 @@ namespace AgcDriver::Graphics {
         std::uint32_t CmaskErrors();
 
     private:
+        struct Retired {};
+        TextureDetiler(const Context& context, Retired);
         VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image = false);
         void release() noexcept;
+        void adopt(TextureDetiler& other) noexcept;
+        bool retireToRecorders();
         struct DescriptorRing {
             std::vector<VkDescriptorPool> pools;
             std::vector<std::uint64_t> serials;
@@ -65,6 +69,8 @@ namespace AgcDriver::Graphics {
             std::uint32_t used = 0;
         };
         VkDescriptorSet allocateSet(bool image = false);
+        static constexpr std::size_t RingQueues = 4;
+        static std::size_t ringQueue();
         VkDescriptorSet allocateFrom(DescriptorRing& ring, VkDescriptorSetLayout layout, const std::vector<VkDescriptorPoolSize>& sizes, const char* createWhat, const char* allocateWhat, const char* resetWhat);
         void resetRing(DescriptorRing& ring, const char* resetWhat);
         void checkWindow(const TileMipLayout& layout, const DetileWindow& window, std::uint32_t& columnEnd, std::uint32_t& rowEnd) const;
@@ -74,16 +80,17 @@ namespace AgcDriver::Graphics {
         VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
         VkShaderModule module = VK_NULL_HANDLE;
         std::vector<std::pair<std::uint32_t, VkPipeline>> pipelines;
-        DescriptorRing descriptorSets;
+        std::array<DescriptorRing, RingQueues> descriptorSets;
         VkDescriptorSetLayout cmaskDescriptorLayout = VK_NULL_HANDLE;
         VkPipelineLayout cmaskPipelineLayout = VK_NULL_HANDLE;
         VkPipeline cmaskPipeline = VK_NULL_HANDLE;
-        DescriptorRing cmaskDescriptorSets;
+        std::array<DescriptorRing, RingQueues> cmaskDescriptorSets;
         std::unique_ptr<Buffer> cmaskErrors;
         VkDescriptorSetLayout imageDescriptorLayout = VK_NULL_HANDLE;
         VkPipelineLayout imagePipelineLayout = VK_NULL_HANDLE;
         VkShaderModule imageModule = VK_NULL_HANDLE;
-        DescriptorRing imageDescriptorSets;
+        std::array<DescriptorRing, RingQueues> imageDescriptorSets;
+        bool recorded = false;
     };
 
 }

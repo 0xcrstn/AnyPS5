@@ -19,7 +19,7 @@ std::size_t EnvironmentBytes(const char* name, std::size_t unit, std::size_t fal
 }
 
 std::atomic<bool>& EnabledFlag() {
-    static std::atomic<bool> flag{std::getenv("APS5_DRAW_SNAPSHOT_ARENA") != nullptr && std::strcmp(std::getenv("APS5_DRAW_SNAPSHOT_ARENA"), "0") != 0};
+    static std::atomic<bool> flag{std::getenv("APS5_DRAW_SNAPSHOT_ARENA") == nullptr || std::strcmp(std::getenv("APS5_DRAW_SNAPSHOT_ARENA"), "0") != 0};
     return flag;
 }
 
@@ -49,7 +49,7 @@ std::atomic<bool>& DeviceTwinsFlag() {
 }
 
 std::atomic<bool>& WorkerCopiesFlag() {
-    static std::atomic<bool> flag{std::getenv("APS5_WORKER_SNAPSHOT_COPIES") != nullptr};
+    static std::atomic<bool> flag{std::getenv("APS5_WORKER_SNAPSHOT_COPIES") == nullptr || std::strcmp(std::getenv("APS5_WORKER_SNAPSHOT_COPIES"), "0") != 0};
     return flag;
 }
 
@@ -477,6 +477,7 @@ std::optional<DrawSnapshotArena::Prefill> DrawSnapshotArena::PrepareCopy(std::ui
         }
         auto first = address;
         auto last = address + bytes;
+        const auto dirtySerial = GuestMemory::EpochDirtySetEnabled() ? GuestMemory::DirtySerial() : 0;
         std::uint64_t generation = 0;
         if (!ranges.has_value()) {
             const auto widenedFirst = address - (address % SegmentGranule) / alignment * alignment;
@@ -511,7 +512,7 @@ std::optional<DrawSnapshotArena::Prefill> DrawSnapshotArena::PrepareCopy(std::ui
         prefill.bytes = bytes;
         prefill.generation = generation;
         prefill.registryGeneration = registryGeneration;
-        prefill.dirtySerial = GuestMemory::EpochDirtySetEnabled() ? GuestMemory::DirtySerial() : 0;
+        prefill.dirtySerial = dirtySerial;
         target = chunk->buffer->Bytes().subspan(placement->offset, segmentBytes);
     }
     if (ranges.has_value()) {

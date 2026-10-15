@@ -31,6 +31,7 @@ public:
     std::optional<Affine> AffineOf(const IrValue* value, std::uint32_t depth = 0);
     BufferIndexOrigin OriginOf(const IrValue* value);
     std::optional<std::uint8_t> BuildIndex(const IrValue* value, std::vector<BufferIndexNode>& nodes, std::uint16_t& blocking, std::uint32_t depth = 0);
+    std::optional<std::uint8_t> BuildFloatIndex(const IrValue* value, std::vector<BufferIndexNode>& nodes, std::uint16_t& blocking, std::uint32_t depth);
     void Note(BufferReadRanges& ranges, const IrValue& inst, const MemoryInfo& memory);
 
 private:

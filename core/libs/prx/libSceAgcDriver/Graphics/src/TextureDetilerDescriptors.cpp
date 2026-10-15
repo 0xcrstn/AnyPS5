@@ -7,12 +7,19 @@
 
 namespace AgcDriver::Graphics {
 
+std::size_t TextureDetiler::ringQueue() {
+    static_assert(RingQueues == Recorder::PhysicalQueues);
+    const auto* recorder = Recorder::Current();
+    return recorder != nullptr ? recorder->PhysicalQueue() : 0;
+}
+
 void TextureDetiler::BeginBatch() {
     GuestMemory::AssertGpuLockHeld("TextureDetiler::BeginBatch");
     if (const auto* recorder = Recorder::Current(); recorder != nullptr && !recorder->Idle()) return;
-    resetRing(descriptorSets, "vkResetDescriptorPool texture detiler");
-    resetRing(cmaskDescriptorSets, "vkResetDescriptorPool CMASK clear");
-    resetRing(imageDescriptorSets, "vkResetDescriptorPool texture detiler");
+    const auto queue = ringQueue();
+    resetRing(descriptorSets[queue], "vkResetDescriptorPool texture detiler");
+    resetRing(cmaskDescriptorSets[queue], "vkResetDescriptorPool CMASK clear");
+    resetRing(imageDescriptorSets[queue], "vkResetDescriptorPool texture detiler");
 }
 
 void TextureDetiler::resetRing(DescriptorRing& ring, const char* resetWhat) {
@@ -60,12 +67,13 @@ VkDescriptorSet TextureDetiler::allocateFrom(DescriptorRing& ring, VkDescriptorS
     Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &set), allocateWhat);
     ++ring.used;
     ring.serials[ring.current] = recorder != nullptr ? recorder->OpenSerial() : 0;
+    recorded = recorded || recorder != nullptr;
     return set;
 }
 
 VkDescriptorSet TextureDetiler::allocateSet(bool image) {
-    if (image) return allocateFrom(imageDescriptorSets, imageDescriptorLayout, {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64}}, "vkCreateDescriptorPool texture detiler", "vkAllocateDescriptorSets texture detiler", "vkResetDescriptorPool texture detiler");
-    return allocateFrom(descriptorSets, descriptorLayout, {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 * 2}}, "vkCreateDescriptorPool texture detiler", "vkAllocateDescriptorSets texture detiler", "vkResetDescriptorPool texture detiler");
+    if (image) return allocateFrom(imageDescriptorSets[ringQueue()], imageDescriptorLayout, {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64}}, "vkCreateDescriptorPool texture detiler", "vkAllocateDescriptorSets texture detiler", "vkResetDescriptorPool texture detiler");
+    return allocateFrom(descriptorSets[ringQueue()], descriptorLayout, {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 * 2}}, "vkCreateDescriptorPool texture detiler", "vkAllocateDescriptorSets texture detiler", "vkResetDescriptorPool texture detiler");
 }
 
 }

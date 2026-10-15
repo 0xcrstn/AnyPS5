@@ -85,6 +85,7 @@ public:
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request);
     DrawEntryCounters DrawCacheCounters();
     BindingPlanCounters PlanCounters();
+    std::uint64_t FrozenIndirectRedos();
     DispatchCacheTotals DispatchCacheCounters();
     struct DispatchCacheFootprint {
         std::size_t entries = 0;
@@ -278,6 +279,7 @@ private:
     static void noteRecordHistory(std::uint64_t ticket, const std::shared_ptr<DrawRecordResult>& result);
     static void recordDrawInputs(const DrawInputs& inputs, DrawRecordResult& result, const std::shared_ptr<VulkanDevice>& localDevice);
     void noteDrawInputWriters(const DrawInputs& inputs, std::uint32_t queue);
+    static bool freezeIndirectDraws();
     FrozenFallback frozenFallback(std::span<const std::uint32_t> packet);
     DrawVerdict freezeDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
     static bool prepareDispatches();
@@ -384,6 +386,8 @@ private:
     static LabelTimelineMode labelTimelineMode();
     static std::chrono::microseconds batchAgeBound();
     void runBatchAge(std::chrono::microseconds bound) noexcept;
+    static bool completionWatcher();
+    void runCompletionWatcher() noexcept;
     void dischargeWait(WaitObservation& observation, std::span<const std::uint32_t> packet);
     void noteWaitChain(const WaitObservation& observation, std::span<const std::uint32_t> packet);
     void noteRelease(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
@@ -480,12 +484,15 @@ private:
     std::atomic<std::uint64_t> packetsDone{0};
 
     std::atomic<std::uint64_t> eventSerial{0};
-    QueueScheduler queueScheduler{QueueScheduler::ConfiguredMode(), QueueScheduler::ConfiguredVerify()};
+    QueueScheduler queueScheduler{QueueScheduler::ConfiguredMode(), QueueScheduler::ConfiguredVerify(), QueueScheduler::ConfiguredRecording()};
     std::thread batchAgeThread;
     std::mutex batchAgeMutex;
     std::condition_variable batchAgeChanged;
     std::atomic<std::uint64_t> batchAgeSubmits{0};
     std::atomic<std::uint64_t> batchAgeChecks{0};
+    std::thread completionThread;
+    std::atomic<std::uint64_t> completionWatcherWaits{0};
+    std::atomic<std::uint64_t> completionWatcherReaps{0};
     alignas(64) std::shared_ptr<ShaderRegistry> shaders = std::make_shared<ShaderRegistry>();
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>> dispatchCache;

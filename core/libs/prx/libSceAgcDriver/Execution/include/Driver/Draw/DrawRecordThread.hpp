@@ -106,9 +106,6 @@ enum class CommandProcessorReads : std::uint8_t { Drain, Overlap, Verify };
 
 bool ParseMemoryPacketJobs(const char* text);
 bool MemoryPacketJobs();
-bool ParseFrozenIndirectDraws(const char* text);
-bool FrozenIndirectDraws();
-std::uint64_t FrozenIndirectRedos();
 CommandProcessorReads ParseCommandProcessorReads(const char* text);
 CommandProcessorReads CommandProcessorReadsMode();
 void SetCommandProcessorReadsMode(CommandProcessorReads mode);

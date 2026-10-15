@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "ThreadOwned.hpp"
@@ -133,7 +134,7 @@ DirtySetCounters& dirtySetCounters() {
 }
 
 std::atomic<bool>& epochDirtySetFlag() {
-    static std::atomic<bool> flag{std::getenv("APS5_EPOCH_DIRTY_SET") != nullptr && std::strcmp(std::getenv("APS5_EPOCH_DIRTY_SET"), "0") != 0};
+    static std::atomic<bool> flag{std::getenv("APS5_EPOCH_DIRTY_SET") == nullptr || std::strcmp(std::getenv("APS5_EPOCH_DIRTY_SET"), "0") != 0};
     return flag;
 }
 
@@ -1180,16 +1181,24 @@ WriteTracker& Tracker() {
 
 // Takes the tracker mutex; under APS5_PROFILE_DRAW an acquisition that found it held is counted
 // ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
-std::unique_lock<std::mutex> lockTracker(WriteTracker& tracker) {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return std::unique_lock(tracker.mutex);
-    std::unique_lock lock(tracker.mutex, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        trackerWaits.fetch_add(1, std::memory_order_relaxed);
-        lock.lock();
+class TrackerLock : Coherence::DriverAccessScope, public std::unique_lock<std::mutex> {
+public:
+    explicit TrackerLock(WriteTracker& tracker) : std::unique_lock<std::mutex>(tracker.mutex, std::defer_lock) {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (!profile) {
+            lock();
+            return;
+        }
+        if (!try_lock()) {
+            trackerWaits.fetch_add(1, std::memory_order_relaxed);
+            lock();
+        }
+        trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
     }
-    trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
-    return lock;
+};
+
+TrackerLock lockTracker(WriteTracker& tracker) {
+    return TrackerLock(tracker);
 }
 
 #ifdef _WIN32
@@ -1309,7 +1318,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 }
 
 bool collectCoverageEnabled() {
-    static const bool enabled = std::getenv("APS5_COLLECT_COVERAGE") != nullptr;
+    static const bool enabled = std::getenv("APS5_COLLECT_COVERAGE") == nullptr || std::strcmp(std::getenv("APS5_COLLECT_COVERAGE"), "0") != 0;
     return enabled;
 }
 
@@ -1942,7 +1951,40 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
     });
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> aliasRanges(std::uint64_t address, std::size_t bytes) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ALIAS_STAMPS");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    if (!enabled || bytes == 0) return {};
+    std::array<std::uintptr_t, 16> begins{}, ends{};
+    auto count = GuestArena::GuestArenaAliasRanges_nid_postfix(static_cast<std::uintptr_t>(address), bytes, begins.data(), ends.data(), begins.size());
+    if (count == 0) return {};
+    std::vector<std::uintptr_t> moreBegins, moreEnds;
+    const std::uintptr_t* first = begins.data();
+    const std::uintptr_t* last = ends.data();
+    if (count > begins.size()) {
+        moreBegins.resize(count);
+        moreEnds.resize(count);
+        count = std::min(count, GuestArena::GuestArenaAliasRanges_nid_postfix(static_cast<std::uintptr_t>(address), bytes, moreBegins.data(), moreEnds.data(), count));
+        first = moreBegins.data();
+        last = moreEnds.data();
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    ranges.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) ranges.emplace_back(first[index], last[index]);
+    return ranges;
+}
+
+std::uint64_t markWrittenOne(std::uint64_t address, std::size_t bytes);
+
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+    const auto generation = markWrittenOne(address, bytes);
+    for (const auto& [begin, end] : aliasRanges(address, bytes)) static_cast<void>(markWrittenOne(begin, static_cast<std::size_t>(end - begin)));
+    return generation;
+}
+
+std::uint64_t markWrittenOne(std::uint64_t address, std::size_t bytes) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -2074,7 +2116,18 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
     return storedOverLocked(tracker, address, bytes, generation);
 }
 
+MarkedWrites markWrittenUnlessStoredOne(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t since);
+
 MarkedWrites MarkWrittenUnlessStored(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t since) {
+    const auto result = markWrittenUnlessStoredOne(ranges, since);
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        for (const auto& [aliasBegin, aliasEnd] : aliasRanges(begin, static_cast<std::size_t>(end - begin))) static_cast<void>(markWrittenOne(aliasBegin, static_cast<std::size_t>(aliasEnd - aliasBegin)));
+    }
+    return result;
+}
+
+MarkedWrites markWrittenUnlessStoredOne(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t since) {
     for (const auto& [begin, end] : ranges) logDriverStore(begin, end);
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);

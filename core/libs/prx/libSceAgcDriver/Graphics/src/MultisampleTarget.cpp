@@ -41,7 +41,8 @@ VkClearColorValue fastClearColor(const ColorTarget& target) {
 
 template<typename Record>
 void recordCommands(const Context& context, Record&& record) {
-    auto* recorder = Recorder::Current();
+    auto* recorder = Recorder::GraphicsRecorder();
+    if (recorder != nullptr && recorder->Device() != context.device) recorder = nullptr;
     std::unique_ptr<CommandBatch> batch;
     if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
     record(recorder != nullptr ? recorder->Commands() : batch->Handle(), recorder);
@@ -82,6 +83,7 @@ public:
             allocation.allocationSize = requirements.size;
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory multisampled target");
+            DeviceMemoryPlacements::Track(memory, DeviceMemoryKind::MultisampleTarget, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
             Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory multisampled target");
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             viewInfo.image = image;
@@ -194,7 +196,7 @@ private:
         if (resolvePass) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, resolvePass, nullptr);
         if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-        if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        if (memory) { DeviceMemoryPlacements::Untrack(memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); }
     }
 };
 

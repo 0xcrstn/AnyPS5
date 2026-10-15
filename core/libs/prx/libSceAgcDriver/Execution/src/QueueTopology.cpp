@@ -41,6 +41,24 @@ std::string DescribeQueueFamilies(std::span<const QueueFamilyInfo> families) {
     return text;
 }
 
+namespace {
+
+bool DedicatedFamily(std::span<const QueueFamilyInfo> families, std::uint32_t index, std::uint32_t graphicsFamily, std::uint32_t sparseFamily) {
+    const auto& family = families[index];
+    if (index == graphicsFamily || family.count == 0 || (family.flags & ComputeBit) == 0 || (family.flags & GraphicsBit) != 0) return false;
+    return index != sparseFamily || family.count >= 2;
+}
+
+}
+
+QueueTopology DefaultQueueTopology(std::span<const QueueFamilyInfo> families, std::uint32_t graphicsFamily, std::uint32_t sparseFamily) {
+    if (graphicsFamily >= families.size()) throw std::logic_error("queue topology: the graphics family is out of range");
+    for (std::uint32_t i = 0; i < families.size(); ++i) {
+        if (DedicatedFamily(families, i, graphicsFamily, sparseFamily)) return QueueTopology::Dedicated;
+    }
+    return families[graphicsFamily].count >= 2 ? QueueTopology::SameFamily : QueueTopology::Serial;
+}
+
 TopologyPlan PlanQueueTopology(QueueTopology topology, std::span<const QueueFamilyInfo> families, std::uint32_t graphicsFamily, std::uint32_t sparseFamily) {
     if (graphicsFamily >= families.size()) throw std::logic_error("queue topology: the graphics family is out of range");
     TopologyPlan plan;
@@ -54,9 +72,7 @@ TopologyPlan PlanQueueTopology(QueueTopology topology, std::span<const QueueFami
         return plan;
     }
     for (std::uint32_t i = 0; i < families.size(); ++i) {
-        const auto& family = families[i];
-        if (i == graphicsFamily || family.count == 0 || (family.flags & ComputeBit) == 0 || (family.flags & GraphicsBit) != 0) continue;
-        if (i == sparseFamily && family.count < 2) continue;
+        if (!DedicatedFamily(families, i, graphicsFamily, sparseFamily)) continue;
         plan.computeFamily = i;
         plan.computeIndex = i == sparseFamily ? 1 : 0;
         return plan;

@@ -78,6 +78,10 @@ public:
         std::uint64_t stored, built, rejected, pending, sharedHits;
     };
     PipelinePrewarmStatistics PipelinePrewarmCounters() const;
+    struct PipelineCacheProbeStatistics {
+        std::uint64_t computeHits, computeMisses, graphicsHits, graphicsMisses;
+    };
+    PipelineCacheProbeStatistics PipelineCacheProbeCounters() const;
     bool ImportGuestMemory(const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
     // Sends recorded work to the GPU without waiting for it. With `reapFirst` it first retires batches
     // that already finished, so the in-flight list stays short (APS5_NO_OPPORTUNISTIC_REAP=1 skips
@@ -96,6 +100,8 @@ public:
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.
     void ReapRecorded();
+    std::vector<Graphics::Recorder::UnlockedWait> CompletionWaits() const;
+    bool CompletionWaitsOnTimelines() const;
     bool ReapMayRetire() const;
     // Records a store of `bytes` at a guest address behind the recorded work, so the value appears
     // once that work completed; the batch is submitted by the queue worker's flush rules (or at once
@@ -196,6 +202,9 @@ public:
         std::uint64_t created, underGpuMutex;
     };
     static ComputePipelineCreation ComputePipelineCounts();
+    static std::vector<std::uint64_t> DispatchProofVerdicts();
+    static std::uint64_t DispatchProofsVerified();
+    static std::uint64_t UnlockedAddressBuilds();
     void ResolveMemory(std::uint64_t address, std::size_t bytes, bool writable);
     void* Window() const;
     void Resize(std::uint32_t width, std::uint32_t height);
@@ -251,7 +260,7 @@ public:
     // blit-submit times after the flip packet; noted in-place reads checked
     // (APS5_FLIP_READ_CHECK=1) and found overwritten before the blit's fence.
     struct PresentStatistics {
-        std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten, acquireDrops;
+        std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten, acquireDrops, computeWaits;
         double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs;
     };
     static PresentStatistics PresentCounts();
@@ -312,6 +321,8 @@ public:
         std::uint64_t buffers = 0;
         std::uint64_t refused = 0;
         std::uint64_t verified = 0;
+        std::uint64_t preparedAdopted = 0;
+        std::uint64_t preparedRefused = 0;
     };
     static MovedTemplateStatistics MovedTemplateCounters();
     // The driver's recipe events for the [recipe] line: a restart after Rebuild, an attach; the
@@ -326,7 +337,7 @@ public:
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const Graphics::ResolvedDraw* resolved = nullptr);
-    std::shared_ptr<const Graphics::ResolvedDraw> ResolveDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders);
+    std::shared_ptr<const Graphics::ResolvedDraw> ResolveDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after

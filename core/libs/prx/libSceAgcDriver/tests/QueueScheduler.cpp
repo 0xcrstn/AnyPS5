@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -45,7 +46,7 @@ bool WaitUntil(const std::function<bool()>& done) {
 }
 
 void TestModes() {
-    Expect(QueueScheduler::ParseMode(nullptr) == SchedulerMode::Off, "an unset scheduler mode is off");
+    Expect(QueueScheduler::ParseMode(nullptr) == SchedulerMode::Dag, "an unset scheduler mode is dag");
     Expect(QueueScheduler::ParseMode("off") == SchedulerMode::Off, "off parses");
     Expect(QueueScheduler::ParseMode("serial") == SchedulerMode::Serial, "serial parses");
     Expect(QueueScheduler::ParseMode("dag") == SchedulerMode::Dag, "dag parses");
@@ -204,6 +205,7 @@ void TestDagRunsConcurrently() {
     }
     for (auto& worker : workers) worker.join();
     Expect(together.load(), "dag mode serialized two streams");
+    Expect(scheduler.Take().turns == 2 && scheduler.Holder() == QueueScheduler::NoQueue, "dag turns taken without the scheduler mutex were not counted");
 }
 
 void TestVerifyInjection() {
@@ -232,6 +234,84 @@ void TestVerifyInjection() {
 
 }
 
+std::string SchedulePath(const char* name) {
+    return (std::filesystem::temp_directory_path() / (std::string("aps5-schedule-") + name + "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt")).string();
+}
+
+std::vector<std::pair<std::uint32_t, std::size_t>> RunStreams(QueueScheduler& scheduler, bool computeFirst) {
+    std::mutex orderMutex;
+    std::vector<std::pair<std::uint32_t, std::size_t>> order;
+    const auto run = [&](std::uint32_t queue, bool delayed) {
+        if (delayed) std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        for (std::uint64_t submission = 1; submission <= 3; ++submission) {
+            for (std::size_t cursor = 0; cursor < 3; ++cursor) {
+                const auto turn = scheduler.Begin(queue, submission * 10 + queue, cursor, submission * 10 + queue);
+                {
+                    std::lock_guard lock(orderMutex);
+                    order.emplace_back(queue, submission * 10 + cursor);
+                }
+                if (cursor == 1) scheduler.NoteWait(queue, submission * 0x100 + queue, 3);
+            }
+        }
+    };
+    std::thread graphics([&] { run(0, computeFirst); });
+    std::thread compute([&] { run(0x20, !computeFirst); });
+    graphics.join();
+    compute.join();
+    return order;
+}
+
+void TestCaptureReplay() {
+    Expect(QueueScheduler::ParseMode("replay") == SchedulerMode::Replay, "replay parses");
+    Expect(Failure([] { QueueScheduler scheduler(SchedulerMode::Replay, false); }).find("APS5_QUEUE_SCHEDULER_REPLAY") != std::string::npos, "replay without a capture file throws");
+    const auto path = SchedulePath("order");
+    std::vector<std::pair<std::uint32_t, std::size_t>> captured;
+    {
+        QueueScheduler capture(SchedulerMode::Serial, true, {path, ""});
+        Expect(capture.Capturing() && capture.Active(), "a capturing scheduler is active");
+        captured = RunStreams(capture, false);
+        const auto statistics = capture.Take();
+        Expect(statistics.capturedTurns == 18 && statistics.capturedWaits == 6, "the capture did not record every turn and wait");
+    }
+    {
+        QueueScheduler replay(SchedulerMode::Replay, true, {"", path});
+        const auto replayed = RunStreams(replay, true);
+        Expect(replayed == captured, "the replay did not reproduce the captured order of turns");
+        const auto statistics = replay.Take();
+        Expect(statistics.replayedTurns == 18 && statistics.replayedWaits == 6 && statistics.replayMismatches == 0, "the replay did not follow and check every captured turn and wait");
+    }
+    {
+        QueueScheduler replay(SchedulerMode::Replay, true, {"", path});
+        const auto turn = replay.Begin(0, 10, 0, 10);
+        Expect(Failure([&] { replay.NoteWait(0, 0x999, 3); }).find("the capture has no wait there") != std::string::npos, "a wait the capture did not have was not reported");
+    }
+    {
+        QueueScheduler replay(SchedulerMode::Replay, true, {"", path});
+        std::string failure;
+        {
+            const auto first = replay.Begin(0, 10, 0, 10);
+        }
+        {
+            const auto second = replay.Begin(0, 10, 1, 10);
+            failure = Failure([&] { replay.NoteWait(0, 0x777, 3); });
+        }
+        Expect(failure.find("the capture observed 0x10") != std::string::npos, "a wait that observed another value than the capture was not reported");
+        Expect(Failure([&] { const auto third = replay.Begin(0, 10, 4, 10); }).find("where the capture had") != std::string::npos, "a replay that reached another packet than the capture was not reported");
+    }
+    {
+        QueueScheduler replay(SchedulerMode::Replay, false, {"", path});
+        {
+            const auto first = replay.Begin(0, 10, 0, 10);
+        }
+        {
+            const auto second = replay.Begin(0, 10, 1, 10);
+            replay.NoteWait(0, 0x777, 3);
+        }
+        Expect(replay.Take().replayMismatches == 1, "without verify a differing wait is counted, not thrown");
+    }
+    std::filesystem::remove(path);
+}
+
 int main() {
     TestModes();
     TestSerialExclusion();
@@ -241,6 +321,7 @@ int main() {
     TestParkFailure();
     TestDagRunsConcurrently();
     TestVerifyInjection();
+    TestCaptureReplay();
     if (failures != 0) return 1;
     std::puts("queue scheduler tests passed");
     return 0;

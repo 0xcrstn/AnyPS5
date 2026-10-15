@@ -1,3 +1,4 @@
+#include "BdaTable.hpp"
 #include "BdaTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -835,6 +836,78 @@ void spaceReadAcrossImportsWrittenTests(const Context& context) {
 
 ShaderRecompiler::DescriptorBinding binding(Role role, std::uint32_t slot) {
     return {ShaderRecompiler::DescriptorKind::StorageBuffer, role, 0, slot, 1, {}, false};
+}
+
+void addressTemplateTests(const Context& context) {
+    if (!AddressSpaceCounters().enabled) return;
+    constexpr std::size_t piece = 65536;
+    void* block = ::operator new(2 * piece, std::align_val_t{piece});
+    std::memset(block, 0x3a, 2 * piece);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, true, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(guest, true);
+    ShaderRecompiler::RecompileResult pixel;
+    pixel.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    pixel.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    pixel.bdaWrites = false;
+    pixel.bdaAtomics = false;
+    pixel.bdaCoherent = false;
+    const std::array<CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}}};
+    const bool previous = ShaderResources::AddressTemplatesEnabled();
+    ShaderResources::SetAddressTemplates(true);
+    Require(!ShaderResources::NeverReusable(stages), "a read-only address-based draw is refused the resource cache");
+    {
+        auto resources = std::make_shared<ShaderResources>(importing, stages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>{});
+        Require(resources->Reusable() && resources->AddressTemplate() && resources->HoldsLease(), "a read-only address-based draw build is not a reusable address template");
+        Require(resources->Revalidate(stages), "an address template over an unchanged registry did not prove current");
+        resources->RefreshAddressUse();
+        resources->RefreshAddressUse();
+        resources->CheckFaults();
+        ResourceCache cache;
+        const ResourceCache::Key key{0x41u, 0x54u};
+        cache.Insert(key, resources);
+        std::vector<std::shared_ptr<ShaderResources>> evicted;
+        ResourceCache::RemoveLeaseHolders(evicted);
+        Require(std::find(evicted.begin(), evicted.end(), resources) != evicted.end() && cache.Find(key) == nullptr, "the pin waiter's eviction left a template holding the address space in a resource cache");
+        change(guest + piece, true);
+        Require(!resources->Revalidate(stages), "an address template proved current after the registry changed");
+        change(guest + piece, false);
+    }
+    {
+        ResourceCache cache;
+        const ResourceCache::Key key{0x50u, 0x49u, 0x4eu};
+        auto held = std::make_shared<ShaderResources>(importing, stages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>{});
+        Require(held->HoldsLease(), "an address template does not hold the address space");
+        cache.Insert(key, std::move(held));
+        change(guest, false);
+        Require(cache.Find(key) == nullptr, "freeing a registered range left the template pinning it in the resource cache");
+        change(guest, true);
+    }
+    pixel.bdaWrites = true;
+    Require(ShaderResources::NeverReusable(stages), "an address-based draw that writes through pointers is offered the resource cache");
+    {
+        ShaderResources writer(importing, stages, ColorTarget{}, 0, 0, 0, {});
+        Require(!writer.Reusable() && !writer.AddressTemplate(), "an address-based draw that writes through pointers became a template");
+        writer.WriteBack();
+    }
+    pixel.bdaWrites = false;
+    ShaderResources::SetAddressTemplates(false);
+    Require(ShaderResources::NeverReusable(stages), "APS5_ADDRESS_TEMPLATES=0 still offers address-based draws the resource cache");
+    {
+        ShaderResources off(importing, stages, ColorTarget{}, 0, 0, 0, {});
+        Require(!off.Reusable() && !off.AddressTemplate(), "APS5_ADDRESS_TEMPLATES=0 still made an address template");
+        off.WriteBack();
+    }
+    ShaderResources::SetAddressTemplates(previous);
+    change(guest, false);
+    ::operator delete(block, std::align_val_t{piece});
 }
 
 void importedHeapMirrorTests(const Context& context, const BdaTestAccess& access) {
@@ -1723,8 +1796,10 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         ShaderRecompiler::BdaAbi::Header header{};
         ShaderRecompiler::BdaAbi::Range range{};
         std::memcpy(&header, table.data(), sizeof(header));
-        Require(header.version == ShaderRecompiler::BdaAbi::Version && header.count == 1 && header.entryBytes == sizeof(range), "BDA header layout mismatch");
-        std::memcpy(&range, table.data() + sizeof(header), sizeof(range));
+        const auto translation = ShaderRecompiler::BdaTable::TranslationSetting();
+        const auto version = ShaderRecompiler::BdaTable::TableVersion(translation);
+        Require(header.version == version && header.count == 1 && header.entryBytes == sizeof(range), "BDA header layout mismatch");
+        std::memcpy(&range, table.data() + ShaderRecompiler::BdaTable::RangeBaseWord(translation) * sizeof(std::uint32_t), sizeof(range));
         Require(range.begin == snapshots[0].address && range.end == range.begin + source.size(), "64-bit guest address was truncated");
         const auto fault = access.bytes(access.descriptor(5).buffer);
         for (const auto byte : fault) Require(byte == std::byte{}, "fault buffer was not initialized");
@@ -1843,6 +1918,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     spaceImportRunTests(context);
     spaceWritableWritesTests(context);
     spaceReadListTests(context);
+    addressTemplateTests(context);
     importWindowTests(context);
     importSpanningTests(context);
     spaceReadAcrossImportsTests(context, access);

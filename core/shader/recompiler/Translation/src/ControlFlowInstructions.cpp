@@ -1,5 +1,6 @@
 #include "Translation/ControlFlowInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
+#include "BdaAbi.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -377,16 +378,19 @@ IrU32 TranslationContext::readRelativeVector(const RdnaOperand& base, IrValue& o
         throw std::runtime_error(std::string(name) + " source is not a vector register");
     }
     const auto access = relativeWindowAccess(ir, program, base.reg, offset, name, currentVectorLimit);
-    if (access.index == nullptr) {
+    const auto selected = [&] {
         IrU32 result(ir.GetVectorReg(static_cast<VectorReg>(0)));
         for (std::uint32_t reg = base.reg; reg < currentVectorLimit; ++reg) {
             IrValue& hit = ir.IEqual(offset, ir.Constant(reg - base.reg));
             result = IrU32(ir.Select(hit, ir.GetVectorReg(static_cast<VectorReg>(reg)), result.Value()));
         }
-        return applyBitSourceModifiers(base, result);
-    }
+        return result;
+    };
+    if (access.index == nullptr) return applyBitSourceModifiers(base, selected());
     IrValue& loaded = ir.Emit(IrOpcode::LoadVectorWindow, IrType::U32, {access.index});
-    return applyBitSourceModifiers(base, IrU32(ir.Select(*access.inRange, loaded, ir.GetVectorReg(static_cast<VectorReg>(0)))));
+    const IrU32 windowed(ir.Select(*access.inRange, loaded, ir.GetVectorReg(static_cast<VectorReg>(0))));
+    if (program.Metadata().vectorWindowVerify) (void)ir.Emit(IrOpcode::CheckEqualU32, IrType::Void, {&windowed.Value(), &selected().Value(), &ir.Constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::RegisterWindowMismatch))});
+    return applyBitSourceModifiers(base, windowed);
 }
 
 void TranslationContext::writeRelativeVector(const RdnaOperand& base, IrValue& offset, IrU32 value, const char* name, IrValue* enable) {
@@ -395,7 +399,8 @@ void TranslationContext::writeRelativeVector(const RdnaOperand& base, IrValue& o
         throw std::runtime_error(std::string(name) + " destination is not a vector register");
     }
     const auto access = relativeWindowAccess(ir, program, destination.reg, offset, name, currentVectorLimit);
-    if (access.index == nullptr) {
+    const bool verify = access.index != nullptr && program.Metadata().vectorWindowVerify;
+    if (access.index == nullptr || verify) {
         for (std::uint32_t reg = destination.reg; reg < currentVectorLimit; ++reg) {
             IrValue& previous = ir.GetVectorReg(static_cast<VectorReg>(reg));
             IrValue* merged = nullptr;
@@ -405,9 +410,11 @@ void TranslationContext::writeRelativeVector(const RdnaOperand& base, IrValue& o
             } else merged = &ir.Select(ir.GetExec(), value.Value(), previous);
             IrValue* written = &ir.IEqual(offset, ir.Constant(reg - destination.reg));
             if (enable != nullptr) written = &ir.LogicalAnd(*written, *enable);
-            ir.SetVectorReg(static_cast<VectorReg>(reg), ir.Select(*written, *merged, previous));
+            IrValue& updated = ir.Select(*written, *merged, previous);
+            if (verify) ir.SetVectorRegOutsideWindow(static_cast<VectorReg>(reg), updated);
+            else ir.SetVectorReg(static_cast<VectorReg>(reg), updated);
         }
-        return;
+        if (!verify) return;
     }
     IrValue& previous = ir.Emit(IrOpcode::LoadVectorWindow, IrType::U32, {access.index});
     IrValue* merged = nullptr;

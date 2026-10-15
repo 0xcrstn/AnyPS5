@@ -28,7 +28,7 @@ struct Range {
 };
 
 enum class FaultState : std::uint32_t { Empty, Writing, Ready };
-enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable, UnlinkedCall, RangeCacheMismatch, TranslationMismatch, RelativeMismatch, RepairMismatch, SpanMismatch, WriteNoteMismatch };
+enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable, UnlinkedCall, RangeCacheMismatch, TranslationMismatch, RelativeMismatch, RepairMismatch, SpanMismatch, WriteNoteMismatch, FlushProofMismatch, InterpolationFactMismatch, BallotReuseMismatch, RegisterWindowMismatch, ProvenanceMismatch, BufferSelectMismatch };
 
 struct Fault {
     FaultState state;

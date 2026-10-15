@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/DispatchFreeze.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -228,6 +229,7 @@ public:
     explicit GuestBufferMemory(const Context& context);
     ~GuestBufferMemory();
     void AcquireRegistered();
+    bool AcquireCachedSpace();
     // APS5_PROFILE_DRAW: the parts of one address-based build ([address] line every 10 s): the
     // registry lease, the imports pass, the mirror preparation and the mirror compare (blocks and
     // copied blocks) are timed by AcquireRegistered on the calling thread; the caller adds the
@@ -276,6 +278,10 @@ public:
     bool PointerWrites() const { return pointerWrites; }
     void PointerRecorded();
     void CompletePointerWrites(std::span<const Coherence::Interval> written) const;
+    bool ReusableAddressSpace() const;
+    bool AddressSpaceCurrent() const;
+    std::uint64_t AddressSpaceSerial() const;
+    void RefreshAddressUse() const;
     struct CpuCopy {
         std::uint64_t begin = 0;
         std::uint64_t end = 0;
@@ -288,6 +294,7 @@ public:
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
+    std::vector<DispatchFreeze::Reach> ReachableRanges(bool addressBased) const;
     // The BDA table of the cached address space when it serves this upload alone (an address-based
     // build with no region outside it): its ranges, immutable while the space lives, and the
     // space's serial, by which BdaResources reuses the table buffer built for it without a
@@ -322,6 +329,7 @@ public:
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
+    bool HoldsAddressSpace() const { return space != nullptr; }
     std::size_t CopiedBytes() const {
         std::size_t bytes = 0;
         for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
@@ -421,6 +429,7 @@ private:
     // imports changed under the space (`resolve`: the direct regions are re-resolved by UploadFinish).
     void dissolveSpace(bool resolve);
     void completeSpaceWrites() const;
+    void storePointerHeaps() const;
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address) const;

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_PREPAREWORKERS_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <array>
 #include <atomic>
@@ -144,6 +145,11 @@ inline FrozenPrepareVerdict CheckFrozenPrepare(const RecordHistory& history, std
     return FrozenPrepareVerdict::Unchecked;
 }
 
+struct PreparationParked {
+    std::function<bool(std::function<void()>)> arm;
+    std::function<void()> resume;
+};
+
 template <class TJob, class TResult>
 class OrderedPrepare {
 public:
@@ -155,12 +161,16 @@ public:
         std::uint64_t emitted = 0;
         std::uint64_t fullWaits = 0;
         std::uint64_t busyNs = 0;
+        std::uint64_t parked = 0;
     };
 
     OrderedPrepare(std::size_t workers, std::size_t bound, Prepare prepare, Emit emit, Enter enter = {}) : bound(bound), slots(bound), prepare(std::move(prepare)), emit(std::move(emit)), enter(std::move(enter)) {
         if (workers == 0 || bound == 0) throw std::logic_error("ordered preparation needs workers and a bound");
         threads.reserve(workers);
-        for (std::size_t index = 0; index < workers; ++index) threads.emplace_back([this, index] { serve(index); });
+        for (std::size_t index = 0; index < workers; ++index) threads.emplace_back([this, index] {
+            const Coherence::DriverAccessScope driverAccess;
+            serve(index);
+        });
     }
     ~OrderedPrepare() {
         {
@@ -190,6 +200,7 @@ public:
         slot.job.emplace(std::move(job));
         slot.result.reset();
         slot.error = nullptr;
+        slot.resume = nullptr;
         slot.ready = false;
         lock.unlock();
         work.notify_one();
@@ -206,7 +217,7 @@ public:
     }
     Statistics Counts() const {
         std::lock_guard lock(mutex);
-        return {submitted, emitted, fullWaits, busyNs.load(std::memory_order_relaxed)};
+        return {submitted, emitted, fullWaits, busyNs.load(std::memory_order_relaxed), parked};
     }
     std::size_t Workers() const { return threads.size(); }
     static bool OnWorker() { return workerIndex() != NoWorker; }
@@ -217,6 +228,7 @@ private:
         std::optional<TJob> job;
         std::optional<TResult> result;
         std::exception_ptr error;
+        std::function<void()> resume;
         bool ready = false;
     };
     static std::size_t& workerIndex() {
@@ -231,21 +243,57 @@ private:
         if (enter) enter(index);
         for (;;) {
             std::unique_lock lock(mutex);
-            work.wait(lock, [&] { return stopping || started < submitted; });
+            work.wait(lock, [&] { return stopping || started < submitted || !retries.empty(); });
             if (stopping) return;
-            const auto ticket = ++started;
+            std::uint64_t ticket = 0;
+            if (!retries.empty()) {
+                ticket = retries.front();
+                retries.pop_front();
+            } else {
+                ticket = ++started;
+            }
             auto& slot = slots[ticket % bound];
             TJob& job = *slot.job;
+            auto resume = std::move(slot.resume);
+            slot.resume = nullptr;
             lock.unlock();
             const auto begin = std::chrono::steady_clock::now();
             std::optional<TResult> result;
             std::exception_ptr error;
+            std::optional<PreparationParked> parkedOn;
             try {
+                if (resume) resume();
                 result.emplace(prepare(job));
+            } catch (PreparationParked& request) {
+                parkedOn.emplace(std::move(request));
             } catch (...) {
                 error = std::current_exception();
             }
             busyNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count()), std::memory_order_relaxed);
+            if (parkedOn.has_value()) {
+                {
+                    std::lock_guard parkLock(mutex);
+                    slot.resume = std::move(parkedOn->resume);
+                    ++parked;
+                }
+                const auto requeue = [this, ticket] {
+                    {
+                        std::lock_guard requeueLock(mutex);
+                        if (stopping) return;
+                        retries.push_back(ticket);
+                    }
+                    work.notify_one();
+                };
+                bool armed = false;
+                try {
+                    armed = parkedOn->arm(requeue);
+                } catch (...) {
+                    std::lock_guard failedLock(mutex);
+                    slot.resume = [failure = std::current_exception()] { std::rethrow_exception(failure); };
+                }
+                if (!armed) requeue();
+                continue;
+            }
             lock.lock();
             slot.result = std::move(result);
             slot.error = error;
@@ -291,6 +339,8 @@ private:
     std::uint64_t started = 0;
     std::uint64_t emitted = 0;
     std::uint64_t fullWaits = 0;
+    std::uint64_t parked = 0;
+    std::deque<std::uint64_t> retries;
     std::atomic<std::uint64_t> busyNs{0};
     std::exception_ptr failure;
     bool emitting = false;

@@ -28,7 +28,7 @@ std::uint64_t depthWrites = 0;
 std::atomic<std::uint64_t> depthSurfaceSerial{0};
 
 Recorder* RecorderFor(const Context& context) {
-    auto* recorder = Recorder::Current();
+    auto* recorder = Recorder::GraphicsRecorder();
     return recorder != nullptr && recorder->Device() == context.device ? recorder : nullptr;
 }
 
@@ -69,6 +69,7 @@ public:
             allocation.allocationSize = requirements.size;
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory depth target");
+            DeviceMemoryPlacements::Track(memory, DeviceMemoryKind::DepthSurface, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
             Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory depth");
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             viewInfo.image = image;
@@ -308,8 +309,8 @@ private:
     }
 
     void copyPlane(PlaneStorage& plane, const std::shared_ptr<StorageTexture>& storage, bool stencil, bool toStorage) {
-        auto* recorder = Recorder::Current();
-        Require(recorder != nullptr, "depth surface storage copies need an active recorder");
+        auto* recorder = RecorderFor(context);
+        Require(recorder != nullptr, "depth surface storage copies need an active recorder of their device");
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto bytes = static_cast<std::size_t>(target.extent.width) * target.extent.height * (stencil ? 1u : d16 ? 2u : 4u);
         if (plane.staging == nullptr) plane.staging = std::make_unique<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -337,7 +338,7 @@ private:
         depthSurfaceSerial.fetch_add(1, std::memory_order_relaxed);
         if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-        if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        if (memory) { DeviceMemoryPlacements::Untrack(memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); }
         view = VK_NULL_HANDLE;
         image = VK_NULL_HANDLE;
         memory = VK_NULL_HANDLE;
@@ -373,6 +374,7 @@ public:
             allocation.allocationSize = requirements.size;
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory depth plane copy");
+            DeviceMemoryPlacements::Track(memory, DeviceMemoryKind::DepthSurface, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
             Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory depth plane copy");
             stagingSize = static_cast<std::size_t>(sliceBytes()) * layers;
             staging = std::make_unique<DeviceBuffer>(context, stagingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -532,7 +534,7 @@ private:
         depthSurfaceSerial.fetch_add(1, std::memory_order_relaxed);
         staging.reset();
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-        if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        if (memory) { DeviceMemoryPlacements::Untrack(memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); }
         image = VK_NULL_HANDLE;
         memory = VK_NULL_HANDLE;
     }
@@ -560,8 +562,8 @@ public:
 
     void Copy(std::span<const LayeredSlice> slices, bool toStorage) {
         if (slices.empty()) return;
-        auto* recorder = Recorder::Current();
-        Require(recorder != nullptr, "depth surface storage copies need an active recorder");
+        auto* recorder = RecorderFor(context);
+        Require(recorder != nullptr, "depth surface storage copies need an active recorder of their device");
         const auto commands = recorder->Commands();
         recorder->Keep(storage);
         const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
@@ -794,6 +796,14 @@ VkImageView PeekDepthSurfaceView(const Context& context, const DepthTarget& targ
     std::lock_guard lock(surfacesMutex());
     for (const auto& candidate : surfaces()) {
         if (candidate->context.device == context.device && sameSurface(candidate->target, target)) return candidate->view;
+    }
+    return VK_NULL_HANDLE;
+}
+
+VkImage PeekDepthSurfaceImage(const Context& context, const DepthTarget& target) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& candidate : surfaces()) {
+        if (candidate->context.device == context.device && sameSurface(candidate->target, target)) return candidate->image;
     }
     return VK_NULL_HANDLE;
 }

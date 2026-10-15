@@ -250,6 +250,12 @@ std::optional<std::uint8_t> BufferReadAnalysis::BuildIndex(const IrValue* value,
             if (!right) return std::nullopt;
             return push({BufferIndexOp::Select, *left, *right, 0u, 0u});
         }
+        case IrOpcode::ConvertU32F32: {
+            if (value->ArgumentCount() != 1u) return block();
+            const auto converted = BuildFloatIndex(value->Argument(0), nodes, blocking, depth + 1u);
+            if (!converted) return std::nullopt;
+            return push({BufferIndexOp::UnsignedFromFloat, *converted, 0u, 0u, 0u});
+        }
         case IrOpcode::Phi: {
             if (value->ArgumentCount() == 0u) return block();
             auto result = child(0);
@@ -268,6 +274,64 @@ std::optional<std::uint8_t> BufferReadAnalysis::BuildIndex(const IrValue* value,
     nodes.resize(saved);
     if (plain) return push({BufferIndexOp::Range, 0u, 0u, static_cast<std::uint32_t>(plain->low), static_cast<std::uint32_t>(plain->high)});
     return std::nullopt;
+}
+
+std::optional<std::uint8_t> BufferReadAnalysis::BuildFloatIndex(const IrValue* value, std::vector<BufferIndexNode>& nodes, std::uint16_t& blocking, std::uint32_t depth) {
+    if (value == nullptr) return std::nullopt;
+    value = value->Resolve();
+    if (value == nullptr) return std::nullopt;
+    const auto push = [&](BufferIndexNode node) -> std::optional<std::uint8_t> {
+        if (nodes.size() >= MaxIndexNodes) return std::nullopt;
+        nodes.push_back(node);
+        return static_cast<std::uint8_t>(nodes.size() - 1u);
+    };
+    if (value->HasImmediate()) return push({BufferIndexOp::FloatConstant, 0u, 0u, value->ImmediateU32(), 0u});
+    const auto op = value->Opcode();
+    const auto block = [&]() -> std::optional<std::uint8_t> {
+        if (blocking == 0) blocking = static_cast<std::uint16_t>(op);
+        return std::nullopt;
+    };
+    if (depth >= MaxAffineDepth) return block();
+    const auto child = [&](std::size_t index) { return index < value->ArgumentCount() ? BuildFloatIndex(value->Argument(index), nodes, blocking, depth + 1u) : std::nullopt; };
+    const auto binary = [&](BufferIndexOp kind) -> std::optional<std::uint8_t> {
+        const auto left = child(0);
+        if (!left) return std::nullopt;
+        const auto right = child(1);
+        if (!right) return std::nullopt;
+        return push({kind, *left, *right, 0u, 0u});
+    };
+    const auto unary = [&](BufferIndexOp kind) -> std::optional<std::uint8_t> {
+        const auto left = child(0);
+        if (!left) return std::nullopt;
+        return push({kind, *left, 0u, 0u, 0u});
+    };
+    switch (op) {
+    case IrOpcode::ConvertF32U32: {
+        if (value->ArgumentCount() != 1u) return block();
+        const auto integer = BuildIndex(value->Argument(0), nodes, blocking, depth + 1u);
+        if (!integer) return std::nullopt;
+        return push({BufferIndexOp::FloatFromUnsigned, *integer, 0u, 0u, 0u});
+    }
+    case IrOpcode::FPAdd32: return binary(BufferIndexOp::FloatAdd);
+    case IrOpcode::FPSub32: return binary(BufferIndexOp::FloatSub);
+    case IrOpcode::FPMul32: return binary(BufferIndexOp::FloatMul);
+    case IrOpcode::FPMin32: return binary(BufferIndexOp::FloatMin);
+    case IrOpcode::FPMax32: return binary(BufferIndexOp::FloatMax);
+    case IrOpcode::FPFloor32: return unary(BufferIndexOp::FloatFloor);
+    case IrOpcode::FPTrunc32: return unary(BufferIndexOp::FloatTrunc);
+    case IrOpcode::FPFma32:
+    case IrOpcode::FPMad32: {
+        const auto left = child(0);
+        if (!left) return std::nullopt;
+        const auto right = child(1);
+        if (!right) return std::nullopt;
+        const auto addend = child(2);
+        if (!addend) return std::nullopt;
+        return push({BufferIndexOp::FloatFma, *left, *right, *addend, 0u});
+    }
+    default:
+        return block();
+    }
 }
 
 BufferIndexOrigin BufferReadAnalysis::OriginOf(const IrValue* value) {

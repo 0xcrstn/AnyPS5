@@ -139,7 +139,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 };
 
                 while (!ready()) {
-                    if (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
+                    if (completionWatcher() || !completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
                         const auto idleEpochAtCheck = idleEpoch.load(std::memory_order_acquire);
                         const bool storeIdleResults = idleResultsPending();
                         if (storeIdleResults) {
@@ -199,6 +199,14 @@ void Driver::run(std::uint32_t id) noexcept {
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
             execute(submission);
+            if (deferDrawRecords(id)) {
+                bool drain = false;
+                {
+                    std::lock_guard lock(mutex);
+                    drain = idleWaiters != 0 || workers.at(id).pending.empty();
+                }
+                if (drain) waitDrawRecords();
+            }
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             PerformanceContext completionContext(id == 0 ? frameTiming() : FrameTiming::Async());

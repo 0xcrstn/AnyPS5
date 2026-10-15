@@ -114,6 +114,7 @@ public:
     VkFormat ViewFormat() const { return viewFormat; }
     // Whether this texture is a view of a storage image (no snapshot of its own).
     bool ViewsStorageImage() const { return storageSource != nullptr; }
+    VkImage Image() const { return image; }
     const StorageTexture* StorageSource() const { return storageSource.get(); }
     const std::shared_ptr<StorageTexture>& SharedStorageSource() const { return storageSource; }
     // The last key scan of the sampled surface (ProvedClearKeys), for surfaces whose keys are not
@@ -226,7 +227,9 @@ public:
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     static void MarkPendingReached(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::vector<std::uint8_t>& reached);
     static bool DeferredPointerStores();
-    static std::uint64_t NotePointerWriter(std::span<const std::pair<std::uint64_t, std::uint64_t>> heaps);
+    static std::uint64_t NotePointerWriter(std::span<const std::pair<std::uint64_t, std::uint64_t>> heaps, std::span<const std::pair<std::uint64_t, std::uint64_t>> hostWritable = {});
+    static bool PointerWriterReaches(std::uint64_t address, std::size_t bytes);
+    static void NotePointerReadWait();
     static void RetirePointerWriter(std::uint64_t writer);
     // Moves with every change of the pending registry (an image marked dirty, stored, flushed or
     // dropped; after the store for a flush), bumped under the registry's mutex with the change, so

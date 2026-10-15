@@ -129,6 +129,20 @@ void NoteLockedFault(Interval range);
 void SetLeaseWaiter(Materializer waiter);
 using FaultPriority = bool (*)();
 void SetFaultPriority(FaultPriority priority);
+
+inline thread_local int driverAccessDepth = 0;
+
+class DriverAccessScope {
+public:
+    DriverAccessScope() { ++driverAccessDepth; }
+    DriverAccessScope(const DriverAccessScope&) = delete;
+    DriverAccessScope& operator=(const DriverAccessScope&) = delete;
+    ~DriverAccessScope() { --driverAccessDepth; }
+};
+
+inline bool InDriverAccess() {
+    return driverAccessDepth != 0;
+}
 std::uint64_t AcquireReadLease(Interval range, Version version);
 std::uint64_t ProtectResident(Interval range, Version version);
 void RetireReadLease(std::uint64_t lease);
@@ -153,6 +167,7 @@ struct Counters {
     std::uint64_t liveProtections = 0;
     std::uint64_t leases = 0;
     std::uint64_t leaseWaits = 0;
+    std::uint64_t driverReleases = 0;
     std::uint64_t uncoveredReleases = 0;
 };
 

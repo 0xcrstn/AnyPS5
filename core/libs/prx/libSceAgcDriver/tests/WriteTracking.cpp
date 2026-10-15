@@ -234,6 +234,30 @@ void CheckNewestStamp() {
 }
 
 #ifdef _WIN32
+void CheckAliasStamps() {
+    constexpr std::size_t bytes = Block;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot create the aliased backing");
+    auto* first = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+    auto* second = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+    Require(first != nullptr && second != nullptr, "cannot allocate the aliased addresses");
+    GuestArena::GuestArenaMap_nid_postfix(first, bytes, section, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(second, bytes, section, 0, PAGE_READWRITE);
+    CloseHandle(section);
+    const auto a = reinterpret_cast<std::uint64_t>(first);
+    const auto b = reinterpret_cast<std::uint64_t>(second);
+    std::memset(first, 0x11, bytes);
+    CollectWritesUncached(a, bytes);
+    const auto synced = CollectWritesUncached(b, bytes);
+    Require(synced != 0 && UnchangedSince(b + 64, 32, synced), "the second mapping did not collect clean");
+    Require(MarkWritten(a + 64, 32) != 0, "a driver store through the first mapping was not stamped");
+    Require(WrittenSince(b + 64, 32, synced) && StoredOver(b + 64, 32, synced), "a driver store through one mapping did not stamp the other mapping of the same pages");
+    GuestArena::GuestArenaReset_nid_postfix(second, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(second, bytes);
+    GuestArena::GuestArenaReset_nid_postfix(first, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(first, bytes);
+}
+
 void CheckDeferredSharedImports() {
     constexpr std::size_t bytes = 4 * Block;
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
@@ -899,6 +923,31 @@ void CheckEpochDirtyBlockGranularity() {
     Require(DirtySerial() == enabled && UnchangedSinceDirtySerial(tail, 1, enabled), "an already enabled dirty log invalidated its current proof");
 }
 
+void CheckEpochDirtySampleOrder() {
+    struct Restore {
+        bool enabled = EpochDirtySetEnabled();
+        ~Restore() { SetEpochDirtySet(enabled); }
+    } restore;
+    SetEpochDirtySet(true);
+    PartlyCommitted range;
+    range.Commit(0);
+    const auto base = range.Address();
+    std::memset(range.Data(), 0x22, Block);
+    const auto lateGeneration = CollectWritesUncached(base, Block);
+    Require(lateGeneration != 0, "the sample-order range is not collected");
+    Require(MarkWritten(base + 64, 16) != 0, "the sample-order driver store is not stamped");
+    const auto lateSerial = DirtySerial();
+    Require(UnchangedSinceDirtySerial(base, Block, lateSerial) && !UnchangedSince(base, Block, lateGeneration), "a serial sampled after the generation did not reproduce the dirty-set verify disagreement");
+    const auto serial = DirtySerial();
+    const auto generation = CollectWritesUncached(base, Block);
+    Require(generation != 0, "the sample-order range is not collected again");
+    Require(MarkWritten(base + 64, 16) != 0, "the second sample-order driver store is not stamped");
+    Require(!UnchangedSinceDirtySerial(base, Block, serial) && !UnchangedSince(base, Block, generation), "a serial sampled before the generation missed a later store");
+    const auto quietSerial = DirtySerial();
+    const auto quietGeneration = CollectWritesUncached(base, Block);
+    Require(UnchangedSinceDirtySerial(base, Block, quietSerial) == UnchangedSince(base, Block, quietGeneration), "a serial sampled before the generation disagreed without a store");
+}
+
 void CheckEpochDirtyCollectedPages() {
     struct Restore {
         bool enabled = EpochDirtySetEnabled();
@@ -1115,6 +1164,9 @@ int main() {
         }
 #endif
         CheckSharedBlock();
+#ifdef _WIN32
+        CheckAliasStamps();
+#endif
         CheckOwnStore();
         CheckSharedDriverStoreLog();
         CheckCollectEpochSharing();
@@ -1124,6 +1176,7 @@ int main() {
         CheckEpochDirtyImportFailure();
         CheckEpochDirtyUnstampedBatch();
         CheckEpochDirtyBlockGranularity();
+        CheckEpochDirtySampleOrder();
         CheckEpochDirtyCollectedPages();
         CheckEpochDirtyConcurrentPublication();
 #ifdef _WIN32

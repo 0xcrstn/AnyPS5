@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DefaultSwitch.hpp"
+#include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareWorkers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -13,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -24,6 +27,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <cstring>
+#include <thread>
 #include <string_view>
 #include <tuple>
 #include <vector>
@@ -269,7 +274,7 @@ Driver::DrawRecordState& Driver::drawRecordState() {
 
 bool Driver::recordThread() {
     static const bool enabled = [] {
-        if (std::getenv("APS5_RECORD_THREAD") == nullptr) return false;
+        if (!DefaultOnSwitch("APS5_RECORD_THREAD")) return false;
         if (std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr) {
             std::fprintf(stderr, "[record-thread] off: APS5_LOCKED_DRAW_PREPARE prepares draws under the GPU mutex\n");
             return false;
@@ -301,15 +306,29 @@ bool Driver::deferDrawRecords(std::uint32_t queue) const {
     return queue == 0 && recordThread();
 }
 
+namespace {
+
+unsigned long defaultPrepareWorkers() {
+    const auto& layout = CpuTopology::Get();
+    if (layout.hybrid) return std::clamp<unsigned long>(static_cast<unsigned long>(std::popcount(layout.efficient & (layout.process != 0 ? layout.process : ~std::uint64_t{0}))), 1ul, 16ul);
+    const auto logical = static_cast<unsigned long>(std::thread::hardware_concurrency());
+    return std::clamp<unsigned long>(logical > 4ul ? logical / 2ul - 2ul : 1ul, 1ul, 16ul);
+}
+
+}
+
 std::uint32_t Driver::prepareAhead() {
     static const std::uint32_t depth = [] {
         const char* text = std::getenv("APS5_PREPARE_AHEAD");
-        if (text == nullptr) return std::uint32_t{0};
-        char* end = nullptr;
-        const auto value = std::strtoul(text, &end, 10);
-        if (end == text || *end != '\0' || value < 1 || value > 64) throw std::runtime_error(std::string("APS5_PREPARE_AHEAD=") + text + ": expected a record depth from 1 to 64");
+        unsigned long value = std::max(4ul, defaultPrepareWorkers());
+        if (text != nullptr) {
+            if (std::strcmp(text, "0") == 0) return std::uint32_t{0};
+            char* end = nullptr;
+            value = std::strtoul(text, &end, 10);
+            if (end == text || *end != '\0' || value < 1 || value > 64) throw std::runtime_error(std::string("APS5_PREPARE_AHEAD=") + text + ": expected 0 (off) or a record depth from 1 to 64");
+        }
         if (!recordThread()) {
-            std::fprintf(stderr, "[record-thread] APS5_PREPARE_AHEAD ignored: it needs APS5_RECORD_THREAD\n");
+            if (text != nullptr) std::fprintf(stderr, "[record-thread] APS5_PREPARE_AHEAD ignored: it needs APS5_RECORD_THREAD\n");
             return std::uint32_t{0};
         }
         if (value == 1) return std::uint32_t{0};
@@ -324,16 +343,19 @@ std::uint32_t Driver::prepareAhead() {
 std::uint32_t Driver::prepareWorkers() {
     static const std::uint32_t workers = [] {
         const char* text = std::getenv("APS5_PREPARE_WORKERS");
-        if (text == nullptr) return std::uint32_t{0};
-        char* end = nullptr;
-        const auto value = std::strtoul(text, &end, 10);
-        if (end == text || *end != '\0' || value < 1 || value > 16) throw std::runtime_error(std::string("APS5_PREPARE_WORKERS=") + text + ": expected a preparation worker count from 1 to 16");
+        unsigned long value = defaultPrepareWorkers();
+        if (text != nullptr) {
+            if (std::strcmp(text, "0") == 0) return std::uint32_t{0};
+            char* end = nullptr;
+            value = std::strtoul(text, &end, 10);
+            if (end == text || *end != '\0' || value < 1 || value > 16) throw std::runtime_error(std::string("APS5_PREPARE_WORKERS=") + text + ": expected 0 (off) or a preparation worker count from 1 to 16");
+        }
         if (!recordThread()) {
-            std::fprintf(stderr, "[record-thread] APS5_PREPARE_WORKERS ignored: it needs APS5_RECORD_THREAD\n");
+            if (text != nullptr) std::fprintf(stderr, "[record-thread] APS5_PREPARE_WORKERS ignored: it needs APS5_RECORD_THREAD\n");
             return std::uint32_t{0};
         }
-        if (std::getenv("APS5_PREPARE_AHEAD") == nullptr) {
-            std::fprintf(stderr, "[record-thread] APS5_PREPARE_WORKERS ignored: it needs APS5_PREPARE_AHEAD\n");
+        if (prepareAhead() == 0) {
+            if (text != nullptr) std::fprintf(stderr, "[record-thread] APS5_PREPARE_WORKERS ignored: it needs APS5_PREPARE_AHEAD\n");
             return std::uint32_t{0};
         }
         const auto depth = std::max<std::uint32_t>(prepareAhead(), 1u);
@@ -347,7 +369,7 @@ std::uint32_t Driver::prepareWorkers() {
 
 bool Driver::prepareDispatches() {
     static const bool enabled = [] {
-        if (std::getenv("APS5_PREPARE_DISPATCHES") == nullptr) return false;
+        if (!DefaultOnSwitch("APS5_PREPARE_DISPATCHES")) return false;
         if (prepareWorkers() == 0) {
             std::fprintf(stderr, "[record-thread] APS5_PREPARE_DISPATCHES ignored: it needs APS5_PREPARE_WORKERS\n");
             return false;
@@ -416,13 +438,25 @@ void Driver::noteRecordHistory(std::uint64_t ticket, const std::shared_ptr<DrawR
     recordHistory().Note(ticket, std::shared_ptr<const DrawRecordEffects>(result, &result->effects));
 }
 
+std::uint64_t Driver::FrozenIndirectRedos() {
+    return drawRecordCounters().orderedRedos[static_cast<std::size_t>(FrozenFallback::Indirect)].load(std::memory_order_relaxed);
+}
+
+bool Driver::freezeIndirectDraws() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_FREEZE_INDIRECT_DRAWS");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
 FrozenFallback Driver::frozenFallback(std::span<const std::uint32_t> packet) {
     static const bool dumps = [] {
         const char* shaders = std::getenv("APS5_DUMP_DRAW_SHADERS");
         const char* slot = std::getenv("APS5_DUMP_DRAW_SLOT1");
         return (shaders != nullptr && std::strtoull(shaders, nullptr, 16) != 0) || (slot != nullptr && std::strtoull(slot, nullptr, 16) != 0);
     }();
-    if (Pm4::IndirectDrawOpcode((packet[0] >> 8u) & 0xffu) && !FrozenIndirectDraws()) return FrozenFallback::Indirect;
+    if (Pm4::IndirectDrawOpcode((packet[0] >> 8u) & 0xffu) && !freezeIndirectDraws()) return FrozenFallback::Indirect;
     if (!bindingPlan()) return FrozenFallback::DrawCache;
     if (dumps || ShaderRecompiler::DebugProbeActive()) return FrozenFallback::Debug;
     if (device.Load() == nullptr) return FrozenFallback::NoDevice;
@@ -908,7 +942,7 @@ void Driver::mergeFrozenRecords() {
 }
 
 bool Driver::recordDispatches() {
-    static const bool enabled = recordThread() && std::getenv("APS5_RECORD_THREAD_DISPATCH") != nullptr;
+    static const bool enabled = recordThread() && DefaultOnSwitch("APS5_RECORD_THREAD_DISPATCH");
     return enabled;
 }
 
@@ -1152,23 +1186,6 @@ void Driver::waitDrawRecordsAt(std::uint32_t opcode) {
         ~Reset() { packetWaitOpcode() = 0x102u; }
     } reset;
     waitDrawRecords();
-}
-
-bool ParseFrozenIndirectDraws(const char* text) {
-    if (text == nullptr) return true;
-    const std::string_view value(text);
-    if (value == "1" || value == "on") return true;
-    if (value == "0" || value == "off") return false;
-    throw std::invalid_argument("APS5_FROZEN_INDIRECT_DRAWS must be 0, 1, off or on, not \"" + std::string(value) + "\"");
-}
-
-bool FrozenIndirectDraws() {
-    static const bool enabled = ParseFrozenIndirectDraws(std::getenv("APS5_FROZEN_INDIRECT_DRAWS"));
-    return enabled;
-}
-
-std::uint64_t FrozenIndirectRedos() {
-    return drawRecordCounters().orderedRedos[static_cast<std::size_t>(FrozenFallback::Indirect)].load(std::memory_order_relaxed);
 }
 
 CommandProcessorReads ParseCommandProcessorReads(const char* text) {
@@ -1418,6 +1435,9 @@ void Driver::reportDrawRecords() {
         static std::uint64_t lastFullWaits = 0;
         const auto fullWaits = pipeline.fullWaits - lastFullWaits;
         lastFullWaits = pipeline.fullWaits;
+        static std::uint64_t lastParked = 0;
+        const auto parked = pipeline.parked - lastParked;
+        lastParked = pipeline.parked;
         const auto reasons = [](const std::array<std::atomic<std::uint64_t>, Reasons>& values, std::array<std::uint64_t, Reasons>& last) {
             std::string text;
             for (std::size_t reason = 1; reason < Reasons; ++reason) {
@@ -1433,7 +1453,7 @@ void Driver::reportDrawRecords() {
         const auto orderedText = reasons(counters.orderedRedos, lastOrdered);
         const auto busy = seconds > 0 ? static_cast<double>(workerDelta[7]) / (seconds * 1e9 * workers) * 100.0 : 0.0;
         char text[512];
-        std::snprintf(text, sizeof(text), "; prepare workers %u: %llu frozen draws (freeze %.2f us each, %llu register files copied so far), %llu prepared to nothing; inline on queue 0 after a drain: %s; redone in order on the record thread: stale %llu, unchecked %llu, after a worker error or rejection %llu, refused by a worker: %s; workers busy %.1f %%, reorder buffer full %llu, record queue full %llu", workers, static_cast<unsigned long long>(workerDelta[0]), workerDelta[0] != 0 ? static_cast<double>(workerDelta[1]) / 1000.0 / static_cast<double>(workerDelta[0]) : 0.0, static_cast<unsigned long long>(counters.frozenCopies.load()), static_cast<unsigned long long>(workerDelta[2]), inlineText.c_str(), static_cast<unsigned long long>(workerDelta[4]), static_cast<unsigned long long>(workerDelta[5]), static_cast<unsigned long long>(workerDelta[6]), orderedText.c_str(), busy, static_cast<unsigned long long>(fullWaits), static_cast<unsigned long long>(workerDelta[3]));
+        std::snprintf(text, sizeof(text), "; prepare workers %u: %llu frozen draws (freeze %.2f us each, %llu register files copied so far), %llu prepared to nothing; inline on queue 0 after a drain: %s; redone in order on the record thread: stale %llu, unchecked %llu, after a worker error or rejection %llu, refused by a worker: %s; workers busy %.1f %%, parked on a compile %llu, reorder buffer full %llu, record queue full %llu", workers, static_cast<unsigned long long>(workerDelta[0]), workerDelta[0] != 0 ? static_cast<double>(workerDelta[1]) / 1000.0 / static_cast<double>(workerDelta[0]) : 0.0, static_cast<unsigned long long>(counters.frozenCopies.load()), static_cast<unsigned long long>(workerDelta[2]), inlineText.c_str(), static_cast<unsigned long long>(workerDelta[4]), static_cast<unsigned long long>(workerDelta[5]), static_cast<unsigned long long>(workerDelta[6]), orderedText.c_str(), busy, static_cast<unsigned long long>(parked), static_cast<unsigned long long>(fullWaits), static_cast<unsigned long long>(workerDelta[3]));
         ahead += text;
         if (prepareDispatches()) {
             static std::array<std::uint64_t, Reasons> lastDispatchInline{};

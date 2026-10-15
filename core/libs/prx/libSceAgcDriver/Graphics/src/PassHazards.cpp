@@ -1,7 +1,35 @@
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
 
 namespace AgcDriver::Graphics {
+
+ReadOnlyAddressPasses ParseReadOnlyAddressPasses(const char* text) {
+    if (text == nullptr || std::strcmp(text, "1") == 0) return ReadOnlyAddressPasses::On;
+    if (std::strcmp(text, "0") == 0) return ReadOnlyAddressPasses::Off;
+    if (std::strcmp(text, "verify") == 0) return ReadOnlyAddressPasses::Verify;
+    throw std::runtime_error(std::string("APS5_READONLY_ADDRESS_PASSES must be 0, 1 or verify, not ") + text);
+}
+
+DepthPassMerge ParseDepthPassMerge(const char* text) {
+    if (text == nullptr || std::strcmp(text, "1") == 0) return DepthPassMerge::On;
+    if (std::strcmp(text, "0") == 0) return DepthPassMerge::Off;
+    if (std::strcmp(text, "verify") == 0) return DepthPassMerge::Verify;
+    throw std::runtime_error(std::string("APS5_DEPTH_PASS_MERGE must be 0, 1 or verify, not ") + text);
+}
+
+DepthPassMerge DepthPassMergeSetting() {
+    static const auto setting = ParseDepthPassMerge(std::getenv("APS5_DEPTH_PASS_MERGE"));
+    return setting;
+}
+
+ReadOnlyAddressPasses ReadOnlyAddressPassesSetting() {
+    static const auto setting = ParseReadOnlyAddressPasses(std::getenv("APS5_READONLY_ADDRESS_PASSES"));
+    return setting;
+}
 
 void GuestRangeSet::Insert(std::uint64_t begin, std::uint64_t end) {
     if (begin >= end) return;
@@ -32,12 +60,20 @@ bool PassHazards::overlapsAny(const GuestRangeSet& set, GuestRangeList ranges) c
 }
 
 PassHazard PassHazards::Check(const PassAccess& access, bool samePass) const {
+    return check(access, samePass, access.anyWrites, anyWrites);
+}
+
+PassHazard PassHazards::CheckKnownAddressWrites(const PassAccess& access, bool samePass) const {
+    return check(access, samePass, access.anyWrites && !access.knownAddressWrites, unknownAddressWrites);
+}
+
+PassHazard PassHazards::check(const PassAccess& access, bool samePass, bool accessWrites, bool earlierWrites) const {
     const auto touchesMemory = [](const PassAccess& use) {
         const auto nonEmpty = [](GuestRangeList ranges) { return std::any_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.first < range.second; }); };
         return use.anyReads || use.anyWrites || nonEmpty(use.reads) || nonEmpty(use.writes);
     };
     const bool earlierTouches = anyReads || anyWrites || !reads.Empty() || !writes.Empty();
-    if ((access.anyWrites && earlierTouches) || (anyWrites && touchesMemory(access))) return PassHazard::UnknownWrite;
+    if ((accessWrites && earlierTouches) || (earlierWrites && touchesMemory(access))) return PassHazard::UnknownWrite;
     const bool writesRanges = std::any_of(access.writes.begin(), access.writes.end(), [](const auto& range) { return range.first < range.second; });
     if ((access.anyReads && !writes.Empty()) || (anyReads && writesRanges)) return PassHazard::UnknownRead;
     if (overlapsAny(writes, access.reads)) return PassHazard::ReadAfterWrite;
@@ -74,6 +110,7 @@ void PassHazards::Add(const PassAccess& access) {
     }
     anyReads = anyReads || access.anyReads;
     anyWrites = anyWrites || access.anyWrites;
+    unknownAddressWrites = unknownAddressWrites || (access.anyWrites && !access.knownAddressWrites);
 }
 
 void PassHazards::Clear() {
@@ -81,7 +118,7 @@ void PassHazards::Clear() {
     writes.Clear();
     images.clear();
     attachments.clear();
-    anyReads = anyWrites = false;
+    anyReads = anyWrites = unknownAddressWrites = false;
 }
 
 bool PassHazards::Empty() const {
