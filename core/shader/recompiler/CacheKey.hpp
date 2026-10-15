@@ -281,6 +281,7 @@ private:
         append(key, value.registrationWordLimit);
         append(key, value.vertexSubgroups);
         append(key, value.float16DenormPreserve);
+        append(key, value.robustBufferAccess2);
     }
 };
 

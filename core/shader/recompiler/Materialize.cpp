@@ -454,6 +454,7 @@ RecompileResult materializeSkeleton(const CompiledVariant& variant, const Recomp
         result.spirv = artifact.spirv.Resolved();
     }
     parts.bindings = bindingPlan;
+    if (std::none_of(bindingPlan->bindings.begin(), bindingPlan->bindings.end(), [](const PreparedDescriptorBinding& binding) { return binding.descriptor.role == DescriptorRole::FaultBuffer; })) result.bdaAbiVersion = 0u;
     return result;
 }
 
@@ -491,6 +492,7 @@ void fillMaterializedValues(RecompileResult& result, const CompiledVariant& vari
     result.bdaWrites = variant.info.info.bdaWrites;
     result.bdaAtomics = variant.info.info.bdaAtomics;
     result.bdaCoherent = variant.info.info.bdaCoherent;
+    result.bdaSpinWait = variant.info.info.bdaSpinWait;
     result.imageTablePoison.clear();
     result.imageTableRanges.clear();
     result.imageTableReadRanges.clear();

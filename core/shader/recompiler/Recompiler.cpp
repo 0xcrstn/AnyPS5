@@ -35,6 +35,7 @@
 #include "Optimization/include/Optimization/ConstantFolder.hpp"
 #include "Optimization/include/Optimization/DeadCodeEliminator.hpp"
 #include "Optimization/include/Optimization/DenormalFlushEliminator.hpp"
+#include "Optimization/include/Optimization/InterpolationFactsAnnotator.hpp"
 #include "Optimization/include/Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/include/Optimization/HostInterpolationChecker.hpp"
 #include "Optimization/include/Optimization/MaskedSelectEliminator.hpp"
@@ -325,6 +326,8 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     if (denormalFlushEliminator.Eliminate(program).removedFlushes != 0u) {
         deadCodeEliminator.Eliminate(program);
     }
+    constexpr InterpolationFactsAnnotator interpolationFactsAnnotator;
+    static_cast<void>(interpolationFactsAnnotator.Annotate(program));
 
     if (inputInfo.vertex != nullptr) {
         constexpr TessellationLowering tessellationLowering;
@@ -688,6 +691,7 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
 
     constexpr ShaderInfoCollector shaderInfoCollector;
     shaderInfoCollector.Collect(program, inputInfo);
+    PrepareRewriteVerification(program);
 }
 
 bool VerifyShaderEmission() {
@@ -768,6 +772,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program,
     targetOptions.registrationModules = registration;
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
+    targetOptions.robustBufferAccess2 = request.target.robustBufferAccess2;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;

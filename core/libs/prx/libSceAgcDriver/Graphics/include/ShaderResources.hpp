@@ -289,6 +289,7 @@ public:
     void UseMirrors(Recorder& recorder, std::span<const std::size_t> movedAllocations) const;
     static void LeaseInPlaceReads(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads);
     void RecordPlacementCopyBack(Recorder& recorder, VkCommandBuffer commands) const;
+    [[nodiscard]] std::vector<DispatchFreeze::Reach> ReachableRanges() const;
     void PublishResidentReads(Recorder& recorder) const;
     void RefreshAddressUse() const;
     void RefreshMirrorsForDirectUse(Recorder& recorder) const;

@@ -122,6 +122,11 @@ IrValue& IrBuilder::GetVectorReg(VectorReg reg) {
     return Emit(IrOpcode::GetVectorRegister, IrType::U32, {&operand});
 }
 
+void IrBuilder::SetVectorRegOutsideWindow(VectorReg reg, IrValue& value) {
+    IrValue& operand = createRegisterOperand(program, RegisterBank::Vector, RegIndex(reg), IrType::VectorReg);
+    (void)Emit(IrOpcode::SetVectorRegister, IrType::Void, {&operand, &value});
+}
+
 void IrBuilder::SetVectorReg(VectorReg reg, IrValue& value) {
     if (IrValue* index = vectorWindowIndex(reg)) {
         (void)Emit(IrOpcode::StoreVectorWindow, IrType::Void, {index, &value});
