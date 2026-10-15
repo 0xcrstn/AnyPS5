@@ -17,10 +17,13 @@ Mode ParseMode(const char* variable, const char* value);
 Mode AuditMode();
 Mode OrderingMode();
 Mode DirectoryMode();
+Mode FaultsMode();
 void SetModesForTests(Mode audit, Mode ordering, Mode directory);
+void SetFaultsModeForTests(Mode faults);
 bool Tracking();
 bool Ordering();
 bool Canonicalizing();
+bool FaultOwnership();
 
 using Version = std::uint64_t;
 
@@ -99,6 +102,19 @@ Release SnapshotRelease(std::uint32_t queue, Interval label, std::uint64_t value
 void ImportFrontier(std::uint32_t consumerQueue, const Release& release);
 std::vector<std::pair<std::uint32_t, Version>> QueueFrontier(std::uint32_t queue);
 
+struct ProtectionBackend {
+    std::uint64_t (*protect)(std::uintptr_t address, std::size_t bytes, bool (*resolve)(std::uint64_t token, void* context), void* context, void (*releaseContext)(void* context)) = nullptr;
+    void (*release)(std::uint64_t token) = nullptr;
+};
+
+using Materializer = void (*)(Interval range);
+
+void SetProtectionBackend(ProtectionBackend backend);
+void SetMaterializer(Materializer materializer);
+std::uint64_t ProtectDeviceOwned(Interval range, Source source, Version version);
+void ReleaseDeviceOwned(std::uint64_t protection);
+void NoteLockedFault(Interval range);
+
 struct Counters {
     std::uint64_t reservations = 0;
     std::uint64_t completions = 0;
@@ -111,6 +127,12 @@ struct Counters {
     std::uint64_t committedIntervals = 0;
     std::uint64_t evictedIntervals = 0;
     std::uint64_t activeWriters = 0;
+    std::uint64_t protections = 0;
+    std::uint64_t refusedProtections = 0;
+    std::uint64_t partialProtections = 0;
+    std::uint64_t faultsResolved = 0;
+    std::uint64_t lockedFaults = 0;
+    std::uint64_t liveProtections = 0;
 };
 
 Counters CurrentCounters();

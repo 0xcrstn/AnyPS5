@@ -78,6 +78,7 @@ struct UnitShadow {
     std::vector<std::uint64_t> generation;
     std::vector<std::uint8_t> published;
     std::vector<Coherence::Version> versions;
+    std::vector<std::uint64_t> protections;
     // Slab k covers units [k * SlabUnits(), (k + 1) * SlabUnits()), made on demand; a failed
     // allocation is not retried before the noted present.
     std::vector<std::shared_ptr<ShadowSlab>> slabs;
@@ -92,11 +93,18 @@ struct UnitShadow {
     // The unit's bytes inside the import.
     std::pair<std::uint64_t, std::uint64_t> UnitRange(std::uint64_t unit) const { return {std::max(UnitBegin(unit), importBase), std::min(UnitBegin(unit + 1), ImportEnd())}; }
     bool Live(std::uint64_t unit) const { return generation[unit] != 0 && published[unit] == 0; }
+    UnitShadow() = default;
+    UnitShadow(const UnitShadow&) = delete;
+    UnitShadow& operator=(const UnitShadow&) = delete;
+    ~UnitShadow() {
+        for (auto& protection : protections) Coherence::ReleaseDeviceOwned(std::exchange(protection, 0));
+    }
     void Recount() {
         std::uint32_t live = 0, fresh = 0;
         for (std::uint64_t unit = 0; unit < Units(); ++unit) {
             live += Live(unit) ? 1u : 0u;
             fresh += generation[unit] != 0 ? 1u : 0u;
+            if (!Live(unit) && unit < protections.size() && protections[unit] != 0) Coherence::ReleaseDeviceOwned(std::exchange(protections[unit], 0));
         }
         liveUnits = live;
         freshUnits = fresh;
@@ -173,6 +181,7 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     shadow->generation.assign(static_cast<std::size_t>(units), 0);
     shadow->published.assign(static_cast<std::size_t>(units), 0);
     shadow->versions.assign(static_cast<std::size_t>(units), 0);
+    shadow->protections.assign(static_cast<std::size_t>(units), 0);
     const auto slabs = (units + SlabUnits() - 1) / SlabUnits();
     shadow->slabs.assign(static_cast<std::size_t>(slabs), nullptr);
     shadow->slabFailedUntil.assign(static_cast<std::size_t>(slabs), 0);
@@ -301,6 +310,20 @@ void verifyPublished(const UnitShadow& shadow, const std::vector<SlabCopies>& co
 std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_t first, std::uint64_t last, const std::vector<std::uint8_t>& selected, PublishReason reason) {
     const auto selectedFirst = first;
     auto& registry = Registry();
+    std::vector<std::uint64_t> deferred;
+    struct Settle {
+        std::vector<std::uint64_t>& deferred;
+        ~Settle() {
+            if (deferred.empty()) return;
+            if (auto* recorder = Recorder::Active()) {
+                recorder->OnCompleteWithoutGuestAccess([released = std::move(deferred)] {
+                    for (const auto protection : released) Coherence::ReleaseDeviceOwned(protection);
+                });
+            } else {
+                for (const auto protection : deferred) Coherence::ReleaseDeviceOwned(protection);
+            }
+        }
+    } settle{deferred};
     std::vector<SlabCopies> copies;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::uint64_t bytes = 0;
@@ -357,6 +380,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
                 ranges.emplace_back(begin, end);
             }
             shadow->published[unit] = 1;
+            if (shadow->protections[unit] != 0) deferred.push_back(std::exchange(shadow->protections[unit], 0));
             slab->lastUse = Recorder::Presents();
             bytes += end - begin;
             ++units;
@@ -775,6 +799,10 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;
                 shadow->versions[unit] = version != 0 ? version : Coherence::CurrentVersion();
+                if (Coherence::FaultOwnership() && shadow->protections[unit] == 0) {
+                    const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
+                    if (unitEnd > unitBegin) shadow->protections[unit] = Coherence::ProtectDeviceOwned({unitBegin, unitEnd}, Coherence::Source::ShadowUnit, shadow->versions[unit]);
+                }
                 current->lastUse = present;
             }
         }

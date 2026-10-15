@@ -4630,6 +4630,182 @@ int coherenceOrderingTests(const Device& device, Recorder& recorder) {
     return 0;
 }
 
+int coherenceFaultTests(const Device& device, Recorder& recorder) {
+#ifndef _WIN32
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+    std::cout << "skipped, guest access protection is Windows only\n";
+    return 77;
+#else
+    using namespace AgcDriver::GuestMemory;
+    namespace Coherence = AgcDriver::Coherence;
+    const auto& base = device.GetContext();
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 2 * unit;
+    std::unique_lock gpu(GpuMutex());
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared fault section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto* alias = static_cast<std::uint8_t*>(GuestArena::GuestArenaMapAlias_nid_postfix(address, bytes));
+    Require(alias != nullptr, "cannot map an alias of the fault block");
+    struct Release {
+        void* block;
+        void* alias;
+        ~Release() {
+            Coherence::SetFaultsModeForTests(Coherence::Mode::Reference);
+            Coherence::ResetForTests();
+            GuestArena::GuestArenaUnmapAlias_nid_postfix(alias);
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block, alias};
+    std::memset(block, 0x11, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the fault block refused or compared: not tested\n";
+        return 77;
+    }
+    CollectWritesUncached(address, bytes);
+    Coherence::SetFaultsModeForTests(Coherence::Mode::New);
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetMaterializer([](Coherence::Interval range) { StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin)); });
+    Coherence::ResetForTests();
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = 128;
+    resource.height = 128;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == unit, "the fault image does not fill its 64 KiB block");
+    auto image = StorageTexture::Create(context, detiler, resource, 0);
+    const auto paint = [&](std::array<float, 4> color) {
+        const VkClearColorValue value{{color[0], color[1], color[2], color[3]}};
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+        const auto counters = Coherence::CurrentCounters();
+        Require(counters.liveProtections != 0, "a pending image over shared guest memory was not protected: " + Coherence::Report());
+    };
+    const auto texel = [](std::array<std::uint8_t, 4> color, std::uint64_t offset) { return color[offset % 4]; };
+    const auto holds = [&](std::uint64_t from, std::uint64_t to, std::array<std::uint8_t, 4> color, std::uint64_t skipFrom, std::uint64_t skipTo) {
+        for (auto at = from; at < to; ++at) {
+            if (at >= skipFrom && at < skipTo) continue;
+            if (alias[at] != texel(color, at)) return false;
+        }
+        return true;
+    };
+
+    paint({1.0f, 0.0f, 0.0f, 1.0f});
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint32_t*>(address + 100) = 0x12345678u;
+    gpu.lock();
+    Require(alias[100] == 0x78 && alias[101] == 0x56 && alias[102] == 0x34 && alias[103] == 0x12, "a native store over a pending image was lost");
+    Require(holds(0, unit, {255, 0, 0, 255}, 100, 104), "the GPU bytes around a native store were not materialized before it");
+    Require(StorageTexture::FindPending(address, unit) == nullptr, "the faulting store left the image pending");
+
+    paint({0.0f, 1.0f, 0.0f, 1.0f});
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint8_t*>(address + 200) = 0xff;
+    gpu.lock();
+    Require(alias[200] == 0xff, "a native store of the value the host bytes already held lost to the GPU result");
+    Require(holds(0, unit, {0, 255, 0, 255}, 200, 201), "the GPU bytes around a same-value store are wrong");
+
+    paint({0.0f, 0.0f, 1.0f, 1.0f});
+    gpu.unlock();
+    {
+        const std::uint64_t value = 0x0102030405060708ull;
+        std::memcpy(reinterpret_cast<void*>(address + 0x3ffc), &value, sizeof(value));
+    }
+    gpu.lock();
+    Require(alias[0x3ffc] == 0x08 && alias[0x4003] == 0x01, "a native store across a protection page boundary was lost");
+    Require(holds(0, unit, {0, 0, 255, 255}, 0x3ffc, 0x4004), "the GPU bytes around a cross-page store are wrong");
+
+    paint({1.0f, 1.0f, 1.0f, 1.0f});
+    gpu.unlock();
+    {
+        std::atomic<int> ready{0};
+        const auto store = [&](std::uint64_t offset, std::uint32_t value) {
+            ++ready;
+            while (ready.load() < 2) std::this_thread::yield();
+            *reinterpret_cast<volatile std::uint32_t*>(address + offset) = value;
+        };
+        std::thread first(store, 0x1000, 0xaaaaaaaau);
+        std::thread second(store, 0x2008, 0xbbbbbbbbu);
+        first.join();
+        second.join();
+    }
+    gpu.lock();
+    Require(alias[0x1000] == 0xaa && alias[0x2008] == 0xbb, "one of two native writers on one protected page was lost");
+    Require(holds(0, unit, {255, 255, 255, 255}, 0x1000, 0x2010), "the GPU bytes around two native writers are wrong");
+
+    {
+        auto destination = ShadowDestinationFor(base, *import, address + unit, address + 2 * unit);
+        Require(destination.has_value() && destination->seedUnits.empty(), "the shadow fault unit has no destination");
+        auto pattern = std::make_shared<Buffer>(base, static_cast<std::size_t>(unit), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(pattern->Bytes().data(), 0x77, pattern->Bytes().size());
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(destination->slab);
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, SlabOffset(*import, *destination->slab, address + unit), unit};
+        base.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, pattern->Handle(), destination->buffer, 1, &piece);
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const ShadowedRange range{address + unit, address + 2 * unit, destination->slab};
+        MarkShadowed(*import, std::span(&range, 1), TrackerGeneration());
+    }
+    Require(AnyShadowedOverlaps(address + unit, unit), "the shadow fault unit is not shadowed");
+    gpu.unlock();
+    const auto loaded = *reinterpret_cast<volatile std::uint8_t*>(address + unit + 5);
+    gpu.lock();
+    Require(loaded == 0x77, "a native load of an unpublished shadow unit read the stale host bytes");
+    Require(!AnyShadowedOverlaps(address + unit, unit), "a native load left the shadow unit unpublished");
+
+    recorder.Sync();
+    const auto counters = Coherence::CurrentCounters();
+    Require(counters.faultsResolved >= 5 && counters.liveProtections == 0 && counters.lockedFaults == 0, "native access ownership: " + Coherence::Report());
+    std::cout << "coherence native access ownership: ok\n";
+    return 0;
+#endif
+}
+
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -9926,6 +10102,17 @@ int main(int argc, char** argv) {
         }
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--coherence-faults-only") {
+            if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, unit shadows or host imports are unavailable
+";
+                return 77;
+            }
+            gpu.unlock();
+            const auto result = coherenceFaultTests(device, recorder);
+            gpu.lock();
+            return result;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
             return 0;

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -20,6 +21,7 @@ constexpr std::size_t RingEvents = 4096;
 constexpr std::size_t MaxCommitted = 65536;
 constexpr std::size_t ReportedDivergences = 16;
 constexpr std::size_t TraceEvents = 24;
+constexpr std::uint64_t ProtectionGranule = 4096;
 
 enum class EventType : std::uint8_t { Reserve, Recorded, Complete, Commit, Abandon, Publish, StalePublish, StaleRead, Undrained, Remapped };
 
@@ -86,6 +88,84 @@ struct Modes {
 
 std::atomic<bool> overridden{false};
 Modes overrideModes{Mode::Reference, Mode::Reference, Mode::Reference};
+std::atomic<bool> faultsOverridden{false};
+std::atomic<Mode> overrideFaults{Mode::Reference};
+
+struct Protection {
+    std::uint64_t token = 0;
+    Interval range;
+    Source source = Source::PendingImage;
+    Version version = 0;
+};
+
+struct Ledger {
+    std::mutex mutex;
+    std::map<std::uint64_t, Protection> live;
+    std::uint64_t next = 0;
+    ProtectionBackend backend;
+    Materializer materializer = nullptr;
+    std::uint64_t protections = 0;
+    std::uint64_t refused = 0;
+    std::uint64_t partial = 0;
+    std::uint64_t resolved = 0;
+    std::uint64_t locked = 0;
+};
+
+Ledger& Protections() {
+    static Ledger ledger;
+    return ledger;
+}
+
+struct ResolverContext {
+    std::uint64_t protection;
+};
+
+[[noreturn]] void AbortInFault(const char* what, Interval range, const char* detail) {
+    std::fprintf(stderr, "[coherence] %s [0x%llx, 0x%llx): %s\n", what, static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end), detail);
+    std::fflush(stderr);
+    std::abort();
+}
+
+bool ResolveProtection(std::uint64_t token, void* context) {
+    const auto id = static_cast<ResolverContext*>(context)->protection;
+    auto& ledger = Protections();
+    Interval range;
+    Materializer materializer = nullptr;
+    ProtectionBackend backend;
+    bool live = false;
+    {
+        std::lock_guard lock(ledger.mutex);
+        backend = ledger.backend;
+        materializer = ledger.materializer;
+        const auto found = ledger.live.find(id);
+        if (found != ledger.live.end()) {
+            live = true;
+            range = found->second.range;
+        }
+    }
+    if (live) {
+        try {
+            if (materializer == nullptr) throw std::runtime_error("no materializer is installed");
+            materializer(range);
+        } catch (const std::exception& error) {
+            AbortInFault("native access to device-owned guest memory could not be materialized", range, error.what());
+        }
+        std::lock_guard lock(ledger.mutex);
+        ledger.live.erase(id);
+        ++ledger.resolved;
+    }
+    if (backend.release != nullptr) backend.release(token);
+    return true;
+}
+
+void ReleaseResolverContext(void* context) {
+    delete static_cast<ResolverContext*>(context);
+}
+
+Mode EnvironmentFaults() {
+    static const Mode faults = ParseMode("APS5_COHERENCE_FAULTS", std::getenv("APS5_COHERENCE_FAULTS"));
+    return faults;
+}
 
 const Modes& EnvironmentModes() {
     static const Modes modes{ParseMode("APS5_COHERENCE_AUDIT", std::getenv("APS5_COHERENCE_AUDIT")), ParseMode("APS5_COHERENCE_ORDERING", std::getenv("APS5_COHERENCE_ORDERING")), ParseMode("APS5_COHERENCE_DIRECTORY", std::getenv("APS5_COHERENCE_DIRECTORY"))};
@@ -264,6 +344,102 @@ Mode OrderingMode() {
 
 Mode DirectoryMode() {
     return CurrentModes().directory;
+}
+
+Mode FaultsMode() {
+    return faultsOverridden.load(std::memory_order_acquire) ? overrideFaults.load(std::memory_order_acquire) : EnvironmentFaults();
+}
+
+void SetFaultsModeForTests(Mode faults) {
+    overrideFaults.store(faults, std::memory_order_release);
+    faultsOverridden.store(true, std::memory_order_release);
+}
+
+bool FaultOwnership() {
+    return FaultsMode() != Mode::Reference;
+}
+
+void SetProtectionBackend(ProtectionBackend backend) {
+    auto& ledger = Protections();
+    std::lock_guard lock(ledger.mutex);
+    ledger.backend = backend;
+}
+
+void SetMaterializer(Materializer materializer) {
+    auto& ledger = Protections();
+    std::lock_guard lock(ledger.mutex);
+    ledger.materializer = materializer;
+}
+
+std::uint64_t ProtectDeviceOwned(Interval range, Source source, Version version) {
+    if (!FaultOwnership() || range.end <= range.begin) return 0;
+    const bool verify = FaultsMode() == Mode::Verify;
+    const auto begin = (range.begin + ProtectionGranule - 1) & ~(ProtectionGranule - 1);
+    const auto end = range.end & ~(ProtectionGranule - 1);
+    const bool whole = begin == range.begin && end == range.end;
+    auto& ledger = Protections();
+    ProtectionBackend backend;
+    std::uint64_t id = 0;
+    {
+        std::lock_guard lock(ledger.mutex);
+        backend = ledger.backend;
+        if (backend.protect == nullptr || backend.release == nullptr) throw std::runtime_error("APS5_COHERENCE_FAULTS: no guest access protection backend is installed");
+        if (!whole) ++ledger.partial;
+    }
+    if (verify && !whole) {
+        char text[192];
+        std::snprintf(text, sizeof(text), "APS5_COHERENCE_FAULTS=verify: device-owned guest memory [0x%llx, 0x%llx) does not fill whole protection pages", static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end));
+        throw std::runtime_error(text);
+    }
+    if (begin >= end) return 0;
+    {
+        std::lock_guard lock(ledger.mutex);
+        id = ++ledger.next;
+        ledger.live.emplace(id, Protection{0, {begin, end}, source, version});
+    }
+    auto context = std::make_unique<ResolverContext>(ResolverContext{id});
+    const auto token = backend.protect(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin), &ResolveProtection, context.get(), &ReleaseResolverContext);
+    if (token != 0) static_cast<void>(context.release());
+    std::unique_lock lock(ledger.mutex);
+    if (token == 0) {
+        ledger.live.erase(id);
+        ++ledger.refused;
+        lock.unlock();
+        if (!verify) return 0;
+        char text[192];
+        std::snprintf(text, sizeof(text), "APS5_COHERENCE_FAULTS=verify: guest memory [0x%llx, 0x%llx) refused access protection", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end));
+        throw std::runtime_error(text);
+    }
+    ++ledger.protections;
+    const auto found = ledger.live.find(id);
+    if (found == ledger.live.end()) return 0;
+    found->second.token = token;
+    return id;
+}
+
+void ReleaseDeviceOwned(std::uint64_t protection) {
+    if (protection == 0) return;
+    auto& ledger = Protections();
+    std::uint64_t token = 0;
+    ProtectionBackend backend;
+    {
+        std::lock_guard lock(ledger.mutex);
+        const auto found = ledger.live.find(protection);
+        if (found == ledger.live.end()) return;
+        token = found->second.token;
+        backend = ledger.backend;
+        ledger.live.erase(found);
+    }
+    if (token != 0 && backend.release != nullptr) backend.release(token);
+}
+
+void NoteLockedFault(Interval range) {
+    auto& ledger = Protections();
+    {
+        std::lock_guard lock(ledger.mutex);
+        ++ledger.locked;
+    }
+    if (FaultsMode() == Mode::Verify) AbortInFault("APS5_COHERENCE_FAULTS=verify: the driver touched device-owned guest memory while holding the GPU mutex", range, "a driver access must resolve its range first");
 }
 
 void SetModesForTests(Mode audit, Mode ordering, Mode directory) {
@@ -541,6 +717,14 @@ Counters CurrentCounters() {
     auto counters = state.counters;
     counters.committedIntervals = state.committed.size();
     counters.activeWriters = state.active.size();
+    auto& ledger = Protections();
+    std::lock_guard protections(ledger.mutex);
+    counters.protections = ledger.protections;
+    counters.refusedProtections = ledger.refused;
+    counters.partialProtections = ledger.partial;
+    counters.faultsResolved = ledger.resolved;
+    counters.lockedFaults = ledger.locked;
+    counters.liveProtections = ledger.live.size();
     return counters;
 }
 
@@ -571,6 +755,14 @@ void ResetForTests() {
     state.remapsReported = 0;
     state.recordedByQueue.clear();
     state.imported.clear();
+    auto& ledger = Protections();
+    std::lock_guard protections(ledger.mutex);
+    ledger.live.clear();
+    ledger.protections = 0;
+    ledger.refused = 0;
+    ledger.partial = 0;
+    ledger.resolved = 0;
+    ledger.locked = 0;
 }
 
 }

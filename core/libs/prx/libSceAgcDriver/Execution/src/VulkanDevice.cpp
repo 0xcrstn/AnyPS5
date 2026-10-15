@@ -981,12 +981,32 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : VulkanDevice(wind
 
 VulkanDevice::VulkanDevice(CompileOnly) : VulkanDevice(nullptr, true) {}
 
-VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) : state(std::make_unique<State>()), serial([] { static std::atomic<std::uint64_t> serials{0}; return serials.fetch_add(1, std::memory_order_relaxed) + 1; }()) {
-    state->compileOnly = compileOnly;
+namespace {
+
+void MaterializeNativeAccess(Coherence::Interval range) {
+    Graphics::StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin));
+}
+
+void InstallCoherence() {
     if (Coherence::Canonicalizing()) {
         Coherence::SetBackingTranslator(&GuestArena::GuestArenaBackingRuns_nid_postfix);
         static_cast<void>(Coherence::Translate({0x10000, 0x10001}));
     }
+    if (!Coherence::FaultOwnership()) return;
+#ifdef _WIN32
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetMaterializer(&MaterializeNativeAccess);
+    GuestArena::GuestArenaSetResolveHostWrites_nid_postfix(true);
+#else
+    throw std::runtime_error("APS5_COHERENCE_FAULTS: guest access protection is not implemented on this platform");
+#endif
+}
+
+}
+
+VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) : state(std::make_unique<State>()), serial([] { static std::atomic<std::uint64_t> serials{0}; return serials.fetch_add(1, std::memory_order_relaxed) + 1; }()) {
+    state->compileOnly = compileOnly;
+    InstallCoherence();
     APS5_LOG_OUT("VulkanDevice constructor window=%p", static_cast<const void*>(window));
 #ifdef _WIN32
     state->library = SDL_LoadObject("vulkan-1.dll");

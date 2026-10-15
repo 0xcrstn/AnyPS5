@@ -201,6 +201,13 @@ Three switches take `0` (the default), `1` or `verify`; any other value stops th
 
 `APS5_COHERENCE_DIRECTORY=1` makes those checks compare guest bytes by the memory backing them, so a write through one mapping and a store through another mapping of the same memory are compared. `verify` also stops the title when a writer completes after its range was mapped to other memory. This switch is Windows only; on other systems it stops the title at start.
 
+`APS5_COHERENCE_FAULTS=1` makes guest memory whose newest bytes are only on the GPU inaccessible to the title's own CPU code. That covers the whole 4 KiB pages under a pending storage image or an unpublished unit shadow, through every mapping of them.
+- **First access:** the first load or store there is held. The driver stores and publishes the GPU results over the range and waits for them, then lets the access proceed. A title reading results after a label, or overwriting part of a GPU result, then sees the right bytes, including a store of a value the old bytes already held.
+- **File reads:** kernel file reads into such memory resolve it first.
+- **Refused ranges:** ranges the protection refuses (pinned or resident pages) keep the default behaviour.
+- **`verify`:** stops the title at a refused or partly covered range, and at a driver access to such memory made while it holds the GPU lock.
+- **Limits:** unmapping or reprotecting such memory before the driver stored it stops the title. Windows only. Each pending image costs a protection change, so expect a slowdown.
+
 ### Tracing system library calls
 
 Windows only. An executable converted with `--trace-imports` records the calls it makes to the libraries named in `APS5_TRACE_CALLS`, a comma-separated list such as `libkernel,libSceSaveData`, or `all`. Without the variable nothing is recorded. The crash and abort reports then end with the last 64 calls: sequence number, thread, library, import name as the executable imports it (a NID) and the caller's address. They are followed by the 32 most called imports since start-up, with their number of calls.

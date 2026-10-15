@@ -201,6 +201,92 @@ void ReleaseTests() {
     Require(Throws([] { CheckDrained(true, true, "label", true); }).empty(), "audit verify failed the reference path's undrained images, which only ordering verify checks");
 }
 
+struct FakeGuard {
+    std::uint64_t token;
+    std::uintptr_t address;
+    std::size_t bytes;
+    bool (*resolve)(std::uint64_t, void*);
+    void* context;
+    void (*releaseContext)(void*);
+};
+
+std::vector<FakeGuard> guards;
+std::vector<Interval> materialized;
+std::uint64_t nextGuard = 0;
+bool refuseProtection = false;
+
+std::uint64_t FakeProtect(std::uintptr_t address, std::size_t bytes, bool (*resolve)(std::uint64_t, void*), void* context, void (*releaseContext)(void*)) {
+    if (refuseProtection) return 0;
+    guards.push_back({++nextGuard, address, bytes, resolve, context, releaseContext});
+    return nextGuard;
+}
+
+void FakeRelease(std::uint64_t token) {
+    for (auto it = guards.begin(); it != guards.end(); ++it) {
+        if (it->token != token) continue;
+        const auto guard = *it;
+        guards.erase(it);
+        guard.releaseContext(guard.context);
+        return;
+    }
+}
+
+bool FakeFault(std::uintptr_t address) {
+    for (const auto& guard : guards) {
+        if (address < guard.address || address >= guard.address + guard.bytes) continue;
+        const auto copy = guard;
+        Require(copy.resolve(copy.token, copy.context), "the resolver refused");
+        for (const auto& left : guards) Require(left.token != copy.token, "the resolver retained its protection");
+        return true;
+    }
+    return false;
+}
+
+void FaultTests() {
+    guards.clear();
+    materialized.clear();
+    refuseProtection = false;
+    SetProtectionBackend({});
+    SetMaterializer(nullptr);
+    Reset(Mode::Reference, Mode::Reference);
+    SetFaultsModeForTests(Mode::Reference);
+    Require(ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 1) == 0, "the reference path protected guest memory");
+    SetFaultsModeForTests(Mode::New);
+    Require(Throws([] { static_cast<void>(ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 1)); }).find("no guest access protection backend") != std::string::npos, "native ownership ran without a protection backend");
+    SetProtectionBackend({&FakeProtect, &FakeRelease});
+    SetMaterializer([](Interval range) { materialized.push_back(range); });
+    const auto image = ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 3);
+    Require(image != 0 && guards.size() == 1 && guards[0].address == 0x10000 && guards[0].bytes == 0x10000, "a whole-page device range was not protected as it is");
+    const auto trimmed = ProtectDeviceOwned({0x30010, 0x32008}, Source::ShadowUnit, 4);
+    Require(trimmed != 0 && guards.size() == 2 && guards[1].address == 0x31000 && guards[1].bytes == 0x1000, "a partial-page range was not trimmed to its whole pages");
+    Require(ProtectDeviceOwned({0x40010, 0x40ff0}, Source::ShadowUnit, 5) == 0, "a range inside one page was protected");
+    auto counters = CurrentCounters();
+    Require(counters.protections == 2 && counters.partialProtections == 2 && counters.liveProtections == 2, "the protection counters disagree: " + Report());
+    Require(FakeFault(0x18000), "a fault inside the protected image found no guard");
+    Require(materialized.size() == 1 && materialized[0].begin == 0x10000 && materialized[0].end == 0x20000, "the fault did not materialize the device-owned range first");
+    Require(guards.size() == 1 && CurrentCounters().faultsResolved == 1 && CurrentCounters().liveProtections == 1, "a resolved fault kept its protection");
+    ReleaseDeviceOwned(image);
+    Require(guards.size() == 1, "releasing a resolved protection released another");
+    ReleaseDeviceOwned(trimmed);
+    ReleaseDeviceOwned(trimmed);
+    Require(guards.empty() && CurrentCounters().liveProtections == 0, "a released protection is still live");
+    refuseProtection = true;
+    Require(ProtectDeviceOwned({0x50000, 0x60000}, Source::PendingImage, 6) == 0 && CurrentCounters().refusedProtections == 1, "a refused protection was not counted");
+    SetFaultsModeForTests(Mode::Verify);
+    Require(Throws([] { static_cast<void>(ProtectDeviceOwned({0x50000, 0x60000}, Source::PendingImage, 7)); }).find("refused access protection") != std::string::npos, "faults verify accepted a refused protection");
+    refuseProtection = false;
+    Require(Throws([] { static_cast<void>(ProtectDeviceOwned({0x30010, 0x32008}, Source::ShadowUnit, 8)); }).find("whole protection pages") != std::string::npos, "faults verify accepted a partly covered range");
+    SetFaultsModeForTests(Mode::New);
+    const auto released = ProtectDeviceOwned({0x70000, 0x71000}, Source::PendingImage, 9);
+    ReleaseDeviceOwned(released);
+    Require(guards.empty() && !FakeFault(0x70000), "a released range still faults");
+    NoteLockedFault({0x70000, 0x71000});
+    Require(CurrentCounters().lockedFaults == 1, "a locked fault was not counted");
+    SetFaultsModeForTests(Mode::Reference);
+    SetProtectionBackend({});
+    SetMaterializer(nullptr);
+}
+
 void LifetimeTests() {
     Reset(Mode::New, Mode::Reference);
     const auto before = NextVersion();
@@ -296,6 +382,7 @@ int main() {
         RecordOrderTests();
         DirectoryTests();
         ReleaseTests();
+        FaultTests();
         LifetimeTests();
         CommitSplitTests();
         EvictionTests();

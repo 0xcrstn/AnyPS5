@@ -273,6 +273,7 @@ public:
     static bool PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason = "memory access");
     static bool StoreForPointerAccess(std::uint64_t address, std::size_t bytes, bool writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt);
     static void AuditPointerReads(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt);
+    static void MaterializeForNativeAccess(std::uint64_t address, std::size_t bytes);
     // For the [hooksync] recorded-store line: images a FlushPending stored after a hook skip of
     // theirs (AccessKeptByCpu), of which by the hook for the same read site as the last skip; 10 s deltas.
     struct HookSkipCounts {
@@ -628,6 +629,8 @@ private:
     bool dirty = false;
     std::uint64_t version = 0;
     Coherence::Version coherenceVersion = 0;
+    std::uint64_t accessProtection = 0;
+    void settleProtection();
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     std::vector<bool> layerOriginal;
     std::map<std::uint64_t, std::uint64_t> keptAtUnwatch;
