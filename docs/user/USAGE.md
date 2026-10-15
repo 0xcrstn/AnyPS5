@@ -311,9 +311,10 @@ These switches change how recompiled shaders reach guest memory through addresse
 
 ### GPU placement and render pass experiments
 
-These switches are on by default (`1`); `0` turns one off, and any other value than those shown stops the title at start.
+Both switches are on by default (`1`); `0` turns one off, and any other value than those shown stops the title at start.
 
 - `APS5_DEVICE_UPLOADS=0|1|verify`: whether buffers the driver only writes from the CPU and the GPU reads (address tables, shader data of up to 64 KiB, image table maps, mesh arguments) go to video memory the CPU can write directly, instead of system memory the GPU reads over PCIe. It needs a device-local, host-visible memory heap of at least 1 GiB (resizable BAR); without one the buffers stay in system memory and the `[uploads]` line counts them. `verify` reads each write back and stops the title if it differs.
+- `APS5_READONLY_ADDRESS_PASSES=0|1|verify`: whether a draw whose shaders read through addresses but never store through them is treated as reading unknown memory only, instead of also writing it, so it no longer ends the render pass for the draws after it. `verify` keeps the old behaviour and counts the pass breaks only such draws caused, on the `[barriers]` line.
 
 ### Tracing system library calls
 

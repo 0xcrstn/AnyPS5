@@ -2369,7 +2369,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
-    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
+    const auto readOnlyAddressPasses = ReadOnlyAddressPassesSetting();
+    const bool knownAddressWrites = unknownMemory && readOnlyAddressPasses != ReadOnlyAddressPasses::Off && resources.KnownAddressWrites();
+    const bool unknownWrites = unknownMemory && !(knownAddressWrites && readOnlyAddressPasses == ReadOnlyAddressPasses::On);
+    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownWrites, knownAddressWrites && unknownWrites};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     parts.lap(RecordAccess);
     resources.UseMirrors(*recorder);

@@ -1604,6 +1604,7 @@ enum class PassBreak : std::uint8_t { Closed, Forced, SampleSlot, Target, Target
 constexpr std::size_t PassBreaks = static_cast<std::size_t>(PassBreak::Count);
 constexpr const char* PassBreakNames[PassBreaks] = {"closed", "forced", "sample-slot", "target", "target-fenced", "raw", "waw", "war", "image", "unknown-read", "unknown-write"};
 std::atomic<std::uint64_t> passBreaks[PassBreaks]{};
+std::atomic<std::uint64_t> readOnlyAddressDraws{0}, avoidableAddressBreaks{0};
 
 PassBreak PassBreakFor(PassHazard hazard) {
     switch (hazard) {
@@ -1627,6 +1628,7 @@ void CountPassBreak(PassBreak reason) {
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
     ensureOpen();
+    if (access.knownAddressWrites && DrawOrGpuProfiled()) readOnlyAddressDraws.fetch_add(1, std::memory_order_relaxed);
     auto& pass = open->renderPass;
     const auto coveredStart = [&] {
         VkAccessFlags covered = 0;
@@ -1643,6 +1645,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
         return start;
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
+    if (hazard == PassHazard::UnknownWrite && DrawOrGpuProfiled() && open->passHazards.CheckKnownAddressWrites(access, pass.key == key) != PassHazard::UnknownWrite) avoidableAddressBreaks.fetch_add(1, std::memory_order_relaxed);
     if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
@@ -2123,7 +2126,8 @@ void reportBarriers() {
         std::snprintf(text, sizeof(text), " %s %llu", PassBreakNames[i], static_cast<unsigned long long>(passBreaks[i].exchange(0, std::memory_order_relaxed)));
         breaks += text;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("; render passes begun by reason:%s", breaks.c_str());
+    static constexpr const char* ReadOnlyAddressModes[] = {"0", "1", "verify"};
+    AgcDriver::ProfilePrint_nid_no_patch("; render passes begun by reason:%s; read-only address-based draws (APS5_READONLY_ADDRESS_PASSES=%s): %llu, unknown-write breaks only they caused %llu", breaks.c_str(), ReadOnlyAddressModes[static_cast<std::size_t>(ReadOnlyAddressPassesSetting())], static_cast<unsigned long long>(readOnlyAddressDraws.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(avoidableAddressBreaks.exchange(0, std::memory_order_relaxed)));
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
