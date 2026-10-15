@@ -1196,7 +1196,7 @@ void fillMaterializedValues(RecompileResult& result, const CompiledVariant& vari
         }
     }
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
-    result.bdaWrites = variant.info.info.bdaWrites || variant.info.info.usesDma;
+    result.bdaWrites = variant.info.info.bdaWrites;
     result.imageTablePoison.clear();
     result.imageTableRanges.clear();
     result.imageTableReadRanges.clear();
