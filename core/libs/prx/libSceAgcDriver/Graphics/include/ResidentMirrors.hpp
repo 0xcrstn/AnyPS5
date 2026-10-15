@@ -24,6 +24,7 @@ std::shared_ptr<ResidentMirror> PlacementOfImport(const Context& context, const 
 VkDeviceAddress MirrorPristineAddress(const ResidentMirror& mirror);
 void RecordPlacementCopyBack(const Context& context, VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress table, bool verify);
 VkBuffer MirrorBuffer(const ResidentMirror& mirror);
+VkDeviceSize MirrorBufferOffset(const ResidentMirror& mirror);
 void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirror>> mirrors);
 void RefreshMirrorsForDirectUse(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirror>> mirrors);
 void NoteMirroredWrite(std::uint64_t begin, std::uint64_t end);

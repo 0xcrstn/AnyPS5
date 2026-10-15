@@ -84,10 +84,10 @@ struct DescriptorRejected : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-enum class DeviceMemoryKind : std::uint8_t { Buffer, Texture, StorageTexture, DepthSurface, MultisampleTarget, UnitShadow, TextureProxy, PooledBuffer, HostImport, RenderTarget, Placeholder, Presentation, Upload, Count };
+enum class DeviceMemoryKind : std::uint8_t { Buffer, Texture, StorageTexture, DepthSurface, MultisampleTarget, UnitShadow, TextureProxy, PooledBuffer, HostImport, RenderTarget, Placeholder, Presentation, Upload, LinearSpace, Count };
 
 inline const char* DeviceMemoryKindName(DeviceMemoryKind kind) {
-    static constexpr const char* names[] = {"device buffers", "textures", "storage textures", "depth surfaces", "multisample targets", "unit shadows", "texture proxies", "pooled buffers", "host imports", "render targets", "placeholders", "presentation", "uploads"};
+    static constexpr const char* names[] = {"device buffers", "textures", "storage textures", "depth surfaces", "multisample targets", "unit shadows", "texture proxies", "pooled buffers", "host imports", "render targets", "placeholders", "presentation", "uploads", "linear address space"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(DeviceMemoryKind::Count));
     return names[static_cast<std::size_t>(kind)];
 }
@@ -291,6 +291,7 @@ struct Context {
     VkDeviceSize hostImportAlignment = 0;
     bool dmaBufImport = false;
     bool sparseBinding = false;
+    bool sparseResidencyBuffer = false;
     std::uint32_t queueFamily = 0;
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
     VkQueue sparseQueue = VK_NULL_HANDLE;

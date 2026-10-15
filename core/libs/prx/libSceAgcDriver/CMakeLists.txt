@@ -245,6 +245,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/CacheSizing.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidentMirrors.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LinearSpace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidentStaging.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
@@ -1078,6 +1079,20 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+add_test_executable(agc_linear_space_tests EXCLUDE_FROM_ALL tests/LinearSpace.cpp)
+target_include_directories(agc_linear_space_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_linear_space_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_linear_space_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_linear_space_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_linear_space_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_linear_space COMMAND agc_linear_space_tests)
+    if(WIN32)
+        set_tests_properties(agc_linear_space PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_device_memory_fallback_tests EXCLUDE_FROM_ALL tests/DeviceMemoryFallback.cpp)
 target_include_directories(agc_device_memory_fallback_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
 target_link_libraries(agc_device_memory_fallback_tests PRIVATE libSceAgcDriver libc)
@@ -1529,6 +1544,8 @@ if(BUILD_TESTING)
     set_tests_properties(agc_draw_input_twins_sync PROPERTIES ENVIRONMENT "APS5_SYNC_DRAWS=1")
     add_test(NAME agc_resident_mirrors COMMAND agc_driver_recorder_tests --resident-mirrors-only)
     set_tests_properties(agc_resident_mirrors PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_RESIDENT_MIRRORS=1;APS5_RESIDENT_MIRROR_AFTER=1;APS5_VERIFY_RESIDENT_MIRRORS=1")
+    add_test(NAME agc_resident_mirrors_separate COMMAND agc_driver_recorder_tests --resident-mirrors-only)
+    set_tests_properties(agc_resident_mirrors_separate PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_RESIDENT_MIRRORS=1;APS5_RESIDENT_MIRROR_AFTER=1;APS5_VERIFY_RESIDENT_MIRRORS=1;APS5_LINEAR_ADDRESS_SPACE=0")
     add_test(NAME agc_resident_buffer_mirrors COMMAND agc_driver_recorder_tests --resident-buffer-mirrors-only)
     set_tests_properties(agc_resident_buffer_mirrors PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_RESIDENT_BUFFER_MIRRORS=1;APS5_RESIDENT_MIRROR_AFTER=1;APS5_VERIFY_RESIDENT_MIRRORS=1")
     add_test(NAME agc_lazy_staging_out COMMAND agc_driver_recorder_tests --lazy-staging-out-only)
@@ -1591,7 +1608,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_metadata_pass COMMAND agc_driver_recorder_tests --metadata-pass-only)
     set_tests_properties(agc_metadata_pass PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_recorder_read_list agc_sparse_run_import agc_sparse_run_import_copied agc_metadata_pass agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_unit_shadow agc_pointer_access_shadow agc_deferred_pointer_stores agc_coherence_ordering agc_coherence_faults agc_coherence_input_leases agc_coherence_residency agc_coherence_lazy_release agc_snapshot_twins agc_draw_input_twins agc_draw_input_twins_sync agc_resident_mirrors agc_resident_buffer_mirrors agc_lazy_staging_out agc_lazy_staging_out_verify agc_lazy_staging_out_bounded agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_retire agc_draw_snapshot_epoch agc_multisample_guest_access agc_draw_inputs_in_place agc_resident_present agc_slice_dirty agc_queued_write_groups agc_present_then_store agc_staging_reuse agc_tiled_resolve PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_recorder_read_list agc_sparse_run_import agc_sparse_run_import_copied agc_metadata_pass agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_unit_shadow agc_pointer_access_shadow agc_deferred_pointer_stores agc_coherence_ordering agc_coherence_faults agc_coherence_input_leases agc_coherence_residency agc_coherence_lazy_release agc_snapshot_twins agc_draw_input_twins agc_draw_input_twins_sync agc_resident_mirrors agc_resident_mirrors_separate agc_resident_buffer_mirrors agc_lazy_staging_out agc_lazy_staging_out_verify agc_lazy_staging_out_bounded agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_retire agc_draw_snapshot_epoch agc_multisample_guest_access agc_draw_inputs_in_place agc_resident_present agc_slice_dirty agc_queued_write_groups agc_present_then_store agc_staging_reuse agc_tiled_resolve PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         add_test(NAME agc_host_import_second_mapping COMMAND agc_driver_recorder_tests --host-import-second-mapping-only)
         set_tests_properties(agc_host_import_second_mapping PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT_MODIFICATION

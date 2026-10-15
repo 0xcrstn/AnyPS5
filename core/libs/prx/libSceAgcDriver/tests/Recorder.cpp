@@ -38,6 +38,7 @@
 #include "BufferUpdate_spv.h"
 #include "AddressCopy_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LinearSpace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include "SampleArray_spv.h"
 #include "Cover_vert_spv.h"
@@ -196,6 +197,12 @@ public:
             function<PFN_vkGetPhysicalDeviceFeatures>("vkGetPhysicalDeviceFeatures")(context.physical, &supported);
             enabled.occlusionQueryPrecise = supported.occlusionQueryPrecise;
             context.occlusionQueryPrecise = supported.occlusionQueryPrecise == VK_TRUE;
+            if (supported.sparseBinding == VK_TRUE && supported.sparseResidencyBuffer == VK_TRUE && (families[family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0) {
+                enabled.sparseBinding = VK_TRUE;
+                enabled.sparseResidencyBuffer = VK_TRUE;
+                context.sparseBinding = true;
+                context.sparseResidencyBuffer = true;
+            }
             enabled.shaderStorageImageReadWithoutFormat = supported.shaderStorageImageReadWithoutFormat;
             enabled.shaderStorageImageWriteWithoutFormat = supported.shaderStorageImageWriteWithoutFormat;
             context.singlePassStorage = supported.shaderStorageImageReadWithoutFormat == VK_TRUE && supported.shaderStorageImageWriteWithoutFormat == VK_TRUE;
@@ -9279,7 +9286,7 @@ bool residentMirrorTests(const Device& device, Recorder& recorder, bool descript
     if (descriptors) {
         std::uint32_t adjustment = 0;
         const auto info = leased.MirroredDescriptor(address, bytes, adjustment, mirrors);
-        Require(mirrors.size() == 1 && info.buffer == AgcDriver::Graphics::MirrorBuffer(*mirrors.front()) && info.buffer != import->buffer && info.offset + adjustment == address - import->base, "a read-only V# over an import was not bound to its resident mirror");
+        Require(mirrors.size() == 1 && info.buffer == AgcDriver::Graphics::MirrorBuffer(*mirrors.front()) && info.buffer != import->buffer && info.offset + adjustment == AgcDriver::Graphics::MirrorBufferOffset(*mirrors.front()) + address - import->base, "a read-only V# over an import was not bound to its resident mirror");
         mirrorAddress = AgcDriver::Graphics::MirrorDeviceAddress(*mirrors.front()) + (address - import->base);
     } else {
         const auto ranges = leased.MirroredRanges(leased.AddressRanges(), mirrors);
@@ -9340,6 +9347,7 @@ bool residentMirrorTests(const Device& device, Recorder& recorder, bool descript
     };
     const auto snapshot = [&] { return std::vector<std::uint32_t>(guest, guest + words); };
     const auto before = AgcDriver::Graphics::MirrorTotals();
+    const auto linearBefore = AgcDriver::Graphics::LinearSpaceTotals();
     auto expected = snapshot();
     auto first = read();
     recorder.Submit();
@@ -9406,6 +9414,7 @@ bool residentMirrorTests(const Device& device, Recorder& recorder, bool descript
     const auto after = AgcDriver::Graphics::MirrorTotals();
     Require(after.made - before.made <= 1 && after.uses - before.uses == 9 && after.refreshes - before.refreshes >= 8 && after.midBatchSyncs - before.midBatchSyncs == 1, "resident mirror counters do not match the reads");
     if (const char* verify = std::getenv("APS5_VERIFY_RESIDENT_MIRRORS"); verify != nullptr && std::strcmp(verify, "0") != 0) Require(after.verified - before.verified >= 8 && after.verifyDiffering == before.verifyDiffering, "a resident mirror differed from its import at the start of a batch");
+    if (AgcDriver::Graphics::LinearSpaceEnabled(context)) Require(AgcDriver::Graphics::LinearSpaceTotals().binds > linearBefore.binds || AgcDriver::Graphics::LinearSpaceTotals().usedPages > 0, "the resident mirror was not placed in the linear address space");
     leased.WriteBack();
     std::cout << "resident mirror tests passed (" << (after.refreshedBytes - before.refreshedBytes) / 1024 << " KiB refreshed, " << (after.midBatchBytes - before.midBatchBytes) / 1024 << " KiB synced mid-batch)\n";
     return true;
