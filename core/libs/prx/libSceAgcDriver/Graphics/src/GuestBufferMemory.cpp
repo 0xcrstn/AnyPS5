@@ -280,6 +280,7 @@ HostImports& Imports() {
 
 void destroyImport(const Context& context, const HostImport& entry) {
     context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
+    DeviceMemoryPlacements::Untrack(entry.memory);
     context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
 #ifdef _WIN32
     GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
@@ -298,6 +299,7 @@ struct RetiredImport {
     ~RetiredImport() {
         const auto& entry = node.mapped();
         destroyBuffer(device, entry.buffer, nullptr);
+        DeviceMemoryPlacements::Untrack(entry.memory);
         freeMemory(device, entry.memory, nullptr);
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
@@ -354,7 +356,7 @@ bool releaseParkedImports(HostImports& state, std::uint64_t begin, std::uint64_t
 const char* bindImport(const Context& context, HostImport& entry, VkExternalMemoryHandleTypeFlagBits handleType, const void* import, std::uint32_t importTypes, bool& allocated, VkResult& failure) {
     const auto failed = [&](const char* step, VkResult result) -> const char* {
         if (entry.buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
-        if (entry.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
+        if (entry.memory) { DeviceMemoryPlacements::Untrack(entry.memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr); }
         entry.buffer = VK_NULL_HANDLE;
         entry.memory = VK_NULL_HANDLE;
         failure = result;
@@ -377,6 +379,7 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     allocation.allocationSize = entry.bytes;
     allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
     if (const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &entry.memory); result != VK_SUCCESS) return failed("vkAllocateMemory", result);
+    DeviceMemoryPlacements::Track(entry.memory, DeviceMemoryKind::HostImport, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
     allocated = true;
     if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, entry.buffer, entry.memory, 0); result != VK_SUCCESS) return failed("vkBindBufferMemory", result);
     const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, entry.buffer};
@@ -452,7 +455,7 @@ struct ImportChunk {
     ImportChunk(const ImportChunk&) = delete;
     ImportChunk& operator=(const ImportChunk&) = delete;
     ~ImportChunk() {
-        if (memory != VK_NULL_HANDLE) freeMemory(device, memory, nullptr);
+        if (memory != VK_NULL_HANDLE) { DeviceMemoryPlacements::Untrack(memory); freeMemory(device, memory, nullptr); }
     }
 };
 
@@ -528,6 +531,7 @@ std::shared_ptr<ImportChunk> importChunk(const Context& context, int file, std::
         step = "vkAllocateMemory";
         return nullptr;
     }
+    DeviceMemoryPlacements::Track(chunk->memory, DeviceMemoryKind::HostImport, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
     chunk->device = context.device;
     chunk->freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
     chunk->memoryType = allocation.memoryTypeIndex;
@@ -2361,6 +2365,7 @@ void ClearHostImports(VkDevice device) {
     if (state.device != device) return;
     for (const auto& [address, entry] : state.imports) {
         state.destroyBuffer(state.device, entry.buffer, nullptr);
+        DeviceMemoryPlacements::Untrack(entry.memory);
         state.freeMemory(state.device, entry.memory, nullptr);
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
@@ -2450,7 +2455,7 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
     if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     if (commands[0] != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 2, commands);
     if (destination != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, destination, nullptr);
-    if (destinationMemory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, destinationMemory, nullptr);
+    if (destinationMemory != VK_NULL_HANDLE) { DeviceMemoryPlacements::Untrack(destinationMemory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, destinationMemory, nullptr); }
     if (import.buffer != VK_NULL_HANDLE) destroyImport(context, import);
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
 }

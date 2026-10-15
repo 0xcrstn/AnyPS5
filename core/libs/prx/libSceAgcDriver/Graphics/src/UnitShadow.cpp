@@ -217,7 +217,9 @@ std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t first
     try {
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory) != VK_SUCCESS) memory = VK_NULL_HANDLE;
+        DeviceMemoryPlacements::Track(memory, DeviceMemoryKind::UnitShadow, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
         if (memory != VK_NULL_HANDLE && context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0) != VK_SUCCESS) {
+            DeviceMemoryPlacements::Untrack(memory);
             context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
             memory = VK_NULL_HANDLE;
         }
@@ -496,7 +498,7 @@ ShadowSlab::ShadowSlab(const Context& context, VkBuffer buffer, VkDeviceMemory m
 
 ShadowSlab::~ShadowSlab() {
     if (buffer != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
-    if (memory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory != VK_NULL_HANDLE) { DeviceMemoryPlacements::Untrack(memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); }
 }
 
 ShadowSlabPin::ShadowSlabPin(std::shared_ptr<ShadowSlab> slab) : slab(std::move(slab)) {
