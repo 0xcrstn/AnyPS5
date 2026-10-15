@@ -3677,8 +3677,18 @@ void GuestBufferMemory::completeSpaceWrites() const {
     }
 }
 
+void GuestBufferMemory::SetPointerAccess(bool writes, std::vector<std::pair<std::uint64_t, std::uint64_t>> exempt) {
+    pointerWrites = writes;
+    pointerExempt = std::move(exempt);
+}
+
+void GuestBufferMemory::ForgetPointerShadows() const {
+    for (const auto& [begin, end] : pointerHeaps) static_cast<void>(ForgetPublishedShadows(begin, static_cast<std::size_t>(end - begin)));
+}
+
 void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
+    pointerHeaps.clear();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
     for (const auto& region : regions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
@@ -3876,6 +3886,16 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         copyRegion(region, addressable);
         if (profile) copyUs += microsecondsSince(copyStart);
     }
+    if (addressable) {
+        const auto heap = [&](const Region& region) {
+            if (region.direct != nullptr && region.hostBacked) pointerHeaps.emplace_back(region.begin, region.end);
+        };
+        if (space != nullptr) {
+            for (const auto& region : space->base) heap(region);
+        }
+        for (const auto& region : regions) heap(region);
+    }
+    for (const auto& [begin, end] : pointerHeaps) static_cast<void>(StorageTexture::StoreForPointerAccess(begin, static_cast<std::size_t>(end - begin), pointerWrites, pointerExempt));
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     if (addressable && AnyDeviceResident()) {
         if (auto* active = Recorder::Active()) {

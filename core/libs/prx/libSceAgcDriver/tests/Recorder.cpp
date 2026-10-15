@@ -63,6 +63,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <random>
 #include <mutex>
 #include <stdexcept>
@@ -4187,6 +4188,144 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     Require(words[2 * unit] == 0x99 && words[3 * unit - 1] == 0x99, "the retire did not publish the unit still registered");
     Require(words[5 * unit] == 0x88 && words[5 * unit + unit - 1] == 0x88, "the retire did not publish a unit covered by the old registration");
     Require(words[127 * unit] == 0x66 && words[128 * unit] == 0x77, "the retire did not publish the second slab's units covered by the old registration");
+}
+
+void pointerAccessShadowTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& base = device.GetContext();
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 4 * unit;
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared pointer access section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    struct Release {
+        void* block;
+        ~Release() {
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+#else
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "unit shadows are on without write watching");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+#endif
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the pointer access block refused or compared: not tested\n";
+        return;
+    }
+    CollectWritesUncached(address, bytes);
+    const auto* words = static_cast<const std::uint8_t*>(block);
+    const auto copyBuffer = base.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto retile = [&](std::uint64_t begin, std::uint8_t value) {
+        auto destination = ShadowDestinationFor(base, *import, begin, begin + unit);
+        Require(destination.has_value() && destination->seedUnits.empty(), "a whole-unit retile piece has no destination");
+        auto pattern = std::make_shared<Buffer>(base, static_cast<std::size_t>(unit), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(pattern->Bytes().data(), value, pattern->Bytes().size());
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(destination->slab);
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, SlabOffset(*import, *destination->slab, begin), unit};
+        copyBuffer(commands, pattern->Handle(), destination->buffer, 1, &piece);
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const ShadowedRange range{begin, begin + unit, destination->slab};
+        MarkShadowed(*import, std::span(&range, 1), TrackerGeneration());
+    };
+    const auto build = [&](std::optional<bool> writes, std::vector<std::pair<std::uint64_t, std::uint64_t>> exempt, bool forget) {
+        GuestBufferMemory leased(base);
+        leased.AcquireRegistered();
+        if (writes.has_value()) leased.SetPointerAccess(*writes, std::move(exempt));
+        leased.Upload(true);
+        if (forget) leased.ForgetPointerShadows();
+        recorder.Sync();
+        leased.WriteBack();
+    };
+    retile(address, 0x22);
+    Require(AnyShadowedOverlaps(address, unit), "the retiled unit is not shadowed");
+    build(std::nullopt, {}, false);
+    Require(words[0] == 0x22 && words[unit - 1] == 0x22, "an address-based build read its heap in place without the unit shadow's newer bytes");
+    Require(!AnyShadowedOverlaps(address, unit), "the unit read by an address-based build is still unpublished");
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address + unit;
+    resource.width = 128;
+    resource.height = 128;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == unit, "the pointer access image does not fill its 64 KiB block");
+    auto image = StorageTexture::Create(context, detiler, resource, 0);
+    const auto write = [&](const VkClearColorValue& color) {
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+    };
+    const auto holds = [&](std::array<std::uint8_t, 4> color) {
+        for (std::size_t at = 0; at < unit; ++at) {
+            if (words[unit + at] != color[at % 4]) return false;
+        }
+        return true;
+    };
+    write({{1.0f, 0.0f, 0.0f, 1.0f}});
+    build(false, {}, false);
+    Require(StorageTexture::FindPending(address + unit, unit) == image, "an address-based build that only reads stored a pending image");
+    build(true, {{address + unit, address + 2 * unit}}, false);
+    Require(StorageTexture::FindPending(address + unit, unit) == image, "an address-based build stored the image of its own target");
+    build(true, {}, false);
+    Require(StorageTexture::FindPending(address + unit, unit) == nullptr, "an address-based build that stores through pointers left an image pending over its heap");
+    Require(holds({255, 0, 0, 255}), "the image stored before an address-based build that stores through pointers did not reach its heap");
+    retile(address + 2 * unit, 0x33);
+    build(true, {}, true);
+    Require(words[2 * unit] == 0x33 && words[3 * unit - 1] == 0x33, "an address-based build that stores through pointers read its heap without the unit shadow's newer bytes");
+    {
+        const std::pair<std::uint64_t, std::uint64_t> run{2 * unit, 3 * unit};
+        const auto sources = ShadowSources(base, *import, address, std::span(&run, 1), {});
+        Require(sources.size() == 1 && !sources[0].shadow, "a unit under an address-based build that stores through pointers still reads from its slab");
+    }
+    std::cout << "pointer access over unit shadows: ok\n";
 }
 
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
@@ -9606,6 +9745,14 @@ int main(int argc, char** argv) {
                 return 77;
             }
             unitShadowTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--pointer-access-shadow-only") {
+            if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, unit shadows or host imports are unavailable\n";
+                return 77;
+            }
+            pointerAccessShadowTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--split-writeback-only") {

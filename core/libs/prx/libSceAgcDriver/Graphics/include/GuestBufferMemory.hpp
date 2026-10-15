@@ -263,6 +263,8 @@ public:
     void Upload(bool addressable);
     void UploadPrepare(bool addressable);
     void UploadFinish(bool addressable);
+    void SetPointerAccess(bool writes, std::vector<std::pair<std::uint64_t, std::uint64_t>> exempt);
+    void ForgetPointerShadows() const;
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
@@ -458,6 +460,9 @@ private:
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.
     bool regionsSorted = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    bool pointerWrites = false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pointerExempt;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pointerHeaps;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readsOverBase;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
     std::uint64_t accountedHostCopyBytes = 0;

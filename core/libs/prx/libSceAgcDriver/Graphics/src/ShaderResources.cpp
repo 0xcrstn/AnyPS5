@@ -1542,6 +1542,7 @@ void ValidateRuntimeResources(const CompiledShader& shader, std::span<const std:
 
 void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {
     PerformanceTimer frameTiming("Resources.Prepare");
+    if (target != nullptr && target->bytes != 0) pointerTargets.assign({{target->address, target->address + target->bytes}});
     const auto stageStart = std::chrono::steady_clock::now();
     phaseStart = stageStart;
     if (BuildProfiled()) {
@@ -1910,6 +1911,13 @@ void ShaderResources::buildComplete() {
         Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
         resolveImageTables();
         timing.bindingsMs += phase(BuildPhase::Images);
+        if (usesBda) {
+            auto exempt = std::move(pointerTargets);
+            for (const auto& storage : storageTextures) {
+                if (storage != nullptr) exempt.emplace_back(storage->Descriptor().baseAddress, storage->Descriptor().baseAddress + storage->GuestBytes());
+            }
+            guestMemory.SetPointerAccess(!bdaReadOnly, std::move(exempt));
+        }
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, mirrorReads);
@@ -5033,6 +5041,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     } else {
         recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
     }
+    if (usesBda && !bdaReadOnly) guestMemory.ForgetPointerShadows();
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (!storageWritten[index]) continue;
