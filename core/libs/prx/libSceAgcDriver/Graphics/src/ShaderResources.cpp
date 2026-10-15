@@ -2097,8 +2097,10 @@ void ShaderResources::noteReusable() {
     // Taken whether or not the object turns out reusable: the lookups' records are this build's.
     captureValidation();
     reusable = false;
+    addressTemplate = false;
     directRegions.clear();
-    if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
+    const bool address = usesBda && drawBuild && bdaReadOnly && !placeWrites && AddressTemplatesEnabled() && !LoopGuardEnabled() && bda != nullptr && !bda->HasPlacements() && guestMemory.ReusableAddressSpace();
+    if (guestMemory.HasCopiedWrites() || (HoldsLease() && !address) || (usesBda && !address) || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
     if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
     const auto regions = guestMemory.DirectRegions();
@@ -2120,14 +2122,33 @@ void ShaderResources::noteReusable() {
             region.committedEnd = cut.committedEnd;
         }
     }
+    addressTemplate = address;
     reusable = true;
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
     const bool loopGuard = LoopGuardEnabled();
-    return std::any_of(shaders.begin(), shaders.end(), [loopGuard](const CompiledShader& shader) {
-        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
+    const bool addressTemplates = AddressTemplatesEnabled() && !loopGuard && std::none_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr || shader.program->bdaWrites || shader.stage == ShaderRecompiler::ShaderStage::Compute; });
+    return std::any_of(shaders.begin(), shaders.end(), [loopGuard, addressTemplates](const CompiledShader& shader) {
+        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard, addressTemplates](const ShaderRecompiler::DescriptorBinding& binding) { return (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable && !addressTemplates) || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
     });
+}
+
+void ShaderResources::VerifyAddressTemplate(const ShaderResources& fresh) const {
+    Require(addressTemplate, "APS5_VERIFY_ADDRESS_TEMPLATES: the reused template is not an address template");
+    Require(fresh.usesBda && fresh.bdaReadOnly && fresh.guestMemory.HoldsAddressSpace(), "APS5_VERIFY_ADDRESS_TEMPLATES: a fresh build of a reused address template does not map the cached address space");
+    Require(fresh.guestMemory.AddressSpaceSerial() == guestMemory.AddressSpaceSerial(), "APS5_VERIFY_ADDRESS_TEMPLATES: a fresh build maps another address space than the reused template");
+    const auto heaps = guestMemory.PointerHeaps();
+    const auto freshHeaps = fresh.guestMemory.PointerHeaps();
+    Require(std::equal(heaps.begin(), heaps.end(), freshHeaps.begin(), freshHeaps.end()), "APS5_VERIFY_ADDRESS_TEMPLATES: a fresh build stores other pointer heaps than the reused template");
+    const auto reads = guestMemory.InPlaceReads();
+    const auto freshReads = fresh.guestMemory.InPlaceReads();
+    Require(reads == freshReads, "APS5_VERIFY_ADDRESS_TEMPLATES: a fresh build reads other ranges in place than the reused template");
+}
+
+void ShaderResources::RefreshAddressUse() const {
+    if (!addressTemplate || !addressUsed.exchange(true, std::memory_order_acq_rel)) return;
+    guestMemory.RefreshAddressUse();
 }
 
 // APS5_PROFILE_DRAW: the per-device descriptor caches' counters, every 10 s.
@@ -2539,6 +2560,7 @@ ShaderResources::EpochProofVerdict ShaderResources::AdoptEpochProof(const EpochP
     if (result.verdict != EpochProofVerdict::Held) return result.verdict;
     const auto start = std::chrono::steady_clock::now();
     if (!reusable || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return EpochProofVerdict::Disabled;
+    if (addressTemplate && !guestMemory.AddressSpaceCurrent()) return EpochProofVerdict::Stamps;
     std::lock_guard lock(proofMutex);
     if (proofBasis != result.basis) return EpochProofVerdict::Basis;
     if (!epochProofScalarsHold()) return EpochProofVerdict::Stamps;
@@ -2931,6 +2953,7 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    if (addressTemplate && !guestMemory.AddressSpaceCurrent()) return false;
     std::unique_lock<std::recursive_mutex> proofLock(proofMutex, std::defer_lock);
     if (ParallelRevalidateRequested()) proofLock.lock();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3480,6 +3503,21 @@ void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::sh
         }
         serial.fetch_add(1, std::memory_order_acq_rel);
         if (evicted != nullptr) evicted->push_back(std::move(it->resources));
+        bytes -= it->bytes;
+        index.erase(it->key);
+        it = entries.erase(it);
+    }
+}
+
+void ResourceCache::RemoveAddressTemplates(std::vector<std::shared_ptr<ShaderResources>>& evicted) {
+    std::lock_guard lock(mutex);
+    for (auto it = entries.begin(); it != entries.end();) {
+        if (!it->resources->AddressTemplate()) {
+            ++it;
+            continue;
+        }
+        serial.fetch_add(1, std::memory_order_acq_rel);
+        evicted.push_back(std::move(it->resources));
         bytes -= it->bytes;
         index.erase(it->key);
         it = entries.erase(it);
@@ -4866,6 +4904,11 @@ bool MovedWordRing() {
     return MovedWordRingFlag().load(std::memory_order_relaxed);
 }
 
+std::atomic<bool>& AddressTemplatesFlag() {
+    static std::atomic<bool> flag{std::getenv("APS5_ADDRESS_TEMPLATES") == nullptr || std::strcmp(std::getenv("APS5_ADDRESS_TEMPLATES"), "0") != 0};
+    return flag;
+}
+
 std::atomic<bool>& InPlaceDrawInputsFlag() {
     static std::atomic<bool> flag{std::getenv("APS5_IN_PLACE_DRAW_INPUTS") == nullptr ? Coherence::InputLeases() : std::strcmp(std::getenv("APS5_IN_PLACE_DRAW_INPUTS"), "0") != 0};
     return flag;
@@ -4882,6 +4925,14 @@ bool AddressBasedDrawSnapshots() {
     }();
     return enabled;
 }
+}
+
+bool ShaderResources::AddressTemplatesEnabled() {
+    return AddressTemplatesFlag().load(std::memory_order_relaxed);
+}
+
+void ShaderResources::SetAddressTemplates(bool enabled) {
+    AddressTemplatesFlag().store(enabled, std::memory_order_relaxed);
 }
 
 void ShaderResources::SetInPlaceDrawInputs(bool enabled) {

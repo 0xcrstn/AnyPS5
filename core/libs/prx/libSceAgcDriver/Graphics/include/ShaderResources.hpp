@@ -263,6 +263,7 @@ public:
     void UseMirrors(Recorder& recorder) const;
     void RecordPlacementCopyBack(Recorder& recorder, VkCommandBuffer commands) const;
     void PublishResidentReads(Recorder& recorder) const;
+    void RefreshAddressUse() const;
     void RefreshMirrorsForDirectUse(Recorder& recorder) const;
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
@@ -306,6 +307,10 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
+    bool AddressTemplate() const { return addressTemplate; }
+    void VerifyAddressTemplate(const ShaderResources& fresh) const;
+    static bool AddressTemplatesEnabled();
+    static void SetAddressTemplates(bool enabled);
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
@@ -668,6 +673,8 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    bool addressTemplate = false;
+    mutable std::atomic<bool> addressUsed{false};
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
@@ -743,6 +750,7 @@ public:
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
     void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
+    void RemoveAddressTemplates(std::vector<std::shared_ptr<ShaderResources>>& evicted);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
