@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/RecordQueue.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include <array>
@@ -39,6 +40,8 @@ struct Driver::FrozenDraw {
     std::shared_ptr<const ShaderRegistry> shaders;
     std::size_t offset = 0;
     std::uint64_t epoch = 0;
+    bool dispatch = false;
+    std::uint64_t indirectArguments = 0;
 };
 
 struct Driver::PreparedFrozenDraw {
@@ -47,6 +50,7 @@ struct Driver::PreparedFrozenDraw {
     std::string rejected;
     FrozenFallback refused = FrozenFallback::None;
     std::shared_ptr<DrawInputs> inputs;
+    std::shared_ptr<DispatchInputs> dispatchInputs;
     std::vector<PreparedRead> reads;
     std::uint64_t program = 0;
     std::shared_ptr<VulkanDevice> device;
@@ -89,6 +93,15 @@ struct DrawRecordCounters {
     std::atomic<std::uint64_t> redoStored{0};
     std::atomic<std::uint64_t> redoUnchecked{0};
     std::atomic<std::uint64_t> redoErrors{0};
+    std::atomic<std::uint64_t> frozenDispatches{0};
+    std::atomic<std::uint64_t> frozenDispatchNs{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrozenFallback::Count)> dispatchInline{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrozenFallback::Count)> dispatchOrdered{};
+    std::atomic<std::uint64_t> dispatchRedoStale{0};
+    std::atomic<std::uint64_t> dispatchRedoUnchecked{0};
+    std::atomic<std::uint64_t> dispatchRedoErrors{0};
+    std::atomic<std::uint64_t> dispatchVerified{0};
+    std::atomic<std::uint64_t> dispatchVerifyStale{0};
 };
 
 DrawRecordCounters& drawRecordCounters() {
@@ -123,6 +136,11 @@ RecordHistory& recordHistory() {
     return *history;
 }
 
+RegisterFreezer& registerFreezer() {
+    static RegisterFreezer freezer;
+    return freezer;
+}
+
 void surfaceRecordFailure() {
     if (auto failure = drawRecords().TakeFailure()) {
         try {
@@ -133,9 +151,9 @@ void surfaceRecordFailure() {
     }
 }
 
-std::string frozenIdentity(std::uint64_t serial, std::uint32_t queue, std::size_t offset, std::uint64_t program) {
-    char text[160];
-    std::snprintf(text, sizeof(text), "draw of program 0x%llx in submission %llu queue 0x%x at dword %zu (prepared from a frozen packet)", static_cast<unsigned long long>(program), static_cast<unsigned long long>(serial), queue, offset);
+std::string frozenIdentity(const char* what, std::uint64_t serial, std::uint32_t queue, std::size_t offset, std::uint64_t program) {
+    char text[192];
+    std::snprintf(text, sizeof(text), "%s of program 0x%llx in submission %llu queue 0x%x at dword %zu (prepared from a frozen packet)", what, static_cast<unsigned long long>(program), static_cast<unsigned long long>(serial), queue, offset);
     return text;
 }
 
@@ -221,6 +239,29 @@ std::uint32_t Driver::prepareWorkers() {
     return workers;
 }
 
+bool Driver::prepareDispatches() {
+    static const bool enabled = [] {
+        if (std::getenv("APS5_PREPARE_DISPATCHES") == nullptr) return false;
+        if (prepareWorkers() == 0) {
+            std::fprintf(stderr, "[record-thread] APS5_PREPARE_DISPATCHES ignored: it needs APS5_PREPARE_WORKERS\n");
+            return false;
+        }
+        if (!recordDispatches()) {
+            std::fprintf(stderr, "[record-thread] APS5_PREPARE_DISPATCHES ignored: it needs APS5_RECORD_THREAD_DISPATCH\n");
+            return false;
+        }
+        Graphics::GuestBufferMemory::RecordPrepareCpuCopies(true, std::getenv("APS5_VERIFY_PREPARE_DISPATCHES") != nullptr);
+        std::fprintf(stderr, "[record-thread] prepare dispatches: queue 0 freezes dispatches into the draw ticket order; preparation workers prepare them through stage A%s\n", std::getenv("APS5_VERIFY_PREPARE_DISPATCHES") != nullptr ? ", and the record thread verifies each against an in-order preparation" : "");
+        return true;
+    }();
+    return enabled;
+}
+
+bool Driver::verifyPrepareDispatches() {
+    static const bool enabled = prepareDispatches() && std::getenv("APS5_VERIFY_PREPARE_DISPATCHES") != nullptr;
+    return enabled;
+}
+
 bool Driver::parallelResolve() {
     static const bool enabled = [] {
         if (!Graphics::ParallelResolveRequested()) return false;
@@ -286,7 +327,7 @@ DrawVerdict Driver::freezeDraw(QueueState& queue, std::span<const std::uint32_t>
     frozenProducer() = true;
     surfaceRecordFailure();
     startDrawRecords();
-    static RegisterFreezer freezer;
+    auto& freezer = registerFreezer();
     auto frozen = std::make_shared<FrozenDraw>();
     frozen->packet.assign(packet.begin(), packet.end());
     frozen->state = freezer.Freeze(queue);
@@ -321,6 +362,49 @@ DrawVerdict Driver::freezeDraw(QueueState& queue, std::span<const std::uint32_t>
     return DrawVerdict::Drawn;
 }
 
+void Driver::freezeDispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments, std::chrono::steady_clock::time_point begin) {
+    auto& counters = drawRecordCounters();
+    frozenProducer() = true;
+    surfaceRecordFailure();
+    startDrawRecords();
+    auto& freezer = registerFreezer();
+    auto frozen = std::make_shared<FrozenDraw>();
+    frozen->packet.assign(packet.begin(), packet.end());
+    frozen->state = freezer.Freeze(queue);
+    frozen->serial = submission.serial;
+    frozen->queue = submission.queue;
+    frozen->shaders = submission.shaders;
+    frozen->offset = currentPacketOffset();
+    frozen->epoch = GuestMemory::CollectEpoch();
+    frozen->dispatch = true;
+    frozen->indirectArguments = indirectArguments;
+    counters.frozenCopies.store(freezer.Copies(), std::memory_order_relaxed);
+    const auto frozenAt = std::chrono::steady_clock::now();
+    counters.frozenDispatchNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(frozenAt - begin).count());
+    auto& records = drawRecords();
+    if (const auto ticket = AheadWaitTicket(records.Posted(), records.Finished(), frozenBound()); ticket != 0) {
+        ++counters.recordsFull;
+        records.WaitFinished(ticket);
+    }
+    frozenDraws().Submit(std::move(frozen));
+    ++counters.frozenDispatches;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) {
+        const auto now = std::chrono::steady_clock::now();
+        auto& pending = pendingDispatchPhases();
+        pending.outcome = DispatchOutcome::Real;
+        pending.phases = true;
+        pending.hit = false;
+        pending.validated = false;
+        pending.ms = {};
+        if (packetStartedAt() != std::chrono::steady_clock::time_point{}) pending.ms[PhasePrologue] = std::chrono::duration<double, std::milli>(begin - packetStartedAt()).count();
+        pending.ms[PhaseKey] = std::chrono::duration<double, std::milli>(frozenAt - begin).count();
+        pending.ms[PhaseLockWait] = std::chrono::duration<double, std::milli>(now - frozenAt).count();
+        pending.tailAt = now;
+    }
+    reportDrawRecords();
+}
+
 std::shared_ptr<Driver::PreparedFrozenDraw> Driver::prepareFrozen(const FrozenDraw& frozen, bool inOrder) {
     if (frozenProducer()) throw std::logic_error("prepare workers: a frozen draw reached preparation on queue 0's own thread");
     thread_local FrozenQueueCopy copy;
@@ -345,9 +429,11 @@ std::shared_ptr<Driver::PreparedFrozenDraw> Driver::prepareFrozen(const FrozenDr
     frozenSink() = &sink;
     auto prepared = std::make_shared<PreparedFrozenDraw>();
     prepared->start = drawRecords().Finished();
-    prepared->verdict = drawNow(queue, frozen.packet, submission, prepared->rejected);
+    if (frozen.dispatch) dispatchNow(queue, frozen.packet, submission, frozen.indirectArguments);
+    else prepared->verdict = drawNow(queue, frozen.packet, submission, prepared->rejected);
     prepared->refused = sink.refused;
     prepared->inputs = std::move(sink.inputs);
+    prepared->dispatchInputs = std::move(sink.dispatchInputs);
     prepared->reads = std::move(sink.reads);
     prepared->program = sink.program;
     prepared->device = device.Load();
@@ -358,11 +444,12 @@ void Driver::emitFrozen(const std::shared_ptr<FrozenDraw>& frozen, std::optional
     auto& counters = drawRecordCounters();
     std::shared_ptr<PreparedFrozenDraw> ready = prepared.has_value() ? *prepared : nullptr;
     const bool redo = error != nullptr || ready == nullptr || ready->refused != FrozenFallback::None || !ready->rejected.empty();
-    if (!redo && ready->inputs == nullptr) {
+    if (!redo && ready->inputs == nullptr && ready->dispatchInputs == nullptr) {
         ++counters.frozenNothing;
         return;
     }
-    if (!redo) noteDrawInputWriters(*ready->inputs, frozen->queue);
+    if (!redo && ready->dispatchInputs != nullptr) noteDispatchInputWriters(*ready->dispatchInputs, frozen->queue);
+    if (!redo && ready->inputs != nullptr) noteDrawInputWriters(*ready->inputs, frozen->queue);
     auto result = std::make_shared<DrawRecordResult>();
     result->ticket = drawRecords().Post([this, frozen, ready, error, result] {
         struct Restore {
@@ -387,30 +474,50 @@ void Driver::emitFrozen(const std::shared_ptr<FrozenDraw>& frozen, std::optional
         auto& counters = drawRecordCounters();
         auto use = ready;
         try {
+            const bool dispatch = frozen->dispatch;
             bool redo = false;
             if (error != nullptr || use == nullptr || !use->rejected.empty()) {
                 redo = true;
-                ++counters.redoErrors;
+                ++(dispatch ? counters.dispatchRedoErrors : counters.redoErrors);
             } else if (use->refused != FrozenFallback::None) {
                 redo = true;
-                ++counters.orderedRedos[static_cast<std::size_t>(use->refused)];
+                ++(dispatch ? counters.dispatchOrdered : counters.orderedRedos)[static_cast<std::size_t>(use->refused)];
             } else {
                 switch (CheckFrozenPrepare(recordHistory(), use->start, ticket, use->reads, pendingWriteOverlaps)) {
                 case FrozenPrepareVerdict::Fresh: break;
-                case FrozenPrepareVerdict::PendingWrite: redo = true; ++counters.redoPending; break;
-                case FrozenPrepareVerdict::Stored: redo = true; ++counters.redoStored; break;
-                case FrozenPrepareVerdict::Unchecked: redo = true; ++counters.redoUnchecked; break;
+                case FrozenPrepareVerdict::PendingWrite: redo = true; ++(dispatch ? counters.dispatchRedoStale : counters.redoPending); break;
+                case FrozenPrepareVerdict::Stored: redo = true; ++(dispatch ? counters.dispatchRedoStale : counters.redoStored); break;
+                case FrozenPrepareVerdict::Unchecked: redo = true; ++(dispatch ? counters.dispatchRedoUnchecked : counters.redoUnchecked); break;
                 }
             }
             if (redo) {
                 use = prepareFrozen(*frozen, true);
-                if (use->refused != FrozenFallback::None) throw std::logic_error("a frozen draw refused its in-order preparation");
+                if (use->refused != FrozenFallback::None) throw std::logic_error(dispatch ? "a frozen dispatch refused its in-order preparation" : "a frozen draw refused its in-order preparation");
                 if (use->inputs != nullptr) noteDrawInputWriters(*use->inputs, frozen->queue);
+                if (use->dispatchInputs != nullptr) noteDispatchInputWriters(*use->dispatchInputs, frozen->queue);
+            } else if (dispatch && verifyPrepareDispatches() && use->dispatchInputs != nullptr) {
+                auto fresh = prepareFrozen(*frozen, true);
+                if (fresh->refused != FrozenFallback::None) throw std::logic_error("APS5_VERIFY_PREPARE_DISPATCHES: the in-order preparation refused a dispatch a worker prepared");
+                if (fresh->dispatchInputs == nullptr) throw std::runtime_error("APS5_VERIFY_PREPARE_DISPATCHES: the in-order preparation prepared nothing where a worker prepared a dispatch");
+                const auto touchedEarlier = [&](std::uint64_t address, std::size_t bytes) {
+                    const auto earlier = recordHistory().Between(use->start, ticket - 1);
+                    if (!earlier) return true;
+                    const std::array<PreparedRead, 1> read{PreparedRead{address, bytes}};
+                    return StaleAfterEach(*earlier, read, pendingWriteOverlaps) != DrawPrepareStale::No;
+                };
+                if (staleDispatchInputs(*use->dispatchInputs, *fresh->dispatchInputs, touchedEarlier)) {
+                    ++counters.dispatchVerifyStale;
+                    use = std::move(fresh);
+                } else {
+                    ++counters.dispatchVerified;
+                }
             }
             if (!use->rejected.empty()) throw std::runtime_error(use->rejected);
+            if (use->dispatchInputs != nullptr) recordDispatchInputs(*use->dispatchInputs, use->device);
             if (use->inputs != nullptr) recordDrawInputs(*use->inputs, *result, use->device);
         } catch (const std::exception& failure) {
-            throw std::runtime_error(frozenIdentity(frozen->serial, frozen->queue, frozen->offset, use != nullptr ? use->program : 0) + ": " + failure.what());
+            const char* what = !frozen->dispatch ? "draw" : frozen->indirectArguments != 0 ? "indirect dispatch" : "dispatch";
+            throw std::runtime_error(frozenIdentity(what, frozen->serial, frozen->queue, frozen->offset, use != nullptr ? use->program : 0) + ": " + failure.what());
         }
         GuestMemory::LogDriverStores(nullptr);
         result->effects.writeGenerationAfter = Graphics::Recorder::WriteGeneration();
@@ -483,9 +590,18 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
-    if (drawRecordState().active || resolvingAhead() || !deferDispatchRecords(submission.queue)) {
+    if (drawRecordState().active || resolvingAhead() || frozenSink() != nullptr || !deferDispatchRecords(submission.queue)) {
         dispatchNow(queue, packet, submission, indirectArguments);
         return;
+    }
+    if (prepareDispatches()) {
+        const auto begin = std::chrono::steady_clock::now();
+        const auto reason = dispatchFrozenFallback(queue, packet, submission, indirectArguments);
+        if (reason == FrozenFallback::None) {
+            freezeDispatch(queue, packet, submission, indirectArguments, begin);
+            return;
+        }
+        ++drawRecordCounters().dispatchInline[static_cast<std::size_t>(reason)];
     }
     ++drawRecordCounters().dispatches;
     deferRecord([&] { dispatchNow(queue, packet, submission, indirectArguments); });
@@ -792,6 +908,20 @@ void Driver::reportDrawRecords() {
         char text[512];
         std::snprintf(text, sizeof(text), "; prepare workers %u: %llu frozen draws (freeze %.2f us each, %llu register files copied so far), %llu prepared to nothing; inline on queue 0 after a drain: %s; redone in order on the record thread: stale %llu, unchecked %llu, after a worker error or rejection %llu, refused by a worker: %s; workers busy %.1f %%, reorder buffer full %llu, record queue full %llu", workers, static_cast<unsigned long long>(workerDelta[0]), workerDelta[0] != 0 ? static_cast<double>(workerDelta[1]) / 1000.0 / static_cast<double>(workerDelta[0]) : 0.0, static_cast<unsigned long long>(counters.frozenCopies.load()), static_cast<unsigned long long>(workerDelta[2]), inlineText.c_str(), static_cast<unsigned long long>(workerDelta[4]), static_cast<unsigned long long>(workerDelta[5]), static_cast<unsigned long long>(workerDelta[6]), orderedText.c_str(), busy, static_cast<unsigned long long>(fullWaits), static_cast<unsigned long long>(workerDelta[3]));
         ahead += text;
+        if (prepareDispatches()) {
+            static std::array<std::uint64_t, Reasons> lastDispatchInline{};
+            static std::array<std::uint64_t, Reasons> lastDispatchOrdered{};
+            static std::array<std::uint64_t, 7> lastDispatch{};
+            const std::array<std::uint64_t, 7> dispatchValues{counters.frozenDispatches.load(), counters.frozenDispatchNs.load(), counters.dispatchRedoStale.load(), counters.dispatchRedoUnchecked.load(), counters.dispatchRedoErrors.load(), counters.dispatchVerified.load(), counters.dispatchVerifyStale.load()};
+            std::array<std::uint64_t, 7> dispatchDelta{};
+            for (std::size_t i = 0; i < dispatchValues.size(); ++i) dispatchDelta[i] = dispatchValues[i] - lastDispatch[i];
+            lastDispatch = dispatchValues;
+            const auto dispatchInlineText = reasons(counters.dispatchInline, lastDispatchInline);
+            const auto dispatchOrderedText = reasons(counters.dispatchOrdered, lastDispatchOrdered);
+            char dispatchText[512];
+            std::snprintf(dispatchText, sizeof(dispatchText), "; prepare dispatches: %llu frozen (check and freeze %.2f us each); inline on queue 0 after a drain: %s; redone in order on the record thread: stale %llu, unchecked %llu, after a worker error %llu, refused by a worker: %s; verified %llu, %llu recorded from the in-order preparation after a CPU store", static_cast<unsigned long long>(dispatchDelta[0]), dispatchDelta[0] != 0 ? static_cast<double>(dispatchDelta[1]) / 1000.0 / static_cast<double>(dispatchDelta[0]) : 0.0, dispatchInlineText.c_str(), static_cast<unsigned long long>(dispatchDelta[2]), static_cast<unsigned long long>(dispatchDelta[3]), static_cast<unsigned long long>(dispatchDelta[4]), dispatchOrderedText.c_str(), static_cast<unsigned long long>(dispatchDelta[5]), static_cast<unsigned long long>(dispatchDelta[6]));
+            ahead += dispatchText;
+        }
     }
     ProfilePrint_nid_no_patch("[record-thread] %.3f s: %llu draws, %llu dispatches (%llu overlapped a record), %llu jobs run (%llu on the record thread, %llu inline on queue 0, %llu failed) %.1f ms, %.1f us per job; producer waits %llu (%llu blocked, %.1f ms); %llu packet waits; stale preparations: %llu pending write, %llu stored, %llu unchecked, %llu redone%s\n", seconds, static_cast<unsigned long long>(delta[0]), static_cast<unsigned long long>(delta[7]), static_cast<unsigned long long>(delta[1]), static_cast<unsigned long long>(jobs), static_cast<unsigned long long>(counts.byWorker - lastCounts.byWorker), static_cast<unsigned long long>(counts.byOthers - lastCounts.byOthers), static_cast<unsigned long long>(counts.failed - lastCounts.failed), jobMs, jobs != 0 ? jobMs * 1000 / static_cast<double>(jobs) : 0.0, static_cast<unsigned long long>(counts.waits - lastCounts.waits), static_cast<unsigned long long>(counts.blockedWaits - lastCounts.blockedWaits), waitedMs, static_cast<unsigned long long>(delta[6]), static_cast<unsigned long long>(delta[2]), static_cast<unsigned long long>(delta[3]), static_cast<unsigned long long>(delta[4]), static_cast<unsigned long long>(delta[5]), ahead.c_str());
     lastCounts = counts;

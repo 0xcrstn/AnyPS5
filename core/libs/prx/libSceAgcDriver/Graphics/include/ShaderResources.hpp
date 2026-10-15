@@ -334,6 +334,8 @@ public:
     // compiled shader's descriptors. A recipe hit refreshes the template iff the two differ.
     std::uint64_t DataWordsHash() const { return dataWordsHash; }
     static std::uint64_t DataWordsHash(const CompiledShader& shader);
+    const std::vector<GuestBufferMemory::CpuCopy>& PrepareCpuCopies() const { return guestMemory.PrepareCpuCopies(); }
+    bool PrepareCpuCopiesUnbounded() const { return guestMemory.PrepareCpuCopiesUnbounded(); }
     void PatchPushConstants(std::span<std::byte, PipelinePushConstantBytes> bytes) const {
         for (const auto& [position, adjustment] : pushPatches) bytes[position] = static_cast<std::byte>(adjustment);
     }
