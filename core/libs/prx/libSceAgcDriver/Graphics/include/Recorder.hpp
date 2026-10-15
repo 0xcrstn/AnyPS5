@@ -60,6 +60,7 @@ struct RecorderDomain {
     std::atomic<std::uint64_t> workSinceSubmit{0};
     std::mutex labelTableMutex;
     Recorder* labelTableOwner = nullptr;
+    Recorder* active = nullptr;
 };
 
 class Recorder {
@@ -429,6 +430,7 @@ public:
     // before). A write-back over any tracked label dword is counted on the [recorder] line (must
     // stay 0: it would mean a CPU store landed over a label recorded on the GPU).
     static void NoteWrittenBack(std::uint64_t address, std::size_t bytes);
+    void noteWrittenBack(std::uint64_t address, std::size_t bytes);
 
     // Lock-free readers for the queue workers' packet loops and WAIT_REG_MEM polls (values of the
     // active recorder; a torn-down recorder never publishes):

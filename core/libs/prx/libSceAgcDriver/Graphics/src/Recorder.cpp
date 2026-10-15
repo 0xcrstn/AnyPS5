@@ -44,7 +44,6 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-Recorder* activeRecorder = nullptr;
 
 bool DrawProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -1090,6 +1089,13 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
 
 }
 
+template<typename TValue>
+std::uint64_t SumDomains(std::atomic<TValue> RecorderDomain::*counter, std::memory_order order) {
+    std::uint64_t sum = 0;
+    for (std::uint32_t queue = 0; queue < Recorder::PhysicalQueues; ++queue) sum += static_cast<std::uint64_t>((Recorder::Domain(queue).*counter).load(order));
+    return sum;
+}
+
 RecorderDomain& Recorder::Domain(std::uint32_t physicalQueue) {
     static std::array<RecorderDomain, PhysicalQueues> domains;
     Require(physicalQueue < domains.size(), "recorder domain for an unknown physical queue");
@@ -1098,7 +1104,7 @@ RecorderDomain& Recorder::Domain(std::uint32_t physicalQueue) {
 
 Recorder* Recorder::ForPhysicalQueue(std::uint32_t physicalQueue) {
     Require(physicalQueue < PhysicalQueues, "recorder for an unknown physical queue");
-    return physicalQueue == 0 ? activeRecorder : nullptr;
+    return Domain(physicalQueue).active;
 }
 
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)), domain(Domain(0)) {
@@ -1155,9 +1161,9 @@ Recorder::~Recorder() {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
     }
     holdKept.clear();
-    if (activeRecorder == this) {
-        activeRecorder = nullptr;
-        pendingWrites.store(nullptr, std::memory_order_release);
+    if (domain.active == this) {
+        domain.active = nullptr;
+        if (physicalQueue == 0) pendingWrites.store(nullptr, std::memory_order_release);
         domain.publishGeneration.fetch_add(1, std::memory_order_release);
         domain.pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
         domain.completionLabels.store(0, std::memory_order_release);
@@ -1219,29 +1225,33 @@ Recorder::~Recorder() {
 }
 
 std::optional<std::chrono::steady_clock::time_point> Recorder::PendingLabelSince() {
-    const auto since = Domain(0).pendingLabelSince.load(std::memory_order_acquire);
+    auto since = NoPendingLabel;
+    for (std::uint32_t queue = 0; queue < PhysicalQueues; ++queue) {
+        const auto value = Domain(queue).pendingLabelSince.load(std::memory_order_acquire);
+        if (value != NoPendingLabel && (since == NoPendingLabel || value < since)) since = value;
+    }
     if (since == NoPendingLabel) return std::nullopt;
     return std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(since));
 }
 
 std::uint64_t Recorder::WriteGeneration() {
-    return Domain(0).writeGeneration.load(std::memory_order_acquire);
+    return SumDomains(&RecorderDomain::writeGeneration, std::memory_order_acquire);
 }
 
 std::uint64_t Recorder::PublishGeneration() {
-    return Domain(0).publishGeneration.load(std::memory_order_acquire);
+    return SumDomains(&RecorderDomain::publishGeneration, std::memory_order_acquire);
 }
 
 std::uint64_t Recorder::PendingCompletionLabels() {
-    return Domain(0).completionLabels.load(std::memory_order_acquire);
+    return SumDomains(&RecorderDomain::completionLabels, std::memory_order_acquire);
 }
 
 std::uint64_t Recorder::PendingWriteBackCompletions() {
-    return Domain(0).writeBackCompletions.load(std::memory_order_acquire);
+    return SumDomains(&RecorderDomain::writeBackCompletions, std::memory_order_acquire);
 }
 
 std::uint64_t Recorder::RecordedWorkSinceSubmit() {
-    return Domain(0).workSinceSubmit.load(std::memory_order_relaxed);
+    return SumDomains(&RecorderDomain::workSinceSubmit, std::memory_order_relaxed);
 }
 
 void Recorder::CountRecordedWork() {
@@ -1249,11 +1259,11 @@ void Recorder::CountRecordedWork() {
 }
 
 Recorder* Recorder::Active() {
-    return activeRecorder;
+    return Domain(0).active;
 }
 
 void Recorder::Activate() {
-    activeRecorder = this;
+    domain.active = this;
     if (chunks != nullptr) chunks->Activate();
     {
         std::lock_guard tableLock(domain.labelTableMutex);
@@ -1263,14 +1273,29 @@ void Recorder::Activate() {
 }
 
 std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) {
-    std::lock_guard tableLock(Domain(0).labelTableMutex);
-    if (Domain(0).labelTableOwner == nullptr) return std::nullopt;
-    return Domain(0).labelTableOwner->lookupLabel(address, bytes, afterStamp, refusal);
+    std::optional<LabelHit> found;
+    if (refusal != nullptr) *refusal = LabelRefusal::None;
+    for (std::uint32_t queue = 0; queue < PhysicalQueues; ++queue) {
+        auto& table = Domain(queue);
+        std::lock_guard tableLock(table.labelTableMutex);
+        if (table.labelTableOwner == nullptr) continue;
+        LabelRefusal reason = LabelRefusal::None;
+        auto hit = table.labelTableOwner->lookupLabel(address, bytes, afterStamp, &reason);
+        if (refusal != nullptr && reason != LabelRefusal::None) *refusal = reason;
+        if (!hit.has_value()) continue;
+        Require(!found.has_value(), "a label is pending on two physical queues; composing their label tables is not implemented");
+        found = hit;
+    }
+    return found;
 }
 
 bool Recorder::WideLabelIn(std::uint64_t address, std::size_t bytes) {
-    std::lock_guard tableLock(Domain(0).labelTableMutex);
-    return Domain(0).labelTableOwner != nullptr && Domain(0).labelTableOwner->wideLabelInLocked(address, bytes);
+    for (std::uint32_t queue = 0; queue < PhysicalQueues; ++queue) {
+        auto& table = Domain(queue);
+        std::lock_guard tableLock(table.labelTableMutex);
+        if (table.labelTableOwner != nullptr && table.labelTableOwner->wideLabelInLocked(address, bytes)) return true;
+    }
+    return false;
 }
 
 bool Recorder::wideLabelInLocked(std::uint64_t address, std::size_t bytes) const {
@@ -1418,11 +1443,11 @@ std::uint64_t Recorder::KeyStoreSerial() {
 }
 
 std::uint64_t Recorder::LedgerSerial() {
-    return Domain(0).ledgerSerial.load(std::memory_order_acquire);
+    return SumDomains(&RecorderDomain::ledgerSerial, std::memory_order_acquire);
 }
 
 std::uint64_t Recorder::FinishedBatches() {
-    return Domain(0).finishedBatches.load(std::memory_order_acquire);
+    return SumDomains(&RecorderDomain::finishedBatches, std::memory_order_acquire);
 }
 
 bool Recorder::AccessNeedsFlush(std::uint64_t address, std::size_t bytes) {
@@ -3156,7 +3181,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
-    if (activeRecorder == this) domain.writeGeneration.fetch_add(1, std::memory_order_release);
+    if (domain.active == this) domain.writeGeneration.fetch_add(1, std::memory_order_release);
     // Consecutive dispatches write the same output buffers: a range the snapshot already contains
     // leaves the published union unchanged, so the O(N log N) rebuild is skipped.
     if (SnapshotCovers(address, end)) {
@@ -3184,7 +3209,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writeNotes.push_back(++writeNoteCount);
     batch.writeValues.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
-    if (activeRecorder == this) domain.writeGeneration.fetch_add(1, std::memory_order_release);
+    if (domain.active == this) domain.writeGeneration.fetch_add(1, std::memory_order_release);
     if (!SnapshotCovers(address, address + bytes)) {
         const std::array ranges{std::pair{address, address + bytes}};
         publishPendingWrites(ranges);
@@ -3226,7 +3251,7 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
 }
 
 void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
-    if (activeRecorder != this) {
+    if (physicalQueue != 0 || domain.active != this) {
         publishedWriteRangesValid = false;
         return;
     }
@@ -3586,7 +3611,7 @@ void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes
         open->wideLabels.push_back(wideLabels.emplace(address, address + bytes.size()));
         wideLabelBytes = std::max<std::uint64_t>(wideLabelBytes, bytes.size());
     }
-    if (activeRecorder == this && domain.pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
+    if (domain.active == this && domain.pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         domain.pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
     noteWriteOn(*open, address, bytes.size(), true);
@@ -3723,7 +3748,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
     // poller that sees the bump then finds the label without the GPU mutex.
     noteLabelOn(batch, address, bytes, stamp, queue, behindCompletion);
     noteWriteOn(batch, address, bytes.size(), true);
-    if (&batch == open.get() && activeRecorder == this && domain.pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
+    if (&batch == open.get() && domain.active == this && domain.pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         domain.pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
 }
@@ -3736,15 +3761,21 @@ bool Recorder::AfterRecordedWork(std::function<void()> action) {
     batch.guestCompletions = true;
     ++batch.completionLabelCount;
     domain.completionLabels.fetch_add(1, std::memory_order_acq_rel);
-    if (&batch == open.get() && activeRecorder == this && domain.pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
+    if (&batch == open.get() && domain.active == this && domain.pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         domain.pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
     return true;
 }
 
 void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
-    Recorder* recorder = activeRecorder;
-    if (recorder == nullptr || bytes == 0) return;
+    for (std::uint32_t queue = 0; queue < PhysicalQueues; ++queue) {
+        if (auto* recorder = Domain(queue).active) recorder->noteWrittenBack(address, bytes);
+    }
+}
+
+void Recorder::noteWrittenBack(std::uint64_t address, std::size_t bytes) {
+    Recorder* recorder = this;
+    if (bytes == 0) return;
     GuestMemory::AssertGpuLockHeld("Recorder::NoteWrittenBack");
     const auto end = address + bytes;
     {
@@ -3762,7 +3793,7 @@ void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
             if (label.counted || label.begin >= end || address >= label.end) continue;
             label.counted = true;
             ++batch.completionLabelCount;
-            Domain(0).completionLabels.fetch_add(1, std::memory_order_acq_rel);
+            domain.completionLabels.fetch_add(1, std::memory_order_acq_rel);
             completionLabelsCountedLate.fetch_add(1, std::memory_order_relaxed);
             recorder->markBehindCompletion(batch, label.begin, label.end);
         }
@@ -3787,7 +3818,7 @@ void Recorder::Submit() {
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
     // count behind, and the callers that act on it would otherwise take the mutex for nothing at
     // every packet or submission end until a real batch is next submitted.
-    if (activeRecorder == this) domain.workSinceSubmit.store(0, std::memory_order_relaxed);
+    if (domain.active == this) domain.workSinceSubmit.store(0, std::memory_order_relaxed);
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
@@ -3882,7 +3913,7 @@ void Recorder::Submit() {
     LabelVersions::MarkAll(batch->labelStamps, LabelVersions::Milestone::Submitted);
     inFlight.push_back(std::move(batch));
     inFlightKeptBytes += inFlight.back()->keptBytes;
-    if (activeRecorder == this) domain.pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    if (domain.active == this) domain.pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
 }
 
 std::uint64_t Recorder::SubmitAndEpoch() {
