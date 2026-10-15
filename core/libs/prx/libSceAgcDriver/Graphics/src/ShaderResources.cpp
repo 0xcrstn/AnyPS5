@@ -2861,6 +2861,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (epochDirtySet && epochProofHolds()) {
         if (!GuestMemory::EpochDirtySetVerify()) {
             if (profile) countRevalidate(true, true, start, true);
+            else Revalidations().epochSkips.fetch_add(1, std::memory_order_relaxed);
             if (report != nullptr) *report = {ProofPath::EpochSkip, ProofFailure::None};
             return true;
         }

@@ -375,7 +375,8 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         const auto& program = programs[i];
         pushCursorBytes = Graphics::StagePushOffset(pushCursorBytes, program.binary.stage, localDevice->GraphicsPipelineLibraries());
         pushOffsets[i] = pushCursorBytes;
-        reused[i] = !drawHit && !verifyHit && drawRelocationEnabled() && matched[i] != nullptr && matched[i]->pushOffset == pushCursorBytes;
+        const bool verifyStage = stageData[i].compiled != nullptr && verifyDrawDataHits();
+        reused[i] = !drawHit && !verifyHit && !verifyStage && drawRelocationEnabled() && matched[i] != nullptr && matched[i]->pushOffset == pushCursorBytes;
         const ShaderRecompiler::RecompileResult* front = nullptr;
         if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) {
             for (auto previous = i; previous-- > 0;) {
@@ -385,7 +386,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             }
         }
         if (reused[i] && front != nullptr && matched[i]->inputExports != front->parameterExports) reused[i] = false;
-        if (!reused[i] && !drawHit && !verifyHit) matched[i] = nullptr;
+        if (!reused[i] && !drawHit && !verifyHit && !verifyStage) matched[i] = nullptr;
         if (reused[i]) fresh[i] = matched[i];
         if (drawHit || reused[i]) {
 
