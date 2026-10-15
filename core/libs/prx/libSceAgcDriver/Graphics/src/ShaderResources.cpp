@@ -3901,7 +3901,7 @@ bool PartialSnapshotsDisabled() {
 }
 
 const char* ShaderResources::WholeCopyName(WholeCopy reason) {
-    static constexpr std::array<const char*, static_cast<std::size_t>(WholeCopy::Count)> names{"not analysed", "index from the vertex id", "index from the instance id", "index loaded from memory", "index from user data", "unbounded index", "no draw range", "index unbounded at the draw", "unbounded offset", "unbounded soffset", "unbounded scalar offset", "offset past 32 bits", "other read", "image alias", "swizzled", "add tid", "past 4 GiB", "over half", "disabled"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(WholeCopy::Count)> names{"not analysed", "index from the vertex id", "index from the instance id", "index loaded from memory", "index from user data", "unbounded index", "no draw range", "index unbounded at the draw", "index needs a user word the draw lacks", "index may go below 0 at the draw", "index may pass 32 bits at the draw", "unbounded offset", "unbounded soffset", "unbounded scalar offset", "offset past 32 bits", "other read", "image alias", "swizzled", "add tid", "past 4 GiB", "over half", "disabled"};
     const auto index = static_cast<std::size_t>(reason);
     return index < names.size() ? names[index] : "?";
 }
@@ -3969,8 +3969,12 @@ std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std:
         using Source = ShaderRecompiler::BufferIndexSource;
         if (range.indexSource == Source::Expression && stride != 0) {
             if (drawRanges == nullptr) return whole(WholeCopy::NoDrawRange);
-            const auto evaluated = ShaderRecompiler::EvaluateBufferIndex(range.indexExpression, *drawRanges);
-            if (!evaluated) return whole(WholeCopy::IndexAtDraw);
+            auto failure = ShaderRecompiler::BufferIndexFailure::None;
+            const auto evaluated = ShaderRecompiler::EvaluateBufferIndex(range.indexExpression, *drawRanges, &failure);
+            if (!evaluated) {
+                using Failure = ShaderRecompiler::BufferIndexFailure;
+                return whole(failure == Failure::UserWord ? WholeCopy::IndexAtDrawUserWord : failure == Failure::Underflow ? WholeCopy::IndexAtDrawUnderflow : failure == Failure::Overflow ? WholeCopy::IndexAtDrawOverflow : WholeCopy::IndexAtDraw);
+            }
             firstIndex = evaluated->first;
             lastIndex = evaluated->second;
         } else if (range.indexSource != Source::None && range.indexSource != Source::Expression && stride != 0) {
