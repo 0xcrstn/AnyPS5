@@ -62,7 +62,7 @@ struct Builder {
     }
 
     std::uint32_t eliminate() {
-        return DenormalFlushEliminator{}.Eliminate(program).removedFlushes;
+        return DenormalFlushEliminator{}.Eliminate(program, RewriteMode::Off).removedFlushes;
     }
 
     DenormalFlushEliminationStats eliminate(RewriteMode proofs) {
