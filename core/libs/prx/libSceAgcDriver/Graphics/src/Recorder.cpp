@@ -1187,6 +1187,7 @@ void Recorder::RequireOrderAfter(const Recorder& producer, std::uint64_t serial)
     auto& required = requiredOrder[producer.timeline];
     required = std::max(required, serial);
     ++queueOrder.requiredWaits;
+    if (&producer == peer && !OrderWaitsSuppressed().load(std::memory_order_acquire)) raisePeerFloor(serial);
 }
 
 Recorder::Recorder(const Context& context, bool timelineSemaphores, std::uint32_t physicalQueue) : context(context), id(nextRecorderId.fetch_add(1)), physicalQueue(physicalQueue), domain(Domain(physicalQueue)) {
@@ -1354,13 +1355,33 @@ void Recorder::Activate() {
     GuestMemory::SetFlushHook(&FlushForAccess);
 }
 
-std::optional<bool> Recorder::LaterLabel(const LabelEntry& first, const LabelEntry& second) {
-    const auto order = [](const LabelEntry& entry) -> std::uint64_t { return entry.batch != nullptr ? entry.batch->submitOrder.load(std::memory_order_acquire) : 0; };
-    const auto firstOrder = order(first);
-    const auto secondOrder = order(second);
-    if (firstOrder != 0 && secondOrder != 0) return secondOrder > firstOrder;
-    if (firstOrder != 0) return true;
-    if (secondOrder != 0) return false;
+bool Recorder::PeerSerialization() {
+    static const bool serialized = [] {
+        const char* value = std::getenv("APS5_QUEUE_ORDER");
+        if (value == nullptr || std::strcmp(value, "precise") == 0) return false;
+        if (std::strcmp(value, "serial") == 0) return true;
+        throw std::runtime_error(std::string("APS5_QUEUE_ORDER: expected precise or serial, got ") + value);
+    }();
+    return serialized;
+}
+
+void Recorder::raisePeerFloor(std::uint64_t serial) {
+    auto current = peerFloor.load(std::memory_order_relaxed);
+    while (current < serial && !peerFloor.compare_exchange_weak(current, serial, std::memory_order_acq_rel)) {}
+}
+
+bool Recorder::OrderedAfter(const LabelEntry& later, const Recorder& laterOwner, const LabelEntry& earlier, const Recorder& earlierOwner) {
+    if (earlier.batch == nullptr || earlier.batch->submitOrder.load(std::memory_order_acquire) == 0) return false;
+    const auto earlierSerial = earlier.batch->serial;
+    if (laterOwner.peer != &earlierOwner) return false;
+    if (later.batch != nullptr && later.batch->submitOrder.load(std::memory_order_acquire) != 0) return later.batch->afterPeer.load(std::memory_order_acquire) >= earlierSerial;
+    if (PeerSerialization()) return true;
+    return laterOwner.peerFloor.load(std::memory_order_acquire) >= earlierSerial;
+}
+
+std::optional<bool> Recorder::LaterLabel(const LabelEntry& first, const Recorder& firstOwner, const LabelEntry& second, const Recorder& secondOwner) {
+    if (OrderedAfter(second, secondOwner, first, firstOwner)) return true;
+    if (OrderedAfter(first, firstOwner, second, secondOwner)) return false;
     return std::nullopt;
 }
 
@@ -1382,6 +1403,7 @@ std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, s
     bool queued = false;
     for (std::size_t offset = 0; offset < bytes; offset += 4) {
         const LabelEntry* winner = nullptr;
+        const Recorder* winnerOwner = nullptr;
         bool winnerQueued = false;
         for (const auto* owner : owners) {
             if (owner == nullptr) continue;
@@ -1390,6 +1412,7 @@ std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, s
             if (pick.entry == nullptr) continue;
             if (winner == nullptr) {
                 winner = pick.entry;
+                winnerOwner = owner;
                 winnerQueued = pick.queued;
                 continue;
             }
@@ -1397,13 +1420,14 @@ std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, s
                 if (refusal != nullptr) *refusal = LabelRefusal::BehindCompletion;
                 return std::nullopt;
             }
-            const auto later = LaterLabel(*winner, *pick.entry);
+            const auto later = LaterLabel(*winner, *winnerOwner, *pick.entry, *owner);
             if (!later.has_value()) {
                 if (refusal != nullptr) *refusal = LabelRefusal::Unordered;
                 return std::nullopt;
             }
             if (*later) {
                 winner = pick.entry;
+                winnerOwner = owner;
                 winnerQueued = pick.queued;
             }
         }
@@ -4185,10 +4209,14 @@ void Recorder::Submit() {
     }
     std::unique_lock crossQueueLock(CrossQueueSubmitMutex(), std::defer_lock);
     if (peer != nullptr) crossQueueLock.lock();
-    if (peer != nullptr && peer->timeline != VK_NULL_HANDLE && peer->submissions != 0 && !skipPeerOnce && !OrderWaitsSuppressed().load(std::memory_order_acquire)) {
+    if (PeerSerialization() && peer != nullptr && peer->timeline != VK_NULL_HANDLE && peer->submissions != 0 && !skipPeerOnce && !OrderWaitsSuppressed().load(std::memory_order_acquire)) {
         auto& wait = orderWaits[peer->timeline];
         wait = std::max(wait, peer->submissions);
         ++queueOrder.peerWaits;
+    }
+    std::uint64_t waitedPeer = 0;
+    if (peer != nullptr && peer->timeline != VK_NULL_HANDLE) {
+        if (const auto found = orderWaits.find(peer->timeline); found != orderWaits.end()) waitedPeer = found->second;
     }
     if (QueueOrderVerify()) {
         for (const auto& [semaphore, value] : requiredOrder) {
@@ -4220,6 +4248,8 @@ void Recorder::Submit() {
     skipPeerOnce = false;
     batch->submitted = true;
     batch->serial = ++submissions;
+    raisePeerFloor(waitedPeer);
+    batch->afterPeer.store(peerFloor.load(std::memory_order_acquire), std::memory_order_release);
     batch->submitOrder.store(SubmitOrderCounter().fetch_add(1, std::memory_order_acq_rel) + 1, std::memory_order_release);
     if (crossQueueLock.owns_lock()) crossQueueLock.unlock();
     if (!batch->completions.empty()) PokeSubmitSequence();

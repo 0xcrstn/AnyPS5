@@ -1193,6 +1193,10 @@ void lateLabelTests(Recorder& recorder) {
 
 void crossQueueLabelTests(const Device& device, Recorder& recorder) {
     using Refusal = Recorder::LabelRefusal;
+    if (!device.Timelines() || Recorder::PeerSerialization()) {
+        std::cout << "cross-queue label tests skipped: they need timeline semaphores and APS5_QUEUE_ORDER=precise\n";
+        return;
+    }
     const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
     const std::array<std::byte, 4> two{std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0}};
     const std::array<std::byte, 4> three{std::byte{3}, std::byte{0}, std::byte{0}, std::byte{0}};
@@ -1206,61 +1210,76 @@ void crossQueueLabelTests(const Device& device, Recorder& recorder) {
         AsQueue& operator=(const AsQueue&) = delete;
     };
     Recorder::MapGuestQueue(0x20, 1);
-    Recorder other(device.GetContext(), false, 1);
-    other.Activate();
-    recorder.SetPeer(&other);
-    other.SetPeer(&recorder);
-    struct Unpeer {
-        Recorder& first;
-        Recorder& second;
-        ~Unpeer() {
-            first.Sync();
-            second.Sync();
-            first.SetPeer(nullptr);
-            second.SetPeer(nullptr);
-            Recorder::MapGuestQueue(0x20, 0);
-        }
-    } unpeer{recorder, other};
-    Refusal refusal{};
-    recorder.NoteLabel(a, one, 20, 0);
     {
-        AsQueue compute(0x20);
-        other.NoteLabel(a, two, 21, 0x20);
+        Recorder graphics(device.GetContext(), true, 0);
+        Recorder compute(device.GetContext(), true, 1);
+        graphics.Activate();
+        compute.Activate();
+        graphics.SetPeer(&compute);
+        compute.SetPeer(&graphics);
+        struct Unpeer {
+            Recorder& first;
+            Recorder& second;
+            ~Unpeer() {
+                first.Sync();
+                second.Sync();
+                first.SetPeer(nullptr);
+                second.SetPeer(nullptr);
+            }
+        } unpeer{graphics, compute};
+        AsQueue onGraphics(0);
+        const auto onCompute = [&](auto action) {
+            AsQueue queue(0x20);
+            action();
+        };
+        Refusal refusal{};
+        graphics.NoteLabel(a, one, 20, 0);
+        onCompute([&] { compute.NoteLabel(a, two, 21, 0x20); });
+        Require(!Recorder::LookupLabel(a, 4, 0, &refusal).has_value() && refusal == Refusal::Unordered, "a label pending unsubmitted on two physical queues is not refused as unordered");
+        graphics.Submit();
+        Require(!Recorder::LookupLabel(a, 4, 0, &refusal).has_value() && refusal == Refusal::Unordered, "a batch with no dependency on the other queue was taken to run after it");
+        compute.RequireOrderAfter(graphics, graphics.Submissions());
+        auto hit = Recorder::LookupLabel(a, 4, 0, &refusal);
+        Require(hit.has_value() && hit->value == 2 && hit->queue == 0x20 && hit->stamp == 21 && refusal == Refusal::None, "an open batch that will wait for the other queue's batch does not decide the label");
+        onCompute([&] { compute.Submit(); });
+        hit = Recorder::LookupLabel(a, 4, 0, &refusal);
+        Require(hit.has_value() && hit->value == 2 && refusal == Refusal::None, "a submitted batch that waited for the other queue's batch does not decide the label");
+        graphics.Sync();
+        compute.Sync();
+        Require(!Recorder::LookupLabel(a, 4, 0).has_value(), "the composed entries outlived their batches");
+        onCompute([&] {
+            compute.NoteLabel(b, two, 30, 0x20);
+            compute.Submit();
+        });
+        graphics.NoteLabel(b, three, 29, 0);
+        graphics.Submit();
+        Require(!Recorder::LookupLabel(b, 4, 0, &refusal).has_value() && refusal == Refusal::Unordered, "two submitted batches without a dependency were ordered by their submission");
+        graphics.Sync();
+        compute.Sync();
+        onCompute([&] {
+            compute.NoteLabel(b, two, 31, 0x20);
+            compute.Submit();
+        });
+        graphics.RequireOrderAfter(compute, compute.Submissions());
+        graphics.NoteLabel(b, three, 32, 0);
+        graphics.Submit();
+        hit = Recorder::LookupLabel(b, 4, 0, &refusal);
+        Require(hit.has_value() && hit->value == 3 && hit->stamp == 32 && refusal == Refusal::None, "a graphics batch that waited for the compute batch does not decide the label");
+        Require(!Recorder::LookupLabel(b, 4, 32, &refusal).has_value() && refusal != Refusal::None, "the late rule does not apply to the winning entry");
+        graphics.Sync();
+        compute.Sync();
+        graphics.NoteLabel(c, one, 40, 0);
+        onCompute([&] { compute.NoteLabel(c + 4, two, 41, 0x20); });
+        graphics.Submit();
+        onCompute([&] { compute.Submit(); });
+        hit = Recorder::LookupLabel(c, 8, 0, &refusal);
+        Require(hit.has_value() && hit->value == 0x0000000200000001ull && hit->queue == 0 && hit->stamp == 40 && refusal == Refusal::None, "a 64-bit label whose dwords are pending on two physical queues is not composed");
+        Require(!graphics.PendingLabel(c, 8, 0).has_value(), "one physical queue's own table composed a dword it does not hold");
+        graphics.Sync();
+        compute.Sync();
     }
-    Require(!Recorder::LookupLabel(a, 4, 0, &refusal).has_value() && refusal == Refusal::Unordered, "a label pending unsubmitted on two physical queues is not refused as unordered");
-    recorder.Submit();
-    auto hit = Recorder::LookupLabel(a, 4, 0, &refusal);
-    Require(hit.has_value() && hit->value == 2 && hit->queue == 0x20 && hit->stamp == 21 && refusal == Refusal::None, "the unsubmitted batch, which runs after the submitted one, does not decide the label");
-    other.Submit();
-    hit = Recorder::LookupLabel(a, 4, 0, &refusal);
-    Require(hit.has_value() && hit->value == 2 && refusal == Refusal::None, "the later of two submitted batches does not decide the label");
-    recorder.Sync();
-    other.Sync();
-    Require(!Recorder::LookupLabel(a, 4, 0).has_value(), "the composed entries outlived their batches");
-    {
-        AsQueue compute(0x20);
-        other.NoteLabel(b, two, 30, 0x20);
-    }
-    other.Submit();
-    recorder.NoteLabel(b, three, 29, 0);
-    hit = Recorder::LookupLabel(b, 4, 0, &refusal);
-    Require(hit.has_value() && hit->value == 3 && hit->stamp == 29 && refusal == Refusal::None, "a batch submitted later does not win over a newer stamp on a batch submitted earlier");
-    recorder.Submit();
-    hit = Recorder::LookupLabel(b, 4, 0, &refusal);
-    Require(hit.has_value() && hit->value == 3, "the submission order does not decide between two submitted batches");
-    Require(!Recorder::LookupLabel(b, 4, 29, &refusal).has_value() && refusal != Refusal::None, "the late rule does not apply to the winning entry");
-    recorder.Sync();
-    other.Sync();
-    recorder.NoteLabel(c, one, 40, 0);
-    {
-        AsQueue compute(0x20);
-        other.NoteLabel(c + 4, two, 41, 0x20);
-    }
-    recorder.Submit();
-    other.Submit();
-    hit = Recorder::LookupLabel(c, 8, 0, &refusal);
-    Require(hit.has_value() && hit->value == 0x0000000200000001ull && hit->queue == 0 && hit->stamp == 40 && refusal == Refusal::None, "a 64-bit label whose dwords are pending on two physical queues is not composed");
-    Require(!recorder.PendingLabel(c, 8, 0).has_value(), "one physical queue's own table composed a dword it does not hold");
+    Recorder::MapGuestQueue(0x20, 0);
+    recorder.Activate();
 }
 
 void crossQueueRecordTests(const Device& device, Recorder& recorder) {

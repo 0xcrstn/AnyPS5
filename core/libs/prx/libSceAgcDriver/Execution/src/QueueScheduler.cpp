@@ -196,6 +196,10 @@ void QueueScheduler::releaseLocked(std::uint32_t queue) {
 
 QueueScheduler::Turn QueueScheduler::Begin(std::uint32_t queue, std::uint64_t submission, std::size_t cursor, std::uint64_t received) {
     if (!Active()) return {};
+    if (!serialOrder() && !verify && capture == nullptr && !closedFlag.load(std::memory_order_acquire)) {
+        concurrentTurns.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
     std::unique_lock lock(mutex);
     rethrowClosedLocked();
     auto& stream = streams[queue];
@@ -316,6 +320,7 @@ void QueueScheduler::Close(std::exception_ptr reason) {
         if (capture != nullptr) std::fflush(capture);
         if (isClosed) return;
         isClosed = true;
+        closedFlag.store(true, std::memory_order_release);
         closed = reason != nullptr ? std::move(reason) : std::make_exception_ptr(std::runtime_error("the queue scheduler was closed"));
     }
     changed.notify_all();
@@ -328,7 +333,8 @@ std::uint32_t QueueScheduler::Holder() const {
 
 QueueScheduler::Statistics QueueScheduler::Take() {
     std::lock_guard lock(mutex);
-    const auto taken = statistics;
+    auto taken = statistics;
+    taken.turns += concurrentTurns.exchange(0, std::memory_order_relaxed);
     statistics = Statistics{};
     return taken;
 }
