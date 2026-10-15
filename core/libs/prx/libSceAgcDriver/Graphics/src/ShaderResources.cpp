@@ -4606,12 +4606,13 @@ bool MovedWordRing() {
     return MovedWordRingFlag().load(std::memory_order_relaxed);
 }
 
+std::atomic<bool>& InPlaceDrawInputsFlag() {
+    static std::atomic<bool> flag{std::getenv("APS5_IN_PLACE_DRAW_INPUTS") != nullptr && std::strcmp(std::getenv("APS5_IN_PLACE_DRAW_INPUTS"), "0") != 0};
+    return flag;
+}
+
 bool InPlaceDrawInputs() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("APS5_IN_PLACE_DRAW_INPUTS");
-        return value != nullptr && std::strcmp(value, "0") != 0;
-    }();
-    return enabled;
+    return InPlaceDrawInputsFlag().load(std::memory_order_relaxed);
 }
 
 bool AddressBasedDrawSnapshots() {
@@ -4621,6 +4622,14 @@ bool AddressBasedDrawSnapshots() {
     }();
     return enabled;
 }
+}
+
+void ShaderResources::SetInPlaceDrawInputs(bool enabled) {
+    InPlaceDrawInputsFlag().store(enabled, std::memory_order_relaxed);
+}
+
+bool ShaderResources::InPlaceDrawInputsEnabled() {
+    return InPlaceDrawInputs();
 }
 
 void ShaderResources::SetMovedWordRing(bool enabled) {

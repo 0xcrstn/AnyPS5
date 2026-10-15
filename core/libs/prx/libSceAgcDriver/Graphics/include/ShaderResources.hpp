@@ -211,6 +211,8 @@ public:
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     static std::size_t MaxDrawSnapshotBytes();
     static void SetMovedWordRing(bool enabled);
+    static void SetInPlaceDrawInputs(bool enabled);
+    static bool InPlaceDrawInputsEnabled();
     static std::optional<ByteRanges> GuestReadRanges(std::span<const std::uint32_t> words, const ShaderRecompiler::BufferReadRanges* ranges, std::uint64_t size, WholeCopy* reason = nullptr, const DrawIndexRanges* drawRanges = nullptr);
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
