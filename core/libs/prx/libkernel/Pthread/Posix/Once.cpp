@@ -14,14 +14,17 @@ struct GuestOnce {
 };
 static_assert(offsetof(GuestOnce, mutex) == 8 && sizeof(GuestOnce) == 16);
 std::mutex onceMutex;
-std::condition_variable onceChanged;
+std::condition_variable& OnceChanged() {
+    static auto* const changed = new std::condition_variable();
+    return *changed;
+}
 
 void APS5_VABI ResetOnce(void* control) {
     {
         std::lock_guard lock(onceMutex);
         static_cast<GuestOnce*>(control)->state = 0;
     }
-    onceChanged.notify_all();
+    OnceChanged().notify_all();
 }
 }
 
@@ -29,7 +32,7 @@ extern "C" int APS5_VABI pthread_once_nid_postfix(
     GuestOnce* control, void (APS5_VABI *initialize)()) {
     if (!control || !initialize) return 22;
     std::unique_lock lock(onceMutex);
-    onceChanged.wait(lock, [&] { return control->state != 2; });
+    OnceChanged().wait(lock, [&] { return control->state != 2; });
     if (control->state == 1) return 0;
     if (control->state != 0) return 22;
     control->state = 2;
@@ -50,6 +53,6 @@ extern "C" int APS5_VABI pthread_once_nid_postfix(
     lock.lock();
     control->state = 1;
     lock.unlock();
-    onceChanged.notify_all();
+    OnceChanged().notify_all();
     return 0;
 }

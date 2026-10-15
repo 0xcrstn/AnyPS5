@@ -304,7 +304,7 @@ private:
 };
 
 HostMutex g_mutex;
-HostCondition g_cv;
+HostCondition& g_cv = *new HostCondition();
 std::map<int, Sock> g_socks;
 std::set<int> g_epolls;
 std::map<int, std::map<int, NetEpollEvent>> g_epoll_socks;
