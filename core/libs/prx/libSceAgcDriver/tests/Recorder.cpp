@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/IndexBounds.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -52,6 +53,7 @@
 #include <functional>
 #include <algorithm>
 #include <array>
+#include <span>
 #include <atomic>
 #include <cmath>
 #include <chrono>
@@ -3679,9 +3681,53 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+void lowestIndexTests() {
+    using AgcDriver::Graphics::KnownLowestDrawIndex;
+    using AgcDriver::Graphics::LowestDrawIndex;
+    const std::array<std::uint16_t, 5> strip{0xffffu, 40u, 0xffffu, 37u, 52u};
+    Require(LowestDrawIndex(std::as_bytes(std::span(strip)), 2u, true) == 37u, "the lowest index of a strip with restarts is not 37");
+    const std::array<std::uint16_t, 2> restarts{0xffffu, 0xffffu};
+    Require(!LowestDrawIndex(std::as_bytes(std::span(restarts)), 2u, true).has_value(), "a buffer of restart indices was given a lowest vertex");
+    Require(LowestDrawIndex(std::as_bytes(std::span(restarts)), 2u, false) == 0xffffu, "without primitive restart 0xffff was not taken as a vertex index");
+    const std::array<std::uint32_t, 3> wide{0xffffffffu, 9u, 7u};
+    Require(LowestDrawIndex(std::as_bytes(std::span(wide)), 4u, true) == 7u, "the lowest 32-bit index skipping restarts is not 7");
+    constexpr std::size_t bytes = 65536;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "write watching unavailable: lowest index cache not tested
+";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* indices = static_cast<std::uint32_t*>(block);
+    for (std::uint32_t i = 0; i < 1024u; ++i) indices[i] = 5000u + i;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const std::span<const std::byte> view(static_cast<const std::byte*>(block), 4096);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    auto generation = AgcDriver::GuestMemory::CollectWrites(address, view.size());
+    if (generation == 0) {
+        std::cout << "write tracking returned no generation: lowest index cache not tested
+";
+        return;
+    }
+    AgcDriver::Graphics::TakeLowestIndexCounters();
+    Require(KnownLowestDrawIndex(address, view, 4u, true, generation) == 5000u, "the lowest index of 5000 to 6023 is not 5000");
+    generation = AgcDriver::GuestMemory::CollectWrites(address, view.size());
+    Require(KnownLowestDrawIndex(address, view, 4u, true, generation) == 5000u && AgcDriver::Graphics::TakeLowestIndexCounters().hits == 1u, "an unchanged index buffer was scanned again for its lowest index");
+    indices[700] = 12u;
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    generation = AgcDriver::GuestMemory::CollectWrites(address, view.size());
+    Require(KnownLowestDrawIndex(address, view, 4u, true, generation) == 12u, "a stored index did not replace the cached lowest index");
+    Require(KnownLowestDrawIndex(address, view, 2u, true, generation) == 0u, "a 16-bit reading of the same bytes reused the 32-bit lowest index");
+}
+
 void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
+    lowestIndexTests();
     const auto words = [](std::uint64_t address, std::uint32_t stride, std::uint32_t records, std::uint32_t word3) {
         return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu | (stride << 16u), records, word3};
     };
