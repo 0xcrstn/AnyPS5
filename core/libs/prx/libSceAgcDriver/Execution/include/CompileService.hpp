@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <map>
@@ -95,6 +96,13 @@ public:
         callback();
     }
 
+    bool OnSettledUnlessSettled(std::function<void()> callback) {
+        std::lock_guard lock(mutex);
+        if (settledLocked()) return false;
+        callbacks.push_back(std::move(callback));
+        return true;
+    }
+
     std::exception_ptr Failure() const {
         std::lock_guard lock(mutex);
         return failure;
@@ -135,7 +143,20 @@ private:
             pending.swap(callbacks);
         }
         settledSignal.notify_all();
-        for (auto& callback : pending) callback();
+        std::string failures;
+        for (auto& callback : pending) {
+            try {
+                callback();
+            } catch (const std::exception& error) {
+                failures += std::string(failures.empty() ? "" : "; ") + error.what();
+            } catch (...) {
+                failures += std::string(failures.empty() ? "" : "; ") + "unknown exception";
+            }
+        }
+        if (!failures.empty()) {
+            std::fprintf(stderr, "[compile-service] a settle callback of %s threw, which callbacks must never do: %s\n", key.c_str(), failures.c_str());
+            std::terminate();
+        }
     }
 
     void start() {
@@ -228,6 +249,17 @@ public:
             promoteLocked(ticket, priority);
         }
         changed.notify_all();
+    }
+
+    bool Park(const std::shared_ptr<CompileTicket>& ticket, std::function<void()> callback) {
+        if (ticket == nullptr) throw std::invalid_argument("parking on a null compile ticket");
+        {
+            std::lock_guard lock(mutex);
+            promoteLocked(*ticket, CompilePriority::Demand);
+            if (!ticket->OnSettledUnlessSettled(std::move(callback))) return false;
+        }
+        changed.notify_all();
+        return true;
     }
 
     bool Cancel(const CompileTicket& ticket) {

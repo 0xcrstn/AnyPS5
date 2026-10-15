@@ -247,6 +247,36 @@ void Teardown() {
     Require(speculative->State() == CompileState::Cancelled, "teardown did not cancel speculative work");
 }
 
+void Parking() {
+    CompileService service(Single());
+    Gate gate;
+    std::atomic<int> fired{0};
+    auto blocker = service.Submit("blocker", CompilePriority::Demand, 1, [&](const CompileTicket&) { gate.Block(); });
+    gate.Ready();
+    auto parked = service.Submit("parked", CompilePriority::Predicted, 1, [&](const CompileTicket&) {});
+    Require(service.Park(parked, [&] { fired.fetch_add(1); }), "parking on a queued ticket did not register");
+    Require(parked->Priority() == CompilePriority::Demand, "parking did not promote the ticket to demand");
+    Require(service.CancelSpeculative() == 0 && parked->State() == CompileState::Queued, "speculative cancellation cancelled a parked ticket");
+    Require(fired.load() == 0, "a parked callback fired before its ticket settled");
+    gate.Open();
+    parked->Wait();
+    Require(fired.load() == 1, "a parked callback did not fire exactly once when its ticket settled");
+    bool called = false;
+    Require(!service.Park(parked, [&] { called = true; }), "parking on a settled ticket registered a callback");
+    Require(!parked->OnSettledUnlessSettled([&] { called = true; }), "registering on a settled ticket did not report it settled");
+    Require(!called, "parking on a settled ticket called its callback on the caller");
+    Gate second;
+    auto holder = service.Submit("holder", CompilePriority::Demand, 1, [&](const CompileTicket&) { second.Block(); });
+    second.Ready();
+    auto cancelled = service.Submit("cancelled", CompilePriority::Registration, 1, [&](const CompileTicket&) {});
+    std::atomic<int> cancelFired{0};
+    Require(cancelled->OnSettledUnlessSettled([&] { cancelFired.fetch_add(1); }), "registering on a queued ticket failed");
+    service.Cancel(*cancelled);
+    Require(cancelFired.load() == 1 && cancelled->State() == CompileState::Cancelled, "cancellation did not fire the settle callback");
+    second.Open();
+    holder->Wait();
+}
+
 std::atomic<bool> guardHeld{false};
 
 void WaitGuard() {
@@ -338,6 +368,7 @@ int main() {
         Failure();
         Teardown();
         WaitGuard();
+        Parking();
         RecipeVerification();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "compile service test failed: %s\n", error.what());
