@@ -90,6 +90,10 @@ struct MarkedWrites {
 };
 MarkedWrites MarkWrittenUnlessStored(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t since);
 void LogDriverStores(std::vector<std::pair<std::uint64_t, std::uint64_t>>* log);
+enum class DriverStoredSince : std::uint8_t { No, Stored, Unknown };
+void EnableDriverStoreLog();
+std::uint64_t DriverStoreSequence();
+DriverStoredSince DriverStoresSinceSequence(std::uint64_t sequence, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 std::uint64_t ExchangeCollectEpoch(std::uint64_t epoch);
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
 // returns the current generation instead. A guest write landing between two collects of the same

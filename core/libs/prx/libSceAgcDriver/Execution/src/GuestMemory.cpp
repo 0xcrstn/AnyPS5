@@ -6,6 +6,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include <deque>
 #include <mutex>
 #include <array>
 #include <chrono>
@@ -1707,9 +1708,57 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 namespace {
 thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* driverStoreLog = nullptr;
 
-void logDriverStore(std::uint64_t begin, std::uint64_t end) {
-    if (driverStoreLog != nullptr && begin < end) driverStoreLog->emplace_back(begin, end);
+struct SharedDriverStoreLog {
+    static constexpr std::size_t Capacity = 65536;
+    struct Entry {
+        std::uint64_t sequence;
+        std::uint64_t begin;
+        std::uint64_t end;
+    };
+    std::atomic<bool> enabled{false};
+    std::mutex mutex;
+    std::uint64_t sequence = 0;
+    std::deque<Entry> entries;
+};
+
+SharedDriverStoreLog& sharedDriverStoreLog() {
+    static SharedDriverStoreLog log;
+    return log;
 }
+
+void logDriverStore(std::uint64_t begin, std::uint64_t end) {
+    if (begin >= end) return;
+    if (driverStoreLog != nullptr) driverStoreLog->emplace_back(begin, end);
+    auto& shared = sharedDriverStoreLog();
+    if (!shared.enabled.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(shared.mutex);
+    shared.entries.push_back({++shared.sequence, begin, end});
+    if (shared.entries.size() > SharedDriverStoreLog::Capacity) shared.entries.pop_front();
+}
+}
+
+void EnableDriverStoreLog() {
+    sharedDriverStoreLog().enabled.store(true, std::memory_order_release);
+}
+
+std::uint64_t DriverStoreSequence() {
+    auto& shared = sharedDriverStoreLog();
+    std::lock_guard lock(shared.mutex);
+    return shared.sequence;
+}
+
+DriverStoredSince DriverStoresSinceSequence(std::uint64_t sequence, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    auto& shared = sharedDriverStoreLog();
+    if (!shared.enabled.load(std::memory_order_acquire)) return DriverStoredSince::Unknown;
+    std::lock_guard lock(shared.mutex);
+    if (shared.sequence == sequence) return DriverStoredSince::No;
+    if (shared.entries.empty() || shared.entries.front().sequence > sequence + 1) return DriverStoredSince::Unknown;
+    for (auto entry = shared.entries.rbegin(); entry != shared.entries.rend() && entry->sequence > sequence; ++entry) {
+        for (const auto& [begin, end] : ranges) {
+            if (begin < entry->end && entry->begin < end) return DriverStoredSince::Stored;
+        }
+    }
+    return DriverStoredSince::No;
 }
 
 void LogDriverStores(std::vector<std::pair<std::uint64_t, std::uint64_t>>* log) {
