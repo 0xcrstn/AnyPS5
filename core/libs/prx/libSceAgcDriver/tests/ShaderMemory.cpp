@@ -1522,6 +1522,69 @@ void verifyCaptureValues() {
     const auto branchAfter = CompiledWalkCounts();
     const bool compiledWalk = std::getenv("APS5_NO_COMPILED_WALK") == nullptr;
     require(branchAfter.runs - branchBefore.runs == (compiledWalk ? 5u : 0u), "capture values: the compiled walk did not serve the branch plan as configured");
+    if (compiledWalk) {
+        static std::uint64_t dirty = 0;
+        const SrtMemoryReader readWord = +[](void*, std::uint64_t address, std::uint32_t* value) {
+            std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+            return true;
+        };
+        const SrtStableWord stableWord = +[](void*, std::uint64_t address, std::uint32_t) { return address != dirty; };
+        const auto incrementalPrepared = PreparedShaderInvocation::TryCreate(request, handle);
+        require(incrementalPrepared.has_value(), "incremental instance: the prepared shader stopped matching its request");
+        SrtTapeInstance instance;
+        const auto run = [&](bool incremental) {
+            SrtRuntime runtime;
+            runtime.userData = userData;
+            runtime.shaderBase = request.shader.codeAddress;
+            runtime.readMemory = readWord;
+            runtime.readSpecializationMemory = readWord;
+            if (incremental) {
+                runtime.stableWord = stableWord;
+                runtime.tapeInstance = &instance;
+            }
+            return incrementalPrepared->CaptureValues(runtime);
+        };
+        const auto same = [&](const char* what) {
+            const auto kept = run(true);
+            require(sameSnapshot(kept->snapshot, run(false)->snapshot), std::string("incremental instance: ") + what + ": the snapshot differs from a plain run");
+            return kept;
+        };
+        userData[0] = static_cast<std::uint32_t>(pointerTo(tables.first));
+        userData[1] = static_cast<std::uint32_t>(pointerTo(tables.first) >> 32u);
+        fill(tables.first, first, 1u, 0u);
+        fill(tables.second, second, 1u, 16u);
+        dirty = 0;
+        same("first run");
+        const auto firstReads = instance.freshReads;
+        require(instance.runs == 1 && instance.keptReads == 0 && instance.keptValues == 0 && firstReads != 0, "incremental instance: the first run kept values it never computed");
+        same("unchanged run");
+        require(instance.keptReads == firstReads && instance.freshReads == 0, "incremental instance: an unchanged run read " + std::to_string(instance.freshReads) + " guest words and kept " + std::to_string(instance.keptReads) + ", expected all " + std::to_string(firstReads) + " kept");
+        tables.first[0] = second[0];
+        dirty = pointerTo(tables.first);
+        const auto reread = same("changed word not proven stable");
+        require(reread->snapshot.images.at(0).dwords[0] == second[0] && instance.freshReads == 1 && instance.keptReads + 1 == firstReads, "incremental instance: a word the runtime did not prove stable was not read again alone");
+        tables.first[0] = first[0];
+        dirty = 0;
+        const auto lied = run(true);
+        require(lied->snapshot.images.at(0).dwords[0] == second[0], "incremental instance: a word the runtime proved stable was read again");
+        dirty = pointerTo(tables.first);
+        same("word read again after a stale proof");
+        dirty = 0;
+        userData[0] = static_cast<std::uint32_t>(pointerTo(tables.second));
+        userData[1] = static_cast<std::uint32_t>(pointerTo(tables.second) >> 32u);
+        const auto followed = same("moved SRT pointer");
+        require(followed->snapshot.images.at(0).dwords[0] == second[0] && instance.freshReads != 0, "incremental instance: reads behind a moved pointer were kept");
+        userData[2] = 11u;
+        const auto unread = same("changed unread user word");
+        require(unread->snapshot.userData.at(2) == 11u && instance.freshReads == 0, "incremental instance: a changed user word the walk does not read forced reads");
+        tables.second[20] = 0u;
+        dirty = pointerTo(tables.second) + 20u * sizeof(std::uint32_t);
+        const auto off = same("branch condition off");
+        require(std::ranges::all_of(off->snapshot.images.at(0).dwords, [](std::uint32_t word) { return word == 0u; }), "incremental instance: a skipped branch kept its T#");
+        tables.second[20] = 1u;
+        same("branch condition on again");
+        dirty = 0;
+    }
 
     constexpr int Iterations = 20000;
     const auto noPendingWrites = +[](std::uint64_t, std::size_t, std::span<std::byte>) { return AgcDriver::ShaderMemory::PendingWrite::None; };

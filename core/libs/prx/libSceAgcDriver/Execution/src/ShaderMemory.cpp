@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver {
@@ -693,6 +694,12 @@ bool ShaderMemory::readDirect(std::uint64_t address, std::uint32_t* value) {
         word = fetchWord(address, kind == PageWordwise && pendingWrite != nullptr);
         ++directHooked;
     }
+    recordDirect(address, word);
+    *value = word;
+    return true;
+}
+
+void ShaderMemory::recordDirect(std::uint64_t address, std::uint32_t word) {
     if ((directReads.size() + 1) * 2 > directIndex.size()) {
         directIndex.assign(directIndex.empty() ? 256 : directIndex.size() * 2, 0u);
         const auto mask = directIndex.size() - 1;
@@ -709,8 +716,48 @@ bool ShaderMemory::readDirect(std::uint64_t address, std::uint32_t* value) {
     directIndex[slot] = static_cast<std::uint32_t>(directReads.size());
     recentReads.push_back(static_cast<std::uint32_t>(directReads.size() - 1));
     if (recording != nullptr) recording->push_back({address, 0, word});
-    *value = word;
+}
+
+bool ShaderMemory::stable(void* context, std::uint64_t address, std::uint32_t word) {
+    return static_cast<ShaderMemory*>(context)->stableDirect(address, word);
+}
+
+bool ShaderMemory::stableDirect(std::uint64_t address, std::uint32_t word) {
+    if (!direct || stableSince == 0 || address % sizeof(word) != 0) return false;
+    if (!initial.empty() && address < initialHigh && address + sizeof(word) > initialLow) return false;
+    if (!directIndex.empty()) {
+        const auto mask = directIndex.size() - 1;
+        for (auto slot = static_cast<std::size_t>((address >> 2u) * 0x9e3779b97f4a7c15ull >> 40u) & mask;; slot = (slot + 1) & mask) {
+            const auto held = directIndex[slot];
+            if (held == 0) break;
+            if (directReads[held - 1].address != address) continue;
+            if (directReads[held - 1].word != word) return false;
+            recentReads.push_back(held - 1);
+            return true;
+        }
+    }
+    const auto allocation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    if (allocation != stableAllocation) return false;
+    const auto provider = pendingGenerationProvider.load(std::memory_order_acquire);
+    const auto pending = provider != nullptr ? provider() : instanceSerial;
+    const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
+    if (directPageKind(base, allocation, provider, pending) != PageWhole || !pageUnchanged(base)) return false;
+    recordDirect(address, word);
+    keptWords.emplace_back(address, word);
     return true;
+}
+
+bool ShaderMemory::pageUnchanged(std::uint64_t base) {
+    for (const auto& [page, unchanged] : stablePages) {
+        if (page == base) return unchanged;
+    }
+    const bool unchanged = GuestMemory::CollectWrites(base, PageBytes) != 0 && GuestMemory::UnchangedSince(base, PageBytes, stableSince);
+    stablePages.emplace_back(base, unchanged);
+    return unchanged;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint32_t>> ShaderMemory::TakeKeptWords() {
+    return std::exchange(keptWords, {});
 }
 
 bool ShaderMemory::probeDirect(std::uint64_t address, std::uint64_t end) {
@@ -1216,14 +1263,47 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
     return result;
 }
 
-std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation) {
+void ShaderMemory::enableDirect() {
     if (!direct && DirectReadsEnabled() && WordwisePages() && pages.empty()) {
         direct = true;
         auto& cache = ThreadPageStates();
         instanceSerial = ++cache.serials;
         DirectTotals().captures.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation) {
+    enableDirect();
     return capture(invocation.Request(), nullptr, &invocation, true);
+}
+
+std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation, IncrementalState& state) {
+    enableDirect();
+    const auto allocation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto generation = GuestMemory::TrackerGeneration();
+    stableSince = direct && state.allocation == allocation ? state.generation : 0;
+    stableAllocation = allocation;
+    stablePages.clear();
+    keptWords.clear();
+    tapeInstance = &state.instance;
+    struct Reset {
+        ShaderMemory& memory;
+        ~Reset() {
+            memory.tapeInstance = nullptr;
+            memory.stableSince = 0;
+        }
+    } reset{*this};
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> result;
+    try {
+        result = capture(invocation.Request(), nullptr, &invocation, true);
+    } catch (...) {
+        state = {};
+        throw;
+    }
+    state.plan = result->plan;
+    state.generation = generation;
+    state.allocation = allocation;
+    return result;
 }
 
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation, bool valuesOnly) {
@@ -1243,6 +1323,10 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.accessible = &accessible;
     runtime.pendingWrite = &pending;
     runtime.readWords = &readWords;
+    if (valuesOnly && tapeInstance != nullptr) {
+        runtime.tapeInstance = tapeInstance;
+        runtime.stableWord = &stable;
+    }
     auto capture = invocation != nullptr ? (valuesOnly ? invocation->CaptureValues(runtime) : invocation->Capture(runtime)) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);

@@ -154,6 +154,10 @@ private:
     static bool verifyBindingPlan();
     void planDrawDecode(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches, bool profile);
     void notePlannedStage(bool verified, bool mismatch, SnapshotPart part, bool templateHit, ShaderRecompiler::SnapshotWordCounts words);
+    static bool incrementalBindings();
+    static bool verifyIncrementalBindings();
+    static ShaderMemory::IncrementalState& incrementalBinding(const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::span<const std::uint32_t> userData);
+    void noteIncrementalStage(const ShaderRecompiler::SrtTapeInstance& instance, bool verified, bool stale);
     static std::uint64_t drawDecodeKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
     void reportBindingPlan();
     static bool verifyDrawEntries();

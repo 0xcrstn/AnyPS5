@@ -12,6 +12,7 @@
 #else
 #include <sys/mman.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -243,12 +244,45 @@ void PlannedIndirectDrawsKeepOwnedResults() {
     Require(after.verifiedStages == before.verifiedStages + 8u && after.stageMismatches == before.stageMismatches, "CPU-expanded planned stages differ from full materialization");
 }
 
+void IncrementalDrawsFollowWatchedTables() {
+    auto* words = reinterpret_cast<std::uint32_t*>(AllocateWatched(Block));
+    auto* table = words;
+    auto* values = reinterpret_cast<float*>(words + 64);
+    const auto describe = [&](const float* data) {
+        const auto descriptor = BufferDescriptor(data, 0, 16u, 0x31016facu);
+        std::copy(descriptor.begin(), descriptor.end(), table);
+    };
+    std::fill_n(values, 8, 0.0f);
+    values[0] = 1.0f;
+    values[4] = 0.5f;
+    describe(values);
+    SetVertexRecords(3);
+    const auto before = Counters();
+    Draw(BufferPixelCode.data(), table, 255, "the first incremental draw over a watched table");
+    Draw(BufferPixelCode.data(), table, 255, "an incremental draw over an unchanged watched table");
+    const auto unchanged = Counters();
+    Require(unchanged.incrementalStages == before.incrementalStages + 4u, "incremental draws ran " + std::to_string(unchanged.incrementalStages - before.incrementalStages) + " incremental stages, expected 4");
+    Require(unchanged.keptReads > before.keptReads, "an incremental draw over an unchanged watched table kept no guest word");
+    describe(values + 4);
+    Draw(BufferPixelCode.data(), table, 128, "an incremental draw whose watched table a CPU store changed");
+    describe(values);
+    Draw(BufferPixelCode.data(), table, 255, "an incremental draw whose watched table a CPU store changed back");
+    const auto after = Counters();
+    Require(after.incrementalVerified - before.incrementalVerified == after.incrementalStages - before.incrementalStages, "incremental stages were not all verified");
+    Require(after.incrementalStale == before.incrementalStale && after.stageMismatches == before.stageMismatches, "incremental draws served stale words or differed from the full capture");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        const bool incremental = argc == 2 && std::string(argv[1]) == "incremental";
         SetEnvironment("APS5_BINDING_PLAN");
         SetEnvironment("APS5_VERIFY_BINDING_PLAN");
+        if (incremental) {
+            SetEnvironment("APS5_INCREMENTAL_BINDINGS");
+            SetEnvironment("APS5_VERIFY_INCREMENTAL_BINDINGS");
+        }
         bool libraries = false;
         {
             const auto device = OpenVulkanTestDevice();
@@ -260,6 +294,7 @@ int main() {
         Register(BufferPixelHeader, BufferPixelCode.data(), sizeof(BufferPixelCode), 1);
         PlannedDrawsFollowTheirBuffers(libraries);
         PlannedIndirectDrawsKeepOwnedResults();
+        if (incremental) IncrementalDrawsFollowWatchedTables();
         AgcDriverShutdown_nid_postfix();
         std::cout << "Planned draws read their buffers, reuse their decode and templates, and match the full capture " << (libraries ? "with" : "without") << " graphics pipeline libraries" << std::endl;
         return 0;
