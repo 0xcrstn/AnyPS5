@@ -287,6 +287,10 @@ void BdaResources::CheckFault() const {
         message << "shader stage " << report.stage << " called address 0x" << std::hex << report.address << " at program counter 0x" << report.instruction << ", which no linked callee of that call matches";
         throw std::runtime_error(message.str());
     }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RangeCacheMismatch) {
+        message << "BDA range cache verify: shader stage " << report.stage << " pc 0x" << std::hex << report.instruction << " translated 0x" << report.address << std::dec << " (" << report.bytes << " bytes) through its cached range to a different device address than the table search";
+        throw std::runtime_error(message.str());
+    }
     message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Permission && table != nullptr) {
         const auto bytes = table->Bytes();
