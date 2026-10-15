@@ -381,7 +381,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             // linear bytes on the CPU, so it keeps the waiting batch, as does a build without a
             // recorder (tests). APS5_SYNC_TEXTURE_UPLOAD=1 restores the waiting batch for every upload.
             static const bool syncUploads = std::getenv("APS5_SYNC_TEXTURE_UPLOAD") != nullptr;
-            auto* recorder = dumpWanted || syncUploads ? nullptr : Recorder::Active();
+            auto* recorder = dumpWanted || syncUploads ? nullptr : Recorder::Current();
             std::unique_ptr<CommandBatch> batch;
             VkCommandBuffer commands = VK_NULL_HANDLE;
             if (recorder != nullptr) {
@@ -689,7 +689,7 @@ bool Texture::RefreshDepthCopy() {
         toDepth.push_back(region);
         offset += static_cast<std::uint64_t>(extent.width) * extent.height * copyElementBytes * copyLayers;
     }
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     std::unique_ptr<CommandBatch> batch;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     if (recorder != nullptr) {
@@ -750,7 +750,7 @@ bool Texture::refreshBlockCopy() {
         region.extent = {std::max(copyWidth >> level, 1u) / 4u, std::max(copyHeight >> level, 1u) / 4u, 1u};
         regions.push_back(region);
     }
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     std::unique_ptr<CommandBatch> batch;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     if (recorder != nullptr) {
@@ -2340,7 +2340,7 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     const auto end = address + bytes;
     const auto first = address / blockBytes;
     Require(changed.size() == (end - 1) / blockBytes - first + 1, "texture comparison block count differs");
-    const auto* recorder = Recorder::Active();
+    const auto* recorder = Recorder::Current();
     const auto epoch = GuestMemory::CollectEpoch();
     const bool whole = address == descriptor.baseAddress && bytes == guestBytes;
     const auto hint = memoize && epoch != 0 && whole ? GuestMemory::UntrackedHint(address, bytes) : 0;
@@ -2417,7 +2417,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
         static const bool recordClear = std::getenv("APS5_NO_RECORDED_CLEAR") == nullptr;
-        auto* recorder = recordClear ? Recorder::Active() : nullptr;
+        auto* recorder = recordClear ? Recorder::Current() : nullptr;
         std::unique_ptr<CommandBatch> batch;
         VkCommandBuffer commands = VK_NULL_HANDLE;
         auto timing = Recorder::NoTiming;
@@ -2469,7 +2469,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     }
     if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? surfaceImport() : nullptr) {
         if (AnyDeviceResidentOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
-            if (auto* active = Recorder::Active(); active != nullptr) {
+            if (auto* active = Recorder::Current(); active != nullptr) {
                 if (PublishDeviceResident(*active, descriptor.baseAddress, static_cast<std::size_t>(guestBytes), ResidentSite::Upload) != 0) {
                     active->Submit();
                     active->Sync();
@@ -2543,7 +2543,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         const bool direct = singlePass();
         auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         detiler.BeginBatch();
-        auto* recorder = Recorder::Active();
+        auto* recorder = Recorder::Current();
         std::unique_ptr<CommandBatch> batch;
         VkCommandBuffer commands = VK_NULL_HANDLE;
         auto timing = Recorder::NoTiming;
@@ -2979,7 +2979,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
     const bool direct = singlePass();
     auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     detiler.BeginBatch();
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     std::unique_ptr<CommandBatch> batch;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     auto timing = Recorder::NoTiming;
@@ -3188,7 +3188,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
     auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     auto tiledScratch = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(scratchTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     detiler.BeginBatch();
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     std::unique_ptr<CommandBatch> batch;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkAccessFlags covered = 0;
@@ -3420,7 +3420,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     std::lock_guard lock(pending.mutex);
     // The active recorder installs a hook that also waits for recorded work; without one (tests),
     // pending storage results alone are flushed.
-    if (Recorder::Active() == nullptr) {
+    if (Recorder::Current() == nullptr) {
         static const bool hooked = [] {
             GuestMemory::SetFlushHook(&FlushHook);
             return true;
@@ -3463,7 +3463,7 @@ void StorageTexture::settleProtection() {
     }
     const auto protection = std::exchange(accessProtection, 0);
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    if (auto* recorder = Recorder::Active()) recorder->OnCompleteWithoutGuestAccess([protection] { Coherence::ReleaseDeviceOwned(protection); });
+    if (auto* recorder = Recorder::Current()) recorder->OnCompleteWithoutGuestAccess([protection] { Coherence::ReleaseDeviceOwned(protection); });
     else Coherence::ReleaseDeviceOwned(protection);
 }
 
@@ -3494,10 +3494,10 @@ void StorageTexture::MaterializeForNativeAccess(std::uint64_t address, std::size
     if (GuestMemory::GpuMutex().HeldByThisThread()) Coherence::NoteLockedFault({address, address + bytes});
     std::lock_guard gpu(GuestMemory::GpuMutex());
     static_cast<void>(FlushPending(address, bytes, nullptr, "native access", PublishScope::Whole));
-    if (auto* recorder = Recorder::Active()) {
-        if (AnyDeviceResident()) static_cast<void>(PublishDeviceResident(*recorder, address, bytes, ResidentSite::Native));
-        recorder->Sync();
-    }
+    Recorder::ForEachActive([&](Recorder& recorder) {
+        if (AnyDeviceResident()) static_cast<void>(PublishDeviceResident(recorder, address, bytes, ResidentSite::Native));
+        recorder.Sync();
+    });
 }
 
 void StorageTexture::Flush() {
@@ -3717,7 +3717,7 @@ void StorageTexture::commitStoredSave(const std::vector<std::uint32_t>& units) {
     if (units.empty()) return;
     const auto ticket = ++lastSaveTicket;
     for (const auto unit : units) savedTicket[unit] = ticket;
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     if (recorder == nullptr) {
         applyStoredSave(ticket, units);
         return;
@@ -3758,7 +3758,7 @@ void StorageTexture::awaitStoredSave(const std::vector<bool>* layers) {
         last = std::max(last, layerBegin(unit) + layerBytes(unit));
     }
     if (last <= first) return;
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     Require(recorder != nullptr, "a write-back's saved guest bytes are pending without a recorder");
     recorder->SyncThrough(first, static_cast<std::size_t>(last - first));
     const auto outstanding = [&] {
@@ -4350,7 +4350,7 @@ std::size_t StorageTexture::ClearByKeysFill(std::uint64_t address, std::size_t b
 bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
     VkClearColorValue clearValue{};
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     const char* refusal = !ClearColorFor(storageFormat, keys, clearValue) ? (keys == DccKeys::ClearRegister ? "clear-register code" : "no clear value in the storage format") : recorder == nullptr ? "no recorder" : nullptr;
     if (refusal != nullptr) {
         static std::atomic<bool> reported{false};
@@ -4449,7 +4449,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
             return false;
         }
     }
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     if (recorder == nullptr) {
         refusal = "no recorder";
         return false;
@@ -4610,7 +4610,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
         refusal = "not imported";
         return false;
     }
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     if (recorder == nullptr) {
         refusal = "no recorder";
         return false;
@@ -4909,7 +4909,7 @@ void StorageTexture::retileUnitsTo(const DeviceUnits& target, const std::vector<
             bytes += stop - begin;
         }
     }
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     Require(recorder != nullptr, "a device hand-over needs the recorder");
     const bool direct = singlePass();
     auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -4993,7 +4993,7 @@ std::uint64_t StorageTexture::uploadUnitsFrom(const DeviceUnits& source, std::sp
         Require(descriptor.baseAddress + window.tiledBegin >= source.base && descriptor.baseAddress + window.tiledEnd <= source.base + source.buffer->Size(), "a device hand-over reads outside its buffer");
     }
     for (const auto& [begin, end] : runs) uploadedBytes += end - begin;
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     Require(recorder != nullptr, "a device hand-over needs the recorder");
     const bool direct = singlePass();
     auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -5097,7 +5097,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     }
     std::uint64_t bytes = 0;
     for (const auto& [begin, end] : runs) bytes += end - begin;
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     std::unique_ptr<CommandBatch> batch;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     auto timing = Recorder::NoTiming;
@@ -5209,8 +5209,11 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
 bool StorageTexture::guestBytesSettled() const {
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{descriptor.baseAddress, descriptor.baseAddress + guestBytes}}};
     if (AnyShadowedOverlaps(range) || AnyPendingOverlaps(range)) return false;
-    const auto* recorder = Recorder::Active();
-    return recorder == nullptr || !recorder->PendingWriteOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    bool settled = true;
+    Recorder::ForEachActive([&](Recorder& recorder) {
+        if (recorder.PendingWriteOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) settled = false;
+    });
+    return settled;
 }
 
 bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const {
@@ -5425,7 +5428,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         for (const auto& [from, to] : keep) copied.push_back({from - descriptor.baseAddress, to - descriptor.baseAddress, from - descriptor.baseAddress});
         const auto padding = paddingSeeds(segments, copied);
         detiler.BeginBatch();
-        auto* recorder = Recorder::Active();
+        auto* recorder = Recorder::Current();
         std::unique_ptr<CommandBatch> batch;
         VkCommandBuffer commands = VK_NULL_HANDLE;
         auto timing = Recorder::NoTiming;

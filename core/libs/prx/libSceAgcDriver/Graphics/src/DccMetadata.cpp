@@ -174,7 +174,7 @@ KeyStoreMemo& Memo() {
 
 // Under memo.mutex: the active recorder, with the entries of any other recorder dropped.
 Recorder* MemoRecorder(KeyStoreMemo& memo) {
-    auto* active = Recorder::Active();
+    auto* active = Recorder::Current();
     if (active != memo.recorder) {
         memo.entries.clear();
         memo.recorder = active;
@@ -502,10 +502,10 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
             return DccKeys::Mixed;
         }
         PublishShadow(metaAddress, count, PublishScope::Whole, PublishReason::Keys);
-        if (auto* recorder = Recorder::Active()) {
+        Recorder::ForEachActive([](Recorder& recorder) {
             Recorder::CountSync(2);
-            recorder->Sync();
-        }
+            recorder.Sync();
+        });
     }
     const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
     const auto first = keys[0];
@@ -539,7 +539,7 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
 DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized) {
     memoized = false;
     if (metaAddress != 0 && count != 0 && GuestMemory::GpuMutex().HeldByThisThread()) {
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
+        if (auto* recorder = Recorder::Current(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
             if (const auto keys = PendingStoreKeys(*recorder, metaAddress, count)) {
                 memoized = true;
                 return *keys;
@@ -606,7 +606,7 @@ void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std:
 void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount) {
     const auto count = StoredKeyCount(metaAddress, surfaceBytes, keyCount);
     if (count == 0) return;
-    auto* recorder = CpuKeysOnly() || !GuestMemory::GpuMutex().HeldByThisThread() ? nullptr : Recorder::Active();
+    auto* recorder = CpuKeysOnly() || !GuestMemory::GpuMutex().HeldByThisThread() ? nullptr : Recorder::Current();
     // The bytes are scanned only when no recorded work writes them: a pending clear kernel's keys are
     // not in memory yet, so the bytes could read as uncompressed while the kernel will store a clear
     // code, and the range is stored without looking (the fill lands after the kernel). That includes
@@ -685,7 +685,7 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
         // After the scan: a write noted since the collect is stamped above it anyway; one noted
         // before it may still land after the bytes were read.
         if (GuestMemory::GpuMutex().HeldByThisThread()) {
-            if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+            if (auto* recorder = Recorder::Current(); recorder != nullptr) {
                 const auto info = recorder->DescribePendingWrite(resource.dccAddress, count);
                 stable = !info.has_value() || info->signaled;
             }
@@ -717,7 +717,7 @@ DccKeys ProvedCurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceByt
     const auto keys = currentDccKeys(metaAddress, count, memoized);
     bool stable = collected != 0 && !memoized;
     if (stable) {
-        if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+        if (auto* recorder = Recorder::Current(); recorder != nullptr) {
             const auto info = recorder->DescribePendingWrite(metaAddress, count);
             stable = !info.has_value() || info->signaled;
         }
@@ -757,7 +757,7 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     const auto count = static_cast<std::size_t>(guestBytes / KeyBytes);
     const auto metaAddress = resource.dccAddress;
     if (metaAddress == 0 || count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return std::nullopt;
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
     if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
     Recorder::CountSync(2);

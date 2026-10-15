@@ -9,7 +9,7 @@ namespace AgcDriver::Graphics {
 
 void TextureDetiler::BeginBatch() {
     GuestMemory::AssertGpuLockHeld("TextureDetiler::BeginBatch");
-    if (const auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) return;
+    if (const auto* recorder = Recorder::Current(); recorder != nullptr && !recorder->Idle()) return;
     resetRing(descriptorSets, "vkResetDescriptorPool texture detiler");
     resetRing(cmaskDescriptorSets, "vkResetDescriptorPool CMASK clear");
     resetRing(imageDescriptorSets, "vkResetDescriptorPool texture detiler");
@@ -24,7 +24,7 @@ void TextureDetiler::resetRing(DescriptorRing& ring, const char* resetWhat) {
 
 VkDescriptorSet TextureDetiler::allocateFrom(DescriptorRing& ring, VkDescriptorSetLayout layout, const std::vector<VkDescriptorPoolSize>& sizes, const char* createWhat, const char* allocateWhat, const char* resetWhat) {
     constexpr std::uint32_t setsPerPool = 64;
-    const auto* recorder = Recorder::Active();
+    const auto* recorder = Recorder::Current();
     if (ring.pools.empty() || ring.used == setsPerPool) {
         const auto completed = recorder != nullptr ? recorder->CompletedThrough() : std::numeric_limits<std::uint64_t>::max();
         auto next = ring.pools.size();
