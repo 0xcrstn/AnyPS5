@@ -17,9 +17,9 @@ double MsSince(std::chrono::steady_clock::time_point start) {
 }
 
 SchedulerMode QueueScheduler::ParseMode(const char* value) {
-    if (value == nullptr || std::strcmp(value, "off") == 0) return SchedulerMode::Off;
+    if (value == nullptr || std::strcmp(value, "dag") == 0) return SchedulerMode::Dag;
+    if (std::strcmp(value, "off") == 0) return SchedulerMode::Off;
     if (std::strcmp(value, "serial") == 0) return SchedulerMode::Serial;
-    if (std::strcmp(value, "dag") == 0) return SchedulerMode::Dag;
     throw std::runtime_error(std::string("APS5_QUEUE_SCHEDULER: unknown mode ") + value + " (off, serial or dag)");
 }
 

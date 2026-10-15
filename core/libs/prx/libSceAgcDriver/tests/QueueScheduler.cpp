@@ -45,7 +45,7 @@ bool WaitUntil(const std::function<bool()>& done) {
 }
 
 void TestModes() {
-    Expect(QueueScheduler::ParseMode(nullptr) == SchedulerMode::Off, "an unset scheduler mode is off");
+    Expect(QueueScheduler::ParseMode(nullptr) == SchedulerMode::Dag, "an unset scheduler mode is dag");
     Expect(QueueScheduler::ParseMode("off") == SchedulerMode::Off, "off parses");
     Expect(QueueScheduler::ParseMode("serial") == SchedulerMode::Serial, "serial parses");
     Expect(QueueScheduler::ParseMode("dag") == SchedulerMode::Dag, "dag parses");

@@ -906,6 +906,13 @@ int main(int argc, char** argv) {
             std::puts("Wait floor verify failed as required");
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--wait-floor-submission") {
+            testLabelStoredSinceSubmission();
+            testWideLabelStoredSinceSubmission();
+            LibcRunShutdown_nid_postfix();
+            std::puts("Wait floor submission tests passed");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--wait-floor-activation") {
             testWaitAfterWaitRejectsOverwrittenLabel();
             testWaitObservesValueStoredAfterActivation();
@@ -999,10 +1006,8 @@ int main(int argc, char** argv) {
         testClearState();
         testSubmissions();
         testEndOfPipeInterrupts();
-        testLabelStoredSinceSubmission();
         testEndOfPipeLabelsWithoutWork();
         testLabelHeldAtSubmission();
-        testWideLabelStoredSinceSubmission();
         testWaitFreeSubmissionAfterEarlierQueue0Work();
         testWaitFreeSubmissionQueue0WaitsOn();
         testMultiAcbs();
