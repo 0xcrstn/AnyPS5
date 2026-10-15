@@ -340,6 +340,11 @@ void BdaResources::CheckFault() const {
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::TranslationMismatch) message << "; the legacy and radix BDA translations differ for this access (APS5_BDA_ABI=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::ProvenanceMismatch) message << "; the capability installed from this access's base resource differs from the table lookup (APS5_BDA_PROVENANCE=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RelativeMismatch) message << "; the cached BDA range capability differs from the table lookup for this access (APS5_BDA_RELATIVE=verify)";
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::BufferSelectMismatch) {
+        message.str({});
+        message << "APS5_BUFFER_SELECTS=verify: shader stage " << report.stage << " pc 0x" << std::hex << report.instruction << " read 0x" << static_cast<std::uint32_t>(report.address) << " from a buffer without branches where the guarded read gave 0x" << static_cast<std::uint32_t>(report.address >> 32u) << std::dec << " (" << report.bytes << " components)";
+        throw std::runtime_error(message.str());
+    }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::FlushProofMismatch) {
         message.str({});
         message << "APS5_FLUSH_PROOFS=verify: shader stage " << report.stage << " saw the denormal 0x" << std::hex << static_cast<std::uint32_t>(report.address) << std::dec << " where a proof said a denormal flush was unneeded";

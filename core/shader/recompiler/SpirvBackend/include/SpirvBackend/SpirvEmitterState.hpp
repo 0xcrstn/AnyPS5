@@ -108,6 +108,8 @@ struct SpirvEmitterState {
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
+    bool robustBufferAccess2 = false;
+    RewriteMode bufferSelects = RewriteMode::Off;
     bool sharedFloatFunctions = true;
     bool outlineImageModes = false;
     bool sharedBufferHelpers = true;
@@ -130,6 +132,8 @@ struct SpirvEmitterState {
     std::uint32_t storageBufferU8Variable = 0;
     std::vector<std::uint32_t> memoryByteOffsets;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
+    std::map<std::array<std::uint64_t, 5>, std::array<std::uint32_t, 6>> runtimeDescriptors;
+    std::map<std::array<std::uint32_t, 3>, std::pair<std::uint32_t, std::uint32_t>> runtimeBufferLengths;
     std::uint32_t helperBufferElement = 0;
     std::uint32_t helperBufferByteOffset = 0;
     std::uint32_t helperBufferMisalignment = 0;

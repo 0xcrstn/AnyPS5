@@ -288,6 +288,7 @@ std::uint32_t SpirvValueEmitContext::Label(const IrBlock* block) const {
 }
 
 void PrepareRewriteVerification(IrProgram& program) {
+    if (BufferSelectsSetting() == RewriteMode::Verify) program.Info().usesFaultBuffer = true;
     if (BallotReuseSetting() == RewriteMode::Verify) program.Info().usesFaultBuffer = true;
     const bool log2 = LazyLog2RepairSetting() == RewriteMode::Verify;
     const bool trig = LazyTrigSeriesSetting() == RewriteMode::Verify;
@@ -327,6 +328,8 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.registrationModules = target.registrationModules;
     state.fragmentDescriptorSet = target.fragmentDescriptorSet;
     state.float16DenormPreserve = target.float16DenormPreserve;
+    state.robustBufferAccess2 = target.robustBufferAccess2;
+    state.bufferSelects = target.robustBufferAccess2 ? BufferSelectsSetting() : RewriteMode::Off;
     state.sharedFloatFunctions = target.sharedFloatFunctions.value_or(SharedFloatFunctions());
     state.outlineImageModes = target.outlineImageModes.value_or(OutlineImageModes());
     state.sharedBufferHelpers = target.sharedBufferHelpers.value_or(SharedBufferHelpers());

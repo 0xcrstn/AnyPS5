@@ -60,6 +60,11 @@ inline RewriteMode InterpolationFactsSetting() {
     return mode;
 }
 
+inline RewriteMode BufferSelectsSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_BUFFER_SELECTS", std::getenv("APS5_BUFFER_SELECTS"), RewriteMode::On);
+    return mode;
+}
+
 inline RewriteMode BdaSpanHelpersSetting() {
     static const RewriteMode mode = ParseRewriteMode("APS5_BDA_SPAN_HELPERS", std::getenv("APS5_BDA_SPAN_HELPERS"), RewriteMode::On);
     return mode;
