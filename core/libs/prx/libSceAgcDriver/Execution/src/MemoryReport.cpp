@@ -104,6 +104,12 @@ std::string Describe(const std::function<std::string()>& device) {
     text += "; host mapped " + mib(space.hostMapped) + ", images " + mib(space.image);
     const auto vulkan = device ? device() : std::string{};
     if (!vulkan.empty()) text += " | vulkan " + vulkan;
+    const auto placed = [&](Graphics::DeviceMemoryKind kind, const char* name) {
+        const auto local = Graphics::DeviceMemoryPlacements::Live(kind, false);
+        const auto host = Graphics::DeviceMemoryPlacements::Live(kind, true);
+        return std::string(name) + " " + mib(local.bytes) + " in " + std::to_string(local.allocations) + " device-local, " + mib(host.bytes) + " in " + std::to_string(host.allocations) + " placed in host memory";
+    };
+    text += " | live device memory: " + placed(Graphics::DeviceMemoryKind::Buffer, "buffers") + "; " + placed(Graphics::DeviceMemoryKind::Texture, "textures") + "; " + placed(Graphics::DeviceMemoryKind::StorageTexture, "storage textures");
     char part[1536];
     std::snprintf(part, sizeof(part), " | shaders registered %llu; preparation queue %llu (%llu of them used in earlier runs; %llu running on %llu threads), library prebuilds %llu; plans awaiting preparation %llu holding %llu decoded instructions (%s); recompiler sources %llu, resource plans %llu (%llu values, ~%s; %llu of them kept only in the disk cache, ~%s, %llu read back), retained IR programs %llu, IR being prepared %llu (~%s, peak ~%s), variants %llu (~%s metadata, %s SPIR-V in memory, %llu kept only in the disk cache with %s, %llu read back: %s), memoized results %llu (~%s), binding plans %llu, specialized modules %llu (%s SPIR-V), registration modules %llu",
         static_cast<unsigned long long>(backlog.registered), static_cast<unsigned long long>(backlog.queued), static_cast<unsigned long long>(backlog.queuedByUse), static_cast<unsigned long long>(backlog.running), static_cast<unsigned long long>(backlog.threads), static_cast<unsigned long long>(backlog.prebuildsQueued), static_cast<unsigned long long>(backlog.plans), static_cast<unsigned long long>(backlog.planInstructions), mib(backlog.planInstructionBytes).c_str(),
