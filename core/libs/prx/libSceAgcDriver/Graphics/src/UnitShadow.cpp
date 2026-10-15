@@ -21,7 +21,7 @@ namespace {
 
 constexpr std::uint64_t UnitBytes = 65536;
 constexpr std::size_t ReasonCount = static_cast<std::size_t>(PublishReason::Count);
-constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown", "flip"};
+constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown", "flip", "pointer"};
 
 std::uint64_t BudgetBytes() {
     static const std::uint64_t budget = [] {
@@ -57,6 +57,7 @@ struct Statistics {
     std::atomic<std::uint64_t> detiledShadow{0}, detiledShadowBytes{0}, detiledImport{0}, detiledImportBytes{0}, tailPublishes{0};
     std::array<std::atomic<std::uint64_t>, ReasonCount> published{}, publishedBytes{};
     std::atomic<std::uint64_t> staleDroppedCpu{0}, staleDroppedDriver{0}, skippedInCompletion{0}, evictions{0}, lostOnRetire{0}, droppedOnRetire{0}, slabLost{0}, verified{0}, mismatches{0};
+    std::atomic<std::uint64_t> pointerForgotten{0}, pointerKept{0};
 };
 
 Statistics& Stats() {
@@ -81,6 +82,7 @@ struct UnitShadow {
     std::vector<std::shared_ptr<ShadowSlab>> slabs;
     std::vector<std::uint64_t> slabFailedUntil;
     std::uint32_t liveUnits = 0;
+    std::uint32_t freshUnits = 0;
 
     std::uint64_t Units() const { return generation.size(); }
     std::uint64_t UnitBegin(std::uint64_t unit) const { return base + unit * UnitBytes; }
@@ -90,9 +92,13 @@ struct UnitShadow {
     std::pair<std::uint64_t, std::uint64_t> UnitRange(std::uint64_t unit) const { return {std::max(UnitBegin(unit), importBase), std::min(UnitBegin(unit + 1), ImportEnd())}; }
     bool Live(std::uint64_t unit) const { return generation[unit] != 0 && published[unit] == 0; }
     void Recount() {
-        std::uint32_t live = 0;
-        for (std::uint64_t unit = 0; unit < Units(); ++unit) live += Live(unit) ? 1u : 0u;
+        std::uint32_t live = 0, fresh = 0;
+        for (std::uint64_t unit = 0; unit < Units(); ++unit) {
+            live += Live(unit) ? 1u : 0u;
+            fresh += generation[unit] != 0 ? 1u : 0u;
+        }
         liveUnits = live;
+        freshUnits = fresh;
     }
 };
 
@@ -291,6 +297,7 @@ void verifyPublished(const UnitShadow& shadow, const std::vector<SlabCopies>& co
 
 // The publish of one shadow: `selected[k]` (k = unit - first) names the units the scope chose.
 std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_t first, std::uint64_t last, const std::vector<std::uint8_t>& selected, PublishReason reason) {
+    const auto selectedFirst = first;
     auto& registry = Registry();
     std::vector<SlabCopies> copies;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -313,6 +320,8 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         const auto walkBegin = std::max(shadow->UnitBegin(walkFirst), shadow->importBase);
         const auto walkEnd = std::min(shadow->UnitBegin(walkLast + 1), shadow->ImportEnd());
         if (walkEnd > walkBegin) GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+        first = walkFirst;
+        last = walkLast;
     }
     {
         std::lock_guard lock(registry.mutex);
@@ -320,7 +329,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         changedUnits(*shadow, first, last, changed, cpu);
         for (auto unit = first; unit <= last; ++unit) {
             const auto k = static_cast<std::size_t>(unit - first);
-            if (!selected[k] || !shadow->Live(unit)) continue;
+            if (!selected[static_cast<std::size_t>(unit - selectedFirst)] || !shadow->Live(unit)) continue;
             if (changed[k] == GuestMemory::BlockWritten) {
                 // Newer bytes reached the import since the retile: the slab's are dead.
                 shadow->generation[unit] = 0;
@@ -452,6 +461,7 @@ PublishReason PublishReasonFor(const char* flushReason) {
     if (is("buffer copy count") || is("dispatch-cache entry")) return PublishReason::Validate;
     if (is("storage image creation") || is("storage refresh")) return PublishReason::Upload;
     if (is("flip")) return PublishReason::Flip;
+    if (is("address-based heap")) return PublishReason::Pointer;
     return PublishReason::Hook;
 }
 
@@ -497,6 +507,7 @@ bool anyLiveOverlapping(TRegistry& registry, std::uint64_t address, std::size_t 
     const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
     return anyOverlapping(registry, address, end, [&](const std::shared_ptr<UnitShadow>& shadow) {
         if (shadow->liveUnits == 0) return false;
+        if (address <= shadow->importBase && end >= shadow->ImportEnd()) return true;
         const auto begin = std::max(address, shadow->importBase);
         const auto stop = std::min(end, shadow->ImportEnd());
         for (auto unit = shadow->UnitOf(begin); unit <= shadow->UnitOf(stop - 1); ++unit) {
@@ -523,6 +534,35 @@ bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>
         if (end > begin && anyLiveOverlapping(registry, begin, static_cast<std::size_t>(end - begin))) return true;
     }
     return false;
+}
+
+std::size_t ForgetPublishedShadows(std::uint64_t address, std::size_t bytes) {
+    if (!UnitShadowEnabled() || bytes == 0) return 0;
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    auto& registry = Registry();
+    std::lock_guard lock(registry.mutex);
+    std::size_t forgotten = 0, kept = 0;
+    anyOverlapping(registry, address, end, [&](const std::shared_ptr<UnitShadow>& shadow) {
+        if (shadow->freshUnits == 0) return false;
+        const auto first = shadow->UnitOf(std::max(address, shadow->importBase));
+        const auto last = shadow->UnitOf(std::min(end, shadow->ImportEnd()) - 1);
+        for (auto unit = first; unit <= last; ++unit) {
+            if (shadow->generation[unit] == 0) continue;
+            if (shadow->published[unit] == 0) {
+                ++kept;
+                continue;
+            }
+            shadow->generation[unit] = 0;
+            shadow->published[unit] = 0;
+            ++forgotten;
+        }
+        shadow->Recount();
+        return false;
+    });
+    Stats().pointerForgotten.fetch_add(forgotten, std::memory_order_relaxed);
+    Stats().pointerKept.fetch_add(kept, std::memory_order_relaxed);
+    if (forgotten != 0) StorageTexture::BumpPendingSerial();
+    return forgotten;
 }
 
 std::uint64_t SlabBoundary(const HostImport& import, std::uint64_t address) {
@@ -860,6 +900,8 @@ std::string ShadowReport() {
         retired = registry.retired;
     }
     std::snprintf(text, sizeof(text), " %llu/%.1f by reason {%s }, stale-dropped %llu (cpu %llu, driver %llu), skipped-in-completion %llu, slabs %llu live %.1f MiB / peak %.1f MiB, evictions %llu, slab lost %llu, retired %llu, dropped on retire %llu, lost on retire %llu", publishedTotal, mib(publishedBytesTotal), reasons.c_str(), cpuDropped + driverDropped, cpuDropped, driverDropped, take(statistics.skippedInCompletion), liveSlabs, mib(liveBytes), mib(peakBytes), take(statistics.evictions), take(statistics.slabLost), retired, take(statistics.droppedOnRetire), take(statistics.lostOnRetire));
+    line += text;
+    std::snprintf(text, sizeof(text), ", pointer-forgotten %llu (kept %llu)", take(statistics.pointerForgotten), take(statistics.pointerKept));
     line += text;
     if (ShadowVerify()) {
         std::snprintf(text, sizeof(text), ", verified %llu, mismatches %llu", take(statistics.verified), take(statistics.mismatches));

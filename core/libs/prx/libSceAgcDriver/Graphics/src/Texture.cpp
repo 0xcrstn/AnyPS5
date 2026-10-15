@@ -1431,6 +1431,7 @@ bool FillClearColor(VkFormat format, std::uint32_t elementBytes, std::span<const
 // The image being validated by Refresh: its own pending results are what the next dispatch wants,
 // so the comparison with guest memory must not flush them.
 thread_local const StorageTexture* refreshing = nullptr;
+thread_local std::span<const std::pair<std::uint64_t, std::uint64_t>> pointerExempt;
 
 void FlushHook(std::uint64_t address, std::size_t bytes) {
     StorageTexture::FlushPending(address, bytes);
@@ -3475,6 +3476,7 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
     if (published != nullptr) *published = false;
+    const auto exemptRanges = std::exchange(pointerExempt, {});
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
     // another thread releases outside the GPU mutex once the batch completed.
     std::vector<std::shared_ptr<StorageTexture>> flush;
@@ -3484,7 +3486,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         const auto* exempt = refreshing;
         for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
-            if (texture != except && texture != exempt && texture->overlaps(address, bytes)) {
+            if (texture != except && texture != exempt && texture->overlaps(address, bytes) && std::none_of(exemptRanges.begin(), exemptRanges.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return texture->overlaps(range.first, static_cast<std::size_t>(range.second - range.first)); })) {
                 if (!texture->pendingUnitInside(address, bytes)) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
                     ++it;
@@ -3711,6 +3713,18 @@ bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes
     if (scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes)) return false;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     return PublishShadow(address, bytes, scope, PublishReasonFor(reason)) != 0;
+}
+
+bool StorageTexture::StoreForPointerAccess(std::uint64_t address, std::size_t bytes, bool writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt) {
+    if (!writes) return PublishShadowsOnly(address, bytes, PublishScope::Whole, "address-based heap");
+    const auto previous = std::exchange(pointerExempt, exempt);
+    struct Restore {
+        std::span<const std::pair<std::uint64_t, std::uint64_t>> previous;
+        ~Restore() { pointerExempt = previous; }
+    } restore{previous};
+    bool published = false;
+    const bool stored = FlushPending(address, bytes, nullptr, "address-based heap", PublishScope::Whole, &published);
+    return stored || published;
 }
 
 namespace {
