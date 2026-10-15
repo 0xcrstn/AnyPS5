@@ -5334,9 +5334,9 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     if (Coherence::Tracking() && !guestMemory.Writes().empty()) {
         std::vector<Coherence::Interval> written;
         for (const auto& [begin, end] : guestMemory.Writes()) written.push_back({begin, end});
-        auto token = Coherence::Reserve(Coherence::Producer::ElementWriter, written, false, GuestMemory::GpuLockThreadTag());
-        token.Recorded();
-        elementWriters.push_back({std::move(token), std::move(written)});
+        auto token = std::make_shared<Coherence::ProducerToken>(Coherence::Reserve(Coherence::Producer::ElementWriter, written, false, GuestMemory::GpuLockThreadTag()));
+        token->Recorded();
+        if (token->Held()) recorder.OnCompleteWithoutGuestAccess([token, written = std::move(written)] { token->Complete(written); });
     }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -5370,7 +5370,6 @@ void ShaderResources::CheckFaults() const {
         bda->CheckFault();
         guestMemory.CompletePointerWrites(bda->WrittenRanges());
     }
-    completeElementWriters();
 }
 
 void ShaderResources::WriteBackBuffers() {
@@ -5378,16 +5377,8 @@ void ShaderResources::WriteBackBuffers() {
         bda->CheckFault();
         guestMemory.CompletePointerWrites(bda->WrittenRanges());
     }
-    completeElementWriters();
     if (SkipWriteBack()) return;
     guestMemory.WriteBack();
-}
-
-void ShaderResources::completeElementWriters() const {
-    if (elementWriters.empty()) return;
-    auto writer = std::move(elementWriters.front());
-    elementWriters.pop_front();
-    writer.token.Complete(writer.intervals);
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
