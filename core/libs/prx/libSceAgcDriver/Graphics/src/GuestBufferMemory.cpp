@@ -3686,6 +3686,14 @@ void GuestBufferMemory::ForgetPointerShadows() const {
     for (const auto& [begin, end] : pointerHeaps) static_cast<void>(ForgetPublishedShadows(begin, static_cast<std::size_t>(end - begin)));
 }
 
+void GuestBufferMemory::PointerRecorded() {
+    pointerToken.Recorded();
+}
+
+void GuestBufferMemory::CompletePointerWrites(std::span<const Coherence::Interval> written) const {
+    if (pointerToken.Held()) pointerToken.Complete(written);
+}
+
 void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     pointerHeaps.clear();
@@ -3896,6 +3904,15 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         for (const auto& region : regions) heap(region);
     }
     for (const auto& [begin, end] : pointerHeaps) static_cast<void>(StorageTexture::StoreForPointerAccess(begin, static_cast<std::size_t>(end - begin), pointerWrites, pointerExempt));
+    if (Coherence::Tracking() && !pointerHeaps.empty()) {
+        for (const auto& [begin, end] : pointerHeaps) StorageTexture::AuditPointerReads(begin, static_cast<std::size_t>(end - begin), pointerExempt);
+        if (pointerWrites) {
+            std::vector<Coherence::Interval> heaps;
+            heaps.reserve(pointerHeaps.size());
+            for (const auto& [begin, end] : pointerHeaps) heaps.push_back({begin, end});
+            pointerToken = Coherence::Reserve(Coherence::Producer::PointerWriter, heaps, true, GuestMemory::GpuLockThreadTag());
+        }
+    }
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     if (addressable && AnyDeviceResident()) {
         if (auto* active = Recorder::Active()) {
