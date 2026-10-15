@@ -50,6 +50,17 @@ public:
         std::uint64_t twinViews = 0;
         std::uint64_t twinsRefused = 0;
         std::uint64_t extendedCopies = 0;
+        std::uint64_t placed = 0;
+        std::uint64_t placedBytes = 0;
+        std::uint64_t placedReuses = 0;
+        std::uint64_t placeRefused = 0;
+    };
+    struct Placed {
+        std::uint64_t arena = 0;
+        std::size_t chunk = 0;
+        std::uint64_t serial = 0;
+        VkDeviceSize offset = 0;
+        std::size_t bytes = 0;
     };
 
     explicit DrawSnapshotArena(const Context& context);
@@ -64,6 +75,14 @@ public:
         if (auto hit = lookup(recorder, address, bytes, registryGeneration)) return hit;
         return copy(recorder, address, bytes, registryGeneration, ranges());
     }
+    template <class Fill>
+    std::optional<View> Place(Recorder& recorder, std::size_t bytes, Fill&& fill, Placed* placed) {
+        const auto target = reserve(bytes, placed);
+        if (!target) return std::nullopt;
+        fill(*target);
+        return view(recorder, placed->chunk, placed->offset, placed->bytes, true, placed->bytes, placed->bytes);
+    }
+    std::optional<View> Reuse(Recorder& recorder, const Placed& placed);
     Counters TakeCounters();
     std::size_t ChunkCount() const { return chunks.size(); }
     std::size_t EntryCount() const { return entries.size(); }
@@ -115,6 +134,7 @@ private:
     };
     std::optional<Placement> allocate(std::size_t bytes);
     bool beginTake(std::size_t bytes);
+    std::optional<std::span<std::byte>> reserve(std::size_t bytes, Placed* placed);
     std::optional<View> copy(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, std::optional<CopyRanges> ranges);
     void settleTwin(Recorder& recorder, Chunk& chunk);
     std::optional<std::size_t> reusableChunk() const;

@@ -4595,6 +4595,19 @@ bool PartialSnapshotsDisabled() {
     static const bool disabled = std::getenv("APS5_NO_PARTIAL_DRAW_SNAPSHOTS") != nullptr;
     return disabled;
 }
+
+std::atomic<bool>& MovedWordRingFlag() {
+    static std::atomic<bool> flag{std::getenv("APS5_MOVED_WORD_RING") != nullptr && std::strcmp(std::getenv("APS5_MOVED_WORD_RING"), "0") != 0};
+    return flag;
+}
+
+bool MovedWordRing() {
+    return MovedWordRingFlag().load(std::memory_order_relaxed);
+}
+}
+
+void ShaderResources::SetMovedWordRing(bool enabled) {
+    MovedWordRingFlag().store(enabled, std::memory_order_relaxed);
 }
 
 const char* ShaderResources::WholeCopyName(WholeCopy reason) {
@@ -4728,7 +4741,38 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (override != moved.end() && !override->words.empty()) {
             constexpr std::size_t MovedWordBufferSlots = 8;
             const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
-            const bool reusedWords = held != movedWordBuffers.end();
+            const auto keep = [&](MovedWordBuffer entry) {
+                if (held != movedWordBuffers.end()) *held = std::move(entry);
+                else if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
+                else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
+            };
+            if (MovedWordRing()) {
+                auto& arena = recorder.SnapshotArena();
+                auto view = held != movedWordBuffers.end() && held->buffer == nullptr ? arena.Reuse(recorder, held->placed) : std::nullopt;
+                const bool reusedPlacement = view.has_value();
+                DrawSnapshotArena::Placed placed;
+                if (!view) {
+                    view = arena.Place(recorder, override->size, [&](std::span<std::byte> target) {
+                        std::memcpy(target.data(), override->words.data(), override->size);
+                        for (const auto& patch : dataPatches) {
+                            if (patch.allocation == index && patch.byte < override->size) target[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                        }
+                    }, &placed);
+                }
+                if (view) {
+                    if (!reusedPlacement) keep(MovedWordBuffer{index, override->words, override->size, nullptr, placed});
+                    selected.push_back(index);
+                    result->snapshots.push_back({0, nullptr, {}, view->buffer, view->offset, view->bytes});
+                    if (statistics != nullptr && reusedPlacement) {
+                        ++statistics->reused;
+                    } else if (statistics != nullptr) {
+                        ++statistics->copied;
+                        statistics->copiedBytes += override->size;
+                    }
+                    continue;
+                }
+            }
+            const bool reusedWords = held != movedWordBuffers.end() && held->buffer != nullptr;
             std::shared_ptr<Buffer> buffer;
             if (reusedWords) {
                 buffer = held->buffer;
@@ -4738,9 +4782,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 for (const auto& patch : dataPatches) {
                     if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
                 }
-                MovedWordBuffer entry{index, override->words, override->size, buffer};
-                if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
-                else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
+                keep(MovedWordBuffer{index, override->words, override->size, buffer});
             }
             selected.push_back(index);
             const auto wordHandle = buffer->Handle();
