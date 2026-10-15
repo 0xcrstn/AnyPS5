@@ -119,6 +119,8 @@ void Driver::stop() {
     }
     batchAgeChanged.notify_all();
     if (batchAgeThread.joinable()) batchAgeThread.join();
+    Graphics::Recorder::PokeSubmitSequence();
+    if (completionThread.joinable()) completionThread.join();
     StopWorkerSampler();
     MemoryReport::Stop();
     CloseRegistrationPreparation();

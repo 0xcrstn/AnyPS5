@@ -94,9 +94,14 @@ std::uint32_t FunctionLdsAllocationDwords(const IrProgram& program, const Shader
     return std::min(inputInfo.pixel->psExtraLdsDwords, FunctionLdsDwordLimit);
 }
 
+std::uint32_t FunctionLdsUnboundedDwords(const IrProgram& program, const ShaderStageInputInfo& inputInfo) {
+    if (program.Resources().stage != IrShaderStage::Pixel || inputInfo.pixel == nullptr || inputInfo.pixel->psExtraLdsDwords != 0u) return FunctionLdsDwordLimit;
+    return std::clamp(inputInfo.pixel->inputNum * 12u, 64u, FunctionLdsDwordLimit);
 }
 
-SpirvEmitterState::SpirvEmitterState(const IrProgram& program, const ShaderStageInputInfo& inputInfo) : module(program.Resources().stage == IrShaderStage::Mesh ? 0x00010400u : 0x00010300u), program(program), inputInfo(inputInfo), requirements(AnalyzeProgramRequirements(program, FunctionLdsAllocationDwords(program, inputInfo))) {
+}
+
+SpirvEmitterState::SpirvEmitterState(const IrProgram& program, const ShaderStageInputInfo& inputInfo) : module(program.Resources().stage == IrShaderStage::Mesh ? 0x00010400u : 0x00010300u), program(program), inputInfo(inputInfo), requirements(AnalyzeProgramRequirements(program, FunctionLdsAllocationDwords(program, inputInfo), FunctionLdsUnboundedDwords(program, inputInfo))) {
 }
 
 SpirvValueEmitContext::SpirvValueEmitContext(SpirvEmitterState& state) : state(state) {

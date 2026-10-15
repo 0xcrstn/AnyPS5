@@ -35,6 +35,7 @@ function(add_shader_recompiler target runtimeTarget)
 
     add_library(${target} STATIC EXCLUDE_FROM_ALL
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Recompiler.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Materialize.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderManifest.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CompileTrace.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvIntern.cpp

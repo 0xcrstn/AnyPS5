@@ -114,6 +114,7 @@ public:
     VkFormat ViewFormat() const { return viewFormat; }
     // Whether this texture is a view of a storage image (no snapshot of its own).
     bool ViewsStorageImage() const { return storageSource != nullptr; }
+    VkImage Image() const { return image; }
     const StorageTexture* StorageSource() const { return storageSource.get(); }
     const std::shared_ptr<StorageTexture>& SharedStorageSource() const { return storageSource; }
     // The last key scan of the sampled surface (ProvedClearKeys), for surfaces whose keys are not

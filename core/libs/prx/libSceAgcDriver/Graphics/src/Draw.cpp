@@ -456,8 +456,8 @@ struct DrawOutcome {
 
 // The resources of a draw: a recipe hit (reserved for the draw recipe step), a resource-cache
 // template hit, a build, or an address-based (BDA) build.
-enum DrawKind : std::size_t { KindRecipeHit, KindTemplateHit, KindBuild, KindBda, KindCount };
-constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "template hit", "build", "BDA"};
+enum DrawKind : std::size_t { KindRecipeHit, KindTemplateHit, KindBuild, KindBda, KindAddressHit, KindBdaWriter, KindCount };
+constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "template hit", "build", "BDA reading", "BDA template hit", "BDA writing"};
 
 struct DrawProfile {
     std::mutex mutex;
@@ -1789,7 +1789,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 if (verifyAddress && cached->AddressTemplate()) cached->VerifyAddressTemplate(ShaderResources(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots));
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
-                outcome.kind = KindTemplateHit;
+                outcome.kind = resolved.resources->AddressTemplate() ? KindAddressHit : KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
                 countCache(&DrawProfile::cacheMisses);
@@ -1807,7 +1807,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
-        outcome.kind = outcome.addressBased ? KindBda : KindBuild;
+        outcome.kind = !outcome.addressBased ? KindBuild : resolved.resources->WritesThroughPointers() ? KindBdaWriter : KindBda;
         if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
     }
     timer.phase(PhaseResources);
@@ -1971,13 +1971,12 @@ bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, R
 
 std::shared_ptr<Buffer> meshArgumentBuffer(const Context& context, std::span<const std::uint32_t> restartTable) {
     const auto tableBytes = restartTable.empty() ? 0u : sizeof(std::uint32_t) * (restartTable.size() + 1u);
-    auto arguments = std::make_shared<Buffer>(context, ShaderRecompiler::MeshArgumentBytes + tableBytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    auto arguments = std::make_shared<Buffer>(context, ShaderRecompiler::MeshArgumentBytes + tableBytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, UploadMemoryProperties(context, ShaderRecompiler::MeshArgumentBytes + tableBytes));
     if (!restartTable.empty()) {
         Require(restartTable.size() <= std::numeric_limits<std::uint32_t>::max(), "mesh restart table is too large");
         const auto length = static_cast<std::uint32_t>(restartTable.size());
-        auto* bytes = arguments->Bytes().data() + ShaderRecompiler::MeshArgumentBytes;
-        std::memcpy(bytes, &length, sizeof(length));
-        std::memcpy(bytes + sizeof(length), restartTable.data(), restartTable.size_bytes());
+        WriteUpload(*arguments, ShaderRecompiler::MeshArgumentBytes, &length, sizeof(length));
+        WriteUpload(*arguments, ShaderRecompiler::MeshArgumentBytes + sizeof(length), restartTable.data(), restartTable.size_bytes());
     }
     return arguments;
 }
@@ -1985,7 +1984,7 @@ std::shared_ptr<Buffer> meshArgumentBuffer(const Context& context, std::span<con
 std::shared_ptr<Buffer> directMeshArguments(const Context& context, const Pm4::DrawParameters& draw, std::span<const std::uint32_t> restartTable) {
     auto arguments = meshArgumentBuffer(context, restartTable);
     const MeshArguments resolved{0u, 0u, 0u, draw.indexCount, 0u};
-    std::memcpy(arguments->Bytes().data(), &resolved, sizeof(resolved));
+    WriteUpload(*arguments, 0, &resolved, sizeof(resolved));
     return arguments;
 }
 
@@ -2003,7 +2002,7 @@ std::shared_ptr<Buffer> recordMeshArguments(const Context& context, VkCommandBuf
     }
     const auto record = !indirect.records.empty() ? indirect.records.front() : Pm4::ReadDrawArguments(*args, 0);
     const auto resolved = ResolveMeshArguments(record, rules);
-    std::memcpy(arguments->Bytes().data(), &resolved, sizeof(resolved));
+    WriteUpload(*arguments, 0, &resolved, sizeof(resolved));
     return arguments;
 }
 
@@ -2353,6 +2352,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (args == nullptr) drawRanges = drawIndexRanges(state, draw, shaders, inputs);
     resources.RefreshAddressUse();
     resources.PublishResidentReads(*recorder);
+    static const bool verifyDataWords = std::getenv("APS5_VERIFY_PIPELINE_MODES") != nullptr;
+    if (verifyDataWords) resources.VerifyDataWords(shaders, record.moved);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.profile ? &outcome.bindings : nullptr, drawRanges ? &*drawRanges : nullptr, record.prefills);
     parts.lap(RecordBindings);
     const bool capture = CaptureInputsEnabled();
@@ -2363,18 +2364,25 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
-    const auto passImages = resources.StorageImages();
+    const auto depthPassMerge = DepthPassMergeSetting();
+    const auto passImages = depthPassMerge != DepthPassMerge::Off ? resources.PassImages() : resources.StorageImages();
     std::vector<std::pair<VkImage, bool>> passAttachments;
-    passAttachments.reserve(record.targets.size());
+    passAttachments.reserve(record.targets.size() + 1u);
+    const VkImage depthImage = state.depth && depthPassMerge != DepthPassMerge::Off ? PeekDepthSurfaceImage(context, *state.depth) : VK_NULL_HANDLE;
+    if (depthImage != VK_NULL_HANDLE) passAttachments.emplace_back(depthImage, true);
     for (const auto& target : record.targets) {
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
-    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
-    const bool fenced = state.depth.has_value() || !record.proxies.empty();
+    const auto readOnlyAddressPasses = ReadOnlyAddressPassesSetting();
+    const bool knownAddressWrites = unknownMemory && readOnlyAddressPasses != ReadOnlyAddressPasses::Off && resources.KnownAddressWrites();
+    const bool unknownWrites = unknownMemory && !(knownAddressWrites && readOnlyAddressPasses == ReadOnlyAddressPasses::On);
+    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownWrites, knownAddressWrites && unknownWrites};
+    const bool depthFenced = state.depth.has_value() && (depthPassMerge != DepthPassMerge::On || depthImage == VK_NULL_HANDLE);
+    const bool fenced = depthFenced || !record.proxies.empty();
     parts.lap(RecordAccess);
     resources.UseMirrors(*recorder);
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess, state.depth.has_value() && record.proxies.empty());
     parts.lap(RecordPassStart);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -2495,8 +2503,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
-    if (bound != nullptr) bound->pass = recorder->OpenPassSerial();
     if (resources.HasPlacements()) resources.RecordPlacementCopyBack(*recorder, recorder->Commands());
+    if (bound != nullptr) bound->pass = recorder->OpenPassSerial();
     parts.lap(RecordLeave);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);

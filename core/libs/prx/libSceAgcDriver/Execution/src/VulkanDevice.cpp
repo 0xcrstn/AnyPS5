@@ -15,6 +15,7 @@
 #endif
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueTopology.hpp"
+#include "prx/libSceAgcDriver/Execution/include/QueueFamilyDispatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DriverHeapTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -513,6 +514,9 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::Recorder> recorder;
     QueueTopology topology = QueueTopology::Serial;
     bool topologyForced = false;
+    std::uint32_t computeFamily = VK_QUEUE_FAMILY_IGNORED;
+    std::uint32_t computeIndex = 0;
+    bool familyDispatch = false;
     VkQueue computeQueue = VK_NULL_HANDLE;
     VkCommandPool computePool = VK_NULL_HANDLE;
     std::unique_ptr<Graphics::Recorder> computeRecorder;
@@ -825,7 +829,7 @@ struct VulkanDevice::State {
             uploadMapping = nullptr;
             if (uploadBuffer) DeviceFunction<PFN_vkDestroyBuffer>("vkDestroyBuffer")(device, uploadBuffer, nullptr);
             uploadBuffer = VK_NULL_HANDLE;
-            if (uploadMemory) DeviceFunction<PFN_vkFreeMemory>("vkFreeMemory")(device, uploadMemory, nullptr);
+            if (uploadMemory) { Graphics::DeviceMemoryPlacements::Untrack(uploadMemory); DeviceFunction<PFN_vkFreeMemory>("vkFreeMemory")(device, uploadMemory, nullptr); }
             uploadMemory = VK_NULL_HANDLE;
             uploadSize = 0;
             VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -848,6 +852,7 @@ struct VulkanDevice::State {
             allocation.allocationSize = requirements.size;
             allocation.memoryTypeIndex = memoryType;
             check(DeviceFunction<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocation, nullptr, &uploadMemory), "vkAllocateMemory display upload");
+            Graphics::DeviceMemoryPlacements::Track(uploadMemory, Graphics::DeviceMemoryKind::Upload, (memoryProperties.memoryHeaps[memoryProperties.memoryTypes[memoryType].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0, allocation.allocationSize);
             check(DeviceFunction<PFN_vkBindBufferMemory>("vkBindBufferMemory")(device, uploadBuffer, uploadMemory, 0), "vkBindBufferMemory display upload");
             check(DeviceFunction<PFN_vkMapMemory>("vkMapMemory")(device, uploadMemory, 0, pixels.size(), 0, &uploadMapping), "vkMapMemory display upload");
             uploadSize = pixels.size();
@@ -1076,7 +1081,7 @@ struct VulkanDevice::State {
             DestroyRetiredSwapchains();
             if (uploadMapping) reinterpret_cast<PFN_vkUnmapMemory>(deviceProc(device, "vkUnmapMemory"))(device, uploadMemory);
             if (uploadBuffer) reinterpret_cast<PFN_vkDestroyBuffer>(deviceProc(device, "vkDestroyBuffer"))(device, uploadBuffer, nullptr);
-            if (uploadMemory) reinterpret_cast<PFN_vkFreeMemory>(deviceProc(device, "vkFreeMemory"))(device, uploadMemory, nullptr);
+            if (uploadMemory) { Graphics::DeviceMemoryPlacements::Untrack(uploadMemory); reinterpret_cast<PFN_vkFreeMemory>(deviceProc(device, "vkFreeMemory"))(device, uploadMemory, nullptr); }
             if (swapchain) reinterpret_cast<PFN_vkDestroySwapchainKHR>(deviceProc(device, "vkDestroySwapchainKHR"))(device, swapchain, nullptr);
             const auto destroyPool = reinterpret_cast<PFN_vkDestroyCommandPool>(deviceProc(device, "vkDestroyCommandPool"));
             const auto destroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(deviceProc(device, "vkDestroyDevice"));
@@ -1085,6 +1090,7 @@ struct VulkanDevice::State {
             }
             if (computePool != VK_NULL_HANDLE) destroyPool(device, computePool, nullptr);
             destroyDevice(device, nullptr);
+            if (familyDispatch) RemoveQueueFamilyDispatch(device);
         }
         if (instance != VK_NULL_HANDLE) {
             if (surface) reinterpret_cast<PFN_vkDestroySurfaceKHR>(instanceProc(instance, "vkDestroySurfaceKHR"))(instance, surface, nullptr);
@@ -1821,7 +1827,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // Guest shaders routinely read past descriptor ranges; robust access turns that into zeros
     // instead of a GPU fault that loses the device.
     enabled.robustBufferAccess = available.robustBufferAccess;
-    VkDeviceQueueCreateInfo queueInfos[2]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
+    VkDeviceQueueCreateInfo queueInfos[3]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
     if (available.sparseBinding && state->dmaBufImport) {
         std::uint32_t families = 0;
         auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
@@ -1867,13 +1873,25 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         APS5_LOG_OUT("Vulkan queue families: %s; graphics family %u, sparse family %d", DescribeQueueFamilies(topologyFamilies).c_str(), family, state->sparseFamily == VK_QUEUE_FAMILY_IGNORED ? -1 : static_cast<int>(state->sparseFamily));
         const char* requestedTopology = std::getenv("APS5_QUEUE_TOPOLOGY");
         state->topologyForced = requestedTopology != nullptr;
-        const auto topology = requestedTopology != nullptr ? ParseQueueTopology(requestedTopology) : family < topologyFamilies.size() && topologyFamilies[family].count >= 2 ? QueueTopology::SameFamily : QueueTopology::Serial;
+        const auto topology = requestedTopology != nullptr ? ParseQueueTopology(requestedTopology) : DefaultQueueTopology(topologyFamilies, family, state->sparseFamily);
         const auto plan = PlanQueueTopology(topology, topologyFamilies, family, state->sparseFamily);
         for (std::uint32_t guest = 0; guest < Graphics::Recorder::GuestQueues; ++guest) Graphics::Recorder::MapGuestQueue(guest, 0);
-        if (plan.topology == QueueTopology::Dedicated) {
-            throw std::runtime_error(std::string("APS5_QUEUE_TOPOLOGY=dedicated: compute queue family ") + std::to_string(plan.computeFamily) + " is available, but queue family ownership transfers for a dedicated compute family are not implemented");
-        }
         state->topology = plan.topology;
+        if (plan.topology == QueueTopology::Dedicated) {
+            static const float priorities[2] = {1.0f, 1.0f};
+            state->computeFamily = plan.computeFamily;
+            state->computeIndex = plan.computeIndex;
+            if (plan.computeFamily == state->sparseFamily) {
+                queueInfos[1].queueCount = plan.computeIndex + 1;
+                queueInfos[1].pQueuePriorities = priorities;
+            } else {
+                auto& computeInfo = queueInfos[deviceInfo.queueCreateInfoCount];
+                computeInfo.queueFamilyIndex = plan.computeFamily;
+                computeInfo.queueCount = 1;
+                computeInfo.pQueuePriorities = priorities;
+                ++deviceInfo.queueCreateInfoCount;
+            }
+        }
         if (plan.topology == QueueTopology::SameFamily) {
             static const float priorities[2] = {1.0f, 1.0f};
             queueInfos[0].queueCount = plan.queuesFromGraphicsFamily;
@@ -2164,6 +2182,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     deviceInfo.pNext = &bdaFeatures;
     auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
+    if (state->topology == QueueTopology::Dedicated && !compileOnly) {
+        state->deviceProc = InstallQueueFamilyDispatch(state->device, state->deviceProc, family, state->computeFamily);
+        state->familyDispatch = true;
+    }
     state->shaderProfile = std::move(shaderProfile);
     if (compileOnly) return;
     if (calibratedTimestamps != nullptr) {
@@ -2187,6 +2209,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     if (state->topology == QueueTopology::SameFamily) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 1, &state->computeQueue);
+    if (state->topology == QueueTopology::Dedicated) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->computeFamily, state->computeIndex, &state->computeQueue);
     state->queueFamily = family;
     if (state->sparseFamily != VK_QUEUE_FAMILY_IGNORED) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->sparseFamily, 0, &state->sparseQueue);
     if (checkpoints) state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
@@ -2206,6 +2229,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     poolInfo.queueFamilyIndex = family;
     check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &poolInfo, nullptr, &state->pool), "vkCreateCommandPool");
     if (state->topology == QueueTopology::SameFamily) check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &poolInfo, nullptr, &state->computePool), "vkCreateCommandPool compute");
+    if (state->topology == QueueTopology::Dedicated) {
+        VkCommandPoolCreateInfo computePoolInfo = poolInfo;
+        computePoolInfo.queueFamilyIndex = state->computeFamily;
+        check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &computePoolInfo, nullptr, &state->computePool), "vkCreateCommandPool dedicated compute");
+        RegisterComputeFamilyPool(state->computePool);
+    }
     static const bool procTable = std::getenv("APS5_NO_PROC_TABLE") == nullptr;
     if (procTable) {
         Graphics::FillDeviceFunctions(graphicsContext(), state->deviceFunctions);
@@ -2231,15 +2260,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->recorder->Activate();
     state->context = buildContext();
     state->contextReady = true;
-    if (state->topology == QueueTopology::SameFamily && !state->topologyForced && !(state->timelineSemaphores && state->recorder->HasTimeline())) {
+    if (state->topology != QueueTopology::Serial && !state->topologyForced && !(state->timelineSemaphores && state->recorder->HasTimeline())) {
         APS5_LOG_OUT("Vulkan queue topology serial: %s", "the device has no timeline semaphores to order a second queue");
         state->topology = QueueTopology::Serial;
     }
-    if (state->topology == QueueTopology::SameFamily) {
-        require(state->timelineSemaphores && state->recorder->HasTimeline(), "APS5_QUEUE_TOPOLOGY=same-family needs timeline semaphores to order the two queues");
+    if (state->topology != QueueTopology::Serial) {
+        require(state->timelineSemaphores && state->recorder->HasTimeline(), (std::string("APS5_QUEUE_TOPOLOGY=") + QueueTopologyName(state->topology) + " needs timeline semaphores to order the two queues").c_str());
         auto compute = state->context;
         compute.queue = state->computeQueue;
         compute.pool = state->computePool;
+        if (state->topology == QueueTopology::Dedicated) {
+            compute.queueFamily = state->computeFamily;
+            compute.graphicsQueue = false;
+        }
         state->computeRecorder = std::make_unique<Graphics::Recorder>(compute, state->timelineSemaphores, 1);
         require(state->computeRecorder->HasTimeline(), "the compute recorder has no timeline semaphore");
         state->computeRecorder->Activate();
@@ -2248,7 +2281,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->recorder->SetPeer(state->computeRecorder.get());
         state->computeRecorder->SetPeer(state->recorder.get());
         for (std::uint32_t guest = 1; guest < Graphics::Recorder::GuestQueues; ++guest) Graphics::Recorder::MapGuestQueue(guest, 1);
-        APS5_LOG_OUT("Vulkan queue topology same-family: guest queue 0 on queue %p, the other guest queues on queue %p", reinterpret_cast<void*>(state->queue), reinterpret_cast<void*>(state->computeQueue));
+        APS5_LOG_OUT("Vulkan queue topology %s: guest queue 0 on queue %p (family %u), the other guest queues on queue %p (family %u)", QueueTopologyName(state->topology), reinterpret_cast<void*>(state->queue), family, reinterpret_cast<void*>(state->computeQueue), state->topology == QueueTopology::Dedicated ? state->computeFamily : family);
     }
     state->StartPipelinePrewarm(graphicsContext());
     if (window != nullptr) {
@@ -2410,6 +2443,19 @@ void VulkanDevice::ReapRecorded(std::uint64_t serial) {
 void VulkanDevice::ReapRecorded() {
     if (state->recorder) state->recorder->Reap();
     if (state->computeRecorder) state->computeRecorder->Reap();
+}
+
+std::vector<Graphics::Recorder::UnlockedWait> VulkanDevice::CompletionWaits() const {
+    std::vector<Graphics::Recorder::UnlockedWait> waits;
+    for (const auto* recorder : {state->recorder.get(), state->computeRecorder.get()}) {
+        if (recorder == nullptr) continue;
+        if (auto wait = recorder->CompletionWait()) waits.push_back(std::move(*wait));
+    }
+    return waits;
+}
+
+bool VulkanDevice::CompletionWaitsOnTimelines() const {
+    return state->recorder && state->recorder->HasTimeline() && (!state->computeRecorder || state->computeRecorder->HasTimeline());
 }
 
 bool VulkanDevice::ReapMayRetire() const {
@@ -5358,8 +5404,14 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     resources.PublishResidentReads(recorder);
+    auto dispatchReads = resources.DeviceReads();
+    dispatchReads.insert(dispatchReads.end(), record.movedReads.begin(), record.movedReads.end());
+    const auto dispatchImages = resources.StorageImages();
+    const bool addressBased = resources.HoldsLease() || resources.UsesAddressTable();
+    const Graphics::PassAccess dispatchAccess{dispatchReads, resources.GpuWrites(), dispatchImages, {}, addressBased, addressBased && !resources.KnownAddressWrites(), false};
+    const bool independentDispatch = argumentImport == nullptr && record.shader->program->workgroupMemoryDwords == 0 && resources.DispatchEffectsKnown() && !Graphics::AnyDeviceResident();
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    const auto commands = recorder.DispatchCommands(dispatchAccess, record.resources.get(), independentDispatch, &covered);
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);
@@ -5464,12 +5516,14 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
     }
     recorder.EndGpuTiming(gpuTiming);
-    const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
-    constexpr VkAccessFlags dispatchedAccess = Graphics::Recorder::DrawPassAccess | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
-    Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
-    recorder.EndGpuTiming(trailingTiming);
-    recorder.MarkCovered(dispatchedAccess);
+    if (!recorder.DeferDispatchBarrier(dispatchAccess, record.resources.get(), independentDispatch)) {
+        const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
+        constexpr VkAccessFlags dispatchedAccess = Graphics::Recorder::DispatchedAccess;
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+        recorder.EndGpuTiming(trailingTiming);
+        recorder.MarkCovered(dispatchedAccess);
+    }
     resources.RecordPlacementCopyBack(recorder, commands);
     recordStep(PhaseRecordBind);
     resources.MarkGpuWrites(recorder);

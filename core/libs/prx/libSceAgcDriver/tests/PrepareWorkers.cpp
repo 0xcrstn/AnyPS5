@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -300,6 +301,56 @@ void testRegisterSnapshotCopyOnWrite() {
 
 }
 
+void testParkedHeadReleasesItsWorker() {
+    std::mutex mutex;
+    std::function<void()> wake;
+    std::atomic<int> attempts{0};
+    std::atomic<int> prepared{0};
+    std::vector<int> emitted;
+    std::vector<bool> failed;
+    {
+        OrderedPrepare<int, int> pipeline(1, 8, [&](int& job) {
+            if (job == 1 && attempts++ == 0) {
+                throw PreparationParked{[&](std::function<void()> requeue) {
+                    std::lock_guard lock(mutex);
+                    wake = std::move(requeue);
+                    return true;
+                }, [] {}};
+            }
+            if (job == 6 && attempts++ < 3) {
+                throw PreparationParked{[](std::function<void()>) { return false; }, [] { throw std::runtime_error("the compile failed"); }};
+            }
+            ++prepared;
+            return job;
+        }, [&](int& job, std::optional<int>&, std::exception_ptr error) {
+            std::lock_guard lock(mutex);
+            emitted.push_back(job);
+            failed.push_back(error != nullptr);
+        });
+        for (int job = 1; job <= 5; ++job) pipeline.Submit(job);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (prepared.load() < 4 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Expect(prepared.load() == 4, "the only worker prepared the later jobs while the head was parked");
+        {
+            std::lock_guard lock(mutex);
+            Expect(emitted.empty(), "nothing is emitted past a parked head");
+            Expect(static_cast<bool>(wake), "the parked head armed its wake");
+        }
+        Expect(!pipeline.Idle(), "a parked head keeps the pipeline busy");
+        std::function<void()> requeue;
+        {
+            std::lock_guard lock(mutex);
+            requeue = wake;
+        }
+        requeue();
+        pipeline.Submit(6);
+        pipeline.WaitEmitted();
+        Expect(pipeline.Counts().parked == 2, "both parked preparations were counted");
+    }
+    Expect(emitted == std::vector<int>({1, 2, 3, 4, 5, 6}), "a parked head is emitted in ticket order after its wake");
+    Expect(failed == std::vector<bool>({false, false, false, false, false, true}), "a failed compile reaches its own job as an error");
+}
+
 int main() {
     testEmitInTicketOrderWithOutOfOrderCompletion();
     testBoundBlocksTheProducer();
@@ -309,6 +360,7 @@ int main() {
     testFrozenStaleCheck();
     testStaleResultIsRedoneInOrder();
     testRegisterSnapshotCopyOnWrite();
+    testParkedHeadReleasesItsWorker();
     if (failures != 0) {
         std::fprintf(stderr, "%d prepare worker checks failed\n", failures);
         return 1;

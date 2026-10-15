@@ -1,10 +1,13 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "ThreadOwned.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -115,6 +118,69 @@ void Driver::runBatchAge(std::chrono::microseconds bound) noexcept {
                 }
             }
             lock.lock();
+        }
+    } catch (...) {
+        ReportFailure(std::current_exception());
+    }
+}
+
+bool Driver::completionWatcher() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_COMPLETION_WATCHER");
+        if (value == nullptr || std::strcmp(value, "1") == 0) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        throw std::runtime_error(std::string("APS5_COMPLETION_WATCHER: expected 0 or 1, got ") + value);
+    }();
+    return enabled;
+}
+
+void Driver::runCompletionWatcher() noexcept {
+    try {
+        constexpr std::uint64_t WaitSliceNs = 50'000'000;
+        while (!stopping.load(std::memory_order_acquire)) {
+            const auto seen = Graphics::Recorder::SubmitSequence();
+            std::shared_ptr<VulkanDevice> held;
+            std::vector<Graphics::Recorder::UnlockedWait> waits;
+            bool timelines = true;
+            {
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                held = device.Load();
+                if (held != nullptr) {
+                    timelines = held->CompletionWaitsOnTimelines();
+                    if (timelines) waits = held->CompletionWaits();
+                }
+            }
+            bool reap = false;
+            if (!timelines) {
+                PollSleep();
+                reap = completionsPending();
+            } else if (waits.empty()) {
+                Graphics::Recorder::WaitSubmitSequence(seen, std::chrono::milliseconds(50));
+            } else {
+                completionWatcherWaits.fetch_add(1, std::memory_order_relaxed);
+                const auto result = Graphics::Recorder::UnlockedWait::Any(waits, WaitSliceNs);
+                if (result != VK_SUCCESS && result != VK_TIMEOUT) throw std::runtime_error("vkWaitSemaphoresKHR completion watcher failed with " + std::to_string(static_cast<int>(result)));
+                reap = result == VK_SUCCESS;
+            }
+            waits.clear();
+            {
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                if (reap && !stopping.load(std::memory_order_acquire)) {
+                    if (const auto localDevice = device.Load()) {
+                        bumpEpoch(&EpochBumps::reaps);
+                        localDevice->ReapRecorded();
+                        completionWatcherReaps.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                held.reset();
+            }
+            if (reap) {
+                {
+                    std::lock_guard lock(mutex);
+                    idleEpoch.fetch_add(1, std::memory_order_release);
+                }
+                changed.notify_all();
+            }
         }
     } catch (...) {
         ReportFailure(std::current_exception());

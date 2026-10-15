@@ -199,6 +199,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/QueueScheduler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WaitBroker.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/QueueTopology.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/QueueFamilyDispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DriverHeapTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
@@ -405,8 +406,8 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
-    add_test_executable(agc_queue_topology_tests tests/QueueTopology.cpp Execution/src/QueueTopology.cpp)
-    target_include_directories(agc_queue_topology_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    add_test_executable(agc_queue_topology_tests tests/QueueTopology.cpp Execution/src/QueueTopology.cpp Execution/src/QueueFamilyDispatch.cpp)
+    target_include_directories(agc_queue_topology_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
     target_link_libraries(agc_queue_topology_tests PRIVATE libc)
     configure_windows_unwind(agc_queue_topology_tests)
     add_test(NAME agc_queue_topology COMMAND agc_queue_topology_tests)
@@ -1389,6 +1390,16 @@ if(BUILD_TESTING)
         set_tests_properties(agc_pipeline_cache agc_pipeline_cache_file PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_store_runs COMMAND agc_driver_recorder_tests --store-runs-only)
+    add_test(NAME agc_store_runs_deferred_barriers_off COMMAND agc_driver_recorder_tests --store-runs-only)
+    add_test(NAME agc_store_runs_deferred_barriers_verify COMMAND agc_driver_recorder_tests --store-runs-only)
+    set_tests_properties(agc_store_runs agc_store_runs_deferred_barriers_off agc_store_runs_deferred_barriers_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_store_runs_deferred_barriers_off PROPERTIES ENVIRONMENT "APS5_DISPATCH_BARRIERS=0")
+    set_tests_properties(agc_store_runs_deferred_barriers_verify PROPERTIES ENVIRONMENT "APS5_DISPATCH_BARRIERS=verify")
+    if(WIN32)
+        set_tests_properties(agc_store_runs agc_store_runs_deferred_barriers_off agc_store_runs_deferred_barriers_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_draw_snapshot_arena COMMAND agc_driver_recorder_tests --draw-snapshot-arena-only)
     set_tests_properties(agc_draw_snapshot_arena PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     if(WIN32)
@@ -1431,10 +1442,11 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_storage_upload_lifetime COMMAND agc_driver_recorder_tests --storage-upload-lifetime-only)
+    add_test(NAME agc_detiler_retirement COMMAND agc_driver_recorder_tests --detiler-retirement-only)
     add_test(NAME agc_storage_upload_failure COMMAND agc_driver_recorder_tests --storage-upload-failure-only)
-    set_tests_properties(agc_storage_upload_lifetime agc_storage_upload_failure PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_storage_upload_lifetime agc_storage_upload_failure agc_detiler_retirement PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(agc_storage_upload_lifetime agc_storage_upload_failure PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_storage_upload_lifetime agc_storage_upload_failure agc_detiler_retirement PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_storage_baseline_settled PROPERTIES SKIP_RETURN_CODE 77)
@@ -1835,6 +1847,7 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     configure_windows_unwind(${agcExecutionTest})
     list(APPEND agcExecutionTests ${agcExecutionTest})
 endforeach()
+target_link_libraries(agc_driver_completion_watcher_tests PRIVATE libkernel)
 foreach(agcExecutionTestName IN LISTS ANYPS5_AGC_EXECUTION_TESTS)
     if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/execution/${agcExecutionTestName}.cpp)
         message(FATAL_ERROR "ANYPS5_AGC_EXECUTION_TESTS names ${agcExecutionTestName}, which has no source in tests/execution")
@@ -2089,6 +2102,41 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_property(TEST agc_driver_same_family_missing_order APPEND PROPERTY ENVIRONMENT "APS5_QUEUE_TOPOLOGY=same-family;APS5_QUEUE_TOPOLOGY_VERIFY=1")
+    foreach(dedicatedTest IN ITEMS queue_topology_same_family same_family_missing_order label_publication_order completion_watcher)
+        add_test(NAME agc_driver_${dedicatedTest}_dedicated COMMAND agc_driver_${dedicatedTest}_tests)
+        set_tests_properties(agc_driver_${dedicatedTest}_dedicated PROPERTIES
+                ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_TOPOLOGY=dedicated;APS5_QUEUE_TOPOLOGY_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(agc_driver_${dedicatedTest}_dedicated PROPERTIES ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    add_test(NAME agc_driver_same_family_missing_order_dedicated_injected COMMAND agc_driver_same_family_missing_order_tests --missing-order)
+    set_tests_properties(agc_driver_same_family_missing_order_dedicated_injected PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_TOPOLOGY=dedicated;APS5_QUEUE_TOPOLOGY_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_same_family_missing_order_dedicated_injected PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    set(agcScheduleCapture "${CMAKE_CURRENT_BINARY_DIR}/aps5-schedule-capture.txt")
+    add_test(NAME agc_driver_schedule_capture COMMAND agc_driver_same_family_missing_order_tests)
+    set_tests_properties(agc_driver_schedule_capture PROPERTIES FIXTURES_SETUP agc_schedule_capture
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_SCHEDULER=serial;APS5_QUEUE_SCHEDULER_CAPTURE=${agcScheduleCapture}" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_schedule_replay COMMAND agc_driver_same_family_missing_order_tests)
+    set_tests_properties(agc_driver_schedule_replay PROPERTIES FIXTURES_REQUIRED agc_schedule_capture
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_SCHEDULER=replay;APS5_QUEUE_SCHEDULER_REPLAY=${agcScheduleCapture};APS5_QUEUE_SCHEDULER_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_schedule_capture agc_driver_schedule_replay PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_completion_watcher_off COMMAND agc_driver_completion_watcher_tests)
+    set_tests_properties(agc_driver_completion_watcher_off PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_COMPLETION_WATCHER=0" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_driver_completion_watcher PROPERTIES TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_completion_watcher_off PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_same_family_missing_order_injected COMMAND agc_driver_same_family_missing_order_tests --missing-order)
     set_tests_properties(agc_driver_same_family_missing_order_injected PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_TOPOLOGY=same-family;APS5_QUEUE_TOPOLOGY_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
@@ -2171,6 +2219,12 @@ if(BUILD_TESTING)
     set_property(TEST agc_driver_binding_plan_draws agc_driver_binding_plan_draws_storage_off agc_driver_binding_plan_draws_copy_results APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_MATERIALIZE_TEMPLATES=unset:")
     set_property(TEST agc_driver_binding_plan_draws agc_driver_binding_plan_draws_copy_results APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_MATERIALIZE_STORAGE_REUSE=unset:")
     set_property(TEST agc_driver_binding_plan_draws agc_driver_binding_plan_draws_storage_off APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_COPY_DRAW_STAGE_RESULTS=unset:")
+    set_property(TEST agc_driver_binding_plan_draws agc_driver_binding_plan_draws_storage_off agc_driver_binding_plan_draws_copy_results APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_COMPILE_PARK=set:0")
+    add_test(NAME agc_driver_draw_library_parity_verify COMMAND agc_driver_draw_library_parity_tests)
+    set_tests_properties(agc_driver_draw_library_parity_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_PIPELINE_MODES=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_property(TEST agc_driver_draw_library_parity_verify APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     if(WIN32)
         set_property(TEST agc_driver_binding_plan_draws_storage_off agc_driver_binding_plan_draws_copy_results agc_driver_binding_plan_draws_incremental agc_driver_binding_plan_draws_plans APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
@@ -2279,6 +2333,12 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_uint8x4_color_target_no_resident PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_RESIDENT_TARGETS=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_driver_uint8x4_color_target_no_resident PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_array_layer_target_cpu_upload COMMAND agc_driver_array_layer_target_tests)
+    set_tests_properties(agc_driver_array_layer_target_cpu_upload PROPERTIES ENVIRONMENT "APS5_NO_HOST_IMPORT=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_driver_array_layer_target_cpu_upload PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_driver_flat_store PROPERTIES RUN_SERIAL TRUE)

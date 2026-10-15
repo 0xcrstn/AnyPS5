@@ -80,21 +80,29 @@ public:
         }
     }
     std::uint32_t PhysicalQueue() const { return physicalQueue; }
+    bool GraphicsCapable() const { return context.graphicsQueue; }
+    static Recorder* GraphicsRecorder();
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
     explicit Recorder(const Context& context, bool timelineSemaphores = false, std::uint32_t physicalQueue = 0);
     VkSemaphore Timeline() const { return timeline; }
-    void SetPeer(Recorder* peer) { this->peer = peer; }
+    void SetPeer(Recorder* peer) {
+        this->peer = peer;
+        foreignProducers.clear();
+    }
     void RequireOrderAfter(const Recorder& producer, std::uint64_t serial);
     void DropOrderWaitsForTest() {
         orderWaits.clear();
         skipPeerOnce = true;
     }
     static bool QueueOrderVerify();
+    static bool PeerSerialization();
     static void SuppressOrderWaitsForTest(bool suppress);
     struct QueueOrderStatistics {
         std::uint64_t requiredWaits = 0;
         std::uint64_t peerWaits = 0;
         std::uint64_t waitedSubmits = 0;
+        std::uint64_t foreignRecords = 0;
+        std::uint64_t foreignWaits = 0;
     };
     QueueOrderStatistics QueueOrderCounts() const { return queueOrder; }
     ~Recorder();
@@ -114,12 +122,19 @@ public:
     void MarkCovered(VkAccessFlags access);
     static constexpr VkAccessFlags DrawPassAccess = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
+    static constexpr VkAccessFlags DispatchedAccess = DrawPassAccess | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    enum class DispatchBarriers : std::uint8_t { Off, On, Verify };
+    static DispatchBarriers ParseDispatchBarriers(const char* text);
+    static DispatchBarriers DispatchBarriersSetting();
+    VkCommandBuffer DispatchCommands(const PassAccess& access, const void* owner, bool independent, VkAccessFlags* coveredAccess);
+    bool DeferDispatchBarrier(const PassAccess& access, const void* owner, bool deferrable);
+    bool DispatchBarrierPending() const;
     struct DrawPassStart {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         bool continued = false;
         bool barrier = true;
     };
-    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, bool depth = false);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     std::uint64_t OpenPassSerial() const;
     static bool ChunkedRecordingEnabled();
@@ -157,6 +172,7 @@ public:
     DrawSnapshotArena& SnapshotArena();
     std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
     void FlushDeferredReleases();
+    void WaitDeferredReleases();
     static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
     void BoundKeptBytes();
     std::size_t InFlightKeptBytes() const { return inFlightKeptBytes; }
@@ -277,6 +293,28 @@ public:
     // it touches only the immutable timeline semaphore (the caller keeps the device alive). Requires
     // HasTimeline(); the debug switch APS5_NO_TIMELINE makes the device create the recorder without one.
     void WaitSerial(std::uint64_t serial);
+    class UnlockedWait {
+    public:
+        UnlockedWait(UnlockedWait&& other) noexcept;
+        UnlockedWait(const UnlockedWait&) = delete;
+        UnlockedWait& operator=(const UnlockedWait&) = delete;
+        UnlockedWait& operator=(UnlockedWait&&) = delete;
+        ~UnlockedWait();
+        static VkResult Any(std::span<const UnlockedWait> waits, std::uint64_t timeoutNs);
+
+    private:
+        friend class Recorder;
+        UnlockedWait(std::atomic<int>* count, VkDevice device, PFN_vkWaitSemaphoresKHR wait, VkSemaphore timeline, std::uint64_t serial);
+        std::atomic<int>* count;
+        VkDevice device;
+        PFN_vkWaitSemaphoresKHR wait;
+        VkSemaphore timeline;
+        std::uint64_t serial;
+    };
+    std::optional<UnlockedWait> CompletionWait() const;
+    static std::uint64_t SubmitSequence();
+    static void WaitSubmitSequence(std::uint64_t seen, std::chrono::microseconds timeout);
+    static void PokeSubmitSequence();
     // Under the mutex: finishes (completions, release) the in-flight batches up to `serial`, from the
     // front only; tolerates batches another thread finished meanwhile. Later batches stay in flight.
     void FinishUpTo(std::uint64_t serial);
@@ -677,6 +715,7 @@ private:
         std::uint64_t traceId = 0;
         bool submitted = false;
         std::atomic<std::uint64_t> submitOrder{0};
+        std::atomic<std::uint64_t> afterPeer{0};
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
@@ -761,6 +800,8 @@ private:
         struct RenderPass {
             bool open = false;
             bool fenced = false;
+            bool fencedBesidesDepth = false;
+            bool depth = false;
             std::uint64_t key = 0;
             std::uint64_t serial = 0;
             std::uint32_t timing = NoTiming;
@@ -769,6 +810,11 @@ private:
             ChunkInheritance inheritance;
         } renderPass;
         PassHazards passHazards;
+        PassHazards dispatchHazards;
+        std::vector<const void*> dispatchOwners;
+        bool dispatchBarrierPending = false;
+        bool dispatchBarrierDeferred = false;
+        bool drawDepth = false;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
         // Queued DCC key stores (see QueueKeyStore).
@@ -865,6 +911,7 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
+    void flushDispatchBarrier();
     void dropStaleHoldKept();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();
@@ -917,7 +964,10 @@ private:
     };
     LabelPick pickLabelLocked(std::uint64_t dword, std::uint32_t tag) const;
     static std::optional<LabelHit> evaluateLabel(std::span<const LabelEntry* const> entries, std::uint64_t afterStamp, LabelRefusal* refusal);
-    static std::optional<bool> LaterLabel(const LabelEntry& first, const LabelEntry& second);
+    static std::optional<bool> LaterLabel(const LabelEntry& first, const Recorder& firstOwner, const LabelEntry& second, const Recorder& secondOwner);
+    static bool OrderedAfter(const LabelEntry& later, const Recorder& laterOwner, const LabelEntry& earlier, const Recorder& earlierOwner);
+    std::atomic<std::uint64_t> peerFloor{0};
+    void raisePeerFloor(std::uint64_t serial);
     // Whether the in-flight batch with that serial has not signaled its fence (false when it is
     // not in flight any more): what makes a wait for it a real GPU wait (ThreadHookWaits).
     bool unsignaled(std::uint64_t serial) const;
@@ -933,6 +983,9 @@ private:
     RecorderDomain& domain;
     Recorder* peer = nullptr;
     bool skipPeerOnce = false;
+    bool submittingNow = false;
+    std::map<Recorder*, std::uint64_t> foreignProducers;
+    void noteForeignRecord();
     std::map<VkSemaphore, std::uint64_t> orderWaits;
     std::map<VkSemaphore, std::uint64_t> requiredOrder;
     QueueOrderStatistics queueOrder;

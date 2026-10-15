@@ -252,6 +252,19 @@ public:
                 extensionsEnabled.insert(extensionsEnabled.end(), libraryExtensions.begin(), libraryExtensions.end());
                 address.pNext = &library;
             }
+            VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timelineFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            if (hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timelineFeatures};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                timelines = timelineFeatures.timelineSemaphore == VK_TRUE;
+            }
+            timelineFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            timelineFeatures.timelineSemaphore = VK_TRUE;
+            if (timelines) {
+                extensionsEnabled.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                timelineFeatures.pNext = address.pNext;
+                address.pNext = &timelineFeatures;
+            }
             VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
             if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness};
@@ -295,6 +308,7 @@ public:
 
     ~Device() { release(); }
     bool NullDescriptors() const { return nullDescriptors; }
+    bool Timelines() const { return timelines; }
     const Context& GetContext() const { return context; }
     bool Graphics() const { return graphics; }
     VkPhysicalDeviceProperties Properties() const {
@@ -329,6 +343,7 @@ private:
     Context context{};
     bool graphics = false;
     bool nullDescriptors = false;
+    bool timelines = false;
 };
 
 using Kind = Recorder::ReadKind;
@@ -1178,56 +1193,149 @@ void lateLabelTests(Recorder& recorder) {
 
 void crossQueueLabelTests(const Device& device, Recorder& recorder) {
     using Refusal = Recorder::LabelRefusal;
+    if (!device.Timelines() || Recorder::PeerSerialization()) {
+        std::cout << "cross-queue label tests skipped: they need timeline semaphores and APS5_QUEUE_ORDER=precise\n";
+        return;
+    }
     const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
     const std::array<std::byte, 4> two{std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0}};
     const std::array<std::byte, 4> three{std::byte{3}, std::byte{0}, std::byte{0}, std::byte{0}};
     constexpr std::uint64_t a = 0x74000, b = 0x74100, c = 0x74200;
     recorder.Sync();
-    Recorder other(device.GetContext(), false, 1);
-    other.Activate();
-    recorder.SetPeer(&other);
-    other.SetPeer(&recorder);
-    struct Unpeer {
-        Recorder& first;
-        Recorder& second;
-        ~Unpeer() {
-            first.Sync();
-            second.Sync();
-            first.SetPeer(nullptr);
-            second.SetPeer(nullptr);
+    struct AsQueue {
+        std::uint32_t previous = AgcDriver::GuestMemory::GpuLockThreadTag();
+        explicit AsQueue(std::uint32_t queue) { AgcDriver::GuestMemory::TagGpuLockThread(queue); }
+        ~AsQueue() { AgcDriver::GuestMemory::TagGpuLockThread(previous); }
+        AsQueue(const AsQueue&) = delete;
+        AsQueue& operator=(const AsQueue&) = delete;
+    };
+    Recorder::MapGuestQueue(0x20, 1);
+    {
+        Recorder graphics(device.GetContext(), true, 0);
+        Recorder compute(device.GetContext(), true, 1);
+        graphics.Activate();
+        compute.Activate();
+        graphics.SetPeer(&compute);
+        compute.SetPeer(&graphics);
+        struct Unpeer {
+            Recorder& first;
+            Recorder& second;
+            ~Unpeer() {
+                first.Sync();
+                second.Sync();
+                first.SetPeer(nullptr);
+                second.SetPeer(nullptr);
+            }
+        } unpeer{graphics, compute};
+        AsQueue onGraphics(0);
+        const auto onCompute = [&](auto action) {
+            AsQueue queue(0x20);
+            action();
+        };
+        Refusal refusal{};
+        graphics.NoteLabel(a, one, 20, 0);
+        onCompute([&] { compute.NoteLabel(a, two, 21, 0x20); });
+        Require(!Recorder::LookupLabel(a, 4, 0, &refusal).has_value() && refusal == Refusal::Unordered, "a label pending unsubmitted on two physical queues is not refused as unordered");
+        graphics.Submit();
+        Require(!Recorder::LookupLabel(a, 4, 0, &refusal).has_value() && refusal == Refusal::Unordered, "a batch with no dependency on the other queue was taken to run after it");
+        compute.RequireOrderAfter(graphics, graphics.Submissions());
+        auto hit = Recorder::LookupLabel(a, 4, 0, &refusal);
+        Require(hit.has_value() && hit->value == 2 && hit->queue == 0x20 && hit->stamp == 21 && refusal == Refusal::None, "an open batch that will wait for the other queue's batch does not decide the label");
+        onCompute([&] { compute.Submit(); });
+        hit = Recorder::LookupLabel(a, 4, 0, &refusal);
+        Require(hit.has_value() && hit->value == 2 && refusal == Refusal::None, "a submitted batch that waited for the other queue's batch does not decide the label");
+        graphics.Sync();
+        compute.Sync();
+        Require(!Recorder::LookupLabel(a, 4, 0).has_value(), "the composed entries outlived their batches");
+        onCompute([&] {
+            compute.NoteLabel(b, two, 30, 0x20);
+            compute.Submit();
+        });
+        graphics.NoteLabel(b, three, 29, 0);
+        graphics.Submit();
+        Require(!Recorder::LookupLabel(b, 4, 0, &refusal).has_value() && refusal == Refusal::Unordered, "two submitted batches without a dependency were ordered by their submission");
+        graphics.Sync();
+        compute.Sync();
+        onCompute([&] {
+            compute.NoteLabel(b, two, 31, 0x20);
+            compute.Submit();
+        });
+        graphics.RequireOrderAfter(compute, compute.Submissions());
+        graphics.NoteLabel(b, three, 32, 0);
+        graphics.Submit();
+        hit = Recorder::LookupLabel(b, 4, 0, &refusal);
+        Require(hit.has_value() && hit->value == 3 && hit->stamp == 32 && refusal == Refusal::None, "a graphics batch that waited for the compute batch does not decide the label");
+        Require(!Recorder::LookupLabel(b, 4, 32, &refusal).has_value() && refusal != Refusal::None, "the late rule does not apply to the winning entry");
+        graphics.Sync();
+        compute.Sync();
+        graphics.NoteLabel(c, one, 40, 0);
+        onCompute([&] { compute.NoteLabel(c + 4, two, 41, 0x20); });
+        graphics.Submit();
+        onCompute([&] { compute.Submit(); });
+        hit = Recorder::LookupLabel(c, 8, 0, &refusal);
+        Require(hit.has_value() && hit->value == 0x0000000200000001ull && hit->queue == 0 && hit->stamp == 40 && refusal == Refusal::None, "a 64-bit label whose dwords are pending on two physical queues is not composed");
+        Require(!graphics.PendingLabel(c, 8, 0).has_value(), "one physical queue's own table composed a dword it does not hold");
+        graphics.Sync();
+        compute.Sync();
+    }
+    Recorder::MapGuestQueue(0x20, 0);
+    recorder.Activate();
+}
+
+void crossQueueRecordTests(const Device& device, Recorder& recorder) {
+    if (!device.Timelines()) {
+        std::cout << "cross-queue record tests skipped: the device has no timeline semaphores\n";
+        return;
+    }
+    const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    constexpr std::uint64_t base = 0x75000;
+    recorder.Sync();
+    struct AsQueue {
+        std::uint32_t previous = AgcDriver::GuestMemory::GpuLockThreadTag();
+        explicit AsQueue(std::uint32_t queue) { AgcDriver::GuestMemory::TagGpuLockThread(queue); }
+        ~AsQueue() { AgcDriver::GuestMemory::TagGpuLockThread(previous); }
+        AsQueue(const AsQueue&) = delete;
+        AsQueue& operator=(const AsQueue&) = delete;
+    };
+    Recorder::MapGuestQueue(0x20, 1);
+    {
+        Recorder graphics(device.GetContext(), true, 0);
+        Recorder compute(device.GetContext(), true, 1);
+        graphics.Activate();
+        compute.Activate();
+        graphics.SetPeer(&compute);
+        compute.SetPeer(&graphics);
+        struct Unpeer {
+            Recorder& first;
+            Recorder& second;
+            ~Unpeer() {
+                first.Sync();
+                second.Sync();
+                first.SetPeer(nullptr);
+                second.SetPeer(nullptr);
+            }
+        } unpeer{graphics, compute};
+        AsQueue onGraphics(0);
+        const auto before = graphics.QueueOrderCounts();
+        graphics.NoteLabel(base, one, 60, 0);
+        compute.NoteLabel(base + 0x40, one, 61, 0);
+        auto counts = graphics.QueueOrderCounts();
+        Require(counts.foreignRecords == before.foreignRecords + 1 && graphics.Submissions() == 1 && compute.Submissions() == 0, "a record into the other physical queue did not submit the recording queue's earlier work first");
+        graphics.NoteLabel(base + 0x80, one, 62, 0);
+        graphics.Submit();
+        counts = graphics.QueueOrderCounts();
+        Require(counts.foreignWaits == before.foreignWaits + 1 && compute.Submissions() == 1 && counts.requiredWaits > before.requiredWaits && counts.waitedSubmits > before.waitedSubmits, "the recording queue's next batch did not submit the other queue's batch and wait for it");
+        {
+            AsQueue onCompute(0x20);
+            compute.NoteLabel(base + 0xc0, one, 63, 0x20);
+            compute.Submit();
         }
-    } unpeer{recorder, other};
-    Refusal refusal{};
-    recorder.NoteLabel(a, one, 20, 0);
-    other.NoteLabel(a, two, 21, 0x20);
-    Require(!Recorder::LookupLabel(a, 4, 0, &refusal).has_value() && refusal == Refusal::Unordered, "a label pending unsubmitted on two physical queues is not refused as unordered");
-    recorder.Submit();
-    auto hit = Recorder::LookupLabel(a, 4, 0, &refusal);
-    Require(hit.has_value() && hit->value == 2 && hit->queue == 0x20 && hit->stamp == 21 && refusal == Refusal::None, "the unsubmitted batch, which runs after the submitted one, does not decide the label");
-    other.Submit();
-    hit = Recorder::LookupLabel(a, 4, 0, &refusal);
-    Require(hit.has_value() && hit->value == 2 && refusal == Refusal::None, "the later of two submitted batches does not decide the label");
-    recorder.Sync();
-    other.Sync();
-    Require(!Recorder::LookupLabel(a, 4, 0).has_value(), "the composed entries outlived their batches");
-    other.NoteLabel(b, two, 30, 0x20);
-    other.Submit();
-    recorder.NoteLabel(b, three, 29, 0);
-    hit = Recorder::LookupLabel(b, 4, 0, &refusal);
-    Require(hit.has_value() && hit->value == 3 && hit->stamp == 29 && refusal == Refusal::None, "a batch submitted later does not win over a newer stamp on a batch submitted earlier");
-    recorder.Submit();
-    hit = Recorder::LookupLabel(b, 4, 0, &refusal);
-    Require(hit.has_value() && hit->value == 3, "the submission order does not decide between two submitted batches");
-    Require(!Recorder::LookupLabel(b, 4, 29, &refusal).has_value() && refusal != Refusal::None, "the late rule does not apply to the winning entry");
-    recorder.Sync();
-    other.Sync();
-    recorder.NoteLabel(c, one, 40, 0);
-    other.NoteLabel(c + 4, two, 41, 0x20);
-    recorder.Submit();
-    other.Submit();
-    hit = Recorder::LookupLabel(c, 8, 0, &refusal);
-    Require(hit.has_value() && hit->value == 0x0000000200000001ull && hit->queue == 0 && hit->stamp == 40 && refusal == Refusal::None, "a 64-bit label whose dwords are pending on two physical queues is not composed");
-    Require(!recorder.PendingLabel(c, 8, 0).has_value(), "one physical queue's own table composed a dword it does not hold");
+        Require(graphics.QueueOrderCounts().foreignRecords == counts.foreignRecords && compute.QueueOrderCounts().foreignRecords == 0, "a queue's record into its own physical queue counted as a cross-queue record");
+        graphics.Sync();
+        compute.Sync();
+    }
+    Recorder::MapGuestQueue(0x20, 0);
+    recorder.Activate();
 }
 
 void largeLabelTests(Recorder& recorder) {
@@ -1571,6 +1679,35 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     start = recorder.StartDrawPass(0x5eed, false, false, PassAccess{});
     Require(!start.continued && start.barrier, "a render pass begun after uncovered work skipped its barrier");
     recorder.Sync();
+    {
+        const std::pair<std::uint64_t, std::uint64_t> first{0x1000, 0x2000};
+        const std::pair<std::uint64_t, std::uint64_t> second{0x3000, 0x4000};
+        const PassAccess writesFirst{{}, std::span(&first, 1), {}, {}, false, false, false};
+        const PassAccess writesSecond{{}, std::span(&second, 1), {}, {}, false, false, false};
+        const PassAccess readsFirst{std::span(&first, 1), {}, {}, {}, false, false, false};
+        const int owners[3]{};
+        const auto setting = Recorder::DispatchBarriersSetting();
+        const bool on = setting == Recorder::DispatchBarriers::On;
+        recorder.DispatchCommands(writesFirst, &owners[0], true, &covered);
+        Require(recorder.DeferDispatchBarrier(writesFirst, &owners[0], true) == on, "a dispatch's trailing barrier was deferred with the switch off (or recorded with it on)");
+        Require(recorder.DispatchBarrierPending() == (setting != Recorder::DispatchBarriers::Off), "a deferrable dispatch left nothing pending");
+        recorder.DispatchCommands(writesSecond, &owners[1], true, &covered);
+        Require(!on || (covered == Recorder::DispatchedAccess && recorder.DispatchBarrierPending()), "an independent dispatch flushed the deferred barrier or was not covered by it");
+        recorder.DeferDispatchBarrier(writesSecond, &owners[1], true);
+        recorder.DispatchCommands(readsFirst, &owners[2], true, &covered);
+        Require(!recorder.DispatchBarrierPending() && (!on || covered == Recorder::DispatchedAccess), "a dispatch reading a deferred dispatch's writes did not get its barrier");
+        recorder.DeferDispatchBarrier(readsFirst, &owners[2], true);
+        recorder.DispatchCommands(writesSecond, &owners[2], true, &covered);
+        Require(!recorder.DispatchBarrierPending(), "a second dispatch of the same resources skipped the barrier");
+        recorder.DeferDispatchBarrier(writesSecond, &owners[2], true);
+        recorder.DispatchCommands(writesFirst, &owners[0], false, &covered);
+        Require(!recorder.DispatchBarrierPending(), "a dispatch with unknown effects skipped the barrier");
+        recorder.DeferDispatchBarrier(writesFirst, &owners[0], true);
+        recorder.Commands(&covered);
+        Require(!recorder.DispatchBarrierPending() && (!on || covered == Recorder::DispatchedAccess), "other work did not get the deferred barrier");
+        recorder.Sync();
+        Require(Recorder::ParseDispatchBarriers(nullptr) == Recorder::DispatchBarriers::On && Recorder::ParseDispatchBarriers("0") == Recorder::DispatchBarriers::Off && Recorder::ParseDispatchBarriers("verify") == Recorder::DispatchBarriers::Verify, "APS5_DISPATCH_BARRIERS values");
+    }
     // The hazard tracker (counting mode only): accesses are noted without effect on the batch.
     const std::pair<std::uint64_t, std::uint64_t> range{address, address + 64};
     recorder.NoteAccess(Recorder::CommandClass::Fill, Recorder::Access{{}, std::span(&range, 1), {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -6600,6 +6737,94 @@ private:
     static inline StorageUploadProbe* active = nullptr;
 };
 
+class DetilerReleaseProbe {
+public:
+    explicit DetilerReleaseProbe(Context& context) : context(context), resolver(context.deviceProc) {
+        Require(active == nullptr, "nested detiler release probe");
+        active = this;
+        context.deviceProc = resolve;
+    }
+    ~DetilerReleaseProbe() {
+        context.deviceProc = resolver;
+        active = nullptr;
+    }
+    std::uint64_t Released() const { return released; }
+
+private:
+    template<typename TFunction>
+    TFunction function(VkDevice device, const char* name) const { return reinterpret_cast<TFunction>(resolver(device, name)); }
+    static VKAPI_ATTR void VKAPI_CALL destroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks* callbacks) {
+        if (pipeline != VK_NULL_HANDLE) ++active->released;
+        active->function<PFN_vkDestroyPipeline>(device, "vkDestroyPipeline")(device, pipeline, callbacks);
+    }
+    static VKAPI_ATTR void VKAPI_CALL destroyPool(VkDevice device, VkDescriptorPool pool, const VkAllocationCallbacks* callbacks) {
+        if (pool != VK_NULL_HANDLE) ++active->released;
+        active->function<PFN_vkDestroyDescriptorPool>(device, "vkDestroyDescriptorPool")(device, pool, callbacks);
+    }
+    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL resolve(VkDevice device, const char* name) {
+        if (std::strcmp(name, "vkDestroyPipeline") == 0) return reinterpret_cast<PFN_vkVoidFunction>(destroyPipeline);
+        if (std::strcmp(name, "vkDestroyDescriptorPool") == 0) return reinterpret_cast<PFN_vkVoidFunction>(destroyPool);
+        return active->resolver(device, name);
+    }
+    Context& context;
+    PFN_vkGetDeviceProcAddr resolver;
+    std::uint64_t released = 0;
+    static inline DetilerReleaseProbe* active = nullptr;
+};
+
+void detilerRetirementTests(const Device& device, Recorder& previous) {
+    auto context = device.GetContext();
+    DetilerReleaseProbe probe(context);
+    constexpr std::uint32_t side = 64;
+    const auto layout = ComputeMipLayout(TextureTileMode::kLinear, 56, side, side, 1).front();
+    Require(layout.pitchBytes == side * 4u && layout.tiledSize == layout.linearSize, "the linear detile fixture has a padded pitch");
+    const auto bytes = static_cast<std::size_t>(layout.linearSize);
+    Buffer source(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer destination(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer otherSource(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer otherDestination(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    for (std::size_t index = 0; index < bytes; ++index) {
+        source.Bytes()[index] = static_cast<std::byte>((index * 7u + 3u) & 0xffu);
+        otherSource.Bytes()[index] = static_cast<std::byte>((index * 13u + 5u) & 0xffu);
+    }
+    constexpr int rounds = 4;
+    const auto initial = probe.Released();
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        for (int round = 0; round < rounds; ++round) {
+            std::memset(destination.Bytes().data(), 0, bytes);
+            std::memset(otherDestination.Bytes().data(), 0, bytes);
+            const auto record = [&](TextureDetiler& detiler, const Buffer& from, const Buffer& to) {
+                detiler.BeginBatch();
+                const auto commands = recorder.Commands();
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+                detiler.Dispatch(commands, TextureTileMode::kLinear, 4, from.Handle(), 0, to.Handle(), 0, layout);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            };
+            const auto before = probe.Released();
+            {
+                std::lock_guard gpu(GpuMutex());
+                {
+                    TextureDetiler retired(context);
+                    record(retired, source, destination);
+                }
+                Require(recorder.Recording(), "the recorded detile was submitted before its detiler was destroyed");
+                Require(probe.Released() == before, "a destroyed detiler released its pipeline or descriptor pool while its recorded detile was unsubmitted");
+                TextureDetiler live(context);
+                record(live, otherSource, otherDestination);
+                Require(probe.Released() == before, "recording after a detiler was destroyed released its objects early");
+                recorder.Sync();
+            }
+            Require(std::memcmp(source.Bytes().data(), destination.Bytes().data(), bytes) == 0, "a detile recorded by a destroyed detiler did not run with its own descriptors");
+            Require(std::memcmp(otherSource.Bytes().data(), otherDestination.Bytes().data(), bytes) == 0, "a detile recorded after another detiler was destroyed lost its descriptors");
+        }
+    }
+    Require(probe.Released() == initial + 4u * rounds, "the destroyed detilers' pipelines and descriptor pools were not all released once their batches completed");
+    previous.Activate();
+    std::cout << "Detiler retirement: passed\n";
+}
+
 void storageUploadLifetimeTests(const Device& device, Recorder& previous, bool failView) {
     auto context = device.GetContext();
     context.hostImportAlignment = 0;
@@ -9415,6 +9640,7 @@ bool drawInputTwinTests(const Device& device, Recorder& recorder) {
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
             recorder.Sync();
+            recorder.WaitDeferredReleases();
             ClearCachedPipelines(context.device);
             GuestAllocations::Mutation mutation;
             mutation.Remove(block);
@@ -9520,6 +9746,7 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
             recorder.Sync();
+            recorder.WaitDeferredReleases();
             ClearCachedPipelines(context.device);
             {
                 GuestAllocations::Mutation mutation;
@@ -10872,6 +11099,7 @@ bool withResolveScene(const Device& device, Recorder& recorder, const std::funct
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
             recorder.Sync();
+            recorder.WaitDeferredReleases();
             ClearCachedPipelines(context.device);
             {
                 GuestAllocations::Mutation mutation;
@@ -11075,6 +11303,7 @@ bool parallelResolveTests(const Device& device, Recorder& recorder) {
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
             recorder.Sync();
+            recorder.WaitDeferredReleases();
             ClearCachedPipelines(context.device);
             {
                 GuestAllocations::Mutation mutation;
@@ -11548,6 +11777,10 @@ int main(int argc, char** argv) {
             pendingWriteSnapshotBenchmark(recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--detiler-retirement-only") {
+            detilerRetirementTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && (std::string_view(argv[1]) == "--storage-upload-lifetime-only" || std::string_view(argv[1]) == "--storage-upload-failure-only")) {
             storageUploadLifetimeTests(device, recorder, std::string_view(argv[1]) == "--storage-upload-failure-only");
             return 0;
@@ -11601,6 +11834,7 @@ int main(int argc, char** argv) {
             labelTests(recorder);
             lateLabelTests(recorder);
             crossQueueLabelTests(device, recorder);
+            crossQueueRecordTests(device, recorder);
             largeLabelTests(recorder);
             std::cout << "Completion label storage and ordering tests passed\n";
             return 0;
@@ -11639,6 +11873,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--resident-buffer-mirrors-only") {
             if (!residentMirrorTests(device, recorder, true)) return 77;
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--store-runs-only") {
+            storeRunTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--resident-mirrors-only") {

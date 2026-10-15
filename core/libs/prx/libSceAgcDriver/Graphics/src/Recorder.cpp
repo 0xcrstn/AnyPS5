@@ -1132,6 +1132,14 @@ Recorder* Recorder::Current() {
     return ForPhysicalQueue(PhysicalQueueOf(GuestMemory::GpuLockThreadTag()));
 }
 
+Recorder* Recorder::GraphicsRecorder() {
+    auto* current = Current();
+    if (current == nullptr || current->GraphicsCapable()) return current;
+    auto* graphics = ForPhysicalQueue(0);
+    Require(graphics != nullptr && graphics->GraphicsCapable(), "graphics work from a compute-only queue has no graphics recorder to go to");
+    return graphics;
+}
+
 Recorder* Recorder::ForPhysicalQueue(std::uint32_t physicalQueue) {
     Require(physicalQueue < PhysicalQueues, "recorder for an unknown physical queue");
     return Domain(physicalQueue).active;
@@ -1179,6 +1187,7 @@ void Recorder::RequireOrderAfter(const Recorder& producer, std::uint64_t serial)
     auto& required = requiredOrder[producer.timeline];
     required = std::max(required, serial);
     ++queueOrder.requiredWaits;
+    if (&producer == peer && !OrderWaitsSuppressed().load(std::memory_order_acquire)) raisePeerFloor(serial);
 }
 
 Recorder::Recorder(const Context& context, bool timelineSemaphores, std::uint32_t physicalQueue) : context(context), id(nextRecorderId.fetch_add(1)), physicalQueue(physicalQueue), domain(Domain(physicalQueue)) {
@@ -1346,13 +1355,33 @@ void Recorder::Activate() {
     GuestMemory::SetFlushHook(&FlushForAccess);
 }
 
-std::optional<bool> Recorder::LaterLabel(const LabelEntry& first, const LabelEntry& second) {
-    const auto order = [](const LabelEntry& entry) -> std::uint64_t { return entry.batch != nullptr ? entry.batch->submitOrder.load(std::memory_order_acquire) : 0; };
-    const auto firstOrder = order(first);
-    const auto secondOrder = order(second);
-    if (firstOrder != 0 && secondOrder != 0) return secondOrder > firstOrder;
-    if (firstOrder != 0) return true;
-    if (secondOrder != 0) return false;
+bool Recorder::PeerSerialization() {
+    static const bool serialized = [] {
+        const char* value = std::getenv("APS5_QUEUE_ORDER");
+        if (value == nullptr || std::strcmp(value, "precise") == 0) return false;
+        if (std::strcmp(value, "serial") == 0) return true;
+        throw std::runtime_error(std::string("APS5_QUEUE_ORDER: expected precise or serial, got ") + value);
+    }();
+    return serialized;
+}
+
+void Recorder::raisePeerFloor(std::uint64_t serial) {
+    auto current = peerFloor.load(std::memory_order_relaxed);
+    while (current < serial && !peerFloor.compare_exchange_weak(current, serial, std::memory_order_acq_rel)) {}
+}
+
+bool Recorder::OrderedAfter(const LabelEntry& later, const Recorder& laterOwner, const LabelEntry& earlier, const Recorder& earlierOwner) {
+    if (earlier.batch == nullptr || earlier.batch->submitOrder.load(std::memory_order_acquire) == 0) return false;
+    const auto earlierSerial = earlier.batch->serial;
+    if (laterOwner.peer != &earlierOwner) return false;
+    if (later.batch != nullptr && later.batch->submitOrder.load(std::memory_order_acquire) != 0) return later.batch->afterPeer.load(std::memory_order_acquire) >= earlierSerial;
+    if (PeerSerialization()) return true;
+    return laterOwner.peerFloor.load(std::memory_order_acquire) >= earlierSerial;
+}
+
+std::optional<bool> Recorder::LaterLabel(const LabelEntry& first, const Recorder& firstOwner, const LabelEntry& second, const Recorder& secondOwner) {
+    if (OrderedAfter(second, secondOwner, first, firstOwner)) return true;
+    if (OrderedAfter(first, firstOwner, second, secondOwner)) return false;
     return std::nullopt;
 }
 
@@ -1374,6 +1403,7 @@ std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, s
     bool queued = false;
     for (std::size_t offset = 0; offset < bytes; offset += 4) {
         const LabelEntry* winner = nullptr;
+        const Recorder* winnerOwner = nullptr;
         bool winnerQueued = false;
         for (const auto* owner : owners) {
             if (owner == nullptr) continue;
@@ -1382,6 +1412,7 @@ std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, s
             if (pick.entry == nullptr) continue;
             if (winner == nullptr) {
                 winner = pick.entry;
+                winnerOwner = owner;
                 winnerQueued = pick.queued;
                 continue;
             }
@@ -1389,13 +1420,14 @@ std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, s
                 if (refusal != nullptr) *refusal = LabelRefusal::BehindCompletion;
                 return std::nullopt;
             }
-            const auto later = LaterLabel(*winner, *pick.entry);
+            const auto later = LaterLabel(*winner, *winnerOwner, *pick.entry, *owner);
             if (!later.has_value()) {
                 if (refusal != nullptr) *refusal = LabelRefusal::Unordered;
                 return std::nullopt;
             }
             if (*later) {
                 winner = pick.entry;
+                winnerOwner = owner;
                 winnerQueued = pick.queued;
             }
         }
@@ -1604,6 +1636,9 @@ enum class PassBreak : std::uint8_t { Closed, Forced, SampleSlot, Target, Target
 constexpr std::size_t PassBreaks = static_cast<std::size_t>(PassBreak::Count);
 constexpr const char* PassBreakNames[PassBreaks] = {"closed", "forced", "sample-slot", "target", "target-fenced", "raw", "waw", "war", "image", "unknown-read", "unknown-write"};
 std::atomic<std::uint64_t> passBreaks[PassBreaks]{};
+std::atomic<std::uint64_t> readOnlyAddressDraws{0}, avoidableAddressBreaks{0};
+std::atomic<std::uint64_t> dispatchBarriersSkipped{0}, dispatchBarrierConflicts{0}, dispatchBarrierFlushes{0};
+std::atomic<std::uint64_t> depthPassMerges{0};
 
 PassBreak PassBreakFor(PassHazard hazard) {
     switch (hazard) {
@@ -1625,8 +1660,10 @@ void CountPassBreak(PassBreak reason) {
 
 }
 
-Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
+Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, bool depth) {
     ensureOpen();
+    open->drawDepth = depth;
+    if (access.knownAddressWrites && DrawOrGpuProfiled()) readOnlyAddressDraws.fetch_add(1, std::memory_order_relaxed);
     auto& pass = open->renderPass;
     const auto coveredStart = [&] {
         VkAccessFlags covered = 0;
@@ -1643,8 +1680,13 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
         return start;
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
+    if (hazard == PassHazard::UnknownWrite && DrawOrGpuProfiled() && open->passHazards.CheckKnownAddressWrites(access, pass.key == key) != PassHazard::UnknownWrite) avoidableAddressBreaks.fetch_add(1, std::memory_order_relaxed);
     if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
+    if (hazard == PassHazard::None && DrawOrGpuProfiled() && (depth || pass.depth)) {
+        const bool depthMerge = MergeBarriers() && !pass.afterPass && (!fenced || depth) && !pass.fencedBesidesDepth;
+        if (merge || depthMerge) depthPassMerges.fetch_add(1, std::memory_order_relaxed);
+    }
     const bool elide = merge && hazard == PassHazard::None;
     CountPassBreak(hazard != PassHazard::None ? PassBreakFor(hazard) : merge ? PassBreak::Target : PassBreak::TargetFenced);
     endOpenRenderPass(!merge);
@@ -1671,6 +1713,8 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     pass.open = true;
     pass.key = key;
     pass.fenced = pass.fenced || fenced;
+    pass.fencedBesidesDepth = pass.fencedBesidesDepth || (fenced && !open->drawDepth);
+    pass.depth = pass.depth || open->drawDepth;
     open->passHazards.Add(access);
     if (pass.chunked && chunks != nullptr) chunks->Post();
 }
@@ -1785,6 +1829,7 @@ void Recorder::FlushKeyStores() {
 }
 
 void Recorder::recordKeyStores(bool forWriter) {
+    flushDispatchBarrier();
     auto stores = std::move(open->keyStores);
     open->keyStores.clear();
     if (stores.empty()) return;
@@ -1817,8 +1862,19 @@ void Recorder::recordKeyStores(bool forWriter) {
     if (forWriter) keyStoreRunsForWriter.fetch_add(1, std::memory_order_relaxed);
 }
 
+void Recorder::noteForeignRecord() {
+    auto* current = Current();
+    if (current == nullptr || current == this || current->peer != this) return;
+    current->Submit();
+    auto& serial = current->foreignProducers[this];
+    if (serial > submissions) return;
+    serial = submissions + 1;
+    ++current->queueOrder.foreignRecords;
+}
+
 void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
+    if (peer != nullptr) noteForeignRecord();
     if (open == nullptr) {
         auto batch = std::make_unique<Batch>();
         try {
@@ -1856,6 +1912,72 @@ void Recorder::ensureOpen() {
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
         if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);
     }
+    flushDispatchBarrier();
+}
+
+void Recorder::flushDispatchBarrier() {
+    if (open == nullptr || !open->dispatchBarrierPending) return;
+    const bool deferred = open->dispatchBarrierDeferred;
+    open->dispatchBarrierPending = false;
+    open->dispatchBarrierDeferred = false;
+    open->dispatchHazards.Clear();
+    open->dispatchOwners.clear();
+    if (!deferred) return;
+    if (DrawOrGpuProfiled()) dispatchBarrierFlushes.fetch_add(1, std::memory_order_relaxed);
+    const auto timing = beginTiming(ClassKey(CommandClass::DispatchTrailing));
+    recordBarrier(open->commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, DispatchedAccess);
+    CountBarriers(CommandClass::DispatchTrailing);
+    EndGpuTiming(timing);
+    open->coveredAccess = DispatchedAccess;
+}
+
+Recorder::DispatchBarriers Recorder::ParseDispatchBarriers(const char* text) {
+    if (text == nullptr || std::strcmp(text, "1") == 0) return DispatchBarriers::On;
+    if (std::strcmp(text, "0") == 0) return DispatchBarriers::Off;
+    if (std::strcmp(text, "verify") == 0) return DispatchBarriers::Verify;
+    throw std::runtime_error(std::string("APS5_DISPATCH_BARRIERS must be 0, 1 or verify, not ") + text);
+}
+
+Recorder::DispatchBarriers Recorder::DispatchBarriersSetting() {
+    static const auto setting = ParseDispatchBarriers(std::getenv("APS5_DISPATCH_BARRIERS"));
+    return setting;
+}
+
+VkCommandBuffer Recorder::DispatchCommands(const PassAccess& access, const void* owner, bool independent, VkAccessFlags* coveredAccess) {
+    if (open == nullptr || !open->dispatchBarrierPending) return Commands(coveredAccess);
+    GuestMemory::AssertGpuLockHeld("Recorder::DispatchCommands");
+    const bool ownerPending = std::find(open->dispatchOwners.begin(), open->dispatchOwners.end(), owner) != open->dispatchOwners.end();
+    const bool skip = independent && !ownerPending && !open->renderPass.open && !open->run.open && open->dispatchHazards.Check(access, false) == PassHazard::None;
+    if (!skip) {
+        if (DrawOrGpuProfiled()) dispatchBarrierConflicts.fetch_add(1, std::memory_order_relaxed);
+        return Commands(coveredAccess);
+    }
+    if (DrawOrGpuProfiled()) dispatchBarriersSkipped.fetch_add(1, std::memory_order_relaxed);
+    if (coveredAccess != nullptr) *coveredAccess = open->dispatchBarrierDeferred ? DispatchedAccess : open->coveredAccess;
+    open->coveredAccess = 0;
+    return open->commands;
+}
+
+bool Recorder::DispatchBarrierPending() const {
+    return open != nullptr && open->dispatchBarrierPending;
+}
+
+bool Recorder::DeferDispatchBarrier(const PassAccess& access, const void* owner, bool deferrable) {
+    const auto setting = DispatchBarriersSetting();
+    if (setting == DispatchBarriers::Off || open == nullptr) return false;
+    if (!deferrable) {
+        open->dispatchBarrierPending = false;
+        open->dispatchBarrierDeferred = false;
+        open->dispatchHazards.Clear();
+        open->dispatchOwners.clear();
+        return false;
+    }
+    open->dispatchHazards.Add(access);
+    open->dispatchOwners.push_back(owner);
+    open->dispatchBarrierPending = true;
+    if (setting == DispatchBarriers::Verify) return false;
+    open->dispatchBarrierDeferred = true;
+    return true;
 }
 
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
@@ -2123,7 +2245,10 @@ void reportBarriers() {
         std::snprintf(text, sizeof(text), " %s %llu", PassBreakNames[i], static_cast<unsigned long long>(passBreaks[i].exchange(0, std::memory_order_relaxed)));
         breaks += text;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("; render passes begun by reason:%s", breaks.c_str());
+    static constexpr const char* SwitchModes[] = {"0", "1", "verify"};
+    AgcDriver::ProfilePrint_nid_no_patch("; render passes begun by reason:%s; read-only address-based draws (APS5_READONLY_ADDRESS_PASSES=%s): %llu, unknown-write breaks only they caused %llu", breaks.c_str(), SwitchModes[static_cast<std::size_t>(ReadOnlyAddressPassesSetting())], static_cast<unsigned long long>(readOnlyAddressDraws.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(avoidableAddressBreaks.exchange(0, std::memory_order_relaxed)));
+    AgcDriver::ProfilePrint_nid_no_patch("; depth pass changes without barriers (APS5_DEPTH_PASS_MERGE=%s): %llu %s", SwitchModes[static_cast<std::size_t>(DepthPassMergeSetting())], static_cast<unsigned long long>(depthPassMerges.exchange(0, std::memory_order_relaxed)), DepthPassMergeSetting() == DepthPassMerge::On ? "merged" : "mergeable");
+    AgcDriver::ProfilePrint_nid_no_patch("; dispatch trailing barriers (APS5_DISPATCH_BARRIERS=%s): %llu %s past independent dispatches, %llu flushed by a conflicting dispatch, %llu deferred ones flushed by other work", SwitchModes[static_cast<std::size_t>(Recorder::DispatchBarriersSetting())], static_cast<unsigned long long>(dispatchBarriersSkipped.exchange(0, std::memory_order_relaxed)), Recorder::DispatchBarriersSetting() == Recorder::DispatchBarriers::On ? "deferred" : "deferrable", static_cast<unsigned long long>(dispatchBarrierConflicts.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(dispatchBarrierFlushes.exchange(0, std::memory_order_relaxed)));
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
@@ -2576,6 +2701,7 @@ void Recorder::foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::
 }
 
 void Recorder::foldSegments() {
+    flushDispatchBarrier();
     const auto commands = open->commands;
     const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(pendingSamples.size(), SegmentFoldCapacity));
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -2595,6 +2721,7 @@ void Recorder::endSamples(Batch& batch) {
 }
 
 void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
+    if (&batch == open.get()) flushDispatchBarrier();
     const auto commands = batch.commands;
     const auto copy = function(cmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
     const auto bind = function(cmdBindPipeline, "vkCmdBindPipeline");
@@ -4013,6 +4140,7 @@ void Recorder::Submit() {
         });
         open->inPlaceLeases.clear();
     }
+    flushDispatchBarrier();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     if (chunks != nullptr && chunks->IsOpen()) chunks->Discard();
@@ -4062,12 +4190,33 @@ void Recorder::Submit() {
         submission.signalSemaphoreCount = 1;
         submission.pSignalSemaphores = &timeline;
     }
+    if (!foreignProducers.empty()) {
+        Require(!submittingNow, "a physical queue's submit re-entered through a cross-queue record");
+        submittingNow = true;
+        struct Clear {
+            bool& flag;
+            ~Clear() { flag = false; }
+        } clear{submittingNow};
+        auto producers = std::move(foreignProducers);
+        foreignProducers.clear();
+        for (const auto& [producer, serial] : producers) {
+            Require(!producer->submittingNow, "two physical queues recorded into each other's open batches");
+            if (producer->submissions < serial) producer->Submit();
+            Require(producer->submissions >= serial, "a cross-queue record was not submitted on its physical queue");
+            RequireOrderAfter(*producer, serial);
+            ++queueOrder.foreignWaits;
+        }
+    }
     std::unique_lock crossQueueLock(CrossQueueSubmitMutex(), std::defer_lock);
     if (peer != nullptr) crossQueueLock.lock();
-    if (peer != nullptr && peer->timeline != VK_NULL_HANDLE && peer->submissions != 0 && !skipPeerOnce && !OrderWaitsSuppressed().load(std::memory_order_acquire)) {
+    if (PeerSerialization() && peer != nullptr && peer->timeline != VK_NULL_HANDLE && peer->submissions != 0 && !skipPeerOnce && !OrderWaitsSuppressed().load(std::memory_order_acquire)) {
         auto& wait = orderWaits[peer->timeline];
         wait = std::max(wait, peer->submissions);
         ++queueOrder.peerWaits;
+    }
+    std::uint64_t waitedPeer = 0;
+    if (peer != nullptr && peer->timeline != VK_NULL_HANDLE) {
+        if (const auto found = orderWaits.find(peer->timeline); found != orderWaits.end()) waitedPeer = found->second;
     }
     if (QueueOrderVerify()) {
         for (const auto& [semaphore, value] : requiredOrder) {
@@ -4099,8 +4248,11 @@ void Recorder::Submit() {
     skipPeerOnce = false;
     batch->submitted = true;
     batch->serial = ++submissions;
+    raisePeerFloor(waitedPeer);
+    batch->afterPeer.store(peerFloor.load(std::memory_order_acquire), std::memory_order_release);
     batch->submitOrder.store(SubmitOrderCounter().fetch_add(1, std::memory_order_acq_rel) + 1, std::memory_order_release);
     if (crossQueueLock.owns_lock()) crossQueueLock.unlock();
+    if (!batch->completions.empty()) PokeSubmitSequence();
     batch->submittedAt = std::chrono::steady_clock::now();
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
@@ -4162,6 +4314,74 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
     return result;
 }
 
+struct SubmitSignal {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::uint64_t sequence = 0;
+};
+
+SubmitSignal& Submitted() {
+    static auto* signal = new SubmitSignal;
+    return *signal;
+}
+
+}
+
+Recorder::UnlockedWait::UnlockedWait(std::atomic<int>* count, VkDevice device, PFN_vkWaitSemaphoresKHR wait, VkSemaphore timeline, std::uint64_t serial) : count(count), device(device), wait(wait), timeline(timeline), serial(serial) {
+    count->fetch_add(1, std::memory_order_acq_rel);
+}
+
+Recorder::UnlockedWait::UnlockedWait(UnlockedWait&& other) noexcept : count(std::exchange(other.count, nullptr)), device(other.device), wait(other.wait), timeline(other.timeline), serial(other.serial) {}
+
+Recorder::UnlockedWait::~UnlockedWait() {
+    if (count != nullptr) count->fetch_sub(1, std::memory_order_acq_rel);
+}
+
+VkResult Recorder::UnlockedWait::Any(std::span<const UnlockedWait> waits, std::uint64_t timeoutNs) {
+    if (waits.empty()) return VK_SUCCESS;
+    std::vector<VkSemaphore> timelines;
+    std::vector<std::uint64_t> serials;
+    for (const auto& item : waits) {
+        Require(item.count != nullptr && item.device == waits.front().device, "an unlocked completion wait spans devices or was moved from");
+        timelines.push_back(item.timeline);
+        serials.push_back(item.serial);
+    }
+    VkSemaphoreWaitInfoKHR info{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
+    info.flags = VK_SEMAPHORE_WAIT_ANY_BIT_KHR;
+    info.semaphoreCount = static_cast<std::uint32_t>(timelines.size());
+    info.pSemaphores = timelines.data();
+    info.pValues = serials.data();
+    return waits.front().wait(waits.front().device, &info, timeoutNs);
+}
+
+std::optional<Recorder::UnlockedWait> Recorder::CompletionWait() const {
+    if (timeline == VK_NULL_HANDLE) return std::nullopt;
+    for (const auto& batch : inFlight) {
+        if (batch->completions.empty()) continue;
+        return UnlockedWait(&WaitersOf(id), context.device, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), timeline, batch->serial);
+    }
+    return std::nullopt;
+}
+
+std::uint64_t Recorder::SubmitSequence() {
+    auto& signal = Submitted();
+    std::lock_guard lock(signal.mutex);
+    return signal.sequence;
+}
+
+void Recorder::WaitSubmitSequence(std::uint64_t seen, std::chrono::microseconds timeout) {
+    auto& signal = Submitted();
+    std::unique_lock lock(signal.mutex);
+    signal.changed.wait_for(lock, timeout, [&] { return signal.sequence != seen; });
+}
+
+void Recorder::PokeSubmitSequence() {
+    auto& signal = Submitted();
+    {
+        std::lock_guard lock(signal.mutex);
+        ++signal.sequence;
+    }
+    signal.changed.notify_all();
 }
 
 void Recorder::WaitSerial(std::uint64_t serial) {
@@ -4215,6 +4435,11 @@ void Recorder::Sync() {
 void Recorder::FlushDeferredReleases() {
     holdKept.clear();
     ReleaseDeferredKeeps();
+}
+
+void Recorder::WaitDeferredReleases() {
+    FlushDeferredReleases();
+    while (deferredPending.load(std::memory_order_acquire) != 0) std::this_thread::yield();
 }
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {

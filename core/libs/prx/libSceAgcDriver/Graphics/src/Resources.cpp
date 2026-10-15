@@ -4,7 +4,12 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <stdexcept>
+#include <string>
 
 namespace AgcDriver::Graphics {
 
@@ -35,6 +40,75 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
     return buffer;
 }
 
+struct UploadStatistics {
+    std::atomic<std::uint64_t> placed{0}, placedBytes{0}, hostFallbacks{0}, verified{0}, verifiedBytes{0};
+};
+
+UploadStatistics& Uploads() {
+    static UploadStatistics statistics;
+    return statistics;
+}
+
+constexpr VkDeviceSize MinUploadHeapBytes = VkDeviceSize{1} << 30u;
+
+}
+
+UploadPlacement ParseUploadPlacement(const char* text) {
+    if (text == nullptr || std::strcmp(text, "1") == 0 || std::strcmp(text, "device") == 0) return UploadPlacement::Device;
+    if (std::strcmp(text, "0") == 0 || std::strcmp(text, "host") == 0) return UploadPlacement::Host;
+    if (std::strcmp(text, "verify") == 0) return UploadPlacement::Verify;
+    throw std::runtime_error(std::string("APS5_DEVICE_UPLOADS must be 0, 1, host, device or verify, not ") + text);
+}
+
+UploadPlacement UploadPlacementSetting() {
+    static const auto placement = ParseUploadPlacement(std::getenv("APS5_DEVICE_UPLOADS"));
+    return placement;
+}
+
+VkMemoryPropertyFlags SelectUploadProperties(const VkPhysicalDeviceMemoryProperties& memory, UploadPlacement placement) {
+    constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    constexpr VkMemoryPropertyFlags device = host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    if (placement == UploadPlacement::Host) return host;
+    for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+        const auto& type = memory.memoryTypes[i];
+        if ((type.propertyFlags & device) != device) continue;
+        const auto& heap = memory.memoryHeaps[type.heapIndex];
+        if ((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 && heap.size >= MinUploadHeapBytes) return device;
+    }
+    return host;
+}
+
+VkMemoryPropertyFlags UploadMemoryProperties(const Context& context, std::size_t bytes) {
+    const auto placement = UploadPlacementSetting();
+    const auto properties = SelectUploadProperties(context.memory, placement);
+    if (placement == UploadPlacement::Host) return properties;
+    if ((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+        Uploads().hostFallbacks.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        Uploads().placed.fetch_add(1, std::memory_order_relaxed);
+        Uploads().placedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    return properties;
+}
+
+void WriteUpload(Buffer& buffer, std::size_t offset, const void* source, std::size_t bytes) {
+    const auto target = buffer.Bytes();
+    Require(offset <= target.size() && bytes <= target.size() - offset, "an upload exceeds its buffer");
+    std::memcpy(target.data() + offset, source, bytes);
+    if (UploadPlacementSetting() != UploadPlacement::Verify) return;
+    Uploads().verified.fetch_add(1, std::memory_order_relaxed);
+    Uploads().verifiedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (std::memcmp(target.data() + offset, source, bytes) == 0) return;
+    const auto* written = reinterpret_cast<const std::byte*>(target.data() + offset);
+    const auto* expected = static_cast<const std::byte*>(source);
+    std::size_t first = 0;
+    while (first < bytes && written[first] == expected[first]) ++first;
+    throw std::runtime_error("APS5_DEVICE_UPLOADS=verify: an upload of " + std::to_string(bytes) + " bytes reads back different at +" + std::to_string(first));
+}
+
+UploadCounters UploadTotals() {
+    auto& uploads = Uploads();
+    return {uploads.placed.load(std::memory_order_relaxed), uploads.placedBytes.load(std::memory_order_relaxed), uploads.hostFallbacks.load(std::memory_order_relaxed), uploads.verified.load(std::memory_order_relaxed), uploads.verifiedBytes.load(std::memory_order_relaxed)};
 }
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, BufferExtent extent) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), handleBytes(extent == BufferExtent::SizeClass ? capacity : size), usage(BufferPool::Usage(usage, properties)), properties(properties) {
@@ -123,7 +197,7 @@ void Buffer::release() noexcept {
     }
     if (mapping) context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, memory);
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) { DeviceMemoryPlacements::Untrack(memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); }
 }
 
 VkBuffer Buffer::Handle() const {
@@ -152,7 +226,6 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         memory = allocation->memory;
         allocationBytes = allocation->allocationBytes;
         capacity = allocation->bytes;
-        placement = DeviceMemoryPlacement(DeviceMemoryKind::Buffer, false, allocationBytes);
         if (allocation->bufferBytes == size) return;
         context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
         buffer = VK_NULL_HANDLE;
@@ -177,8 +250,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocationBytes = allocation.allocationSize;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, allocation.allocationSize, "device buffer");
         hostPlaced = allocation.memoryTypeIndex != context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
-        placement = DeviceMemoryPlacement(DeviceMemoryKind::Buffer, hostPlaced, allocationBytes);
+        memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer", DeviceMemoryKind::Buffer);
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {
         release();
@@ -191,13 +263,12 @@ DeviceBuffer::~DeviceBuffer() {
 }
 
 void DeviceBuffer::release() noexcept {
-    placement.Reset();
     if (buffer && memory && cache && !hostPlaced) {
         cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, size});
         return;
     }
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) { DeviceMemoryPlacements::Untrack(memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); }
 }
 
 VkBuffer DeviceBuffer::Handle() const {
@@ -292,6 +363,7 @@ RenderTarget::RenderTarget(const Context& context, const ColorTarget& target, bo
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory render target");
+        DeviceMemoryPlacements::Track(memory, DeviceMemoryKind::RenderTarget, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory");
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = image;
@@ -312,7 +384,7 @@ RenderTarget::~RenderTarget() {
 void RenderTarget::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) { DeviceMemoryPlacements::Untrack(memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); }
 }
 
 VkImage RenderTarget::Image() const {

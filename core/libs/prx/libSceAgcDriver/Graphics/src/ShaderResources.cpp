@@ -1652,7 +1652,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                     auto& table = tableStage(shader);
                     Require(table.mapAllocation == std::numeric_limits<std::size_t>::max(), "a stage binds two image table maps");
                     table.map = binding.guestDescriptor;
-                    allocations.push_back({0, size, false, std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT), ShaderRecompiler::DescriptorRole::ImageTableMap});
+                    allocations.push_back({0, size, false, std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, UploadMemoryProperties(context, size)), ShaderRecompiler::DescriptorRole::ImageTableMap});
                     table.mapAllocation = allocations.size() - 1u;
                     bindings.push_back({{binding.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, flags, nullptr}, {allocations.size() - 1u}});
                     continue;
@@ -3032,7 +3032,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             auto& revalidations = Revalidations();
             revalidations.epochVerifyChecks.fetch_add(1, std::memory_order_relaxed);
             if (!ok) revalidations.epochVerifyDisagreements.fetch_add(1, std::memory_order_relaxed);
-            GuestMemory::NoteDirtySetVerify(ok, {"resources", epochSerialBefore, epochProof.dirtySerial, 0}, proofRanges);
+            static constexpr std::array<const char*, static_cast<std::size_t>(ProofFailure::Count)> sites{"resources", "resources-imports", "resources-evicted", "resources-pending", "resources-changed", "resources-keys", "resources-other"};
+            const auto site = ok ? sites[0] : sites[std::min(static_cast<std::size_t>(failure), sites.size() - 1)];
+            GuestMemory::NoteDirtySetVerify(ok, {site, epochSerialBefore, epochProof.dirtySerial, 0}, proofRanges);
         }
         if (ok && fast && GuestMemory::EpochDirtySetEnabled()) recordEpochProof(dirtySerialBefore);
         else if (!ok) epochProof.valid = false;
@@ -3347,7 +3349,37 @@ CacheSizing::Limits ResourceCache::DefaultLimits() {
 
 ResourceCache::ResourceCache() : ResourceCache(DefaultLimits()) {}
 
-ResourceCache::ResourceCache(CacheSizing::Limits limits) : sizing(limits) {}
+namespace {
+
+struct CacheRegistry {
+    std::mutex mutex;
+    std::vector<ResourceCache*> caches;
+};
+
+CacheRegistry& Caches() {
+    static auto* registry = new CacheRegistry();
+    return *registry;
+}
+
+}
+
+ResourceCache::ResourceCache(CacheSizing::Limits limits) : sizing(limits) {
+    auto& registry = Caches();
+    std::lock_guard lock(registry.mutex);
+    registry.caches.push_back(this);
+}
+
+ResourceCache::~ResourceCache() {
+    auto& registry = Caches();
+    std::lock_guard lock(registry.mutex);
+    std::erase(registry.caches, this);
+}
+
+void ResourceCache::RemoveLeaseHolders(std::vector<std::shared_ptr<ShaderResources>>& evicted) {
+    auto& registry = Caches();
+    std::lock_guard lock(registry.mutex);
+    for (auto* cache : registry.caches) cache->removeLeaseHolders(evicted);
+}
 
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
@@ -3552,10 +3584,10 @@ void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::sh
     }
 }
 
-void ResourceCache::RemoveAddressTemplates(std::vector<std::shared_ptr<ShaderResources>>& evicted) {
+void ResourceCache::removeLeaseHolders(std::vector<std::shared_ptr<ShaderResources>>& evicted) {
     std::lock_guard lock(mutex);
     for (auto it = entries.begin(); it != entries.end();) {
-        if (!it->resources->AddressTemplate()) {
+        if (!it->resources->HoldsLease()) {
             ++it;
             continue;
         }
@@ -3920,8 +3952,9 @@ std::size_t ShaderResources::addDataBuffer(std::span<const std::uint32_t> words)
     const auto size = words.size() * sizeof(std::uint32_t);
     Require(size <= context.limits.maxStorageBufferRange, "shader data buffer exceeds descriptor range limit");
     const bool refreshable = TemplateDataRefresh() && size <= MaxRefreshBytes;
-    auto buffer = std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (refreshable ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u));
-    std::memcpy(buffer->Bytes().data(), words.data(), size);
+    constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    auto buffer = std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (refreshable ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u), refreshable ? UploadMemoryProperties(context, size) : host);
+    WriteUpload(*buffer, 0, words.data(), size);
     Allocation allocation{0, size, false, std::move(buffer)};
     if (refreshable) allocation.dataWords.assign(words.begin(), words.end());
     allocations.push_back(std::move(allocation));
@@ -4602,7 +4635,7 @@ void ShaderResources::finishImageTables() {
         map[Abi::HeaderPoisonCount] = static_cast<std::uint32_t>(table.poison.size());
         auto& allocation = allocations.at(table.mapAllocation);
         Require(allocation.buffer != nullptr && allocation.size == map.size() * sizeof(std::uint32_t), "image table map buffer disagrees with the map");
-        std::memcpy(allocation.buffer->Bytes().data(), map.data(), allocation.size);
+        WriteUpload(*allocation.buffer, 0, map.data(), allocation.size);
         faults.push_back({IrStage(table.stage), table.program->imageTableShader, table.poison, table.messages});
         ranges.insert(ranges.end(), table.program->imageTableRanges.begin(), table.program->imageTableRanges.end());
     }
@@ -5192,6 +5225,46 @@ std::vector<ShaderResources::SnapshotRequest> ShaderResources::PlanDrawSnapshots
     return requests;
 }
 
+void ShaderResources::VerifyDataWords(std::span<const CompiledShader> shaders, std::span<const MovedBuffer> moved) const {
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) continue;
+        for (const auto& binding : shader.program->bindings) {
+            if (!DataRole(binding.role)) continue;
+            const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+            Require(kept != bindings.end() && kept->allocations.size() == 1, "APS5_VERIFY_PIPELINE_MODES: a draw's data binding " + std::to_string(binding.binding) + " has no single allocation in its resource template");
+            const auto index = kept->allocations.front();
+            const auto& item = allocations[index];
+            if (item.guest || item.buffer == nullptr) continue;
+            const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index && !entry.words.empty(); });
+            std::vector<std::uint32_t> bound;
+            const char* source = "the template's buffer";
+            if (override != moved.end()) {
+                bound = override->words;
+                source = "the moved data words";
+            } else if (!item.dataWords.empty()) {
+                bound = item.dataWords;
+                source = "the template's refreshed data words";
+            } else {
+                bound.resize(item.size / sizeof(std::uint32_t));
+                std::memcpy(bound.data(), item.buffer->Bytes().data(), bound.size() * sizeof(std::uint32_t));
+                for (const auto& patch : dataPatches) {
+                    if (patch.allocation != index || patch.byte >= item.size) continue;
+                    auto bytes = std::as_writable_bytes(std::span(bound));
+                    const auto expected = std::as_bytes(std::span(binding.guestDescriptor));
+                    if (patch.byte < expected.size()) bytes[patch.byte] = expected[patch.byte];
+                }
+            }
+            if (bound == binding.guestDescriptor) continue;
+            std::size_t word = 0;
+            while (word < bound.size() && word < binding.guestDescriptor.size() && bound[word] == binding.guestDescriptor[word]) ++word;
+            char text[256];
+            std::snprintf(text, sizeof(text), "APS5_VERIFY_PIPELINE_MODES: stage %u of the program at 0x%llx binds data words that differ from the draw's at word %zu of %zu (bound 0x%08x, draw 0x%08x, from %s)", static_cast<unsigned>(shader.stage), static_cast<unsigned long long>(shader.programAddress), word, binding.guestDescriptor.size(), word < bound.size() ? bound[word] : 0u, word < binding.guestDescriptor.size() ? binding.guestDescriptor[word] : 0u, source);
+            throw std::runtime_error(text);
+        }
+    }
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindingsStatistics* statistics, const DrawIndexRanges* drawRanges, std::span<const DrawSnapshotArena::Prefill> prefills) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !(AddressBasedDrawSnapshots() && bdaReadOnly))) return {};
     auto lapStart = statistics != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -5706,6 +5779,14 @@ std::uint64_t ShaderResources::RetainedBytes() const {
 bool ShaderResources::HasCachedStorageImages() const {
     if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& image) { return image != nullptr && !image->Cached(); })) return false;
     return std::none_of(textures.begin(), textures.end(), [](const auto& texture) { return texture != nullptr && texture->StorageSource() != nullptr && !texture->StorageSource()->Cached(); });
+}
+
+std::vector<std::pair<VkImage, bool>> ShaderResources::PassImages() const {
+    auto images = StorageImages();
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->Image() != VK_NULL_HANDLE) images.emplace_back(texture->Image(), false);
+    }
+    return images;
 }
 
 bool ShaderResources::ReadsImage(const StorageTexture* image) const {

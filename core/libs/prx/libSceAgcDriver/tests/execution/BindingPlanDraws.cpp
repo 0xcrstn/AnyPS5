@@ -236,12 +236,14 @@ void PlannedIndirectDrawsKeepOwnedResults() {
     SetVertexRecords(3);
     SetPixelBuffer(First.data());
     const auto before = Counters();
+    const auto redosBefore = AgcDriver::DriverDetail::Driver::Get().FrozenIndirectRedos();
     Draw(BufferPixelCode.data(), PixelTable.data(), 255, "the first CPU-expanded indirect planned draw", true);
     SetPixelBuffer(Moved.data());
     Draw(BufferPixelCode.data(), PixelTable.data(), 128, "a CPU-expanded indirect planned draw with moved pixel values", true);
     const auto after = Counters();
-    Require(after.stages == before.stages + 8u, "indirect planned draws did not materialize both initial stages and both patched vertex records");
-    Require(after.verifiedStages == before.verifiedStages + 8u && after.stageMismatches == before.stageMismatches, "CPU-expanded planned stages differ from full materialization");
+    const auto refusedOnWorkers = AgcDriver::DriverDetail::Driver::Get().FrozenIndirectRedos() - redosBefore;
+    Require(after.stages == before.stages + 8u + refusedOnWorkers, "indirect planned draws did not materialize both initial stages and both patched vertex records, beyond the vertex stage of each one a preparation worker refused for the CPU path");
+    Require(after.verifiedStages == before.verifiedStages + 8u + refusedOnWorkers && after.stageMismatches == before.stageMismatches, "CPU-expanded planned stages differ from full materialization");
 }
 
 void IncrementalDrawsFollowWatchedTables() {

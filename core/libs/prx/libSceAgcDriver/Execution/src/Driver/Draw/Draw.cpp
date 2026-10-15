@@ -107,9 +107,13 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
     }
     timing.Mark("device_setup");
     const auto parkForPipeline = [&](const Graphics::State& pipelineState, std::span<const Graphics::CompiledShader> pipelineStages) {
-        if (!VulkanDevice::CompileParkingEnabled() || !onWorkerThread() || frozenSink() != nullptr || GuestMemory::GpuMutex().HeldByThisThread()) return;
+        if (!VulkanDevice::CompileParkingEnabled() || GuestMemory::GpuMutex().HeldByThisThread()) return;
+        auto* sink = frozenSink();
+        const bool parkWorker = sink != nullptr && !sink->inOrder && FrozenPipeline::OnWorker();
+        if (!parkWorker && (sink != nullptr || !onWorkerThread())) return;
         auto ticket = localDevice->TryDrawPipeline(pipelineState, pipelineStages);
         if (ticket == nullptr) return;
+        if (parkWorker) throw PreparationParked{[device = localDevice, ticket](std::function<void()> wake) { return device->ArmCompileWait(ticket, std::move(wake)); }, [ticket] { ticket->Wait(); }};
         ParkedOp op;
         op.queue = submission.queue;
         op.submission = submission.serial;
@@ -481,6 +485,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
+            if (auto* sink = frozenSink(); sink != nullptr && indirectCpu.has_value() && sink->Refuse(FrozenFallback::Indirect)) return DrawVerdict::Nothing;
         } else if (i == 0) {
             fold(result, drawParameters);
         }
@@ -569,7 +574,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             localDevice = std::move(current);
         }
 
-        recordLabelsForPacket(localDevice.get(), submission.queue);
+        if (frozenSink() == nullptr) recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(DrawRowLabels);
     };
     if (drawParameters.indirect && indirectCpu) {
@@ -586,7 +591,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             }
             programResults[i] = &results[resultIndex[i]];
         }
-        recordQueuedLabelsBeforeRead(submission.queue);
+        if (frozenSink() == nullptr) recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
         std::vector<Pm4::DrawArguments> records;

@@ -34,7 +34,7 @@ struct SpirvRequirements {
 };
 
 inline constexpr std::uint32_t FunctionLdsDwordLimit = 8192u;
-[[nodiscard]] SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program, std::uint32_t functionLdsAllocationDwords = FunctionLdsDwordLimit);
+[[nodiscard]] SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program, std::uint32_t functionLdsAllocationDwords = FunctionLdsDwordLimit, std::uint32_t functionLdsUnboundedDwords = FunctionLdsDwordLimit);
 [[nodiscard]] std::uint32_t FunctionLdsDwords(const IrProgram& program);
 [[nodiscard]] std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const IrProgram& program);
 [[nodiscard]] std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program);

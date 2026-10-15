@@ -225,6 +225,7 @@ public:
         double allocateUs = 0;
         double updateUs = 0;
     };
+    void VerifyDataWords(std::span<const CompiledShader> shaders, std::span<const MovedBuffer> moved) const;
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsStatistics* statistics = nullptr, const DrawIndexRanges* drawRanges = nullptr, std::span<const DrawSnapshotArena::Prefill> prefills = {}) const;
     struct SnapshotRequest {
         std::uint64_t begin;
@@ -280,6 +281,10 @@ public:
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
+    bool KnownAddressWrites() const { return usesBda && bdaReadOnly && !guestMemory.HasCopiedWrites(); }
+    bool HasPlacements() const;
+    bool DispatchEffectsKnown() const { return tableStages.empty() && !guestMemory.HasCopiedWrites() && !HasPlacements(); }
+    bool WritesThroughPointers() const { return usesBda && !bdaReadOnly; }
     void UseMirrors(Recorder& recorder) const;
     void RecordPlacementCopyBack(Recorder& recorder, VkCommandBuffer commands) const;
     [[nodiscard]] bool HasPlacements() const;
@@ -298,6 +303,7 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     Recorder::BoundPlacement Placement() const { return guestMemory.Placement(); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
+    std::vector<std::pair<VkImage, bool>> PassImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
@@ -785,6 +791,9 @@ public:
     static CacheSizing::Limits DefaultLimits();
     ResourceCache();
     explicit ResourceCache(CacheSizing::Limits limits);
+    ~ResourceCache();
+    ResourceCache(const ResourceCache&) = delete;
+    ResourceCache& operator=(const ResourceCache&) = delete;
     std::shared_ptr<ShaderResources> Find(const Key& key);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
@@ -794,7 +803,7 @@ public:
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
     void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
-    void RemoveAddressTemplates(std::vector<std::shared_ptr<ShaderResources>>& evicted);
+    static void RemoveLeaseHolders(std::vector<std::shared_ptr<ShaderResources>>& evicted);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
@@ -812,6 +821,7 @@ public:
 
 private:
     void erase(const Key& key);
+    void removeLeaseHolders(std::vector<std::shared_ptr<ShaderResources>>& evicted);
     void evictOverLimit(std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteMiss(const Key& key);
     struct KeyHash {

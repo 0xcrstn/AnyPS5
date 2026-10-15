@@ -22,7 +22,18 @@ struct PassAccess {
     std::span<const std::pair<VkImage, bool>> attachments;
     bool anyReads = false;
     bool anyWrites = false;
+    bool knownAddressWrites = false;
 };
+
+enum class ReadOnlyAddressPasses : std::uint8_t { Off, On, Verify };
+
+ReadOnlyAddressPasses ParseReadOnlyAddressPasses(const char* text);
+ReadOnlyAddressPasses ReadOnlyAddressPassesSetting();
+
+enum class DepthPassMerge : std::uint8_t { Off, On, Verify };
+
+DepthPassMerge ParseDepthPassMerge(const char* text);
+DepthPassMerge DepthPassMergeSetting();
 
 enum class PassHazard : std::uint8_t { None, ReadAfterWrite, WriteAfterWrite, WriteAfterRead, Image, UnknownRead, UnknownWrite };
 
@@ -41,6 +52,7 @@ private:
 class PassHazards {
 public:
     PassHazard Check(const PassAccess& access, bool samePass) const;
+    PassHazard CheckKnownAddressWrites(const PassAccess& access, bool samePass) const;
     void Add(const PassAccess& access);
     void BeginPass() { ++pass; }
     void Clear();
@@ -53,6 +65,7 @@ private:
         std::uint64_t pass;
     };
     bool overlapsAny(const GuestRangeSet& set, GuestRangeList ranges) const;
+    PassHazard check(const PassAccess& access, bool samePass, bool accessWrites, bool earlierWrites) const;
     GuestRangeSet reads;
     GuestRangeSet writes;
     std::vector<std::pair<VkImage, bool>> images;
@@ -60,6 +73,7 @@ private:
     std::uint64_t pass = 0;
     bool anyReads = false;
     bool anyWrites = false;
+    bool unknownAddressWrites = false;
 };
 
 }
