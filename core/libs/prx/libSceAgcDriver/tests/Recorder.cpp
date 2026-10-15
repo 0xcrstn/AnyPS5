@@ -1379,6 +1379,16 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     Require(covered == (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT), "the covered mask is not reported");
     recorder.Commands(&covered);
     Require(covered == 0, "the covered mask survived a Commands() call");
+    recorder.MarkCovered(Recorder::DrawPassAccess);
+    auto start = recorder.StartDrawPass(0x5eed, false, false, PassAccess{});
+    Require(!start.continued && start.barrier == !Recorder::MergeBarriers(), "a render pass begun after a barrier that covered it recorded its own (or skipped it with elision off)");
+    recorder.Commands(&covered);
+    Require(covered == 0, "a render pass start left the covered mask set");
+    recorder.MarkCovered(Recorder::DrawPassAccess & ~VK_ACCESS_INDEX_READ_BIT);
+    start = recorder.StartDrawPass(0x5eed, true, false, PassAccess{});
+    Require(!start.continued && start.barrier, "a render pass begun after a barrier that covered only part of it skipped its own");
+    start = recorder.StartDrawPass(0x5eed, false, false, PassAccess{});
+    Require(!start.continued && start.barrier, "a render pass begun after uncovered work skipped its barrier");
     recorder.Sync();
     // The hazard tracker (counting mode only): accesses are noted without effect on the batch.
     const std::pair<std::uint64_t, std::uint64_t> range{address, address + 64};
@@ -7080,7 +7090,7 @@ void presentThenStoreTests(const Device& device, Recorder& recorder) {
     };
     write({{1.0f, 0.0f, 0.0f, 1.0f}});
     bool presentedPending = false;
-    Require(StorageTexture::PresentThenStore(true, [&] {
+    Require(StorageTexture::PresentThenStore(PublishScope::Whole, [&] {
         presentedPending = StorageTexture::FindPending(address, bytes) == image;
         return true;
     }), "a flip that presented reported no present");
@@ -7089,16 +7099,22 @@ void presentThenStoreTests(const Device& device, Recorder& recorder) {
     settle();
     Require(stored({255, 0, 0, 255}), "the flip did not store the presented image's results");
     write({{0.0f, 1.0f, 0.0f, 1.0f}});
-    Require(!StorageTexture::PresentThenStore(true, [] { return false; }), "a dropped flip reported a present");
+    Require(!StorageTexture::PresentThenStore(PublishScope::Whole, [] { return false; }), "a dropped flip reported a present");
     Require(StorageTexture::FindPending(address, bytes) == nullptr, "a dropped flip did not store the pending results");
     settle();
     Require(stored({0, 255, 0, 255}), "a dropped flip did not store the newer results");
     write({{0.0f, 0.0f, 1.0f, 1.0f}});
-    Require(StorageTexture::PresentThenStore(false, [] { return true; }), "a flip without APS5_STORE_AT_FLIP reported no present");
+    Require(StorageTexture::PresentThenStore(std::nullopt, [] { return true; }), "a flip without APS5_STORE_AT_FLIP reported no present");
     Require(StorageTexture::FindPending(address, bytes) == image, "a flip without APS5_STORE_AT_FLIP stored the pending results");
     image->WriteBack();
     settle();
     Require(stored({0, 0, 255, 255}), "the results kept pending over a flip were not stored later");
+    write({{1.0f, 1.0f, 0.0f, 1.0f}});
+    Require(StorageTexture::PresentThenStore(PublishScope::None, [] { return true; }), "a flip with APS5_STORE_AT_FLIP=shadow reported no present");
+    Require(StorageTexture::FindPending(address, bytes) == nullptr, "APS5_STORE_AT_FLIP=shadow left an image pending after the flip");
+    static_cast<void>(StorageTexture::FlushPending(address, bytes));
+    settle();
+    Require(stored({255, 255, 0, 255}), "the results stored at a flip without a publish did not reach a later reader");
     std::cout << "present then store at flip: ok\n";
 }
 

@@ -5917,9 +5917,11 @@ void highestDrawIndexTests() {
 
 void storeAtFlipTests() {
     using AgcDriver::Graphics::StorageTexture;
-    Require(!StorageTexture::StoreAtFlipRequested(nullptr), "an unset APS5_STORE_AT_FLIP stored at each flip");
-    Require(StorageTexture::StoreAtFlipRequested("1"), "APS5_STORE_AT_FLIP=1 did not store at each flip");
-    for (const char* value : {"0", "", "true", "11"}) expectFailure([&] { StorageTexture::StoreAtFlipRequested(value); }, "expected 1");
+    using AgcDriver::Graphics::PublishScope;
+    Require(!StorageTexture::StoreAtFlipRequested(nullptr).has_value(), "an unset APS5_STORE_AT_FLIP stored at each flip");
+    Require(StorageTexture::StoreAtFlipRequested("1") == PublishScope::Whole, "APS5_STORE_AT_FLIP=1 did not store and publish at each flip");
+    Require(StorageTexture::StoreAtFlipRequested("shadow") == PublishScope::None, "APS5_STORE_AT_FLIP=shadow published the stores at each flip");
+    for (const char* value : {"0", "", "true", "11", "Shadow"}) expectFailure([&] { StorageTexture::StoreAtFlipRequested(value); }, "expected 1 or shadow");
 }
 
 void storeAtLabelTests() {

@@ -21,7 +21,7 @@ namespace {
 
 constexpr std::uint64_t UnitBytes = 65536;
 constexpr std::size_t ReasonCount = static_cast<std::size_t>(PublishReason::Count);
-constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown"};
+constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown", "flip"};
 
 std::uint64_t BudgetBytes() {
     static const std::uint64_t budget = [] {
@@ -451,6 +451,7 @@ PublishReason PublishReasonFor(const char* flushReason) {
     if (is("packet store")) return PublishReason::Label;
     if (is("buffer copy count") || is("dispatch-cache entry")) return PublishReason::Validate;
     if (is("storage image creation") || is("storage refresh")) return PublishReason::Upload;
+    if (is("flip")) return PublishReason::Flip;
     return PublishReason::Hook;
 }
 
