@@ -481,6 +481,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
+            if (auto* sink = frozenSink(); sink != nullptr && indirectCpu.has_value() && sink->Refuse(FrozenFallback::Indirect)) return DrawVerdict::Nothing;
         } else if (i == 0) {
             fold(result, drawParameters);
         }
