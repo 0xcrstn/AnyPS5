@@ -255,6 +255,7 @@ Queue 0's draws and dispatches are prepared on worker threads and recorded on a 
 - `APS5_DRAW_SNAPSHOT_ARENA` (with `APS5_DRAW_SNAPSHOT_ARENA_EXTEND_KIB`, 1024), `APS5_SNAPSHOT_READ_RANGES`, `APS5_MOVED_WORD_RING`: draw input snapshots are shared between draws, and only the ranges a shader reads are copied.
 - `APS5_EPOCH_DIRTY_SET` (with `APS5_EPOCH_DIRTY_SET_WIDEN_KIB`, 256), `APS5_COLLECT_COVERAGE`, `APS5_PRECOLLECT_ON_WORKERS`: write-tracking collects are widened, shared between the threads of a collect epoch and made early on the preparation workers.
 - `APS5_DIRTY_RECORD`: a draw that continues a render pass skips the binds that did not change.
+- `APS5_CP_READS_OVERLAP`: `SET_SH_REG_INDIRECT`, `SET_UCONFIG_REG_INDIRECT`, `SET_CONTEXT_REG_INDIRECT` and `INDEX_ATTRIBUTES_INDIRECT` read their tables when queue 0 parses them, as the command processor does, instead of waiting for the draws queued before them. Verify: `APS5_CP_READS_OVERLAP=verify` reads each table again after those draws are recorded and stops on a difference.
 
 `APS5_IN_PLACE_DRAW_INPUTS` binds read-only draw inputs through their host imports instead of snapshotting them. It is on by default whenever `APS5_COHERENCE_INPUT_LEASES` is: each input then holds a read lease until its batch completes, so a CPU store into it waits for the draw instead of reaching it, and an input whose lease is refused is snapshotted. Setting it to `1` without the leases binds the inputs unprotected (a CPU store before the GPU reads them is seen by the draw); `0` turns it off.
 
