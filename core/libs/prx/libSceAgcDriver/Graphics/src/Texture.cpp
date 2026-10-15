@@ -3396,8 +3396,8 @@ void StorageTexture::FlushDumpSelected(const char* reason) {
     for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
 }
 
-void StorageTexture::FlushAllPending(const char* reason) {
-    static_cast<void>(FlushPending(0, std::numeric_limits<std::size_t>::max(), nullptr, reason));
+void StorageTexture::FlushAllPending(const char* reason, PublishScope scope) {
+    static_cast<void>(FlushPending(0, std::numeric_limits<std::size_t>::max(), nullptr, reason, scope));
 }
 
 bool StorageTexture::AnyPending() {
@@ -3406,16 +3406,17 @@ bool StorageTexture::AnyPending() {
     return pending.textures.begin() != pending.textures.end();
 }
 
-bool StorageTexture::StoreAtFlipRequested(const char* value) {
-    if (value == nullptr) return false;
-    if (std::strcmp(value, "1") == 0) return true;
-    throw std::runtime_error(std::string("APS5_STORE_AT_FLIP=") + value + ": expected 1");
+std::optional<PublishScope> StorageTexture::StoreAtFlipRequested(const char* value) {
+    if (value == nullptr) return std::nullopt;
+    if (std::strcmp(value, "1") == 0) return PublishScope::Whole;
+    if (std::strcmp(value, "shadow") == 0) return PublishScope::None;
+    throw std::runtime_error(std::string("APS5_STORE_AT_FLIP=") + value + ": expected 1 or shadow");
 }
 
-bool StorageTexture::PresentThenStore(bool storeAtFlip, const std::function<bool()>& present) {
+bool StorageTexture::PresentThenStore(std::optional<PublishScope> storeAtFlip, const std::function<bool()>& present) {
     if (!storeAtFlip) FlushDumpSelected("flip");
     const bool presented = present();
-    if (storeAtFlip) FlushAllPending("flip");
+    if (storeAtFlip) FlushAllPending("flip", *storeAtFlip);
     return presented;
 }
 

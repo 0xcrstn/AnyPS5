@@ -2839,7 +2839,7 @@ FrameDumps& Dumps() {
 }
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
-    static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
+    static const auto storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     return Graphics::StorageTexture::PresentThenStore(storeAtFlip, [&] { return presentDisplayBuffer(buffer); });
 }
 

@@ -7071,7 +7071,7 @@ void presentThenStoreTests(const Device& device, Recorder& recorder) {
     };
     write({{1.0f, 0.0f, 0.0f, 1.0f}});
     bool presentedPending = false;
-    Require(StorageTexture::PresentThenStore(true, [&] {
+    Require(StorageTexture::PresentThenStore(PublishScope::Whole, [&] {
         presentedPending = StorageTexture::FindPending(address, bytes) == image;
         return true;
     }), "a flip that presented reported no present");
@@ -7080,16 +7080,22 @@ void presentThenStoreTests(const Device& device, Recorder& recorder) {
     settle();
     Require(stored({255, 0, 0, 255}), "the flip did not store the presented image's results");
     write({{0.0f, 1.0f, 0.0f, 1.0f}});
-    Require(!StorageTexture::PresentThenStore(true, [] { return false; }), "a dropped flip reported a present");
+    Require(!StorageTexture::PresentThenStore(PublishScope::Whole, [] { return false; }), "a dropped flip reported a present");
     Require(StorageTexture::FindPending(address, bytes) == nullptr, "a dropped flip did not store the pending results");
     settle();
     Require(stored({0, 255, 0, 255}), "a dropped flip did not store the newer results");
     write({{0.0f, 0.0f, 1.0f, 1.0f}});
-    Require(StorageTexture::PresentThenStore(false, [] { return true; }), "a flip without APS5_STORE_AT_FLIP reported no present");
+    Require(StorageTexture::PresentThenStore(std::nullopt, [] { return true; }), "a flip without APS5_STORE_AT_FLIP reported no present");
     Require(StorageTexture::FindPending(address, bytes) == image, "a flip without APS5_STORE_AT_FLIP stored the pending results");
     image->WriteBack();
     settle();
     Require(stored({0, 0, 255, 255}), "the results kept pending over a flip were not stored later");
+    write({{1.0f, 1.0f, 0.0f, 1.0f}});
+    Require(StorageTexture::PresentThenStore(PublishScope::None, [] { return true; }), "a flip with APS5_STORE_AT_FLIP=shadow reported no present");
+    Require(StorageTexture::FindPending(address, bytes) == nullptr, "APS5_STORE_AT_FLIP=shadow left an image pending after the flip");
+    static_cast<void>(StorageTexture::FlushPending(address, bytes));
+    settle();
+    Require(stored({255, 255, 0, 255}), "the results stored at a flip without a publish did not reach a later reader");
     std::cout << "present then store at flip: ok\n";
 }
 
