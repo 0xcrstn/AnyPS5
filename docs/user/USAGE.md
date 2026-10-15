@@ -269,20 +269,25 @@ Queue 0's draws and dispatches are prepared on worker threads and recorded on a 
 - `APS5_DRAW_SNAPSHOT_ARENA` (with `APS5_DRAW_SNAPSHOT_ARENA_EXTEND_KIB`, 1024), `APS5_SNAPSHOT_READ_RANGES`, `APS5_MOVED_WORD_RING`: draw input snapshots are shared between draws, and only the ranges a shader reads are copied.
 - `APS5_EPOCH_DIRTY_SET` (with `APS5_EPOCH_DIRTY_SET_WIDEN_KIB`, 256), `APS5_COLLECT_COVERAGE`, `APS5_PRECOLLECT_ON_WORKERS`: write-tracking collects are widened, shared between the threads of a collect epoch and made early on the preparation workers.
 - `APS5_DIRTY_RECORD`: a draw that continues a render pass skips the binds that did not change.
+- `APS5_CP_READS_OVERLAP`: `SET_SH_REG_INDIRECT`, `SET_UCONFIG_REG_INDIRECT`, `SET_CONTEXT_REG_INDIRECT` and `INDEX_ATTRIBUTES_INDIRECT` read their tables when queue 0 parses them, as the command processor does, instead of waiting for the draws queued before them. Verify: `APS5_CP_READS_OVERLAP=verify` reads each table again after those draws are recorded and stops on a difference.
 
-Off by default: `APS5_CHUNKED_RECORDING=1` records a render pass's draws into secondary command buffers on a recording thread (it costs more than it saves at a few draws per pass), and `APS5_IN_PLACE_DRAW_INPUTS=1` binds read-only draw inputs in place instead of snapshotting them (a title's CPU store before the GPU reads them is seen by the draw).
+`APS5_IN_PLACE_DRAW_INPUTS` binds read-only draw inputs through their host imports instead of snapshotting them. It is on by default whenever `APS5_COHERENCE_INPUT_LEASES` is: each input then holds a read lease until its batch completes, so a CPU store into it waits for the draw instead of reaching it, and an input whose lease is refused is snapshotted. Setting it to `1` without the leases binds the inputs unprotected (a CPU store before the GPU reads them is seen by the draw); `0` turns it off.
+
+Off by default: `APS5_CHUNKED_RECORDING=1` records a render pass's draws into secondary command buffers on a recording thread (it costs more than it saves at a few draws per pass).
 
 ### Address-based shader experiments
 
-These switches change how recompiled shaders reach guest memory through addresses. Each accepts the values shown; any other value stops the title at start. `verify` runs the old and the new form side by side and stops the title with a description of the first difference.
+These switches change how recompiled shaders reach guest memory through addresses and how they handle floating point. Each accepts the values shown; any other value stops the title at start. The optimized form is the default (the value marked as such below); the other value turns it off. `verify` runs the old and the new form side by side and stops the title with a description of the first difference.
 
-- `APS5_BDA_ABI=legacy|radix|verify`: how a guest address is found in the table of mapped ranges (a binary search, or an indexed table).
-- `APS5_BDA_RELATIVE=off|on|verify`: whether a shader reuses the last range it found for later accesses inside it. `APS5_BDA_RANGE_CACHE=1` is the same as `on`, and with `APS5_VERIFY_BDA_RANGE_CACHE=1` the same as `verify`; setting both switches to different values stops the title.
-- `APS5_BDA_INLINE_FAST_PATH=off|on`: with `APS5_BDA_RELATIVE=on`, asks the GPU driver to inline that reuse check at each access while the full lookup stays a separate function. The generated code is otherwise identical, so it has no verify mode.
-- `APS5_BDA_SPAN_HELPERS=off|on|verify`: whether wide reads use a reader specialized for the dwords they use.
-- `APS5_BDA_WRITE_NOTES=off|on|verify`: whether a shader skips recording a written page it already recorded.
-- `APS5_LAZY_LOG2_REPAIR=off|on|verify`, `APS5_LAZY_TRIG_SERIES=off|on|verify`: whether log2, sin and cos evaluate only the correction they select.
-- `APS5_BDA_PLACEMENT=host|device|verify`: whether compute shaders that store through addresses (without atomics or coherent accesses) work on device-local copies of the host memory they write, copied back after each dispatch.
+- `APS5_BDA_ABI=legacy|radix|verify` (default `radix`): how a guest address is found in the table of mapped ranges (a binary search, or an indexed table).
+- `APS5_BDA_RELATIVE=off|on|verify` (default `on`): whether a shader reuses the last range it found for later accesses inside it. `APS5_BDA_RANGE_CACHE=1` is the same as `on`, and with `APS5_VERIFY_BDA_RANGE_CACHE=1` the same as `verify`; setting both switches to different values stops the title.
+- `APS5_BDA_INLINE_FAST_PATH=off|on` (default `on`): with `APS5_BDA_RELATIVE=on`, asks the GPU driver to inline that reuse check at each access while the full lookup stays a separate function. The generated code is otherwise identical, so it has no verify mode.
+- `APS5_BDA_SPAN_HELPERS=off|on|verify` (default `on`): whether wide reads use a reader specialized for the dwords they use.
+- `APS5_BDA_WRITE_NOTES=off|on|verify` (default `on`): whether a shader skips recording a written page it already recorded.
+- `APS5_FLUSH_PROOFS=off|on|verify` (default `on`): whether denormal flushes are also removed where a value provably cannot be denormal: loop values that only ever carry flushed values through min, max or selects, NaN-propagation selects, products with constants of magnitude one or more, truncation and rounding, square roots and reciprocal square roots. `verify` keeps the flushes and stops the title when such a value is ever denormal.
+- `APS5_LAZY_LOG2_REPAIR=off|on|verify`, `APS5_LAZY_TRIG_SERIES=off|on|verify` (default `off`): whether log2, sin and cos evaluate only the correction they select.
+- `APS5_BDA_PLACEMENT=host|device|verify` (default `device`): whether compute shaders that store through addresses (without atomics or coherent accesses) work on device-local copies of the host memory they write, copied back after each dispatch.
+- `APS5_RESIDENT_MIRRORS=0|1` (default `1`): whether address-based shaders that only read host memory read device-local copies of it, refreshed from the host before each batch and after GPU writes in it.
 - `APS5_SHADER_MANIFEST=<folder>` writes one line per compiled shader with its address and instruction counts; `APS5_SHADER_MANIFEST_SPIRV=all` (or comma-separated hexadecimal addresses) also writes the shaders. `APS5_SPIRV_GUEST_LINES=1` tags shaders with guest program counters for GPU profilers.
 
 ### Tracing system library calls

@@ -2814,16 +2814,20 @@ std::atomic<std::uint64_t>& InPlaceInputsChangedAfterSubmit() {
 
 }
 
-void Recorder::NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0) return;
+bool Recorder::NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return true;
     if (Coherence::InputLeases()) {
-        if (const auto lease = Coherence::AcquireReadLease({address, address + bytes}, Coherence::CurrentVersion()); lease != 0) OnCompleteWithoutGuestAccess([lease] { Coherence::RetireReadLease(lease); });
+        const auto lease = Coherence::AcquireReadLease({address, address + bytes}, Coherence::CurrentVersion());
+        if (lease == 0) return false;
+        ensureOpen();
+        open->inPlaceLeases.push_back(lease);
     }
-    if (!VerifyInPlaceDrawInputs()) return;
+    if (!VerifyInPlaceDrawInputs()) return true;
     ensureOpen();
     const auto generation = GuestMemory::CollectWritesUncached(address, bytes);
     Require(generation != 0, "APS5_VERIFY_IN_PLACE_DRAW_INPUTS: an input bound in place has no write generation to verify against");
     open->inPlaceInputs.push_back({address, address + bytes, generation});
+    return true;
 }
 
 bool Recorder::FlipReadCheck() {
@@ -3941,6 +3945,12 @@ void Recorder::Submit() {
             }
         });
         open->inPlaceInputs.clear();
+    }
+    if (!open->inPlaceLeases.empty()) {
+        OnCompleteWithoutGuestAccess([leases = std::move(open->inPlaceLeases)] {
+            for (const auto lease : leases) Coherence::RetireReadLease(lease);
+        });
+        open->inPlaceLeases.clear();
     }
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
