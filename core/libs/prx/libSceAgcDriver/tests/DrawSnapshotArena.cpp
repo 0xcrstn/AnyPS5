@@ -253,7 +253,8 @@ void PartialTests(Fixture& fixture) {
     const auto changedAnalysis = analysis(offset, bytes, ranges);
     Statistics changedStatistics;
     const auto changed = fixture.Take(offset, bytes, &changedStatistics, &changedAnalysis);
-    Require(changedStatistics.arenaCopies == 1 && changedStatistics.limited == 1 && changedStatistics.copiedBytes == 84 && (changed.handle != original.handle || changed.offset != original.offset), "a wider read shape reused bytes absent from a partial snapshot");
+    Require(changedStatistics.arenaCopies == 1 && changedStatistics.limited == 1 && changedStatistics.copiedBytes == 8 && changed.handle == original.handle && changed.offset == original.offset, "a wider read shape of an unchanged partial snapshot did not copy only its missing bytes into it");
+    Require(std::memcmp(changed.bytes.data() + 256, fixture.Bytes(offset - 1 + 256), 8) == 0, "a wider read shape reused bytes absent from a partial snapshot");
     *fixture.Bytes(offset - 1 + 64) = std::byte{0xee};
     GuestMemory::BumpCollectEpoch();
     Statistics writtenStatistics;
@@ -302,6 +303,53 @@ void PartialTests(Fixture& fixture) {
     counters = arena.TakeCounters();
     Require(counters.verified != 0 && counters.verifyDiffering == 0 && counters.twinCopies == 0, "partial arena verification or device-twin exclusion failed");
     DrawSnapshotArena::SetDeviceTwins(false);
+    DrawSnapshotArena::SetVerify(false);
+    fixture.Release();
+}
+
+void ExtendedPartialTests(Fixture& fixture) {
+    DrawSnapshotArena::SetEnabled(true);
+    DrawSnapshotArena::SetDeviceTwins(false);
+    DrawSnapshotArena::SetVerify(true);
+    constexpr std::uint64_t offset = 393217;
+    constexpr std::size_t bytes = 98304;
+    constexpr std::size_t viewBytes = bytes + 4;
+    auto* data = fixture.Bytes(0);
+    for (std::size_t index = 393216; index < 524288; ++index) data[index] = static_cast<std::byte>(index * 5u + 1u);
+    GuestMemory::BumpCollectEpoch();
+    const auto analysis = [&](std::vector<ShaderRecompiler::BufferReadRange> reads) {
+        const auto address = fixture.Address() + offset;
+        ShaderRecompiler::BufferReadRanges ranges;
+        ranges.ranges = std::move(reads);
+        return ShaderResources::ReadAnalysis{{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, static_cast<std::uint32_t>(bytes), 0x31000000u}, std::move(ranges)};
+    };
+    const auto guest = [&](std::size_t at) { return fixture.Bytes(offset - 1 + at); };
+    auto& arena = fixture.GetRecorder().SnapshotArena();
+    arena.TakeCounters();
+    const auto firstReads = analysis({{0u, 0u, 100u, 164u}});
+    Statistics firstStatistics;
+    const auto first = fixture.Take(offset, bytes, &firstStatistics, &firstReads);
+    Require(firstStatistics.arenaCopies == 1 && firstStatistics.limited == 1 && firstStatistics.copiedBytes == 64 && first.bytes.size() == viewBytes, "a proved 64-byte read was not copied as a partial snapshot");
+    const auto widerReads = analysis({{0u, 0u, 100u, 164u}, {0u, 0u, 70000u, 70016u}});
+    Statistics widerStatistics;
+    const auto wider = fixture.Take(offset, bytes, &widerStatistics, &widerReads);
+    Require(widerStatistics.arenaCopies == 1 && widerStatistics.limited == 1 && widerStatistics.copiedBytes == 16 && wider.handle == first.handle && wider.offset == first.offset, "a wider read of an unchanged partial snapshot was not added to it in place");
+    Require(std::memcmp(wider.bytes.data() + 101, guest(101), 64) == 0 && std::memcmp(wider.bytes.data() + 70001, guest(70001), 16) == 0, "a partial snapshot extended in place does not hold the guest bytes it covers");
+    auto counters = arena.TakeCounters();
+    Require(counters.partialCopies == 2 && counters.extendedCopies == 1 && counters.copiedBytes == 80, "the arena did not report its in-place extension");
+    *guest(80001) = std::byte{0x5a};
+    GuestMemory::BumpCollectEpoch();
+    const auto laterReads = analysis({{0u, 0u, 100u, 164u}, {0u, 0u, 80000u, 80004u}});
+    Statistics laterStatistics;
+    const auto later = fixture.Take(offset, bytes, &laterStatistics, &laterReads);
+    Require(laterStatistics.arenaCopies == 1 && laterStatistics.copiedBytes == 4 && later.handle == first.handle && later.offset == first.offset && later.bytes[80001] == std::byte{0x5a}, "a read of bytes stored after the partial snapshot was made was not copied fresh into it");
+    *guest(70001) = std::byte{0xa5};
+    GuestMemory::BumpCollectEpoch();
+    const auto staleReads = analysis({{0u, 0u, 70000u, 70016u}});
+    Statistics staleStatistics;
+    const auto stale = fixture.Take(offset, bytes, &staleStatistics, &staleReads);
+    Require(staleStatistics.arenaCopies == 1 && staleStatistics.copiedBytes == 16 && (stale.handle != first.handle || stale.offset != first.offset) && stale.bytes[70001] == std::byte{0xa5}, "a changed range covered by a partial snapshot was reused or recopied in place");
+    Require(wider.bytes[70001] != std::byte{0xa5} && std::memcmp(first.bytes.data() + 101, guest(101), 64) == 0, "a later partial copy overwrote bytes an earlier draw reads");
     DrawSnapshotArena::SetVerify(false);
     fixture.Release();
 }
@@ -838,6 +886,11 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
         Fixture fixture(context, std::size_t{1} << 20u, 1);
         Require(fixture.Ready(), "the partial arena fixture lost its host import");
         PartialTests(fixture);
+    }
+    {
+        Fixture fixture(context, std::size_t{1} << 20u, 1);
+        Require(fixture.Ready(), "the extended partial arena fixture lost its host import");
+        ExtendedPartialTests(fixture);
     }
     {
         DrawSnapshotArena::SetChunkBytes(65536);

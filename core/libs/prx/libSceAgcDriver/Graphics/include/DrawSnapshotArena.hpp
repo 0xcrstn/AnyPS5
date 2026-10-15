@@ -49,6 +49,7 @@ public:
         std::uint64_t twinCopiedBytes = 0;
         std::uint64_t twinViews = 0;
         std::uint64_t twinsRefused = 0;
+        std::uint64_t extendedCopies = 0;
     };
 
     explicit DrawSnapshotArena(const Context& context);
@@ -85,6 +86,7 @@ public:
     static constexpr std::size_t SegmentGranule = 4096;
     static constexpr std::size_t MaxEntries = 16384;
     static constexpr std::size_t LookupDepth = 8;
+    static constexpr std::size_t MaxCopiedRanges = 64;
 
 private:
     struct Chunk {
@@ -118,6 +120,7 @@ private:
     std::optional<std::size_t> reusableChunk() const;
     View view(Recorder& recorder, std::size_t chunk, VkDeviceSize offset, std::size_t bytes, bool copied, std::size_t chargedBytes, std::size_t copiedBytes = 0, bool limited = false);
     std::optional<View> lookup(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges* ranges = nullptr);
+    std::optional<View> extend(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges& ranges);
 
     Context context;
     VkDeviceSize alignment;

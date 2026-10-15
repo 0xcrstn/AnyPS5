@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 
 namespace AgcDriver::Graphics {
 
@@ -127,7 +128,7 @@ void DrawSnapshotArena::ReportActive(double elapsedSeconds) {
         heldBytes += chunk->buffer->Bytes().size();
         if (chunk.use_count() > 1) ++busy;
     }
-    std::fprintf(stderr, "[draw-arena] (%.3f s) %llu takes (%.1f MiB requested): %llu hits (%.1f%%), %llu stale, %llu copies (%.1f MiB copied, %llu exact, %llu unindexed); partial %llu copies (%.1f MiB left uncopied); refused: size %llu, budget %llu; chunks %zu (%zu in flight, %.0f MiB, %llu created, %llu recycled), %zu entries; verify %llu checked, %llu differing; device twins%s: %llu views, %llu prologue copies (%.1f MiB), %llu refused\n", elapsedSeconds, static_cast<unsigned long long>(taken.takes), static_cast<double>(taken.requestedBytes) / 1048576.0, static_cast<unsigned long long>(taken.hits), 100.0 * static_cast<double>(taken.hits) / takes, static_cast<unsigned long long>(taken.stale), static_cast<unsigned long long>(taken.copies), static_cast<double>(taken.copiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.exactSegments), static_cast<unsigned long long>(taken.unindexed), static_cast<unsigned long long>(taken.partialCopies), static_cast<double>(taken.uncopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.refusedSize), static_cast<unsigned long long>(taken.refusedBudget), arena->chunks.size(), busy, static_cast<double>(heldBytes) / 1048576.0, static_cast<unsigned long long>(taken.chunksCreated), static_cast<unsigned long long>(taken.chunksRecycled), arena->entries.size(), static_cast<unsigned long long>(taken.verified), static_cast<unsigned long long>(taken.verifyDiffering), DeviceTwins() ? "" : " (off)", static_cast<unsigned long long>(taken.twinViews), static_cast<unsigned long long>(taken.twinCopies), static_cast<double>(taken.twinCopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.twinsRefused));
+    std::fprintf(stderr, "[draw-arena] (%.3f s) %llu takes (%.1f MiB requested): %llu hits (%.1f%%), %llu stale, %llu copies (%.1f MiB copied, %llu exact, %llu unindexed); partial %llu copies (%llu extended in place, %.1f MiB left uncopied); refused: size %llu, budget %llu; chunks %zu (%zu in flight, %.0f MiB, %llu created, %llu recycled), %zu entries; verify %llu checked, %llu differing; device twins%s: %llu views, %llu prologue copies (%.1f MiB), %llu refused\n", elapsedSeconds, static_cast<unsigned long long>(taken.takes), static_cast<double>(taken.requestedBytes) / 1048576.0, static_cast<unsigned long long>(taken.hits), 100.0 * static_cast<double>(taken.hits) / takes, static_cast<unsigned long long>(taken.stale), static_cast<unsigned long long>(taken.copies), static_cast<double>(taken.copiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.exactSegments), static_cast<unsigned long long>(taken.unindexed), static_cast<unsigned long long>(taken.partialCopies), static_cast<unsigned long long>(taken.extendedCopies), static_cast<double>(taken.uncopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.refusedSize), static_cast<unsigned long long>(taken.refusedBudget), arena->chunks.size(), busy, static_cast<double>(heldBytes) / 1048576.0, static_cast<unsigned long long>(taken.chunksCreated), static_cast<unsigned long long>(taken.chunksRecycled), arena->entries.size(), static_cast<unsigned long long>(taken.verified), static_cast<unsigned long long>(taken.verifyDiffering), DeviceTwins() ? "" : " (off)", static_cast<unsigned long long>(taken.twinViews), static_cast<unsigned long long>(taken.twinCopies), static_cast<double>(taken.twinCopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.twinsRefused));
 }
 
 DrawSnapshotArena::Counters DrawSnapshotArena::TakeCounters() {
@@ -270,6 +271,56 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::lookup(Recorder& recor
     return std::nullopt;
 }
 
+std::optional<DrawSnapshotArena::View> DrawSnapshotArena::extend(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges& ranges) {
+    const auto found = entries.find(address);
+    if (found == entries.end()) return std::nullopt;
+    auto& entry = found->second;
+    if (!entry.limited || entry.end != address + bytes || entry.chunkSerial != chunks[entry.chunk]->serial || entry.registryGeneration != registryGeneration) return std::nullopt;
+    if (GuestMemory::CollectWrites(address, bytes) == 0) return std::nullopt;
+    CopyRanges missing;
+    auto covered = entry.copiedRanges.begin();
+    for (const auto& [first, last] : ranges) {
+        auto from = first;
+        while (from < last) {
+            while (covered != entry.copiedRanges.end() && covered->second <= from) ++covered;
+            if (covered == entry.copiedRanges.end() || covered->first >= last) {
+                missing.emplace_back(from, last);
+                break;
+            }
+            if (covered->first > from) {
+                missing.emplace_back(from, covered->first);
+                from = covered->first;
+            }
+            const auto through = std::min(covered->second, last);
+            if (!GuestMemory::UnchangedSince(address + from, static_cast<std::size_t>(through - from), entry.generation)) return std::nullopt;
+            from = through;
+        }
+    }
+    if (missing.empty() || entry.copiedRanges.size() + missing.size() > MaxCopiedRanges) return std::nullopt;
+    auto& chunk = *chunks[entry.chunk];
+    std::size_t copiedBytes = 0;
+    for (const auto& [from, to] : missing) {
+        std::memcpy(chunk.buffer->Bytes().data() + entry.offset + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
+        copiedBytes += static_cast<std::size_t>(to - from);
+    }
+    CopyRanges sorted;
+    sorted.reserve(entry.copiedRanges.size() + missing.size());
+    std::merge(entry.copiedRanges.begin(), entry.copiedRanges.end(), missing.begin(), missing.end(), std::back_inserter(sorted));
+    CopyRanges merged;
+    merged.reserve(sorted.size());
+    for (const auto& range : sorted) {
+        if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+        else merged.push_back(range);
+    }
+    entry.copiedRanges = std::move(merged);
+    ++counters.copies;
+    ++counters.partialCopies;
+    ++counters.extendedCopies;
+    counters.copiedBytes += copiedBytes;
+    counters.uncopiedBytes += bytes - copiedBytes;
+    return view(recorder, entry.chunk, entry.offset, bytes, true, 0, copiedBytes, true);
+}
+
 std::optional<DrawSnapshotArena::View> DrawSnapshotArena::Take(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration) {
     return Take(recorder, address, bytes, registryGeneration, [] { return std::optional<CopyRanges>{}; });
 }
@@ -296,6 +347,7 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::copy(Recorder& recorde
         }
         if (DeviceTwins()) return std::nullopt;
         if (auto hit = lookup(recorder, address, bytes, registryGeneration, &*ranges)) return hit;
+        if (auto extended = extend(recorder, address, bytes, registryGeneration, *ranges)) return extended;
     }
     auto first = address;
     auto last = address + bytes;
