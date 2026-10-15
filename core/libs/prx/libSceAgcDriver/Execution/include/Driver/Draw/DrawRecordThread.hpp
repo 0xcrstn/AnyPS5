@@ -120,6 +120,7 @@ struct LabelRecordJobCounters {
     std::uint64_t packets = 0;
     std::uint64_t jobs = 0;
     std::uint64_t labels = 0;
+    std::uint64_t endOfPipe = 0;
 };
 
 LabelRecordJobCounters LabelRecordJobTotals();

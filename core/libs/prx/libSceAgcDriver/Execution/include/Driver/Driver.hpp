@@ -432,6 +432,12 @@ private:
     void recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue);
     void recordLabels(VulkanDevice* localDevice, std::uint32_t queue, std::vector<DeferredLabel>& labels);
     bool freezeLabels(std::uint32_t queue, bool force);
+    struct EndOfPipeOutcome {
+        bool wroteOnGpu = false;
+        bool interruptDeferred = false;
+    };
+    EndOfPipeOutcome recordEndOfPipe(VulkanDevice* localDevice, std::uint32_t queue, std::span<const std::uint32_t> packet);
+    bool freezeEndOfPipe(std::uint32_t queue, std::span<const std::uint32_t> packet);
     void emitFrozenLabels(const std::shared_ptr<FrozenDraw>& frozen);
     bool deferredLabelPacket(std::span<const std::uint32_t> packet) const;
     bool recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queue);

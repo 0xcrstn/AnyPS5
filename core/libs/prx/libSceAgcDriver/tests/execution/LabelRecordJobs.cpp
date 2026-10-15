@@ -211,8 +211,9 @@ void DrawsSeeEarlierLabels(bool jobs) {
         Require(after.packets == before.packets && after.jobs == before.jobs, "labels were recorded as jobs with APS5_LABEL_RECORD_JOBS unset");
         return;
     }
-    Require(after.packets - before.packets == Frames, std::to_string(after.packets - before.packets) + " label packets were taken without a drain over " + std::to_string(Frames) + " frames, expected one per frame");
-    Require(after.jobs - before.jobs == Frames && after.labels - before.labels == Frames, std::to_string(after.labels - before.labels) + " labels were recorded in " + std::to_string(after.jobs - before.jobs) + " jobs over " + std::to_string(Frames) + " frames, expected one label and one job per frame");
+    Require(after.packets - before.packets == 2u * Frames, std::to_string(after.packets - before.packets) + " label packets were taken without a drain over " + std::to_string(Frames) + " frames, expected the deferred label and the end-of-pipe label of each frame");
+    Require(after.jobs - before.jobs == Frames && after.labels - before.labels == Frames, std::to_string(after.labels - before.labels) + " deferred labels were recorded in " + std::to_string(after.jobs - before.jobs) + " jobs over " + std::to_string(Frames) + " frames, expected one label and one job per frame");
+    Require(after.endOfPipe - before.endOfPipe <= Frames, std::to_string(after.endOfPipe - before.endOfPipe) + " end-of-pipe labels were recorded as jobs over " + std::to_string(Frames) + " frames, expected at most one per frame");
 }
 
 void SetEnvironment(const char* name, const char* value) {
@@ -245,7 +246,7 @@ int main() {
         Register(BufferPixelHeader, BufferPixelCode.data(), sizeof(BufferPixelCode), 1);
         DrawsSeeEarlierLabels(jobs);
         AgcDriverShutdown_nid_postfix();
-        std::cout << "Draws on the preparation workers see the values earlier RELEASE_MEM labels stored " << (jobs ? "with labels recorded as ordered jobs" : "with labels recorded by queue 0") << std::endl;
+        std::cout << "Draws on the preparation workers see the values earlier RELEASE_MEM labels stored " << (jobs ? "with labels recorded as ordered jobs" : "with labels recorded by queue 0") << " (" << AgcDriver::DriverDetail::LabelRecordJobTotals().endOfPipe << " end-of-pipe labels recorded as jobs)" << std::endl;
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << std::endl;

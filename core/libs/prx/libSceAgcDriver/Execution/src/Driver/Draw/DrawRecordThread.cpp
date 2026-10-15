@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/RecordQueue.hpp"
+#include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -48,6 +49,7 @@ struct Driver::FrozenDraw {
     bool dispatch = false;
     std::uint64_t indirectArguments = 0;
     std::vector<DeferredLabel> labels;
+    bool endOfPipe = false;
 };
 
 struct Driver::PreparedFrozenDraw {
@@ -196,6 +198,7 @@ struct PacketWaitCounts {
     std::atomic<std::uint64_t> labelJobs{0};
     std::atomic<std::uint64_t> labelJobLabels{0};
     std::atomic<std::uint64_t> labelPackets{0};
+    std::atomic<std::uint64_t> endOfPipeJobs{0};
 };
 
 std::atomic<int>& commandProcessorReadsOverride() {
@@ -456,7 +459,7 @@ void Driver::freezeDispatch(QueueState& queue, std::span<const std::uint32_t> pa
 
 std::shared_ptr<Driver::PreparedFrozenDraw> Driver::prepareFrozen(const FrozenDraw& frozen, bool inOrder) {
     if (frozenProducer()) throw std::logic_error("prepare workers: a frozen draw reached preparation on queue 0's own thread");
-    if (!frozen.labels.empty()) return std::make_shared<PreparedFrozenDraw>();
+    if (!frozen.labels.empty() || frozen.endOfPipe) return std::make_shared<PreparedFrozenDraw>();
     struct CopyTag {};
     struct SubmissionTag {};
     auto& copy = HostThreadLocal<FrozenQueueCopy, CopyTag>();
@@ -494,7 +497,7 @@ std::shared_ptr<Driver::PreparedFrozenDraw> Driver::prepareFrozen(const FrozenDr
 }
 
 void Driver::emitFrozen(const std::shared_ptr<FrozenDraw>& frozen, std::optional<std::shared_ptr<PreparedFrozenDraw>>& prepared, std::exception_ptr error) {
-    if (!frozen->labels.empty()) {
+    if (!frozen->labels.empty() || frozen->endOfPipe) {
         emitFrozenLabels(frozen);
         return;
     }
@@ -609,7 +612,18 @@ void Driver::emitFrozenLabels(const std::shared_ptr<FrozenDraw>& frozen) {
         } history{ticket, result};
         auto labels = frozen->labels;
         const auto localDevice = device.Load();
-        recordLabels(localDevice.get(), frozen->queue, labels);
+        if (!labels.empty()) recordLabels(localDevice.get(), frozen->queue, labels);
+        if (frozen->endOfPipe) {
+            const auto outcome = recordEndOfPipe(localDevice.get(), frozen->queue, frozen->packet);
+            if (!outcome.wroteOnGpu) {
+                if (localDevice != nullptr) localDevice->WaitIdle();
+                if (const auto label = Pm4::DecodeLabelWrite(frozen->packet)) {
+                    GuestMemory::Write(label->address, label->Bytes(), 4);
+                    noteLabelStore(label->address, label->Bytes(), ++eventSerial, frozen->queue);
+                }
+            }
+            if (!outcome.interruptDeferred) AgcDriverDeliverEopInterrupt(frozen->queue);
+        }
         GuestMemory::LogDriverStores(nullptr);
         result->effects.writeGenerationAfter = Graphics::Recorder::WriteGeneration();
     });
@@ -644,14 +658,46 @@ bool Driver::freezeLabels(std::uint32_t queue, bool force) {
     return true;
 }
 
+bool Driver::freezeEndOfPipe(std::uint32_t queue, std::span<const std::uint32_t> packet) {
+    if (!LabelRecordJobs() || prepareWorkers() == 0 || !deferDrawRecords(queue) || frozenSink() != nullptr || GuestMemory::GpuMutex().HeldByThisThread() || device.Load() == nullptr) return false;
+    if (!drawRecords().Pending() && frozenDraws().Idle()) return false;
+    frozenProducer() = true;
+    surfaceRecordFailure();
+    startDrawRecords();
+    auto frozen = std::make_shared<FrozenDraw>();
+    frozen->labels.swap(deferredLabels().labels);
+    frozen->packet.assign(packet.begin(), packet.end());
+    frozen->endOfPipe = true;
+    frozen->queue = queue;
+    frozen->offset = currentPacketOffset();
+    frozen->epoch = GuestMemory::CollectEpoch();
+    Graphics::Recorder::ForgetQueuedLabels();
+    queuedLabelsNoted() = 0;
+    auto& records = drawRecords();
+    if (const auto ticket = AheadWaitTicket(records.Posted(), records.Finished(), frozenBound()); ticket != 0) {
+        ++drawRecordCounters().recordsFull;
+        records.WaitFinished(ticket);
+    }
+    auto& counts = packetWaitCounts();
+    counts.endOfPipeJobs.fetch_add(1, std::memory_order_relaxed);
+    counts.labelJobLabels.fetch_add(frozen->labels.size(), std::memory_order_relaxed);
+    frozenDraws().Submit(std::move(frozen));
+    return true;
+}
+
 bool Driver::deferredLabelPacket(std::span<const std::uint32_t> packet) const {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
     if (drainAll || !LabelRecordJobs() || prepareWorkers() == 0 || !DeferLabels() || packet.empty()) return false;
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     if (opcode != 0x49 && opcode != 0x37) return false;
-    if (opcode == 0x49 && packet.size() > 2) {
+    if (opcode == 0x49 && packet.size() > 4) {
         const auto interruptSelect = (packet[2] >> 24u) & 7u;
-        if (interruptSelect != 0 && interruptSelect != 3) return false;
+        const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
+        if (interruptSelect != 0 && interruptSelect != 3) {
+            if (!storesNothing && !Pm4::DecodeLabelWrite(packet).has_value()) return false;
+            packetWaitCounts().labelPackets.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
     }
     const auto label = Pm4::DecodeLabelWrite(packet);
     if (!label.has_value()) return false;
@@ -955,7 +1001,7 @@ void SetCommandProcessorReadsMode(CommandProcessorReads mode) {
 
 LabelRecordJobCounters LabelRecordJobTotals() {
     const auto& counts = packetWaitCounts();
-    return {counts.labelPackets.load(std::memory_order_relaxed), counts.labelJobs.load(std::memory_order_relaxed), counts.labelJobLabels.load(std::memory_order_relaxed)};
+    return {counts.labelPackets.load(std::memory_order_relaxed), counts.labelJobs.load(std::memory_order_relaxed), counts.labelJobLabels.load(std::memory_order_relaxed), counts.endOfPipeJobs.load(std::memory_order_relaxed)};
 }
 
 CommandProcessorReadCounters CommandProcessorReadTotals() {
@@ -1113,9 +1159,9 @@ void Driver::reportDrawRecords() {
         const auto reads = CommandProcessorReadTotals();
         ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s; command processor reads without a drain: %llu, %llu of them ahead of pending records, %llu verified\n", text.empty() ? " none" : text.c_str(), static_cast<unsigned long long>(reads.reads - lastReads.reads), static_cast<unsigned long long>(reads.ahead - lastReads.ahead), static_cast<unsigned long long>(reads.verified - lastReads.verified));
         lastReads = reads;
-        static std::array<std::uint64_t, 3> lastLabels{};
-        const std::array<std::uint64_t, 3> labelTotals{counts.labelPackets.load(std::memory_order_relaxed), counts.labelJobs.load(std::memory_order_relaxed), counts.labelJobLabels.load(std::memory_order_relaxed)};
-        if (LabelRecordJobs()) ProfilePrint_nid_no_patch("[record-thread] labels as ordered record jobs (10 s): %llu label packets without a drain, %llu jobs recorded %llu labels\n", static_cast<unsigned long long>(labelTotals[0] - lastLabels[0]), static_cast<unsigned long long>(labelTotals[1] - lastLabels[1]), static_cast<unsigned long long>(labelTotals[2] - lastLabels[2]));
+        static std::array<std::uint64_t, 4> lastLabels{};
+        const std::array<std::uint64_t, 4> labelTotals{counts.labelPackets.load(std::memory_order_relaxed), counts.labelJobs.load(std::memory_order_relaxed), counts.labelJobLabels.load(std::memory_order_relaxed), counts.endOfPipeJobs.load(std::memory_order_relaxed)};
+        if (LabelRecordJobs()) ProfilePrint_nid_no_patch("[record-thread] labels as ordered record jobs (10 s): %llu label packets without a drain, %llu jobs recorded %llu deferred labels, %llu end-of-pipe labels and interrupts recorded as jobs\n", static_cast<unsigned long long>(labelTotals[0] - lastLabels[0]), static_cast<unsigned long long>(labelTotals[1] - lastLabels[1]), static_cast<unsigned long long>(labelTotals[2] - lastLabels[2]), static_cast<unsigned long long>(labelTotals[3] - lastLabels[3]));
         lastLabels = labelTotals;
     }
     const auto seconds = std::chrono::duration<double>(now - lastReport).count();
