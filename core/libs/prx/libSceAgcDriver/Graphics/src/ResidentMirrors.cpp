@@ -265,6 +265,8 @@ std::uint64_t copiedBytes(const std::vector<VkBufferCopy>& copies) {
 void reportMirrors() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
+    static std::mutex reportMutex;
+    std::lock_guard report(reportMutex);
     static auto last = std::chrono::steady_clock::now();
     static ResidentMirrorCounters previous{};
     const auto now = std::chrono::steady_clock::now();
@@ -658,21 +660,23 @@ void SubmitMirrors(Recorder& recorder) {
         }
         RecordMemoryBarrier(recorder.GetContext(), prologue, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     }
-    std::lock_guard lock(registry.mutex);
-    const auto settle = [&](ResidentMirror& mirror) {
-        if (!mirror.anyWritten) return;
-        for (std::size_t block = 0; block < mirror.written.size(); ++block) {
-            if (mirror.written[block] == 0) continue;
-            mirror.generations[block] = 0;
-            mirror.written[block] = 0;
-            mirror.unsynced[block] = 0;
-            Stats().invalidatedBlocks.fetch_add(1, std::memory_order_relaxed);
-        }
-        mirror.anyWritten = false;
-        mirror.anyUnsynced = false;
-    };
-    for (const auto& [base, mirror] : registry.byBase) settle(*mirror);
-    for (const auto& mirror : used) settle(*mirror);
+    {
+        std::lock_guard lock(registry.mutex);
+        const auto settle = [&](ResidentMirror& mirror) {
+            if (!mirror.anyWritten) return;
+            for (std::size_t block = 0; block < mirror.written.size(); ++block) {
+                if (mirror.written[block] == 0) continue;
+                mirror.generations[block] = 0;
+                mirror.written[block] = 0;
+                mirror.unsynced[block] = 0;
+                Stats().invalidatedBlocks.fetch_add(1, std::memory_order_relaxed);
+            }
+            mirror.anyWritten = false;
+            mirror.anyUnsynced = false;
+        };
+        for (const auto& [base, mirror] : registry.byBase) settle(*mirror);
+        for (const auto& mirror : used) settle(*mirror);
+    }
     reportMirrors();
 }
 
