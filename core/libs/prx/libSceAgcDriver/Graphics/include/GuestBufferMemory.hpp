@@ -270,6 +270,7 @@ public:
     void UploadFinish(bool addressable);
     void SetPointerAccess(bool writes, std::vector<std::pair<std::uint64_t, std::uint64_t>> exempt);
     void ForgetPointerShadows() const;
+    std::span<const std::pair<std::uint64_t, std::uint64_t>> PointerHeaps() const { return pointerHeaps; }
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;

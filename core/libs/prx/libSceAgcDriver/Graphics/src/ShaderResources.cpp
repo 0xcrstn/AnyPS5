@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include <algorithm>
 #include <type_traits>
@@ -5313,7 +5314,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     } else {
         recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
     }
-    if (usesBda && !bdaReadOnly) guestMemory.ForgetPointerShadows();
+    if (usesBda && !bdaReadOnly) {
+        guestMemory.ForgetPointerShadows();
+        for (const auto& [begin, end] : guestMemory.PointerHeaps()) NotePointerWrite(recorder, begin, end);
+    }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (!storageWritten[index]) continue;
