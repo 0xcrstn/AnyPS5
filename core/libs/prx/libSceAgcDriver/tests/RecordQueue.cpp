@@ -225,6 +225,9 @@ void testOverlappingPackets() {
     Expect(!OverlapsDrawRecords(0x50, false) && !OverlapsDrawRecords(0x22, false) && !OverlapsDrawRecords(0x10, false), "copies, conditions and NOP payloads wait for the records");
     Expect(!OverlapsDrawRecords(0x27, true) && !OverlapsDrawRecords(0x69, true), "a predicated packet waits for the records");
     Expect(!OverlapsDrawRecords(0, false), "flips and rendering waits wait for the records");
+    Expect(OverlapsDrawRecords(0x15, false, true) && OverlapsDrawRecords(0x16, false, true), "deferred dispatches overlap a pending record");
+    Expect(!OverlapsDrawRecords(0x16, true, true), "a predicated dispatch waits for the records");
+    Expect(!OverlapsDrawRecords(0x49, false, true) && !OverlapsDrawRecords(0x3c, false, true), "labels and waits wait with dispatches deferred too");
 }
 
 }

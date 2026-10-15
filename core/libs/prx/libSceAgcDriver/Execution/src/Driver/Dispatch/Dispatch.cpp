@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -13,7 +14,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (address == SkippedShader() && address != 0) return;
@@ -58,7 +59,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         packet = resolved;
         indirectArguments = ahead.indirectArguments;
     } else if (indirectArguments != 0 && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
-
+        if (drawRecordState().active) waitDrawRecords();
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         resolved = Pm4::ReadDispatchArguments(indirectArguments, packet[4]);
@@ -76,6 +77,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && indirectArguments == 0 && matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
     } else {
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) Graphics::NoteHtileDepthClear(htile);
+        if (drawRecordState().active && !partialLastGroup && (matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || (indirectArguments == 0 && matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)))) waitDrawRecords();
         if (indirectArguments == 0 && (packet[4] & 0x20u) == 0) {
             if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
         }
@@ -340,6 +342,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const auto& compiled = *compiledResult;
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     for (const auto& region : captured) snapshots.push_back({region.guestAddress, region.bytes});
+    if (drawRecordState().active && !settleDrawRecords(snapshots)) return;
     std::array<std::uint32_t, 3> groups{packet[1], packet[2], packet[3]};
     if (indirectArguments == 0 && (packet[4] & 0x20u) != 0) {
 
@@ -388,7 +391,77 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 
-    for (;;) {
+    const bool deferred = drawRecordState().active && !fromAhead;
+    if (deferred) {
+        std::shared_ptr<PreparedDispatch> prepared;
+        if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {
+            try {
+                prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads, address);
+            } catch (const std::exception& error) {
+                rethrow(error);
+            }
+        }
+        if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value()) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            recordLabelsForPacket(localDevice.get(), submission.queue);
+        }
+        phaseTiming.Phase(PhaseLabels);
+        if (noteWrites && writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
+        phaseTiming.Phase(PhaseNoteWriters);
+        struct Inputs {
+            std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+            decltype(registeredShader) shader;
+            std::shared_ptr<DispatchVariant> keepVariant;
+            std::shared_ptr<DispatchVariant> attachVariant;
+            std::shared_ptr<ShaderMemory> shaderMemory;
+            std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+            std::vector<ShaderRecompiler::MemoryRegion> captured;
+            std::vector<Graphics::GuestMemorySnapshot> snapshots;
+            std::shared_ptr<RecipeHit> recipeHit;
+            std::shared_ptr<PreparedDispatch> prepared;
+            std::array<std::uint32_t, 3> groups;
+            std::uint64_t indirectArguments;
+            std::uint64_t dispatchThreads;
+            std::uint64_t address;
+            bool dataHit;
+            DispatchVariant* attachTo;
+        };
+        auto inputs = std::make_shared<Inputs>(Inputs{compiledResult, registeredShader, keepVariant, attachVariant, shaderMemory, capture, std::move(captured), std::move(snapshots), std::move(recipeHit), std::move(prepared), groups, indirectArguments, dispatchThreads, address, dataHit, attachTo});
+        postDrawRecord(localDevice, submission.queue, recordIdentity(submission, indirectArguments != 0 ? "indirect dispatch" : "dispatch", address), [inputs, localDevice](DrawRecordResult&) {
+            const auto& compiled = *inputs->compiled;
+            const auto& groups = inputs->groups;
+            std::shared_ptr<const Recipe> builtRecipe;
+            for (;;) {
+                if (inputs->recipeHit != nullptr) {
+                    VulkanDevice::IndirectOutcome outcome{0, 0};
+                    const auto result = localDevice->DispatchRecipe(compiled, groups[0], groups[1], groups[2], inputs->indirectArguments, inputs->address, inputs->recipeHit, outcome, VulkanDevice::VerifyRecipes() ? inputs->prepared : nullptr, inputs->dataHit);
+                    if (result == RecipeOutcome::Rebuild) {
+                        inputs->recipeHit = nullptr;
+                        VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, inputs->indirectArguments != 0);
+                        inputs->prepared = localDevice->PrepareDispatch(compiled, inputs->snapshots, inputs->dispatchThreads, inputs->address);
+                        continue;
+                    }
+                    if (inputs->indirectArguments != 0) countIndirect(outcome.cpuReason, outcome.argumentReadMs);
+                } else if (inputs->indirectArguments != 0) {
+                    const auto outcome = localDevice->DispatchIndirect(compiled, inputs->indirectArguments, inputs->snapshots, inputs->address, std::move(inputs->prepared), inputs->attachTo != nullptr ? &builtRecipe : nullptr);
+                    countIndirect(outcome.cpuReason, outcome.argumentReadMs);
+                } else {
+                    localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], inputs->snapshots, inputs->address, std::move(inputs->prepared), inputs->attachTo != nullptr ? &builtRecipe : nullptr);
+                }
+                break;
+            }
+            if (builtRecipe == nullptr) return;
+            if (inputs->dataHit) {
+                auto own = std::make_shared<Recipe>(*builtRecipe);
+                own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, inputs->keepVariant->compiled.get(), 0});
+                builtRecipe = std::move(own);
+            }
+            inputs->attachTo->recipe.store(std::move(builtRecipe), std::memory_order_release);
+            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, inputs->indirectArguments != 0);
+        });
+    }
+    for (; !deferred;) {
 
         std::shared_ptr<PreparedDispatch> prepared;
         if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {

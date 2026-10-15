@@ -37,6 +37,7 @@ RecordQueue& drawRecords() {
 
 struct DrawRecordCounters {
     std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> dispatches{0};
     std::atomic<std::uint64_t> overlapped{0};
     std::atomic<std::uint64_t> stalePending{0};
     std::atomic<std::uint64_t> staleStored{0};
@@ -88,12 +89,47 @@ bool Driver::deferDrawRecords(std::uint32_t queue) const {
     return queue == 0 && recordThread();
 }
 
+bool Driver::recordDispatches() {
+    static const bool enabled = recordThread() && std::getenv("APS5_RECORD_THREAD_DISPATCH") != nullptr;
+    return enabled;
+}
+
+bool Driver::deferDispatchRecords(std::uint32_t queue) const {
+    return queue == 0 && recordDispatches();
+}
+
+std::string Driver::recordIdentity(const Submission& submission, const char* what, std::uint64_t program) {
+    char text[160];
+    std::snprintf(text, sizeof(text), "%s of program 0x%llx in submission %llu queue 0x%x at dword %zu", what, static_cast<unsigned long long>(program), static_cast<unsigned long long>(submission.serial), submission.queue, currentPacketOffset());
+    return text;
+}
+
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
+    if (drawRecordState().active || !deferDrawRecords(submission.queue)) return drawNow(queue, packet, submission, rejected);
+    ++drawRecordCounters().draws;
+    DrawVerdict verdict = DrawVerdict::Nothing;
+    std::string attempt;
+    deferRecord([&] {
+        attempt.clear();
+        verdict = drawNow(queue, packet, submission, attempt);
+    });
+    rejected = std::move(attempt);
+    return verdict;
+}
+
+void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    if (drawRecordState().active || resolvingAhead() || !deferDispatchRecords(submission.queue)) {
+        dispatchNow(queue, packet, submission, indirectArguments);
+        return;
+    }
+    ++drawRecordCounters().dispatches;
+    deferRecord([&] { dispatchNow(queue, packet, submission, indirectArguments); });
+}
+
+void Driver::deferRecord(const std::function<void()>& prepare) {
     auto& state = drawRecordState();
-    if (state.active || !deferDrawRecords(submission.queue)) return drawNow(queue, packet, submission, rejected);
     auto& records = drawRecords();
     auto& counters = drawRecordCounters();
-    ++counters.draws;
     for (;;) {
         state = DrawRecordState{true, records.Pending() ? records.Posted() : 0, false, false};
         struct Reset {
@@ -102,8 +138,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         } reset{state};
         if (state.overlapped != 0) ++counters.overlapped;
         const bool locked = GuestMemory::GpuMutex().HeldByThisThread();
-        std::string attempt;
-        const auto verdict = drawNow(queue, packet, submission, attempt);
+        prepare();
         if (!state.settled) {
             state.settled = true;
             if (state.overlapped != 0) {
@@ -117,10 +152,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
             }
         }
-        if (!state.stale) {
-            rejected = std::move(attempt);
-            return verdict;
-        }
+        if (!state.stale) return;
         ++counters.redos;
     }
 }
@@ -155,7 +187,7 @@ void Driver::finishDrawRecords() {
         try {
             std::rethrow_exception(failure);
         } catch (const std::exception& error) {
-            throw std::runtime_error(std::string("deferred draw record failed: ") + error.what());
+            throw std::runtime_error(std::string("deferred record failed: ") + error.what());
         }
     }
     if (drawRecordResult == nullptr || drawRecordResult->built == nullptr || records.Finished() < drawRecordResult->ticket) return;
@@ -178,10 +210,11 @@ void Driver::waitDrawRecords() {
         if (GuestMemory::GpuMutex().HeldByThisThread()) runDrawRecords();
         else records.WaitIdle();
     }
+    if (auto& state = drawRecordState(); state.active && !state.settled) state.settled = true;
     finishDrawRecords();
 }
 
-void Driver::postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::function<void(DrawRecordResult&)> record) {
+void Driver::postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::string identity, std::function<void(DrawRecordResult&)> record) {
     auto& records = drawRecords();
     if (!records.Started()) {
         records.Start([] {
@@ -195,7 +228,7 @@ void Driver::postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, st
     }
     auto result = std::make_shared<DrawRecordResult>();
     drawRecordResult = result;
-    result->ticket = records.Post([result, record = std::move(record), queue, epoch = GuestMemory::CollectEpoch(), device = localDevice] {
+    result->ticket = records.Post([result, record = std::move(record), identity = std::move(identity), queue, epoch = GuestMemory::CollectEpoch(), device = localDevice] {
         struct Restore {
             std::uint32_t tag;
             std::uint64_t epoch;
@@ -209,7 +242,11 @@ void Driver::postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, st
         result->effects.writeGenerationBefore = Graphics::Recorder::WriteGeneration();
         result->effects.writeGenerationAfter = result->effects.writeGenerationBefore + 1;
         GuestMemory::LogDriverStores(&result->effects.stores);
-        record(*result);
+        try {
+            record(*result);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(identity + ": " + error.what());
+        }
         GuestMemory::LogDriverStores(nullptr);
         result->effects.writeGenerationAfter = Graphics::Recorder::WriteGeneration();
     });
@@ -221,21 +258,21 @@ void Driver::reportDrawRecords() {
     if (!profile) return;
     static auto lastReport = std::chrono::steady_clock::now();
     static RecordQueue::Statistics lastCounts{};
-    static std::array<std::uint64_t, 7> last{};
+    static std::array<std::uint64_t, 8> last{};
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     const auto seconds = std::chrono::duration<double>(now - lastReport).count();
     lastReport = now;
     const auto counts = drawRecords().Counts();
     auto& counters = drawRecordCounters();
-    const std::array<std::uint64_t, 7> values{counters.draws.load(), counters.overlapped.load(), counters.stalePending.load(), counters.staleStored.load(), counters.staleUnchecked.load(), counters.redos.load(), counters.packetWaits.load()};
-    std::array<std::uint64_t, 7> delta{};
+    const std::array<std::uint64_t, 8> values{counters.draws.load(), counters.overlapped.load(), counters.stalePending.load(), counters.staleStored.load(), counters.staleUnchecked.load(), counters.redos.load(), counters.packetWaits.load(), counters.dispatches.load()};
+    std::array<std::uint64_t, 8> delta{};
     for (std::size_t i = 0; i < values.size(); ++i) delta[i] = values[i] - last[i];
     last = values;
     const auto jobs = counts.finished - lastCounts.finished;
     const auto jobMs = static_cast<double>(counts.jobNs - lastCounts.jobNs) / 1e6;
     const auto waitedMs = static_cast<double>(counts.waitedNs - lastCounts.waitedNs) / 1e6;
-    ProfilePrint_nid_no_patch("[record-thread] %.3f s: %llu draws (%llu overlapped a record), %llu jobs run (%llu on the record thread, %llu inline on queue 0, %llu failed) %.1f ms, %.1f us per job; producer waits %llu (%llu blocked, %.1f ms); %llu packet waits; stale preparations: %llu pending write, %llu stored, %llu unchecked, %llu redone\n", seconds, static_cast<unsigned long long>(delta[0]), static_cast<unsigned long long>(delta[1]), static_cast<unsigned long long>(jobs), static_cast<unsigned long long>(counts.byWorker - lastCounts.byWorker), static_cast<unsigned long long>(counts.byOthers - lastCounts.byOthers), static_cast<unsigned long long>(counts.failed - lastCounts.failed), jobMs, jobs != 0 ? jobMs * 1000 / static_cast<double>(jobs) : 0.0, static_cast<unsigned long long>(counts.waits - lastCounts.waits), static_cast<unsigned long long>(counts.blockedWaits - lastCounts.blockedWaits), waitedMs, static_cast<unsigned long long>(delta[6]), static_cast<unsigned long long>(delta[2]), static_cast<unsigned long long>(delta[3]), static_cast<unsigned long long>(delta[4]), static_cast<unsigned long long>(delta[5]));
+    ProfilePrint_nid_no_patch("[record-thread] %.3f s: %llu draws, %llu dispatches (%llu overlapped a record), %llu jobs run (%llu on the record thread, %llu inline on queue 0, %llu failed) %.1f ms, %.1f us per job; producer waits %llu (%llu blocked, %.1f ms); %llu packet waits; stale preparations: %llu pending write, %llu stored, %llu unchecked, %llu redone\n", seconds, static_cast<unsigned long long>(delta[0]), static_cast<unsigned long long>(delta[7]), static_cast<unsigned long long>(delta[1]), static_cast<unsigned long long>(jobs), static_cast<unsigned long long>(counts.byWorker - lastCounts.byWorker), static_cast<unsigned long long>(counts.byOthers - lastCounts.byOthers), static_cast<unsigned long long>(counts.failed - lastCounts.failed), jobMs, jobs != 0 ? jobMs * 1000 / static_cast<double>(jobs) : 0.0, static_cast<unsigned long long>(counts.waits - lastCounts.waits), static_cast<unsigned long long>(counts.blockedWaits - lastCounts.blockedWaits), waitedMs, static_cast<unsigned long long>(delta[6]), static_cast<unsigned long long>(delta[2]), static_cast<unsigned long long>(delta[3]), static_cast<unsigned long long>(delta[4]), static_cast<unsigned long long>(delta[5]));
     lastCounts = counts;
 }
 

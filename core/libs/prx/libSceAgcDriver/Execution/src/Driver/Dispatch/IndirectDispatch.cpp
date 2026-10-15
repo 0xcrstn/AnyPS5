@@ -40,6 +40,7 @@ void Driver::dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> 
                 return;
             }
         }
+        if (deferDispatchRecords(submission.queue)) waitDrawRecords();
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto direct = Pm4::ReadDispatchArguments(arguments, initiator);

@@ -121,6 +121,7 @@ private:
     void lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, const DispatchKeyParts& parts, const std::shared_ptr<const ShaderSnapshot>& registeredShader, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering);
     void insertDispatch(std::uint64_t address, std::uint64_t key, const DispatchKeyParts& parts, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming);
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
+    void dispatchNow(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments);
     void storeDispatchVariant(std::uint64_t key, std::shared_ptr<DispatchVariant> fresh, const std::shared_ptr<DispatchEntry>& missedEntry, std::shared_ptr<DispatchVariant>& attachVariant);
     static bool dispatchRelocationEnabled();
     static bool sameResourceBindings(const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b);
@@ -200,10 +201,14 @@ private:
     static bool recordThread();
     static void runDrawRecords();
     bool deferDrawRecords(std::uint32_t queue) const;
+    static bool recordDispatches();
+    bool deferDispatchRecords(std::uint32_t queue) const;
+    void deferRecord(const std::function<void()>& prepare);
+    static std::string recordIdentity(const Submission& submission, const char* what, std::uint64_t program);
     bool settleDrawRecords(std::span<const Graphics::GuestMemorySnapshot> reads);
     void finishDrawRecords();
     void waitDrawRecords();
-    void postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::function<void(DrawRecordResult&)> record);
+    void postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::string identity, std::function<void(DrawRecordResult&)> record);
     static void noteDrawRecordRecipe(DrawRecordResult& result, std::shared_ptr<const DrawRecipe> built, std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void reportDrawRecords();
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
