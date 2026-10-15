@@ -226,8 +226,8 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     Require(words.size() <= std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t), "BDA table size overflow");
     tableBytes = words.size() * sizeof(std::uint32_t);
     Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
-    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    std::memcpy(table->Bytes().data(), words.data(), tableBytes);
+    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, UploadMemoryProperties(context, tableBytes));
+    WriteUpload(*table, 0, words.data(), tableBytes);
     if (tableCacheEnabled()) {
         std::lock_guard lock(cache.mutex);
         ++cache.misses;
@@ -338,6 +338,11 @@ void BdaResources::CheckFault() const {
     message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::TranslationMismatch) message << "; the legacy and radix BDA translations differ for this access (APS5_BDA_ABI=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RelativeMismatch) message << "; the cached BDA range capability differs from the table lookup for this access (APS5_BDA_RELATIVE=verify)";
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::FlushProofMismatch) {
+        message.str({});
+        message << "APS5_FLUSH_PROOFS=verify: shader stage " << report.stage << " saw the denormal 0x" << std::hex << static_cast<std::uint32_t>(report.address) << std::dec << " where a proof said a denormal flush was unneeded";
+        throw std::runtime_error(message.str());
+    }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::WriteNoteMismatch) message << "; a cached write note skipped a page the written-page record does not hold (APS5_BDA_WRITE_NOTES=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::SpanMismatch) message << "; the specialized BDA span helper differs from the generic one (APS5_BDA_SPAN_HELPERS=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RepairMismatch) {

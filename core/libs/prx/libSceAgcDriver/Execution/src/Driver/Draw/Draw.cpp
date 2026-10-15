@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -484,6 +485,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
+            if (auto* sink = frozenSink(); sink != nullptr && indirectCpu.has_value() && sink->Refuse(FrozenFallback::Indirect)) return DrawVerdict::Nothing;
         } else if (i == 0) {
             fold(result, drawParameters);
         }
@@ -572,7 +574,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             localDevice = std::move(current);
         }
 
-        recordLabelsForPacket(localDevice.get(), submission.queue);
+        if (frozenSink() == nullptr) recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(DrawRowLabels);
     };
     if (drawParameters.indirect && indirectCpu) {
@@ -589,7 +591,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             }
             programResults[i] = &results[resultIndex[i]];
         }
-        recordQueuedLabelsBeforeRead(submission.queue);
+        if (frozenSink() == nullptr) recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
         std::vector<Pm4::DrawArguments> records;
@@ -691,7 +693,8 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         sink->inputs = std::make_shared<DrawInputs>(DrawInputs{relocatedDecode, decode, entry, shaderMemoryOwner, drawParameters, std::move(programs), std::move(decodeReads), std::move(memory), std::move(matchedRegions), std::move(matched), std::move(fresh), std::move(stageCaptures), std::move(results), std::move(stages), std::move(snapshots), recipe, std::move(recipeStages), drawKey});
         if (!sink->inOrder && recipe == nullptr && parallelResolve()) {
             auto& prepared = *sink->inputs;
-            prepared.resolved = localDevice->ResolveDraw(prepared.state->state, prepared.draw, prepared.stages);
+            prepared.resolved = localDevice->ResolveDraw(prepared.state->state, prepared.draw, prepared.stages, prepared.snapshots);
+            for (const auto& [begin, end] : Graphics::StagedDrawReads(*prepared.resolved)) sink->reads.push_back({begin, static_cast<std::size_t>(end - begin)});
         }
         phaseTiming.Phase(DrawRowGraphics);
         timing.Mark("draw_and_resource_release");

@@ -280,6 +280,7 @@ HostImports& Imports() {
 
 void destroyImport(const Context& context, const HostImport& entry) {
     context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
+    DeviceMemoryPlacements::Untrack(entry.memory);
     context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
 #ifdef _WIN32
     GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
@@ -298,6 +299,7 @@ struct RetiredImport {
     ~RetiredImport() {
         const auto& entry = node.mapped();
         destroyBuffer(device, entry.buffer, nullptr);
+        DeviceMemoryPlacements::Untrack(entry.memory);
         freeMemory(device, entry.memory, nullptr);
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
@@ -354,7 +356,7 @@ bool releaseParkedImports(HostImports& state, std::uint64_t begin, std::uint64_t
 const char* bindImport(const Context& context, HostImport& entry, VkExternalMemoryHandleTypeFlagBits handleType, const void* import, std::uint32_t importTypes, bool& allocated, VkResult& failure) {
     const auto failed = [&](const char* step, VkResult result) -> const char* {
         if (entry.buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
-        if (entry.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
+        if (entry.memory) { DeviceMemoryPlacements::Untrack(entry.memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr); }
         entry.buffer = VK_NULL_HANDLE;
         entry.memory = VK_NULL_HANDLE;
         failure = result;
@@ -377,6 +379,7 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     allocation.allocationSize = entry.bytes;
     allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
     if (const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &entry.memory); result != VK_SUCCESS) return failed("vkAllocateMemory", result);
+    DeviceMemoryPlacements::Track(entry.memory, DeviceMemoryKind::HostImport, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
     allocated = true;
     if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, entry.buffer, entry.memory, 0); result != VK_SUCCESS) return failed("vkBindBufferMemory", result);
     const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, entry.buffer};
@@ -452,7 +455,7 @@ struct ImportChunk {
     ImportChunk(const ImportChunk&) = delete;
     ImportChunk& operator=(const ImportChunk&) = delete;
     ~ImportChunk() {
-        if (memory != VK_NULL_HANDLE) freeMemory(device, memory, nullptr);
+        if (memory != VK_NULL_HANDLE) { DeviceMemoryPlacements::Untrack(memory); freeMemory(device, memory, nullptr); }
     }
 };
 
@@ -528,6 +531,7 @@ std::shared_ptr<ImportChunk> importChunk(const Context& context, int file, std::
         step = "vkAllocateMemory";
         return nullptr;
     }
+    DeviceMemoryPlacements::Track(chunk->memory, DeviceMemoryKind::HostImport, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
     chunk->device = context.device;
     chunk->freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
     chunk->memoryType = allocation.memoryTypeIndex;
@@ -2094,10 +2098,19 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
     // reference: no GPU wait, no device lock (the mutating thread may be a driver thread holding
     // it). The registry rescans; a range still pinned by a build or a batch holding the space comes
     // back here and finishes lease batches below.
-    if (auto dropped = Spaces().current.exchange(nullptr); dropped != nullptr) {
-        Spaces().droppedByWaiter.store(true, std::memory_order_relaxed);
-        Spaces().waiterDrops.fetch_add(1, std::memory_order_relaxed);
+    std::vector<std::shared_ptr<ShaderResources>> templates;
+    try {
+        ResourceCache::RemoveLeaseHolders(templates);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[gpu] address template eviction failed: %s\n", error.what());
+    }
+    if (auto dropped = Spaces().current.exchange(nullptr); dropped != nullptr || !templates.empty()) {
+        if (dropped != nullptr) {
+            Spaces().droppedByWaiter.store(true, std::memory_order_relaxed);
+            Spaces().waiterDrops.fetch_add(1, std::memory_order_relaxed);
+        }
         dropped.reset();
+        templates.clear();
         auto& state = Leases();
         std::lock_guard lock(state.mutex);
         ++state.stats.contentionWaits;
@@ -2352,6 +2365,7 @@ void ClearHostImports(VkDevice device) {
     if (state.device != device) return;
     for (const auto& [address, entry] : state.imports) {
         state.destroyBuffer(state.device, entry.buffer, nullptr);
+        DeviceMemoryPlacements::Untrack(entry.memory);
         state.freeMemory(state.device, entry.memory, nullptr);
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
@@ -2441,7 +2455,7 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
     if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     if (commands[0] != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 2, commands);
     if (destination != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, destination, nullptr);
-    if (destinationMemory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, destinationMemory, nullptr);
+    if (destinationMemory != VK_NULL_HANDLE) { DeviceMemoryPlacements::Untrack(destinationMemory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, destinationMemory, nullptr); }
     if (import.buffer != VK_NULL_HANDLE) destroyImport(context, import);
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
 }
@@ -2935,6 +2949,31 @@ void GuestBufferMemory::AcquireRegistered() {
         sweepMirrors();
         reportMirrors();
     }
+}
+
+bool GuestBufferMemory::AcquireCachedSpace() {
+    Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
+    if (!addressSpaceCacheEnabled()) return false;
+    auto current = Spaces().current.load();
+    if (current == nullptr || !current->sparseMirrors.empty() || !current->writableMirrors.empty() || !current->heapRuns.empty()) return false;
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (current->device != context.device || current->generation != generation || current->importsEpoch != state.epoch) return false;
+        importFloor = state.useCounter + 1;
+        const auto stamp = ++state.useCounter;
+        for (const auto& region : current->base) {
+            if (region.direct != nullptr) region.direct->lastUse = stamp;
+        }
+    }
+    ensurePinWaiter();
+    static const bool sortedLookup = std::getenv("APS5_NO_SORTED_SNAPSHOT_LOOKUP") == nullptr;
+    Spaces().hits.fetch_add(1, std::memory_order_relaxed);
+    space = std::move(current);
+    for (const auto& range : space->copied) addCopiedRange(range);
+    regionsSorted = sortedLookup;
+    return true;
 }
 
 void GuestBufferMemory::validate(std::uint64_t address, std::size_t bytes) const {
@@ -3763,6 +3802,54 @@ void GuestBufferMemory::CompletePointerWrites(std::span<const Coherence::Interva
     if (pointerToken.Held()) pointerToken.Complete(written);
 }
 
+void GuestBufferMemory::storePointerHeaps() const {
+    std::vector<std::uint8_t> reached(pointerHeaps.size(), PointerStoreEveryHeap() ? 1 : 0);
+    if (!PointerStoreEveryHeap() && !pointerHeaps.empty()) {
+        StorageTexture::MarkPendingReached(pointerHeaps, reached);
+        MarkShadowedReached(pointerHeaps, reached);
+    }
+    for (std::size_t index = 0; index < pointerHeaps.size(); ++index) {
+        const auto [begin, end] = pointerHeaps[index];
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (reached[index] != 0) static_cast<void>(StorageTexture::StoreForPointerAccess(begin, bytes, pointerExempt));
+        else if (VerifyPointerStorePretest()) Require(!StorageTexture::StoreForPointerAccess(begin, bytes, pointerExempt), "APS5_VERIFY_POINTER_STORE_PRETEST: a pointer heap no pending image or unit shadow reaches stored or published storage results");
+    }
+    if (Coherence::Tracking()) {
+        for (const auto& [begin, end] : pointerHeaps) StorageTexture::AuditPointerReads(begin, static_cast<std::size_t>(end - begin), pointerExempt);
+    }
+}
+
+bool GuestBufferMemory::ReusableAddressSpace() const {
+    if (space == nullptr || !lease.empty() || !uploaded || committed || pointerWrites) return false;
+    if (!space->copied.empty() || !space->writableMirrors.empty() || !space->heapRuns.empty() || !space->heapMirrors.empty() || !space->sparseMirrors.empty()) return false;
+    if (HasCopiedWrites() || HasStagedRegions()) return false;
+    return std::none_of(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy || region.buffer != nullptr || region.mirror != nullptr || region.sparse; });
+}
+
+std::uint64_t GuestBufferMemory::AddressSpaceSerial() const {
+    return space != nullptr ? space->serial : 0;
+}
+
+bool GuestBufferMemory::AddressSpaceCurrent() const {
+    if (space == nullptr || space->device != context.device) return false;
+    if (Spaces().current.load().get() != space.get()) return false;
+    if (space->generation != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return false;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return space->importsEpoch == state.epoch;
+}
+
+void GuestBufferMemory::RefreshAddressUse() const {
+    Require(space != nullptr && uploaded && !committed, "an address template's use needs its uploaded address space");
+    completeSpaceWrites();
+    storePointerHeaps();
+    if (AnyDeviceResident()) {
+        if (auto* active = Recorder::Current()) {
+            for (const auto& [begin, end] : DeviceReads()) PublishDeviceResident(*active, begin, static_cast<std::size_t>(end - begin), ResidentSite::AddressBased);
+        }
+    }
+}
+
 void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     pointerHeaps.clear();
@@ -3972,19 +4059,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         }
         for (const auto& region : regions) heap(region);
     }
-    std::vector<std::uint8_t> reached(pointerHeaps.size(), PointerStoreEveryHeap() ? 1 : 0);
-    if (!PointerStoreEveryHeap() && !pointerHeaps.empty()) {
-        StorageTexture::MarkPendingReached(pointerHeaps, reached);
-        MarkShadowedReached(pointerHeaps, reached);
-    }
-    for (std::size_t index = 0; index < pointerHeaps.size(); ++index) {
-        const auto [begin, end] = pointerHeaps[index];
-        const auto bytes = static_cast<std::size_t>(end - begin);
-        if (reached[index] != 0) static_cast<void>(StorageTexture::StoreForPointerAccess(begin, bytes, pointerExempt));
-        else if (VerifyPointerStorePretest()) Require(!StorageTexture::StoreForPointerAccess(begin, bytes, pointerExempt), "APS5_VERIFY_POINTER_STORE_PRETEST: a pointer heap no pending image or unit shadow reaches stored or published storage results");
-    }
+    storePointerHeaps();
     if (Coherence::Tracking() && !pointerHeaps.empty()) {
-        for (const auto& [begin, end] : pointerHeaps) StorageTexture::AuditPointerReads(begin, static_cast<std::size_t>(end - begin), pointerExempt);
         if (pointerWrites) {
             std::vector<Coherence::Interval> heaps;
             heaps.reserve(pointerHeaps.size());

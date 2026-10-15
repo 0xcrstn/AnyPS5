@@ -42,6 +42,7 @@ PlaceholderImages::PlaceholderImages(const Context& context) : context(context) 
             allocation.allocationSize = requirements.size;
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &image.memory), "vkAllocateMemory placeholder");
+            DeviceMemoryPlacements::Track(image.memory, DeviceMemoryKind::Placeholder, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
             Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image.image, image.memory, 0), "vkBindImageMemory placeholder");
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             viewInfo.image = image.image;
@@ -96,7 +97,7 @@ void PlaceholderImages::release() noexcept {
     for (auto& image : images) {
         if (image.view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, image.view, nullptr);
         if (image.image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image.image, nullptr);
-        if (image.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, image.memory, nullptr);
+        if (image.memory) { DeviceMemoryPlacements::Untrack(image.memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, image.memory, nullptr); }
         image = {};
     }
 }

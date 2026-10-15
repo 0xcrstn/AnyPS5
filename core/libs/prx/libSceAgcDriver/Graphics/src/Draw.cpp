@@ -456,8 +456,8 @@ struct DrawOutcome {
 
 // The resources of a draw: a recipe hit (reserved for the draw recipe step), a resource-cache
 // template hit, a build, or an address-based (BDA) build.
-enum DrawKind : std::size_t { KindRecipeHit, KindTemplateHit, KindBuild, KindBda, KindCount };
-constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "template hit", "build", "BDA"};
+enum DrawKind : std::size_t { KindRecipeHit, KindTemplateHit, KindBuild, KindBda, KindAddressHit, KindBdaWriter, KindCount };
+constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "template hit", "build", "BDA reading", "BDA template hit", "BDA writing"};
 
 struct DrawProfile {
     std::mutex mutex;
@@ -628,7 +628,7 @@ void reportRecordParts(const DrawProfile& profile, double elapsedSeconds) {
         const auto snapshotDraws = profile.bindingDraws != 0 ? static_cast<double>(profile.bindingDraws) : 1.0;
         const auto twins = Recorder::TwinCounters();
         static Recorder::SnapshotTwinCounters reportedTwins{};
-        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw; %llu copies limited to the read ranges, %.1f KiB left uncopied per such draw), %llu skipped, %llu bound in place (%.1f MiB), %llu descriptor writes; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.limited), static_cast<double>(bindings.uncopiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.inPlace), static_cast<double>(bindings.inPlaceBytes) / 1048576.0, static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw; %llu copies limited to the read ranges, %.1f KiB left uncopied per such draw), %llu skipped, %llu bound in place (%.1f MiB), %llu descriptor writes, %llu persistent descriptor sets reused; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.limited), static_cast<double>(bindings.uncopiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.inPlace), static_cast<double>(bindings.inPlaceBytes) / 1048576.0, static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(bindings.persistentSets), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
         if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) {
             std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; device twins%s: %llu snapshot reads bound to one (%.1f MiB), %llu made (%.1f MiB copied in batch prologues), %llu refreshed by changed blocks (%.1f MiB), %llu evicted, %llu reads of unkept snapshots", Recorder::SnapshotTwinsEnabled() ? "" : " (off)", static_cast<unsigned long long>(twins.bound - reportedTwins.bound), static_cast<double>(twins.boundBytes - reportedTwins.boundBytes) / 1048576.0, static_cast<unsigned long long>(twins.made - reportedTwins.made), static_cast<double>(twins.madeBytes - reportedTwins.madeBytes) / 1048576.0, static_cast<unsigned long long>(twins.patched - reportedTwins.patched), static_cast<double>(twins.patchedBytes - reportedTwins.patchedBytes) / 1048576.0, static_cast<unsigned long long>(twins.dropped - reportedTwins.dropped), static_cast<unsigned long long>(twins.unkept - reportedTwins.unkept));
         }
@@ -705,6 +705,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
             profile.bindings.wholeBytes[reason] += bindings.wholeBytes[reason];
         }
         profile.bindings.overHalfReadBytes += bindings.overHalfReadBytes;
+        profile.bindings.persistentSets += bindings.persistentSets;
         profile.bindings.checkUs += bindings.checkUs;
         profile.bindings.collectUs += bindings.collectUs;
         profile.bindings.lookupUs += bindings.lookupUs;
@@ -1733,7 +1734,35 @@ struct FoundTemplate {
 
 bool revalidateAdopted(ShaderResources& cached, std::span<const CompiledShader> shaders, const ShaderResources::EpochProofResult& proof, const State& state, const Pm4::DrawParameters& draw);
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const FoundTemplate* found = nullptr) {
+enum class StagedOutcome : std::size_t { TemplateMiss, Threw, AddressLocked, Unbounded, Adopted, CacheHit, Device, Completed, CompleteThrew, Verified, Count };
+constexpr std::size_t StagedOutcomeCount = static_cast<std::size_t>(StagedOutcome::Count);
+constexpr std::array<const char*, StagedOutcomeCount> StagedOutcomeNames{"template misses staged", "stage A threw", "address space not cached", "unbounded stage-A copies", "adopted", "template hit at encode", "device changed", "already completed", "stage B threw", "verified"};
+void countStaged(StagedOutcome outcome);
+std::string drawIdentity(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+
+std::shared_ptr<ShaderResources> completeStagedBuild(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, const std::shared_ptr<ShaderResources>& staged) {
+    if (staged->Completed()) {
+        countStaged(StagedOutcome::Completed);
+        return nullptr;
+    }
+    try {
+        staged->CompleteDraw(shaders, snapshots);
+    } catch (const std::exception&) {
+        countStaged(StagedOutcome::CompleteThrew);
+        return nullptr;
+    }
+    countStaged(StagedOutcome::Adopted);
+    if (VerifyStagedDrawBuilds()) {
+        auto serial = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        const bool same = staged->SameBuildAs(*serial);
+        if (auto* recorder = Recorder::Current()) recorder->Keep(std::move(serial));
+        if (!same) throw std::logic_error("APS5_VERIFY_STAGED_DRAW_BUILDS: a draw build staged on a preparation worker differs from the serial build in its buffer views, images, set layouts or reusability for the " + drawIdentity(state, draw, shaders));
+        countStaged(StagedOutcome::Verified);
+    }
+    return staged;
+}
+
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const FoundTemplate* found = nullptr, const std::shared_ptr<ShaderResources>& staged = nullptr) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -1754,10 +1783,13 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = found != nullptr ? cached->CheckMovedReadOnlyBuffers(*found->plan, *recorder) : cached->MovedReadOnlyBuffers(shaders, *recorder);
             if (moved.has_value()) {
+                if (staged != nullptr) countStaged(StagedOutcome::CacheHit);
                 if (trimKey && found == nullptr) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                static const bool verifyAddress = std::getenv("APS5_VERIFY_ADDRESS_TEMPLATES") != nullptr;
+                if (verifyAddress && cached->AddressTemplate()) cached->VerifyAddressTemplate(ShaderResources(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots));
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
-                outcome.kind = KindTemplateHit;
+                outcome.kind = resolved.resources->AddressTemplate() ? KindAddressHit : KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
                 countCache(&DrawProfile::cacheMisses);
@@ -1770,11 +1802,12 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         countCache(&DrawProfile::uncacheable);
     }
     timer.phase(PhaseLookup);
+    if (resolved.resources == nullptr && staged != nullptr) resolved.resources = completeStagedBuild(context, state, draw, shaders, snapshots, indexBytes, staged);
     if (resolved.resources == nullptr) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
-        outcome.kind = outcome.addressBased ? KindBda : KindBuild;
+        outcome.kind = !outcome.addressBased ? KindBuild : resolved.resources->WritesThroughPointers() ? KindBdaWriter : KindBda;
         if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
     }
     timer.phase(PhaseResources);
@@ -1938,13 +1971,12 @@ bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, R
 
 std::shared_ptr<Buffer> meshArgumentBuffer(const Context& context, std::span<const std::uint32_t> restartTable) {
     const auto tableBytes = restartTable.empty() ? 0u : sizeof(std::uint32_t) * (restartTable.size() + 1u);
-    auto arguments = std::make_shared<Buffer>(context, ShaderRecompiler::MeshArgumentBytes + tableBytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    auto arguments = std::make_shared<Buffer>(context, ShaderRecompiler::MeshArgumentBytes + tableBytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, UploadMemoryProperties(context, ShaderRecompiler::MeshArgumentBytes + tableBytes));
     if (!restartTable.empty()) {
         Require(restartTable.size() <= std::numeric_limits<std::uint32_t>::max(), "mesh restart table is too large");
         const auto length = static_cast<std::uint32_t>(restartTable.size());
-        auto* bytes = arguments->Bytes().data() + ShaderRecompiler::MeshArgumentBytes;
-        std::memcpy(bytes, &length, sizeof(length));
-        std::memcpy(bytes + sizeof(length), restartTable.data(), restartTable.size_bytes());
+        WriteUpload(*arguments, ShaderRecompiler::MeshArgumentBytes, &length, sizeof(length));
+        WriteUpload(*arguments, ShaderRecompiler::MeshArgumentBytes + sizeof(length), restartTable.data(), restartTable.size_bytes());
     }
     return arguments;
 }
@@ -1952,7 +1984,7 @@ std::shared_ptr<Buffer> meshArgumentBuffer(const Context& context, std::span<con
 std::shared_ptr<Buffer> directMeshArguments(const Context& context, const Pm4::DrawParameters& draw, std::span<const std::uint32_t> restartTable) {
     auto arguments = meshArgumentBuffer(context, restartTable);
     const MeshArguments resolved{0u, 0u, 0u, draw.indexCount, 0u};
-    std::memcpy(arguments->Bytes().data(), &resolved, sizeof(resolved));
+    WriteUpload(*arguments, 0, &resolved, sizeof(resolved));
     return arguments;
 }
 
@@ -1970,7 +2002,7 @@ std::shared_ptr<Buffer> recordMeshArguments(const Context& context, VkCommandBuf
     }
     const auto record = !indirect.records.empty() ? indirect.records.front() : Pm4::ReadDrawArguments(*args, 0);
     const auto resolved = ResolveMeshArguments(record, rules);
-    std::memcpy(arguments->Bytes().data(), &resolved, sizeof(resolved));
+    WriteUpload(*arguments, 0, &resolved, sizeof(resolved));
     return arguments;
 }
 
@@ -2318,6 +2350,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     parts.lap(RecordStores);
     std::optional<ShaderResources::DrawIndexRanges> drawRanges;
     if (args == nullptr) drawRanges = drawIndexRanges(state, draw, shaders, inputs);
+    resources.RefreshAddressUse();
     resources.PublishResidentReads(*recorder);
     static const bool verifyDataWords = std::getenv("APS5_VERIFY_PIPELINE_MODES") != nullptr;
     if (verifyDataWords) resources.VerifyDataWords(shaders, record.moved);
@@ -2338,7 +2371,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
-    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
+    const auto readOnlyAddressPasses = ReadOnlyAddressPassesSetting();
+    const bool knownAddressWrites = unknownMemory && readOnlyAddressPasses != ReadOnlyAddressPasses::Off && resources.KnownAddressWrites();
+    const bool unknownWrites = unknownMemory && !(knownAddressWrites && readOnlyAddressPasses == ReadOnlyAddressPasses::On);
+    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownWrites, knownAddressWrites && unknownWrites};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     parts.lap(RecordAccess);
     resources.UseMirrors(*recorder);
@@ -2644,6 +2680,48 @@ bool VerifyParallelRevalidate() {
     return verify;
 }
 
+bool ParallelDispatchRevalidate() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_PARALLEL_DISPATCH_REVALIDATE");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool VerifyParallelDispatchRevalidate() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_PARALLEL_DISPATCH_REVALIDATE");
+        return ParallelDispatchRevalidate() && text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+bool EpochProofsOffThread() {
+    return ParallelRevalidateRequested() || ParallelDispatchRevalidate();
+}
+
+bool StagedDrawBuilds() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_STAGED_DRAW_BUILDS");
+        if (text != nullptr && std::strcmp(text, "0") == 0) return false;
+        if (!ParallelResolveRequested()) {
+            if (text != nullptr) std::fprintf(stderr, "[record-thread] APS5_STAGED_DRAW_BUILDS ignored: it needs APS5_PARALLEL_RESOLVE\n");
+            return false;
+        }
+        GuestBufferMemory::RecordPrepareCpuCopies(true, std::getenv("APS5_VERIFY_PREPARE_DISPATCHES") != nullptr);
+        return true;
+    }();
+    return enabled;
+}
+
+bool VerifyStagedDrawBuilds() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_STAGED_DRAW_BUILDS");
+        return StagedDrawBuilds() && text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
 struct ResolvedDraw {
     VkDevice device = VK_NULL_HANDLE;
     ResolveStamp stamp;
@@ -2673,7 +2751,13 @@ struct ResolvedDraw {
     std::vector<std::uint8_t> proxied;
     ShaderResources::EpochProofResult epochProof;
     std::vector<DrawSnapshotArena::Prefill> prefills;
+    std::shared_ptr<ShaderResources> staged;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stagedReads;
 };
+
+std::span<const std::pair<std::uint64_t, std::uint64_t>> StagedDrawReads(const ResolvedDraw& resolved) {
+    return resolved.stagedReads;
+}
 
 namespace {
 
@@ -2703,6 +2787,7 @@ struct ResolveCounters {
     std::array<std::atomic<std::uint64_t>, ResolveSerialCount> moved{};
     std::array<std::atomic<std::uint64_t>, EpochVerdictCount> revalidations{};
     std::atomic<std::uint64_t> revalidationsVerified{0};
+    std::array<std::atomic<std::uint64_t>, StagedOutcomeCount> staged{};
 };
 
 ResolveCounters& resolveCounters() {
@@ -2712,6 +2797,14 @@ ResolveCounters& resolveCounters() {
 
 void countRedo(ResolveRedo redo) {
     resolveCounters().redos[static_cast<std::size_t>(redo)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void countStaged(StagedOutcome outcome) {
+    resolveCounters().staged[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+}
+
+const char* stagedOutcomeAt(std::size_t index) {
+    return StagedOutcomeNames.at(index);
 }
 
 std::string drawIdentity(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
@@ -2872,7 +2965,12 @@ ResolvedResources encodeDrawResources(const Context& context, const State& state
         else if (SharedResourceCache().Serial() != early.cacheSerial && SharedResourceCache().Find(early.key) != early.resources) countRedo(ResolveRedo::CacheChanged);
         else adopted = true;
     }
-    if (!adopted) return resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    if (!adopted) {
+        std::shared_ptr<ShaderResources> staged;
+        if (early.staged != nullptr && early.device != context.device) countStaged(StagedOutcome::Device);
+        else staged = early.staged;
+        return resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, nullptr, staged);
+    }
     resolveCounters().resourcesAdopted.fetch_add(1, std::memory_order_relaxed);
     const FoundTemplate found{&early.key, early.resources, &*early.plan, ParallelRevalidateRequested() ? &early.epochProof : nullptr};
     auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, &found);
@@ -2887,7 +2985,7 @@ ResolvedResources encodeDrawResources(const Context& context, const State& state
 
 bool adoptsPipeline(const ResolvedDraw& early, bool inputsAdopted, bool leanSingle, const ShaderResources* resources, std::span<const std::uint8_t> proxied) {
     if (early.pipeline == nullptr) return false;
-    const bool same = inputsAdopted && leanSingle && resources == early.resources.get() && std::ranges::equal(proxied, early.proxied);
+    const bool same = inputsAdopted && leanSingle && (resources == early.resources.get() || (early.staged != nullptr && resources == early.staged.get())) && std::ranges::equal(proxied, early.proxied);
     if (!same) {
         countRedo(ResolveRedo::PipelineState);
         return false;
@@ -2967,6 +3065,8 @@ void reportParallelResolve() {
     static std::array<std::uint64_t, TargetVerdictCount> lastTargets{};
     static std::uint64_t lastTargetsVerified = 0;
     if (ParallelTargetsRequested()) pieces += "; targets from the workers by verdict:" + countList(counters.targets, lastTargets, targetVerdictAt, 1) + ", verified " + verifiedSince(counters.targetsVerified, lastTargetsVerified);
+    static std::array<std::uint64_t, StagedOutcomeCount> lastStaged{};
+    if (StagedDrawBuilds()) pieces += "; draw builds staged on the workers:" + countList(counters.staged, lastStaged, stagedOutcomeAt, 0);
     AgcDriver::ProfilePrint_nid_no_patch("[parallel-resolve] %.3f s: %llu resolved on workers (%.2f us each): inputs %llu, templates %llu, pipelines %llu; %llu encodes (%.2f us each): inputs adopted %llu, templates adopted %llu, pipelines adopted %llu, verified %llu; inputs resolved in encode by reason:%s; templates resolved in encode by reason:%s; redone in encode by reason:%s; serials moved between resolve and encode:%s%s\n", seconds, static_cast<unsigned long long>(delta[0]), perDraw(delta[1], delta[0]), static_cast<unsigned long long>(delta[2]), static_cast<unsigned long long>(delta[3]), static_cast<unsigned long long>(delta[4]), static_cast<unsigned long long>(delta[5]), perDraw(delta[6], delta[5]), static_cast<unsigned long long>(delta[7]), static_cast<unsigned long long>(delta[8]), static_cast<unsigned long long>(delta[9]), static_cast<unsigned long long>(delta[10]), inputs.c_str(), resources.c_str(), redos.c_str(), moved.c_str(), pieces.c_str());
 }
 
@@ -3694,7 +3794,32 @@ bool PrecollectOnWorkers() {
 
 }
 
-std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+namespace {
+
+void stageDrawBuild(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, ResolvedDraw& resolved) {
+    std::shared_ptr<ShaderResources> staged;
+    try {
+        staged = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, ShaderResources::StagedDraw{});
+    } catch (const std::exception&) {
+        countStaged(StagedOutcome::Threw);
+        return;
+    }
+    if (staged->StagedAddressLocked()) {
+        countStaged(StagedOutcome::AddressLocked);
+        return;
+    }
+    if (staged->PrepareCpuCopiesUnbounded()) {
+        countStaged(StagedOutcome::Unbounded);
+        return;
+    }
+    for (const auto& copy : staged->PrepareCpuCopies()) resolved.stagedReads.emplace_back(copy.begin, copy.end);
+    resolved.staged = std::move(staged);
+    countStaged(StagedOutcome::TemplateMiss);
+}
+
+}
+
+std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
     const auto start = std::chrono::steady_clock::now();
     auto resolved = std::make_shared<ResolvedDraw>();
     resolved->device = context.device;
@@ -3752,13 +3877,17 @@ std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const St
                     if (ParallelRevalidateRequested()) resolved->epochProof = resolved->resources->ResolveEpochProof();
                 }
             }
+            if (resolved->resourcesRefusal == ResolveRefusal::TemplateMiss && StagedDrawBuilds()) stageDrawBuild(context, state, draw, shaders, snapshots, indexBytes, *resolved);
         } catch (const std::exception&) {
             resolved->resources = nullptr;
             resolved->plan.reset();
+            resolved->staged.reset();
+            resolved->stagedReads.clear();
             resolved->resourcesRefusal = ResolveRefusal::Threw;
         }
         static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
-        if (resolved->inputsRefusal == ResolveRefusal::None && resolved->resourcesRefusal == ResolveRefusal::None && !resolved->inputs.nothing && !drawTransitions) {
+        const auto* pipelineResources = resolved->resourcesRefusal == ResolveRefusal::None ? resolved->resources.get() : resolved->staged.get();
+        if (resolved->inputsRefusal == ResolveRefusal::None && pipelineResources != nullptr && !resolved->inputs.nothing && !drawTransitions) {
             try {
                 auto masked = maskedState(state, resolved->inputs.fragmentOutputs);
                 std::vector<std::uint8_t> proxied(state.colors.size(), 0u);
@@ -3772,7 +3901,7 @@ std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const St
                     masked->blends.at(state.colors[index].exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
                 }
                 const State& pipelineState = masked.has_value() ? *masked : state;
-                resolved->pipeline = FindCachedPipeline(context, pipelineState, resolved->inputs.VertexLayout(), *resolved->resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+                resolved->pipeline = FindCachedPipeline(context, pipelineState, resolved->inputs.VertexLayout(), *pipelineResources, shaders, VK_IMAGE_LAYOUT_GENERAL);
                 resolved->proxied = std::move(proxied);
             } catch (const std::exception&) {
                 resolved->pipeline = nullptr;
@@ -3784,8 +3913,8 @@ std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const St
             for (const auto& color : state.colors) {
                 if (color.address != 0 && color.bytes != 0) static_cast<void>(GuestMemory::CollectWrites(color.address, color.bytes));
             }
-            if (resolved->resources != nullptr) {
-                for (const auto& [begin, end] : resolved->resources->InPlaceReads()) {
+            if (const auto* precollected = resolved->resources != nullptr ? resolved->resources.get() : resolved->staged.get()) {
+                for (const auto& [begin, end] : precollected->InPlaceReads()) {
                     if (end > begin) static_cast<void>(GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin)));
                 }
             }
@@ -3837,6 +3966,9 @@ ParallelResolveCounts ParallelResolveStatistics() {
     for (std::size_t i = 0; i < ResolveSerialCount; ++i) counts.moved[i] = counters.moved[i].load();
     for (std::size_t i = 0; i < EpochVerdictCount; ++i) counts.revalidations[i] = counters.revalidations[i].load();
     counts.revalidationsVerified = counters.revalidationsVerified.load();
+    counts.stagedBuilt = counters.staged[static_cast<std::size_t>(StagedOutcome::TemplateMiss)].load();
+    counts.stagedAdopted = counters.staged[static_cast<std::size_t>(StagedOutcome::Adopted)].load();
+    counts.stagedVerified = counters.staged[static_cast<std::size_t>(StagedOutcome::Verified)].load();
     return counts;
 }
 

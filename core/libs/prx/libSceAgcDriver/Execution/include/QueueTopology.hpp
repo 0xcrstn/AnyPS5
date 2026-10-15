@@ -26,6 +26,7 @@ QueueTopology ParseQueueTopology(const char* value);
 const char* QueueTopologyName(QueueTopology topology);
 std::string DescribeQueueFamilies(std::span<const QueueFamilyInfo> families);
 TopologyPlan PlanQueueTopology(QueueTopology topology, std::span<const QueueFamilyInfo> families, std::uint32_t graphicsFamily, std::uint32_t sparseFamily);
+QueueTopology DefaultQueueTopology(std::span<const QueueFamilyInfo> families, std::uint32_t graphicsFamily, std::uint32_t sparseFamily);
 
 }
 

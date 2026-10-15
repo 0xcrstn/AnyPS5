@@ -128,7 +128,7 @@ std::string Hex(std::uint32_t value) {
     return text;
 }
 
-void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::uint8_t* base) {
+void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::uint8_t* base, bool first) {
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(base));
     std::vector<std::uint32_t> userData(10, 0u);
     const auto output = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
@@ -148,7 +148,7 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> co
     const auto before = AgcDriver::VulkanDevice::ComputePipelineCounts();
     auto prepared = device.PrepareDispatch(result, {}, Threads, reinterpret_cast<std::uintptr_t>(code.data()));
     const auto after = AgcDriver::VulkanDevice::ComputePipelineCounts();
-    Require(after.created == before.created + 1 && after.underGpuMutex == before.underGpuMutex, "global loads: the address-table program's pipeline was not created before the GPU mutex");
+    Require(after.created == before.created + (first ? 1u : 0u) && after.underGpuMutex == before.underGpuMutex, "global loads: the address-table program's pipeline was not created before the GPU mutex");
     {
         std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
         device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()), std::move(prepared));
@@ -157,9 +157,9 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> co
     device.WaitIdle();
 }
 
-void Run(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::span<const std::uint32_t> code) {
+void Run(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::span<const std::uint32_t> code, bool first = true) {
     Output.fill(Sentinel);
-    Dispatch(device, code, guest.Data());
+    Dispatch(device, code, guest.Data(), first);
     const std::string wave = "global loads: lane ";
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
         const auto& expected = Rows[tid].results;
@@ -183,6 +183,10 @@ int main() {
         }
         std::memcpy(guest.Data() + RegionOffset, FlatGlobalLoadsRegion.data(), FlatGlobalLoadsRegion.size());
         Run(*device, guest, LoadsCode);
+        const auto unlockedBefore = AgcDriver::VulkanDevice::UnlockedAddressBuilds();
+        Run(*device, guest, LoadsCode, false);
+        const char* unlocked = std::getenv("APS5_UNLOCKED_ADDRESS_BUILDS");
+        if (unlocked == nullptr || std::strcmp(unlocked, "0") != 0) Require(AgcDriver::VulkanDevice::UnlockedAddressBuilds() == unlockedBefore + 1, "global loads: the second dispatch did not prepare its address-based build off the GPU mutex on the cached address space");
         std::puts("global loads tests passed");
         return 0;
     } catch (const std::exception& error) {

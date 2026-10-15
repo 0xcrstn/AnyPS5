@@ -109,19 +109,27 @@ std::vector<std::uint32_t> SpirvModule::Finalize() const {
     module.insert(module.end(), globalVariables.begin(), globalVariables.end());
     module.insert(module.end(), functionInstructions.begin(), functionInstructions.end());
     module.insert(module.end(), helperFunctionInstructions.begin(), helperFunctionInstructions.end());
+    for (const auto& nested : nestedHelperInstructions) module.insert(module.end(), nested.begin(), nested.end());
     return module;
 }
 
 void SpirvModule::BeginHelperFunction() {
-    if (inHelperFunction) throw std::runtime_error("SpirvModule helper functions cannot nest");
-    std::swap(functionInstructions, helperFunctionInstructions);
+    if (helperDepth == 0u) {
+        std::swap(functionInstructions, helperFunctionInstructions);
+    } else {
+        if (nestedHelperInstructions.size() < helperDepth) nestedHelperInstructions.emplace_back();
+        std::swap(functionInstructions, nestedHelperInstructions[helperDepth - 1u]);
+    }
+    ++helperDepth;
     inHelperFunction = true;
 }
 
 void SpirvModule::EndHelperFunction() {
     if (!inHelperFunction) throw std::runtime_error("SpirvModule::EndHelperFunction without a helper function");
-    std::swap(functionInstructions, helperFunctionInstructions);
-    inHelperFunction = false;
+    --helperDepth;
+    if (helperDepth == 0u) std::swap(functionInstructions, helperFunctionInstructions);
+    else std::swap(functionInstructions, nestedHelperInstructions[helperDepth - 1u]);
+    inHelperFunction = helperDepth != 0u;
 }
 
 void SpirvModule::RequireVersion(std::uint32_t version) {

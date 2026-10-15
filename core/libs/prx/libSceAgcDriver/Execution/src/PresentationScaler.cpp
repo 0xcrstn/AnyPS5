@@ -18,12 +18,12 @@ PresentationScaler::PresentationScaler(const Graphics::Context& context, VkForma
 PresentationScaler::~PresentationScaler() {
     release();
     if (blackImage != VK_NULL_HANDLE) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, blackImage, nullptr);
-    if (blackMemory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, blackMemory, nullptr);
+    if (blackMemory != VK_NULL_HANDLE) { Graphics::DeviceMemoryPlacements::Untrack(blackMemory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, blackMemory, nullptr); }
 }
 
 void PresentationScaler::release() noexcept {
     if (sourceImage != VK_NULL_HANDLE) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, sourceImage, nullptr);
-    if (sourceMemory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, sourceMemory, nullptr);
+    if (sourceMemory != VK_NULL_HANDLE) { Graphics::DeviceMemoryPlacements::Untrack(sourceMemory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, sourceMemory, nullptr); }
     sourceImage = VK_NULL_HANDLE;
     sourceMemory = VK_NULL_HANDLE;
     sourceWidth = 0;
@@ -52,6 +52,7 @@ void PresentationScaler::EnsureSourceImage(std::uint32_t width, std::uint32_t he
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     Graphics::Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &sourceMemory), "vkAllocateMemory presentation source");
+    Graphics::DeviceMemoryPlacements::Track(sourceMemory, Graphics::DeviceMemoryKind::Presentation, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
     Graphics::Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, sourceImage, sourceMemory, 0), "vkBindImageMemory presentation source");
     sourceWidth = width;
     sourceHeight = height;
@@ -195,10 +196,11 @@ void PresentationScaler::RecordLetterbox(VkCommandBuffer commands, std::uint32_t
             allocation.allocationSize = requirements.size;
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             Graphics::Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory letterbox");
+            Graphics::DeviceMemoryPlacements::Track(memory, Graphics::DeviceMemoryKind::Presentation, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
             Graphics::Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory letterbox");
         } catch (...) {
             context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-            if (memory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+            if (memory != VK_NULL_HANDLE) { Graphics::DeviceMemoryPlacements::Untrack(memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); }
             throw;
         }
         blackImage = image;

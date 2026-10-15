@@ -2,7 +2,10 @@
 #define CORE_SHADER_RECOMPILER_BUFFERREADRANGES_HPP
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <cstddef>
+#include <initializer_list>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -15,7 +18,7 @@ enum class BufferIndexSource : std::uint8_t { None, VertexIndex, InstanceIndex, 
 
 enum class BufferIndexOrigin : std::uint8_t { Bounded, VertexIndex, InstanceIndex, Memory, UserData, Other, Count };
 
-enum class BufferIndexOp : std::uint8_t { Range, VertexIndex, InstanceIndex, UserData, Add, Sub, Mul, MulHigh, ShiftLeft, ShiftRight, And, Or, Divide, Min, Max, Extract, Select, Count };
+enum class BufferIndexOp : std::uint8_t { Range, VertexIndex, InstanceIndex, UserData, Add, Sub, Mul, MulHigh, ShiftLeft, ShiftRight, And, Or, Divide, Min, Max, Extract, Select, FloatConstant, FloatFromUnsigned, FloatAdd, FloatSub, FloatMul, FloatFloor, FloatTrunc, FloatMin, FloatMax, FloatFma, UnsignedFromFloat, Count };
 
 struct BufferIndexNode {
     BufferIndexOp op = BufferIndexOp::Range;
@@ -49,8 +52,19 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
         if (failure != nullptr) *failure = why;
         return std::nullopt;
     };
+    using FloatInterval = std::pair<float, float>;
     std::vector<Interval> values;
     values.reserve(nodes.size());
+    std::vector<FloatInterval> floats(nodes.size());
+    std::vector<std::uint8_t> floating(nodes.size(), 0u);
+    const auto isFloat = [](BufferIndexOp op) { return op >= BufferIndexOp::FloatConstant && op < BufferIndexOp::UnsignedFromFloat; };
+    const auto hull = [](std::initializer_list<float> candidates) {
+        FloatInterval value{std::min(candidates), std::max(candidates)};
+        constexpr float smallest = 0x1p-126f;
+        if (value.first > 0.0f && value.first < smallest) value.first = 0.0f;
+        if (value.second < 0.0f && value.second > -smallest) value.second = 0.0f;
+        return value;
+    };
     const auto ones = [](std::uint64_t value) {
         std::uint64_t mask = 0;
         while (mask < value) mask = (mask << 1u) | 1u;
@@ -58,9 +72,64 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
     };
     for (std::size_t index = 0; index < nodes.size(); ++index) {
         const auto& node = nodes[index];
-        const bool leaf = node.op == BufferIndexOp::Range || node.op == BufferIndexOp::VertexIndex || node.op == BufferIndexOp::InstanceIndex || node.op == BufferIndexOp::UserData;
-        const bool binary = node.op == BufferIndexOp::Add || node.op == BufferIndexOp::Sub || node.op == BufferIndexOp::Mul || node.op == BufferIndexOp::MulHigh || node.op == BufferIndexOp::And || node.op == BufferIndexOp::Or || node.op == BufferIndexOp::Min || node.op == BufferIndexOp::Max || node.op == BufferIndexOp::Select;
+        const bool leaf = node.op == BufferIndexOp::Range || node.op == BufferIndexOp::VertexIndex || node.op == BufferIndexOp::InstanceIndex || node.op == BufferIndexOp::UserData || node.op == BufferIndexOp::FloatConstant;
+        const bool binary = node.op == BufferIndexOp::Add || node.op == BufferIndexOp::Sub || node.op == BufferIndexOp::Mul || node.op == BufferIndexOp::MulHigh || node.op == BufferIndexOp::And || node.op == BufferIndexOp::Or || node.op == BufferIndexOp::Min || node.op == BufferIndexOp::Max || node.op == BufferIndexOp::Select || node.op == BufferIndexOp::FloatAdd || node.op == BufferIndexOp::FloatSub || node.op == BufferIndexOp::FloatMul || node.op == BufferIndexOp::FloatMin || node.op == BufferIndexOp::FloatMax || node.op == BufferIndexOp::FloatFma;
         if ((!leaf && node.left >= index) || (binary && node.right >= index)) return fail(BufferIndexFailure::Malformed);
+        const bool floatArguments = isFloat(node.op) ? node.op != BufferIndexOp::FloatFromUnsigned : node.op == BufferIndexOp::UnsignedFromFloat;
+        if ((!leaf && (floating[node.left] != 0u) != floatArguments) || (binary && (floating[node.right] != 0u) != floatArguments)) return fail(BufferIndexFailure::Malformed);
+        if (isFloat(node.op)) {
+            const auto& x = floats[node.left];
+            const auto& y = floats[node.right];
+            FloatInterval value{0.0f, 0.0f};
+            switch (node.op) {
+            case BufferIndexOp::FloatConstant: {
+                const auto constant = std::bit_cast<float>(node.low);
+                if (!std::isfinite(constant)) return fail(BufferIndexFailure::Malformed);
+                value = hull({constant, constant});
+                break;
+            }
+            case BufferIndexOp::FloatFromUnsigned:
+                value = hull({static_cast<float>(values[node.left].first), static_cast<float>(values[node.left].second)});
+                break;
+            case BufferIndexOp::FloatAdd:
+                value = hull({x.first + y.first, x.second + y.second});
+                break;
+            case BufferIndexOp::FloatSub:
+                value = hull({x.first - y.second, x.second - y.first});
+                break;
+            case BufferIndexOp::FloatMul:
+                value = hull({x.first * y.first, x.first * y.second, x.second * y.first, x.second * y.second});
+                break;
+            case BufferIndexOp::FloatFma: {
+                if (node.low >= index || floating[node.low] == 0u) return fail(BufferIndexFailure::Malformed);
+                const auto& z = floats[node.low];
+                const auto fused = [](float a, float b, float c) { return std::fma(a, b, c); };
+                const auto separate = [](float a, float b, float c) { const volatile float product = a * b; return product + c; };
+                value = hull({fused(x.first, y.first, z.first), fused(x.first, y.second, z.first), fused(x.second, y.first, z.first), fused(x.second, y.second, z.first), fused(x.first, y.first, z.second), fused(x.first, y.second, z.second), fused(x.second, y.first, z.second), fused(x.second, y.second, z.second), separate(x.first, y.first, z.first), separate(x.first, y.second, z.first), separate(x.second, y.first, z.first), separate(x.second, y.second, z.first), separate(x.first, y.first, z.second), separate(x.first, y.second, z.second), separate(x.second, y.first, z.second), separate(x.second, y.second, z.second)});
+                break;
+            }
+            case BufferIndexOp::FloatFloor:
+                value = {std::floor(x.first), std::floor(x.second)};
+                break;
+            case BufferIndexOp::FloatTrunc:
+                value = {std::trunc(x.first), std::trunc(x.second)};
+                break;
+            case BufferIndexOp::FloatMin:
+                value = {std::min(x.first, y.first), std::min(x.second, y.second)};
+                break;
+            case BufferIndexOp::FloatMax:
+                value = {std::max(x.first, y.first), std::max(x.second, y.second)};
+                break;
+            default:
+                return fail(BufferIndexFailure::Malformed);
+            }
+            if (!std::isfinite(value.first) || !std::isfinite(value.second)) return fail(BufferIndexFailure::Overflow);
+            if (value.first > value.second) return fail(BufferIndexFailure::Malformed);
+            floats[index] = value;
+            floating[index] = 1u;
+            values.push_back({0, 0});
+            continue;
+        }
         const auto& a = node.left < values.size() ? values[node.left] : Interval{0, 0};
         const auto& b = node.right < values.size() ? values[node.right] : Interval{0, 0};
         Interval result{0, 0};
@@ -129,6 +198,13 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
         case BufferIndexOp::Select:
             result = {std::min(a.first, b.first), std::max(a.second, b.second)};
             break;
+        case BufferIndexOp::UnsignedFromFloat: {
+            const auto& x = floats[node.left];
+            if (x.first <= -1.0) return fail(BufferIndexFailure::Underflow);
+            if (x.second >= 4294967296.0) return fail(BufferIndexFailure::Overflow);
+            result = {x.first <= 0.0 ? 0u : static_cast<std::uint64_t>(std::floor(x.first)), x.second <= 0.0 ? 0u : static_cast<std::uint64_t>(std::floor(x.second))};
+            break;
+        }
         default:
             return fail(BufferIndexFailure::Malformed);
         }
@@ -136,7 +212,7 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
         if (result.first > result.second) return fail(BufferIndexFailure::Malformed);
         values.push_back(result);
     }
-    if (values.empty()) return fail(BufferIndexFailure::Malformed);
+    if (values.empty() || floating.back() != 0u) return fail(BufferIndexFailure::Malformed);
     return values.back();
 }
 

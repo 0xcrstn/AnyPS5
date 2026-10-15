@@ -584,6 +584,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory block copy");
+        owned->placement = DeviceMemoryPlacement(DeviceMemoryKind::Texture, context.HostPlaced(allocation.memoryTypeIndex), requirements.size);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory block copy");
 
         const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
@@ -641,6 +642,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory depth copy");
+        owned->placement = DeviceMemoryPlacement(DeviceMemoryKind::Texture, context.HostPlaced(allocation.memoryTypeIndex), requirements.size);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory depth copy");
 
         const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
@@ -1542,7 +1544,7 @@ bool ClearKeepsDenormals(const Context& context, VkFormat format) {
             VkDeviceMemory& memory;
             ~Release() {
                 if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-                if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+                if (memory) { DeviceMemoryPlacements::Untrack(memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); }
             }
         } release{context, image, memory};
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1563,6 +1565,7 @@ bool ClearKeepsDenormals(const Context& context, VkFormat format) {
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory denormal clear probe");
+        DeviceMemoryPlacements::Track(memory, DeviceMemoryKind::TextureProxy, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory denormal clear probe");
         Buffer readback(context, elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         CommandBatch batch(context);
@@ -1705,6 +1708,7 @@ VkImageView StorageTexture::AttachmentProxyView() {
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &proxyMemory), "vkAllocateMemory attachment proxy");
+        DeviceMemoryPlacements::Track(proxyMemory, DeviceMemoryKind::TextureProxy, context.HostPlaced(allocation.memoryTypeIndex), allocation.allocationSize);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, proxyImage, proxyMemory, 0), "vkBindImageMemory attachment proxy");
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = proxyImage;
@@ -1715,7 +1719,7 @@ VkImageView StorageTexture::AttachmentProxyView() {
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &proxyView), "vkCreateImageView attachment proxy");
     } catch (...) {
         if (proxyImage) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, proxyImage, nullptr);
-        if (proxyMemory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, proxyMemory, nullptr);
+        if (proxyMemory) { DeviceMemoryPlacements::Untrack(proxyMemory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, proxyMemory, nullptr); }
         proxyImage = VK_NULL_HANDLE;
         proxyMemory = VK_NULL_HANDLE;
         proxyView = VK_NULL_HANDLE;
@@ -5841,10 +5845,10 @@ void StorageTexture::release() noexcept {
     attachmentViews.clear();
     if (proxyView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, proxyView, nullptr);
     if (proxyImage) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, proxyImage, nullptr);
-    if (proxyMemory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, proxyMemory, nullptr);
+    if (proxyMemory) { DeviceMemoryPlacements::Untrack(proxyMemory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, proxyMemory, nullptr); }
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) { DeviceMemoryPlacements::Untrack(memory); context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr); }
     placement.Reset();
 }
 

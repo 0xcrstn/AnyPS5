@@ -137,6 +137,13 @@ public:
     // reconciles imports and refreshes mirrors, which needs the lock.
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0);
     void Complete();
+    struct StagedDraw {};
+    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, StagedDraw);
+    void CompleteDraw(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
+    bool StagedAddressLocked() const { return lockedBuild; }
+    bool UnlockedAddressBuild() const { return usesBda && unlockedPrepare; }
+    static bool VerifyUnlockedAddressBuilds();
+    bool SameBuildAs(const ShaderResources& other) const;
     bool Completed() const { return completed; }
     ~ShaderResources();
     ShaderResources(const ShaderResources&) = delete;
@@ -166,8 +173,14 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        std::shared_ptr<const DrawBindings> persistent;
         ~DrawBindings();
     };
+    enum class RecordBindings : std::uint8_t { Legacy, Persistent };
+    static RecordBindings ParseRecordBindings(const char* text);
+    static RecordBindings RecordBindingsMode();
+    static void SetRecordBindingsMode(RecordBindings mode);
+    static constexpr std::size_t PersistentDrawSetSlots = 4;
     enum class WholeCopy : std::uint8_t { NotAnalysed, IndexVertex, IndexInstance, IndexMemory, IndexUserData, IndexOther, NoDrawRange, IndexAtDraw, IndexAtDrawUserWord, IndexAtDrawUnderflow, IndexAtDrawOverflow, Offset, Soffset, ScalarOffset, Wrap, Opcode, Alias, Swizzled, AddTid, BeyondFourGiB, OverHalf, Disabled, Count };
     static const char* WholeCopyName(WholeCopy reason);
     using ByteRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
@@ -202,6 +215,7 @@ public:
         std::uint64_t inPlace = 0;
         std::uint64_t inPlaceBytes = 0;
         std::uint64_t overHalfReadBytes = 0;
+        std::uint64_t persistentSets = 0;
         double checkUs = 0;
         double collectUs = 0;
         double lookupUs = 0;
@@ -235,6 +249,12 @@ public:
     };
     std::optional<std::vector<MovedDispatchBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder& recorder) const;
     std::shared_ptr<DrawBindings> BindMovedDispatchBuffers(Recorder& recorder, std::span<const MovedDispatchBuffer> moved) const;
+    struct PreparedMovedDispatch {
+        std::vector<MovedDispatchBuffer> moved;
+        std::shared_ptr<DrawBindings> set;
+    };
+    std::optional<PreparedMovedDispatch> PrepareMovedDispatchBuffers(const CompiledShader& shader) const;
+    std::optional<std::vector<MovedDispatchBuffer>> CheckMovedDispatchBuffers(const PreparedMovedDispatch& prepared, Recorder& recorder) const;
     struct GuestBufferView {
         std::uint64_t address;
         std::size_t size;
@@ -261,9 +281,14 @@ public:
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
+    bool KnownAddressWrites() const { return usesBda && bdaReadOnly && !guestMemory.HasCopiedWrites(); }
+    bool HasPlacements() const;
+    bool DispatchEffectsKnown() const { return tableStages.empty() && !guestMemory.HasCopiedWrites() && !HasPlacements(); }
+    bool WritesThroughPointers() const { return usesBda && !bdaReadOnly; }
     void UseMirrors(Recorder& recorder) const;
     void RecordPlacementCopyBack(Recorder& recorder, VkCommandBuffer commands) const;
     void PublishResidentReads(Recorder& recorder) const;
+    void RefreshAddressUse() const;
     void RefreshMirrorsForDirectUse(Recorder& recorder) const;
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
@@ -307,6 +332,10 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
+    bool AddressTemplate() const { return addressTemplate; }
+    void VerifyAddressTemplate(const ShaderResources& fresh) const;
+    static bool AddressTemplatesEnabled();
+    static void SetAddressTemplates(bool enabled);
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
@@ -415,6 +444,17 @@ private:
         std::uint32_t adjustment;
     };
     void writeDataWords(VkCommandBuffer commands, std::size_t allocation, std::span<const std::uint32_t> words) const;
+    struct MovedDispatchCandidate {
+        std::size_t allocation;
+        std::uint64_t address;
+        std::size_t size;
+        std::uint64_t begin;
+        std::size_t bytes;
+        std::uint32_t adjustment;
+    };
+    std::optional<std::vector<MovedDispatchCandidate>> planMovedDispatch(const CompiledShader& shader) const;
+    std::optional<VkDescriptorBufferInfo> movedDispatchView(const MovedDispatchCandidate& candidate, Recorder& recorder) const;
+    std::shared_ptr<DrawBindings> writeMovedDispatchSet(std::span<const MovedDispatchBuffer> moved) const;
 
     struct Binding {
         VkDescriptorSetLayoutBinding layout;
@@ -520,7 +560,7 @@ private:
     void applyAnisoOverride();
     void forgetDeferredInputs();
     void release() noexcept;
-    void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
+    bool prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool unlocked = false);
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
     void reportDescriptorCaches() const;
@@ -639,6 +679,13 @@ private:
         DrawSnapshotArena::Placed placed{};
     };
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
+    struct PersistentDrawSet {
+        std::vector<std::array<std::uint64_t, 4>> key;
+        std::shared_ptr<const DrawBindings> bindings;
+    };
+    mutable std::mutex persistentDrawSetMutex;
+    mutable std::vector<PersistentDrawSet> persistentDrawSets;
+    mutable std::size_t persistentDrawSetNext = 0;
     mutable std::size_t movedWordBufferNext = 0;
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
@@ -669,6 +716,8 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    bool addressTemplate = false;
+    mutable std::atomic<bool> addressUsed{false};
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
@@ -711,6 +760,10 @@ private:
     // Stage A runs without the device lock (a deferred, non-address-based build).
     bool unlockedPrepare = false;
     bool completed = false;
+    ColorTarget stagedTarget{};
+    std::uint32_t stagedColorAttachments = 0;
+    std::uint64_t stagedIndexAddress = 0;
+    std::size_t stagedIndexBytes = 0;
     std::chrono::steady_clock::time_point phaseStart;
 };
 
@@ -735,6 +788,9 @@ public:
     static CacheSizing::Limits DefaultLimits();
     ResourceCache();
     explicit ResourceCache(CacheSizing::Limits limits);
+    ~ResourceCache();
+    ResourceCache(const ResourceCache&) = delete;
+    ResourceCache& operator=(const ResourceCache&) = delete;
     std::shared_ptr<ShaderResources> Find(const Key& key);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
@@ -744,6 +800,7 @@ public:
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
     void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
+    static void RemoveLeaseHolders(std::vector<std::shared_ptr<ShaderResources>>& evicted);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
@@ -761,6 +818,7 @@ public:
 
 private:
     void erase(const Key& key);
+    void removeLeaseHolders(std::vector<std::shared_ptr<ShaderResources>>& evicted);
     void evictOverLimit(std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteMiss(const Key& key);
     struct KeyHash {

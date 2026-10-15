@@ -214,6 +214,40 @@ void DrawIndices() {
     Require(blocked.ranges.front().lastIndex == BufferReadRanges::AnyIndex && blocked.ranges.front().indexOrigin == BufferIndexOrigin::VertexIndex && blocked.ranges.front().blockingOpcode == static_cast<std::uint16_t>(IrOpcode::BitwiseXor32), "an index stopped by an exclusive or did not name that step");
 }
 
+void FloatIndices() {
+    Fixture fixture;
+    BufferReadAnalysis analysis;
+    auto& builder = fixture.builder;
+    const auto emit = [&](IrOpcode opcode, std::initializer_list<IrValue*> arguments) -> IrValue& { return builder.Emit(opcode, IrOpcodeType(opcode), arguments); };
+    auto& instance = emit(IrOpcode::GetBuiltin, {&builder.Constant(static_cast<std::uint32_t>(StageInputKind::InstanceIndex)), &builder.Constant(0u)});
+    auto& vertex = emit(IrOpcode::GetBuiltin, {&builder.Constant(static_cast<std::uint32_t>(StageInputKind::VertexIndex)), &builder.Constant(0u)});
+    auto& halfInstance = emit(IrOpcode::ConvertU32F32, {&emit(IrOpcode::FPFloor32, {&emit(IrOpcode::FPMul32, {&emit(IrOpcode::ConvertF32U32, {&instance}), &builder.ConstantF32(0.5f)})})});
+    BufferReadRanges halved;
+    analysis.Note(halved, fixture.Load(IrOpcode::LoadBufferU32, halfInstance, builder.Constant(0u), builder.Constant(0u)), Memory(0u, 1u));
+    Require(halved.bounded && halved.ranges.size() == 1u && halved.ranges[0].indexSource == BufferIndexSource::Expression, "a load at index u32(floor(f32(instance) * 0.5)) was not recorded as an expression");
+    const auto half = EvaluateBufferIndex(halved.ranges[0].indexExpression, BufferIndexInputs{0u, 0u, 0u, 9u});
+    Require(half && half->first == 0u && half->second == 4u, "u32(floor(f32(instance) * 0.5)) over instances 0 to 9 does not give records 0 to 4");
+    auto& fused = emit(IrOpcode::ConvertU32F32, {&emit(IrOpcode::FPFma32, {&emit(IrOpcode::ConvertF32U32, {&vertex}), &builder.ConstantF32(0.25f), &builder.ConstantF32(1.0f)})});
+    BufferReadRanges quartered;
+    analysis.Note(quartered, fixture.Load(IrOpcode::LoadBufferU32, fused, builder.Constant(0u), builder.Constant(0u)), Memory(0u, 1u));
+    Require(quartered.bounded && quartered.ranges.size() == 1u && quartered.ranges[0].indexSource == BufferIndexSource::Expression, "a load at index u32(fma(f32(vertex), 0.25, 1)) was not recorded as an expression");
+    const auto quarter = EvaluateBufferIndex(quartered.ranges[0].indexExpression, BufferIndexInputs{0u, 8u, 0u, 0u});
+    Require(quarter && quarter->first == 1u && quarter->second == 3u, "u32(fma(f32(vertex), 0.25, 1)) over vertices 0 to 8 does not give records 1 to 3");
+    auto& below = emit(IrOpcode::ConvertU32F32, {&emit(IrOpcode::FPSub32, {&emit(IrOpcode::ConvertF32U32, {&instance}), &builder.ConstantF32(2.0f)})});
+    BufferReadRanges negative;
+    analysis.Note(negative, fixture.Load(IrOpcode::LoadBufferU32, below, builder.Constant(0u), builder.Constant(0u)), Memory(0u, 1u));
+    auto failure = BufferIndexFailure::None;
+    Require(!EvaluateBufferIndex(negative.ranges[0].indexExpression, BufferIndexInputs{0u, 0u, 0u, 9u}, &failure) && failure == BufferIndexFailure::Underflow, "u32(f32(instance) - 2) over instances from 0, where OpConvertFToU is undefined, was given a range");
+    const auto inRange = EvaluateBufferIndex(negative.ranges[0].indexExpression, BufferIndexInputs{0u, 0u, 4u, 9u});
+    Require(inRange && inRange->first == 2u && inRange->second == 7u, "u32(f32(instance) - 2) over instances 4 to 9 does not give records 2 to 7");
+    auto& huge = emit(IrOpcode::ConvertU32F32, {&emit(IrOpcode::FPMul32, {&emit(IrOpcode::ConvertF32U32, {&vertex}), &builder.ConstantF32(1.0e10f)})});
+    BufferReadRanges overflowing;
+    analysis.Note(overflowing, fixture.Load(IrOpcode::LoadBufferU32, huge, builder.Constant(0u), builder.Constant(0u)), Memory(0u, 1u));
+    Require(!EvaluateBufferIndex(overflowing.ranges[0].indexExpression, BufferIndexInputs{0u, 8u, 0u, 0u}, &failure) && failure == BufferIndexFailure::Overflow, "u32(f32(vertex) * 1e10) past 32 bits was given a range");
+    const std::vector<BufferIndexNode> mistyped{{BufferIndexOp::VertexIndex, 0u, 0u, 0u, 0u}, {BufferIndexOp::UnsignedFromFloat, 0u, 0u, 0u, 0u}};
+    Require(!EvaluateBufferIndex(mistyped, BufferIndexInputs{0u, 8u, 0u, 0u}, &failure) && failure == BufferIndexFailure::Malformed, "a float conversion of an integer node was evaluated");
+}
+
 void Collapse() {
     Fixture fixture;
     BufferReadAnalysis analysis;
@@ -231,6 +265,7 @@ int main() {
         BoundedIndex();
         Unbounded();
         DrawIndices();
+        FloatIndices();
         Collapse();
         std::puts("buffer read analysis tests passed");
         return 0;

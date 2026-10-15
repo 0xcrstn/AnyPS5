@@ -12,7 +12,10 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <tuple>
+#include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -77,12 +80,27 @@ Registry& Mirrors() {
     return registry;
 }
 
-std::uint64_t BudgetBytes() {
-    static const std::uint64_t bytes = [] {
+std::optional<std::uint64_t> ConfiguredBudget() {
+    static const std::optional<std::uint64_t> bytes = []() -> std::optional<std::uint64_t> {
         const char* text = std::getenv("APS5_RESIDENT_MIRROR_MIB");
-        return (text != nullptr ? std::strtoull(text, nullptr, 10) : 4096ull) << 20u;
+        if (text == nullptr) return std::nullopt;
+        return std::strtoull(text, nullptr, 10) << 20u;
     }();
     return bytes;
+}
+
+std::uint64_t BudgetBytes(const Context& context) {
+    if (const auto configured = ConfiguredBudget()) return *configured;
+    VkDeviceSize largest = 0;
+    for (std::uint32_t i = 0; i < context.memory.memoryHeapCount; ++i) {
+        if ((context.memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) largest = std::max(largest, context.memory.memoryHeaps[i].size);
+    }
+    return largest / 2u;
+}
+
+bool SwitchOn(const char* name) {
+    const char* text = std::getenv(name);
+    return text == nullptr || std::strcmp(text, "0") != 0;
 }
 
 std::uint32_t MirrorAfterBatches() {
@@ -252,12 +270,17 @@ void reportMirrors() {
 }
 
 bool ResidentMirrorsEnabled() {
-    static const bool enabled = std::getenv("APS5_RESIDENT_MIRRORS") != nullptr && BudgetBytes() != 0;
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_RESIDENT_MIRRORS");
+        if (text == nullptr || std::string_view(text) == "1") return ConfiguredBudget().value_or(1) != 0;
+        if (std::string_view(text) == "0") return false;
+        throw std::runtime_error("APS5_RESIDENT_MIRRORS must be 0 or 1");
+    }();
     return enabled;
 }
 
 bool BufferMirrorsEnabled() {
-    static const bool enabled = std::getenv("APS5_RESIDENT_BUFFER_MIRRORS") != nullptr && BudgetBytes() != 0;
+    static const bool enabled = SwitchOn("APS5_RESIDENT_BUFFER_MIRRORS") && ConfiguredBudget().value_or(1) != 0;
     return enabled;
 }
 
@@ -270,7 +293,8 @@ namespace {
 
 std::shared_ptr<ResidentMirror> mirrorOf(const Context& context, const HostImport& import, bool writable) {
     const bool enabled = writable ? PlacementSetting() != ShaderRecompiler::BdaPlacement::Mode::Host : ResidentMirrorsEnabled() || BufferMirrorsEnabled();
-    if (!enabled || BudgetBytes() == 0 || import.bytes == 0 || import.unwatched || import.dmaBuf || !context.bufferDeviceAddress) return {};
+    const auto budget = BudgetBytes(context);
+    if (!enabled || budget == 0 || import.bytes == 0 || import.unwatched || import.dmaBuf || !context.bufferDeviceAddress) return {};
     if (!GuestMemory::Watched(import.base, static_cast<std::size_t>(import.bytes))) return {};
     auto& registry = Mirrors();
     const auto* recorder = Recorder::Current();
@@ -297,7 +321,7 @@ std::shared_ptr<ResidentMirror> mirrorOf(const Context& context, const HostImpor
             if (!writable) return existing;
             if (existing->usedBy != nullptr && existing->usedBy != recorder) return {};
             if (existing->pristine == nullptr) {
-                if (registry.bytes + existing->bytes > BudgetBytes()) {
+                if (registry.bytes + existing->bytes > budget) {
                     Stats().refused.fetch_add(1, std::memory_order_relaxed);
                     return {};
                 }
@@ -323,8 +347,8 @@ std::shared_ptr<ResidentMirror> mirrorOf(const Context& context, const HostImpor
         return {};
     }
     const auto footprint = writable ? import.bytes * 2u : import.bytes;
-    if (registry.bytes + footprint > BudgetBytes()) {
-        for (auto it = registry.byBase.begin(); it != registry.byBase.end() && registry.bytes + footprint > BudgetBytes();) {
+    if (registry.bytes + footprint > budget) {
+        for (auto it = registry.byBase.begin(); it != registry.byBase.end() && registry.bytes + footprint > budget;) {
             if (it->second.use_count() == 1) {
                 it->second->retired = true;
                 registry.bytes -= Footprint(*it->second);
@@ -333,7 +357,7 @@ std::shared_ptr<ResidentMirror> mirrorOf(const Context& context, const HostImpor
                 ++it;
             }
         }
-        if (registry.bytes + footprint > BudgetBytes()) {
+        if (registry.bytes + footprint > budget) {
             Stats().refused.fetch_add(1, std::memory_order_relaxed);
             return {};
         }

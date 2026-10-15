@@ -252,6 +252,19 @@ public:
                 extensionsEnabled.insert(extensionsEnabled.end(), libraryExtensions.begin(), libraryExtensions.end());
                 address.pNext = &library;
             }
+            VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timelineFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            if (hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timelineFeatures};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                timelines = timelineFeatures.timelineSemaphore == VK_TRUE;
+            }
+            timelineFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            timelineFeatures.timelineSemaphore = VK_TRUE;
+            if (timelines) {
+                extensionsEnabled.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                timelineFeatures.pNext = address.pNext;
+                address.pNext = &timelineFeatures;
+            }
             VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
             if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness};
@@ -295,6 +308,7 @@ public:
 
     ~Device() { release(); }
     bool NullDescriptors() const { return nullDescriptors; }
+    bool Timelines() const { return timelines; }
     const Context& GetContext() const { return context; }
     bool Graphics() const { return graphics; }
     VkPhysicalDeviceProperties Properties() const {
@@ -329,6 +343,7 @@ private:
     Context context{};
     bool graphics = false;
     bool nullDescriptors = false;
+    bool timelines = false;
 };
 
 using Kind = Recorder::ReadKind;
@@ -1176,6 +1191,134 @@ void lateLabelTests(Recorder& recorder) {
     Require(!Recorder::LookupLabel(a, 4, 5).has_value() && !Recorder::LookupLabel(b, 8, 5).has_value() && !recorder.PendingLabelIn(0x70000, 0x400), "(7) entries outlived their batch");
 }
 
+void crossQueueLabelTests(const Device& device, Recorder& recorder) {
+    using Refusal = Recorder::LabelRefusal;
+    const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    const std::array<std::byte, 4> two{std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0}};
+    const std::array<std::byte, 4> three{std::byte{3}, std::byte{0}, std::byte{0}, std::byte{0}};
+    constexpr std::uint64_t a = 0x74000, b = 0x74100, c = 0x74200;
+    recorder.Sync();
+    struct AsQueue {
+        std::uint32_t previous = AgcDriver::GuestMemory::GpuLockThreadTag();
+        explicit AsQueue(std::uint32_t queue) { AgcDriver::GuestMemory::TagGpuLockThread(queue); }
+        ~AsQueue() { AgcDriver::GuestMemory::TagGpuLockThread(previous); }
+        AsQueue(const AsQueue&) = delete;
+        AsQueue& operator=(const AsQueue&) = delete;
+    };
+    Recorder::MapGuestQueue(0x20, 1);
+    Recorder other(device.GetContext(), false, 1);
+    other.Activate();
+    recorder.SetPeer(&other);
+    other.SetPeer(&recorder);
+    struct Unpeer {
+        Recorder& first;
+        Recorder& second;
+        ~Unpeer() {
+            first.Sync();
+            second.Sync();
+            first.SetPeer(nullptr);
+            second.SetPeer(nullptr);
+            Recorder::MapGuestQueue(0x20, 0);
+        }
+    } unpeer{recorder, other};
+    Refusal refusal{};
+    recorder.NoteLabel(a, one, 20, 0);
+    {
+        AsQueue compute(0x20);
+        other.NoteLabel(a, two, 21, 0x20);
+    }
+    Require(!Recorder::LookupLabel(a, 4, 0, &refusal).has_value() && refusal == Refusal::Unordered, "a label pending unsubmitted on two physical queues is not refused as unordered");
+    recorder.Submit();
+    auto hit = Recorder::LookupLabel(a, 4, 0, &refusal);
+    Require(hit.has_value() && hit->value == 2 && hit->queue == 0x20 && hit->stamp == 21 && refusal == Refusal::None, "the unsubmitted batch, which runs after the submitted one, does not decide the label");
+    other.Submit();
+    hit = Recorder::LookupLabel(a, 4, 0, &refusal);
+    Require(hit.has_value() && hit->value == 2 && refusal == Refusal::None, "the later of two submitted batches does not decide the label");
+    recorder.Sync();
+    other.Sync();
+    Require(!Recorder::LookupLabel(a, 4, 0).has_value(), "the composed entries outlived their batches");
+    {
+        AsQueue compute(0x20);
+        other.NoteLabel(b, two, 30, 0x20);
+    }
+    other.Submit();
+    recorder.NoteLabel(b, three, 29, 0);
+    hit = Recorder::LookupLabel(b, 4, 0, &refusal);
+    Require(hit.has_value() && hit->value == 3 && hit->stamp == 29 && refusal == Refusal::None, "a batch submitted later does not win over a newer stamp on a batch submitted earlier");
+    recorder.Submit();
+    hit = Recorder::LookupLabel(b, 4, 0, &refusal);
+    Require(hit.has_value() && hit->value == 3, "the submission order does not decide between two submitted batches");
+    Require(!Recorder::LookupLabel(b, 4, 29, &refusal).has_value() && refusal != Refusal::None, "the late rule does not apply to the winning entry");
+    recorder.Sync();
+    other.Sync();
+    recorder.NoteLabel(c, one, 40, 0);
+    {
+        AsQueue compute(0x20);
+        other.NoteLabel(c + 4, two, 41, 0x20);
+    }
+    recorder.Submit();
+    other.Submit();
+    hit = Recorder::LookupLabel(c, 8, 0, &refusal);
+    Require(hit.has_value() && hit->value == 0x0000000200000001ull && hit->queue == 0 && hit->stamp == 40 && refusal == Refusal::None, "a 64-bit label whose dwords are pending on two physical queues is not composed");
+    Require(!recorder.PendingLabel(c, 8, 0).has_value(), "one physical queue's own table composed a dword it does not hold");
+}
+
+void crossQueueRecordTests(const Device& device, Recorder& recorder) {
+    if (!device.Timelines()) {
+        std::cout << "cross-queue record tests skipped: the device has no timeline semaphores\n";
+        return;
+    }
+    const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    constexpr std::uint64_t base = 0x75000;
+    recorder.Sync();
+    struct AsQueue {
+        std::uint32_t previous = AgcDriver::GuestMemory::GpuLockThreadTag();
+        explicit AsQueue(std::uint32_t queue) { AgcDriver::GuestMemory::TagGpuLockThread(queue); }
+        ~AsQueue() { AgcDriver::GuestMemory::TagGpuLockThread(previous); }
+        AsQueue(const AsQueue&) = delete;
+        AsQueue& operator=(const AsQueue&) = delete;
+    };
+    Recorder::MapGuestQueue(0x20, 1);
+    {
+        Recorder graphics(device.GetContext(), true, 0);
+        Recorder compute(device.GetContext(), true, 1);
+        graphics.Activate();
+        compute.Activate();
+        graphics.SetPeer(&compute);
+        compute.SetPeer(&graphics);
+        struct Unpeer {
+            Recorder& first;
+            Recorder& second;
+            ~Unpeer() {
+                first.Sync();
+                second.Sync();
+                first.SetPeer(nullptr);
+                second.SetPeer(nullptr);
+            }
+        } unpeer{graphics, compute};
+        AsQueue onGraphics(0);
+        const auto before = graphics.QueueOrderCounts();
+        graphics.NoteLabel(base, one, 60, 0);
+        compute.NoteLabel(base + 0x40, one, 61, 0);
+        auto counts = graphics.QueueOrderCounts();
+        Require(counts.foreignRecords == before.foreignRecords + 1 && graphics.Submissions() == 1 && compute.Submissions() == 0, "a record into the other physical queue did not submit the recording queue's earlier work first");
+        graphics.NoteLabel(base + 0x80, one, 62, 0);
+        graphics.Submit();
+        counts = graphics.QueueOrderCounts();
+        Require(counts.foreignWaits == before.foreignWaits + 1 && compute.Submissions() == 1 && counts.requiredWaits > before.requiredWaits && counts.waitedSubmits > before.waitedSubmits, "the recording queue's next batch did not submit the other queue's batch and wait for it");
+        {
+            AsQueue onCompute(0x20);
+            compute.NoteLabel(base + 0xc0, one, 63, 0x20);
+            compute.Submit();
+        }
+        Require(graphics.QueueOrderCounts().foreignRecords == counts.foreignRecords && compute.QueueOrderCounts().foreignRecords == 0, "a queue's record into its own physical queue counted as a cross-queue record");
+        graphics.Sync();
+        compute.Sync();
+    }
+    Recorder::MapGuestQueue(0x20, 0);
+    recorder.Activate();
+}
+
 void largeLabelTests(Recorder& recorder) {
     constexpr std::uint64_t slot = 0x71000, small = slot + 0x10, outside = slot - 4, wide = 0x72000;
     const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
@@ -1517,6 +1660,35 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     start = recorder.StartDrawPass(0x5eed, false, false, PassAccess{});
     Require(!start.continued && start.barrier, "a render pass begun after uncovered work skipped its barrier");
     recorder.Sync();
+    {
+        const std::pair<std::uint64_t, std::uint64_t> first{0x1000, 0x2000};
+        const std::pair<std::uint64_t, std::uint64_t> second{0x3000, 0x4000};
+        const PassAccess writesFirst{{}, std::span(&first, 1), {}, {}, false, false, false};
+        const PassAccess writesSecond{{}, std::span(&second, 1), {}, {}, false, false, false};
+        const PassAccess readsFirst{std::span(&first, 1), {}, {}, {}, false, false, false};
+        const int owners[3]{};
+        const auto setting = Recorder::DispatchBarriersSetting();
+        const bool on = setting == Recorder::DispatchBarriers::On;
+        recorder.DispatchCommands(writesFirst, &owners[0], true, &covered);
+        Require(recorder.DeferDispatchBarrier(writesFirst, &owners[0], true) == on, "a dispatch's trailing barrier was deferred with the switch off (or recorded with it on)");
+        Require(recorder.DispatchBarrierPending() == (setting != Recorder::DispatchBarriers::Off), "a deferrable dispatch left nothing pending");
+        recorder.DispatchCommands(writesSecond, &owners[1], true, &covered);
+        Require(!on || (covered == Recorder::DispatchedAccess && recorder.DispatchBarrierPending()), "an independent dispatch flushed the deferred barrier or was not covered by it");
+        recorder.DeferDispatchBarrier(writesSecond, &owners[1], true);
+        recorder.DispatchCommands(readsFirst, &owners[2], true, &covered);
+        Require(!recorder.DispatchBarrierPending() && (!on || covered == Recorder::DispatchedAccess), "a dispatch reading a deferred dispatch's writes did not get its barrier");
+        recorder.DeferDispatchBarrier(readsFirst, &owners[2], true);
+        recorder.DispatchCommands(writesSecond, &owners[2], true, &covered);
+        Require(!recorder.DispatchBarrierPending(), "a second dispatch of the same resources skipped the barrier");
+        recorder.DeferDispatchBarrier(writesSecond, &owners[2], true);
+        recorder.DispatchCommands(writesFirst, &owners[0], false, &covered);
+        Require(!recorder.DispatchBarrierPending(), "a dispatch with unknown effects skipped the barrier");
+        recorder.DeferDispatchBarrier(writesFirst, &owners[0], true);
+        recorder.Commands(&covered);
+        Require(!recorder.DispatchBarrierPending() && (!on || covered == Recorder::DispatchedAccess), "other work did not get the deferred barrier");
+        recorder.Sync();
+        Require(Recorder::ParseDispatchBarriers(nullptr) == Recorder::DispatchBarriers::On && Recorder::ParseDispatchBarriers("0") == Recorder::DispatchBarriers::Off && Recorder::ParseDispatchBarriers("verify") == Recorder::DispatchBarriers::Verify, "APS5_DISPATCH_BARRIERS values");
+    }
     // The hazard tracker (counting mode only): accesses are noted without effect on the batch.
     const std::pair<std::uint64_t, std::uint64_t> range{address, address + 64};
     recorder.NoteAccess(Recorder::CommandClass::Fill, Recorder::Access{{}, std::span(&range, 1), {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -4908,13 +5080,17 @@ int coherenceLeaseTests(const Device& device, Recorder& recorder) {
     });
     Coherence::ResetForTests();
     const auto copyBuffer = base.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
-    const auto read = [&](Buffer& output) {
+    const auto read = [&](Buffer& output, bool drawInput = false) {
         const auto commands = recorder.Commands();
         RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         const VkBufferCopy piece{address - import->base, 0, 16};
         copyBuffer(commands, import->buffer, output.Handle(), 1, &piece);
         RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
         recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (drawInput) {
+            Require(recorder.NoteInPlaceDrawInput(address, 16), "a draw input bound in place was refused its read lease");
+            return;
+        }
         const auto lease = Coherence::AcquireReadLease({address, address + 16}, Coherence::CurrentVersion());
         Require(lease != 0, "a read lease over shared guest memory was refused");
         recorder.OnCompleteWithoutGuestAccess([lease] { Coherence::RetireReadLease(lease); });
@@ -4939,6 +5115,17 @@ int coherenceLeaseTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     counters = Coherence::CurrentCounters();
     Require(counters.leases == 1002 && counters.leaseWaits == 1 && counters.liveProtections == 0, "unwritten leased reads waited or kept their leases: " + Coherence::Report());
+    Coherence::ResetForTests();
+    read(first, true);
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint32_t*>(address) = 0x43434343u;
+    gpu.lock();
+    read(second, true);
+    recorder.Sync();
+    Require(early[0] == 0x42 && early[3] == 0x42 && early[4] == 0x41, "a draw input bound in place saw a native write made after it was recorded");
+    Require(late[0] == 0x43 && late[3] == 0x43 && late[4] == 0x41, "a draw input bound in place after a native write missed it");
+    counters = Coherence::CurrentCounters();
+    Require(counters.leases == 2 && counters.leaseWaits == 1 && counters.liveProtections == 0, "in-place draw input leases: " + Coherence::Report());
     std::cout << "coherence input leases: ok\n";
     return 0;
 #endif
@@ -5034,6 +5221,16 @@ int coherenceResidencyTests(const Device& device, Recorder& recorder) {
     const auto loaded = *reinterpret_cast<volatile std::uint8_t*>(address + 0x8000);
     gpu.lock();
     Require(loaded == 0xa5 && !AnyDeviceResidentOverlaps(address, bytes), "a native load read host bytes under device-resident results");
+
+    {
+        auto shadow = std::make_shared<Buffer>(base, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::memset(shadow->Bytes().data(), 0x3c, bytes);
+        const auto generation = CollectWritesUncached(address, bytes);
+        NoteDeviceResident(base.device, address + 16, address + 0x1010, shadow, address, import->buffer, import->base, generation);
+        Require(!AnyDeviceResidentOverlaps(address, bytes), "device-resident results the guards cannot cover whole were kept on the device");
+        recorder.Sync();
+        Require(alias[16] == 0x3c && alias[0x100f] == 0x3c && alias[15] != 0x3c && alias[0x1010] != 0x3c, "device-resident results the guards cannot cover were not published in place of a copy-back");
+    }
 
     recorder.Sync();
     const auto counters = Coherence::CurrentCounters();
@@ -9336,6 +9533,7 @@ bool drawInputTwinTests(const Device& device, Recorder& recorder) {
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
             recorder.Sync();
+            recorder.WaitDeferredReleases();
             ClearCachedPipelines(context.device);
             GuestAllocations::Mutation mutation;
             mutation.Remove(block);
@@ -9441,6 +9639,7 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
             recorder.Sync();
+            recorder.WaitDeferredReleases();
             ClearCachedPipelines(context.device);
             {
                 GuestAllocations::Mutation mutation;
@@ -10793,6 +10992,7 @@ bool withResolveScene(const Device& device, Recorder& recorder, const std::funct
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
             recorder.Sync();
+            recorder.WaitDeferredReleases();
             ClearCachedPipelines(context.device);
             {
                 GuestAllocations::Mutation mutation;
@@ -10856,6 +11056,46 @@ bool withResolveScene(const Device& device, Recorder& recorder, const std::funct
 
 std::uint64_t revalidations(const ParallelResolveCounts& counts, ShaderResources::EpochProofVerdict verdict) {
     return counts.revalidations[static_cast<std::size_t>(verdict)];
+}
+
+bool stagedDrawBuildTests(const Device& device, Recorder& recorder) {
+    if (!StagedDrawBuilds()) {
+        std::cout << "skipped, the staged draw build test needs APS5_PARALLEL_RESOLVE=1 and APS5_STAGED_DRAW_BUILDS not 0\n";
+        return false;
+    }
+    return withResolveScene(device, recorder, [&](ResolveScene& scene) {
+        const auto& context = scene.context;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto before = ParallelResolveStatistics();
+        const auto first = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        const auto staged = ParallelResolveStatistics();
+        if (staged.stagedBuilt == before.stagedBuilt) {
+            std::cout << "skipped, the scene's first draw was not staged as a template miss\n";
+            return false;
+        }
+        Require(staged.stagedAdopted == before.stagedAdopted, "a staged draw build was adopted before its encode");
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *first);
+        scene.check("a draw whose build was staged on the side rendered other pixels");
+        const auto adopted = ParallelResolveStatistics();
+        Require(adopted.stagedAdopted - before.stagedAdopted == 1, "the staged draw build was not adopted at encode");
+        Require(!VerifyStagedDrawBuilds() || adopted.stagedVerified - before.stagedVerified == 1, "APS5_VERIFY_STAGED_DRAW_BUILDS checked no adopted build");
+        const auto second = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        const auto repeated = ParallelResolveStatistics();
+        const bool cached = repeated.resourcesResolved == adopted.resourcesResolved + 1;
+        Require(cached != (repeated.stagedBuilt == adopted.stagedBuilt + 1), "a draw repeating an adopted build was neither served by its cached template nor staged again");
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *second);
+        scene.check("a draw repeating an adopted build rendered other pixels");
+        Require(cached || ParallelResolveStatistics().stagedAdopted - adopted.stagedAdopted == 1, "a second staged build of the same draw was not adopted");
+        const auto discarded = ResolveDraw(context, scene.state, scene.indexed, scene.shaders);
+        static_cast<void>(discarded);
+        scene.clear();
+        Draw(context, scene.state, scene.indexed, scene.shaders);
+        scene.check("a serial draw after an unused staged build rendered other pixels");
+        std::cout << "staged draw build tests passed" << (VerifyStagedDrawBuilds() ? " (verified)" : "") << "\n";
+        return true;
+    });
 }
 
 bool parallelRevalidateTests(const Device& device, Recorder& recorder) {
@@ -10956,6 +11196,7 @@ bool parallelResolveTests(const Device& device, Recorder& recorder) {
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
             recorder.Sync();
+            recorder.WaitDeferredReleases();
             ClearCachedPipelines(context.device);
             {
                 GuestAllocations::Mutation mutation;
@@ -11412,6 +11653,9 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--parallel-revalidate-only") {
             return parallelRevalidateTests(device, recorder) ? 0 : 77;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--staged-draw-builds-only") {
+            return stagedDrawBuildTests(device, recorder) ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {
             pendingWriteSnapshotTests(device, recorder);
             return 0;
@@ -11478,6 +11722,8 @@ int main(int argc, char** argv) {
             directCompletionLabelTests(recorder);
             labelTests(recorder);
             lateLabelTests(recorder);
+            crossQueueLabelTests(device, recorder);
+            crossQueueRecordTests(device, recorder);
             largeLabelTests(recorder);
             std::cout << "Completion label storage and ordering tests passed\n";
             return 0;
@@ -11516,6 +11762,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--resident-buffer-mirrors-only") {
             if (!residentMirrorTests(device, recorder, true)) return 77;
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--store-runs-only") {
+            storeRunTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--resident-mirrors-only") {
