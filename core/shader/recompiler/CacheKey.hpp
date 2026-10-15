@@ -4,8 +4,10 @@
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 
 namespace ShaderRecompiler {
@@ -230,13 +232,30 @@ private:
         append(key, value.maxEvaluationOutputComponents);
     }
 
+    static void appendTargetFeatures(std::vector<std::uint64_t>& key, const SpirvTarget& value) {
+        struct ExpandedFeatures {
+            std::vector<std::uint32_t> capabilities;
+            std::vector<std::string> extensions;
+            std::vector<std::uint64_t> words;
+        };
+        struct ExpandedFeaturesStorage {};
+        auto& expanded = HostThreadLocal<ExpandedFeatures, ExpandedFeaturesStorage>();
+        if (expanded.words.empty() || !std::ranges::equal(expanded.capabilities, value.supportedCapabilities) || !std::ranges::equal(expanded.extensions, value.supportedExtensions, [](const std::string& kept, std::string_view current) { return kept == current; })) {
+            expanded.capabilities.assign(value.supportedCapabilities.begin(), value.supportedCapabilities.end());
+            expanded.extensions.assign(value.supportedExtensions.begin(), value.supportedExtensions.end());
+            expanded.words.clear();
+            append(expanded.words, value.supportedCapabilities);
+            append(expanded.words, value.supportedExtensions);
+        }
+        key.insert(key.end(), expanded.words.begin(), expanded.words.end());
+    }
+
     static void append(std::vector<std::uint64_t>& key, const SpirvTarget& value) {
         append(key, value.vulkanVersion);
         append(key, value.spirvVersion);
         append(key, value.subgroupSize);
         append(key, value.bdaAbiVersion);
-        append(key, value.supportedCapabilities);
-        append(key, value.supportedExtensions);
+        appendTargetFeatures(key, value);
         append(key, value.fragmentShaderBarycentricEnabled);
         append(key, value.maxWorkgroupSize);
         append(key, value.maxWorkgroupInvocations);
