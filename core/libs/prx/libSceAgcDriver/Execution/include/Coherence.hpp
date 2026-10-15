@@ -123,6 +123,7 @@ void SetProtectionBackend(ProtectionBackend backend);
 void SetMaterializer(Materializer materializer);
 std::uint64_t ProtectDeviceOwned(Interval range, Source source, Version version);
 void ReleaseDeviceOwned(std::uint64_t protection);
+bool ProtectionLive(std::uint64_t protection);
 void NoteLockedFault(Interval range);
 void SetLeaseWaiter(Materializer waiter);
 std::uint64_t AcquireReadLease(Interval range, Version version);

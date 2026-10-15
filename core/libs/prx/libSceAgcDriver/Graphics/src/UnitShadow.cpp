@@ -572,7 +572,7 @@ std::size_t PublishUnprotectedShadows(PublishReason reason) {
         anyOverlapping(registry, 0, std::numeric_limits<std::uint64_t>::max(), [&](const std::shared_ptr<UnitShadow>& shadow) {
             if (shadow->liveUnits == 0) return false;
             for (std::uint64_t unit = 0; unit < shadow->Units(); ++unit) {
-                if (!shadow->Live(unit) || shadow->protections[unit] != 0) continue;
+                if (!shadow->Live(unit) || Coherence::ProtectionLive(shadow->protections[unit])) continue;
                 const auto [begin, end] = shadow->UnitRange(unit);
                 if (end <= begin) continue;
                 if (!ranges.empty() && ranges.back().second == begin) ranges.back().second = end;
@@ -593,7 +593,7 @@ bool AnyUnprotectedShadow() {
     return anyOverlapping(registry, 0, std::numeric_limits<std::uint64_t>::max(), [&](const std::shared_ptr<UnitShadow>& shadow) {
         if (shadow->liveUnits == 0) return false;
         for (std::uint64_t unit = 0; unit < shadow->Units(); ++unit) {
-            if (shadow->Live(unit) && shadow->protections[unit] == 0) return true;
+            if (shadow->Live(unit) && !Coherence::ProtectionLive(shadow->protections[unit])) return true;
         }
         return false;
     });
@@ -835,7 +835,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;
                 shadow->versions[unit] = version != 0 ? version : Coherence::CurrentVersion();
-                if (Coherence::FaultOwnership() && shadow->protections[unit] == 0) {
+                if (Coherence::FaultOwnership() && !Coherence::ProtectionLive(shadow->protections[unit])) {
                     const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
                     if (unitEnd > unitBegin) shadow->protections[unit] = Coherence::ProtectDeviceOwned({unitBegin, unitEnd}, Coherence::Source::ShadowUnit, shadow->versions[unit]);
                 }

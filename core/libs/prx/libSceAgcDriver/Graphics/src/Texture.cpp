@@ -3436,7 +3436,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         pending.textures.push_back(this);
         BumpPendingSerial();
     }
-    if (Coherence::FaultOwnership() && accessProtection == 0 && guestBytes != 0) accessProtection = Coherence::ProtectDeviceOwned({descriptor.baseAddress, descriptor.baseAddress + guestBytes}, Coherence::Source::PendingImage, coherenceVersion);
+    if (Coherence::FaultOwnership() && !Coherence::ProtectionLive(accessProtection) && guestBytes != 0) accessProtection = Coherence::ProtectDeviceOwned({descriptor.baseAddress, descriptor.baseAddress + guestBytes}, Coherence::Source::PendingImage, coherenceVersion);
 }
 
 void StorageTexture::reconcilePending() {
@@ -3473,7 +3473,7 @@ std::size_t StorageTexture::FlushUnprotected(const char* reason) {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         for (auto* texture : pending.textures) {
-            if (texture->accessProtection == 0 && texture->guestBytes != 0) ranges.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
+            if (!Coherence::ProtectionLive(texture->accessProtection) && texture->guestBytes != 0) ranges.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
         }
     }
     std::size_t stored = 0;
@@ -3485,7 +3485,7 @@ bool StorageTexture::AnyUnprotectedPending() {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     for (auto* texture : pending.textures) {
-        if (texture->accessProtection == 0) return true;
+        if (!Coherence::ProtectionLive(texture->accessProtection)) return true;
     }
     return false;
 }
