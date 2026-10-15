@@ -506,6 +506,19 @@ target_link_libraries(agc_materialize_values_tests PRIVATE shader_recompiler_agc
 set_target_properties(agc_materialize_values_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_materialize_values_tests)
 
+add_test_executable(shader_spirv_interface_tests EXCLUDE_FROM_ALL
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler/tests/SpirvInterfaceTests.cpp
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler/SpirvBackend/src/SpirvModuleShape.cpp)
+target_include_directories(shader_spirv_interface_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler/SpirvBackend/include
+        ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR})
+target_compile_features(shader_spirv_interface_tests PRIVATE cxx_std_20)
+if(BUILD_TESTING)
+    set_target_properties(shader_spirv_interface_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME shader_spirv_interface COMMAND shader_spirv_interface_tests)
+    set_tests_properties(shader_spirv_interface PROPERTIES TIMEOUT 20)
+endif()
+
 add_test_executable(agc_compile_service_tests EXCLUDE_FROM_ALL tests/CompileService.cpp)
 target_include_directories(agc_compile_service_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_compile_service_tests PRIVATE shader_recompiler_agc_driver libc)

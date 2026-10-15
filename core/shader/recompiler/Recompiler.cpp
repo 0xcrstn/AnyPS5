@@ -48,6 +48,7 @@
 #include "SpirvBackend/include/SpirvBackend/SpirvEmitter.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
+#include "SpirvBackend/SpirvModuleShape.hpp"
 #endif
 #include "SpirvBackend/SpirvMemory/SpirvInputOutput.hpp"
 #include "Translation/include/Translation/InstructionTranslator.hpp"
@@ -699,6 +700,39 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
     shaderInfoCollector.Collect(program, inputInfo);
 }
 
+bool VerifyShaderEmission() {
+    static const bool verify = std::getenv("APS5_VERIFY_SHADER_EMISSION") != nullptr;
+    return verify;
+}
+
+void TraceShape(ShaderCompileTrace::Event& event, std::span<const std::uint32_t> words) {
+    const auto shape = DescribeSpirvShape(words);
+    event.Number("functions", shape.functions).Number("entry_words", shape.entryFunctionWords).Number("helper_words", shape.helperFunctionWords).Number("largest_helper_words", shape.largestHelperWords).Number("switches", shape.switches).Number("switch_targets", shape.switchTargets).Number("largest_switch_targets", shape.largestSwitchTargets).Number("calls", shape.functionCalls);
+}
+
+void VerifyEmission(const RecompileRequest& request, const IrProgram& program, const ShaderStageInputInfo& inputInfo, const CompiledBindingLayout& bindings, SpirvTargetOptions options, std::span<const std::uint32_t> produced) {
+    ShaderCompileTrace::Event event("verify.emission");
+    TraceRequest(event, request);
+    constexpr SpirvEmitter spirvEmitter;
+    const auto again = spirvEmitter.Emit(program, inputInfo, bindings, options);
+    if (!std::ranges::equal(again, produced)) throw std::runtime_error("APS5_VERIFY_SHADER_EMISSION: emitting shader 0x" + std::to_string(request.shader.codeAddress) + " again from the same program produced different SPIR-V");
+    options.sharedFloatFunctions = true;
+    const auto shared = spirvEmitter.Emit(program, inputInfo, bindings, options);
+    options.sharedFloatFunctions = false;
+    const auto inPlace = spirvEmitter.Emit(program, inputInfo, bindings, options);
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    static_cast<void>(ValidateAndOptimizeSpirv(shared, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, false));
+    static_cast<void>(ValidateAndOptimizeSpirv(inPlace, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, false));
+#endif
+    if (event.Active()) {
+        event.Number("shared_words", shared.size()).Number("in_place_words", inPlace.size());
+        const auto sharedShape = DescribeSpirvShape(shared);
+        const auto inPlaceShape = DescribeSpirvShape(inPlace);
+        event.Number("shared_functions", sharedShape.functions).Number("in_place_functions", inPlaceShape.functions).Number("shared_helper_words", sharedShape.helperFunctionWords).Number("in_place_helper_words", inPlaceShape.helperFunctionWords);
+    }
+    if (const auto difference = CompareSpirvInterfaces(inPlace, shared)) throw std::runtime_error("APS5_VERIFY_SHADER_EMISSION: shared float functions change the interface of shader 0x" + std::to_string(request.shader.codeAddress) + ": " + *difference);
+}
+
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program, bool consume = false) {
     InFlightIr inFlight(estimateProgramBytes(program));
     const auto inputInfo = RequestInputInfo(request);
@@ -729,7 +763,10 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program,
         ShaderCompileTrace::Event emitEvent(phase);
         TraceRequest(emitEvent, request);
         auto words = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
-        if (emitEvent.Active()) emitEvent.Flag("registration", targetOptions.registrationModules).Number("ir_bytes", estimateProgramBytes(program)).Number("spirv_words", words.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(std::span<const std::uint32_t>(words.data(), words.size())));
+        if (emitEvent.Active()) {
+            emitEvent.Flag("registration", targetOptions.registrationModules).Number("ir_bytes", estimateProgramBytes(program)).Number("spirv_words", words.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(std::span<const std::uint32_t>(words.data(), words.size())));
+            TraceShape(emitEvent, words);
+        }
         return words;
     };
     result.spirv = emit("emit.spirv");
@@ -740,6 +777,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program,
         targetOptions.registrationModules = false;
         result.spirv = emit("emit.spirv_unregistered");
     }
+    if (VerifyShaderEmission()) VerifyEmission(request, program, inputInfo, bindings, targetOptions, result.spirv.Words());
     result.registrationModule = registration;
     result.stencilReplaySafe = (request.shader.stage == ShaderStage::Vertex || stencilReplay) && StencilReplaySafe(program);
     if (stencilReplay) {
