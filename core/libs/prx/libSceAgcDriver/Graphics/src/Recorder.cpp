@@ -1695,6 +1695,22 @@ bool Recorder::ChunkedRecordingEnabled() {
     return ChunkedRecording::Enabled();
 }
 
+std::uint32_t Recorder::EmitWorkers() {
+    static const std::uint32_t workers = [] {
+        const char* value = std::getenv("APS5_EMIT_WORKERS");
+        return static_cast<std::uint32_t>(value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul);
+    }();
+    return workers;
+}
+
+EmitSlot Recorder::CutForEmit() {
+    throw std::logic_error("Recorder::CutForEmit: emit workers are not implemented yet (APS5_EMIT_WORKERS)");
+}
+
+void Recorder::PostEmitUnit(EmitUnit&&) {
+    throw std::logic_error("Recorder::PostEmitUnit: emit workers are not implemented yet (APS5_EMIT_WORKERS)");
+}
+
 bool Recorder::ChunkPass() {
     if (chunks == nullptr) return false;
     if (GpuTimingEnabled()) {

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/EmitUnit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommandSink.hpp"
 #include <unordered_map>
@@ -137,6 +138,9 @@ public:
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     std::uint64_t OpenPassSerial() const;
     static bool ChunkedRecordingEnabled();
+    static std::uint32_t EmitWorkers();
+    EmitSlot CutForEmit();
+    void PostEmitUnit(EmitUnit&& unit);
     bool ChunkPass();
     CommandSink OpenChunk(const Context& drawContext, const ChunkInheritance& inheritance, const ChunkDraw& draw);
     CommandSink PassSink(const Context& drawContext, const ChunkDraw& draw);

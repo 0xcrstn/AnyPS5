@@ -823,51 +823,85 @@ ChunkInheritance Pipeline::Inheritance(const Framebuffer& framebuffer) const {
 }
 
 void Pipeline::BeginPass(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, bool secondary) const {
+    RecordPassBegin(context, commands, DescribePass(framebuffer, extent, state), secondary);
+}
+
+EmitPassBegin Pipeline::DescribePass(const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const {
+    EmitPassBegin begin;
+    begin.area = {{0, 0}, extent};
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
         Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
-        std::vector<VkRenderingAttachmentInfoKHR> colors(colorSlots.size(), VkRenderingAttachmentInfoKHR{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR});
+        begin.rendering = true;
+        begin.layers = state.renderLayers;
+        begin.colorLayout = attachmentLayout;
+        begin.colorViews.assign(colorSlots.size(), VK_NULL_HANDLE);
         for (std::size_t slot = 0; slot < colorSlots.size(); ++slot) {
-            if (colorSlots[slot] == ~0u) continue;
-            colors[slot].imageView = views[colorSlots[slot]];
-            colors[slot].imageLayout = attachmentLayout;
+            if (colorSlots[slot] != ~0u) begin.colorViews[slot] = views[colorSlots[slot]];
+        }
+        if (depthFormat != VK_FORMAT_UNDEFINED) {
+            begin.depthView = views.back();
+            begin.stencil = HasStencil(depthFormat);
+        }
+        return begin;
+    }
+    begin.renderPass = renderPass;
+    begin.framebuffer = framebuffer.Handle();
+    if (sampleLocationsEnabled) {
+        begin.sampleLocations = true;
+        begin.samples = static_cast<VkSampleCountFlagBits>(state.samples);
+        begin.sampleGrid = SampleLocationGrid(state);
+        const auto locations = SampleLocations(state);
+        const auto count = std::min<std::size_t>(locations.size(), state.samples * begin.sampleGrid.width * begin.sampleGrid.height);
+        begin.locations.assign(locations.begin(), locations.begin() + static_cast<std::ptrdiff_t>(count));
+        begin.depthAttachment = static_cast<std::uint32_t>(state.colors.size());
+        begin.depthInitialLocations = state.depth.has_value();
+    }
+    return begin;
+}
+
+void RecordPassBegin(const Context& context, VkCommandBuffer commands, const EmitPassBegin& begin, bool secondary) {
+    if (begin.rendering) {
+        std::vector<VkRenderingAttachmentInfoKHR> colors(begin.colorViews.size(), VkRenderingAttachmentInfoKHR{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR});
+        for (std::size_t slot = 0; slot < begin.colorViews.size(); ++slot) {
+            if (begin.colorViews[slot] == VK_NULL_HANDLE) continue;
+            colors[slot].imageView = begin.colorViews[slot];
+            colors[slot].imageLayout = begin.colorLayout;
             colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         }
         VkRenderingAttachmentInfoKHR depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
-        if (depthFormat != VK_FORMAT_UNDEFINED) {
-            depth.imageView = views.back();
+        if (begin.depthView != VK_NULL_HANDLE) {
+            depth.imageView = begin.depthView;
             depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         }
         VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
         if (secondary) rendering.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT_KHR;
-        rendering.renderArea = {{0, 0}, extent};
-        rendering.layerCount = state.renderLayers;
+        rendering.renderArea = begin.area;
+        rendering.layerCount = begin.layers;
         rendering.colorAttachmentCount = static_cast<std::uint32_t>(colors.size());
         rendering.pColorAttachments = colors.empty() ? nullptr : colors.data();
-        if (depthFormat != VK_FORMAT_UNDEFINED) rendering.pDepthAttachment = &depth;
-        if (depthFormat != VK_FORMAT_UNDEFINED && HasStencil(depthFormat)) rendering.pStencilAttachment = &depth;
+        if (begin.depthView != VK_NULL_HANDLE) rendering.pDepthAttachment = &depth;
+        if (begin.depthView != VK_NULL_HANDLE && begin.stencil) rendering.pStencilAttachment = &depth;
         context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
         return;
     }
-    VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    begin.renderPass = renderPass;
-    begin.framebuffer = framebuffer.Handle();
-    begin.renderArea = {{0, 0}, extent};
-    const auto locations = SampleLocations(state);
-    const auto grid = SampleLocationGrid(state);
-    const VkSampleLocationsInfoEXT info{VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT, nullptr, static_cast<VkSampleCountFlagBits>(state.samples), grid, state.samples * grid.width * grid.height, locations.data()};
-    const VkAttachmentSampleLocationsEXT initial{static_cast<std::uint32_t>(state.colors.size()), info};
-    const VkSubpassSampleLocationsEXT post{0, info};
+    VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    info.renderPass = begin.renderPass;
+    info.framebuffer = begin.framebuffer;
+    info.renderArea = begin.area;
+    const VkSampleLocationsInfoEXT locations{VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT, nullptr, begin.samples, begin.sampleGrid, static_cast<std::uint32_t>(begin.locations.size()), begin.locations.data()};
+    const VkAttachmentSampleLocationsEXT initial{begin.depthAttachment, locations};
+    const VkSubpassSampleLocationsEXT post{0, locations};
     VkRenderPassSampleLocationsBeginInfoEXT sampleLocations{VK_STRUCTURE_TYPE_RENDER_PASS_SAMPLE_LOCATIONS_BEGIN_INFO_EXT};
-    sampleLocations.attachmentInitialSampleLocationsCount = state.depth ? 1 : 0;
-    sampleLocations.pAttachmentInitialSampleLocations = state.depth ? &initial : nullptr;
+    sampleLocations.attachmentInitialSampleLocationsCount = begin.depthInitialLocations ? 1 : 0;
+    sampleLocations.pAttachmentInitialSampleLocations = begin.depthInitialLocations ? &initial : nullptr;
     sampleLocations.postSubpassSampleLocationsCount = 1;
     sampleLocations.pPostSubpassSampleLocations = &post;
-    if (sampleLocationsEnabled) begin.pNext = &sampleLocations;
-    context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, secondary ? VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS : VK_SUBPASS_CONTENTS_INLINE);
+    if (begin.sampleLocations) info.pNext = &sampleLocations;
+    context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &info, secondary ? VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS : VK_SUBPASS_CONTENTS_INLINE);
 }
 
 namespace {
