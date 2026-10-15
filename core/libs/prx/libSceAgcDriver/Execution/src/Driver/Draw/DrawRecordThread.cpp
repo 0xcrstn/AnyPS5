@@ -367,13 +367,25 @@ void Driver::noteRecordHistory(std::uint64_t ticket, const std::shared_ptr<DrawR
     recordHistory().Note(ticket, std::shared_ptr<const DrawRecordEffects>(result, &result->effects));
 }
 
+std::uint64_t Driver::FrozenIndirectRedos() {
+    return drawRecordCounters().orderedRedos[static_cast<std::size_t>(FrozenFallback::Indirect)].load(std::memory_order_relaxed);
+}
+
+bool Driver::freezeIndirectDraws() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_FREEZE_INDIRECT_DRAWS");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
 FrozenFallback Driver::frozenFallback(std::span<const std::uint32_t> packet) {
     static const bool dumps = [] {
         const char* shaders = std::getenv("APS5_DUMP_DRAW_SHADERS");
         const char* slot = std::getenv("APS5_DUMP_DRAW_SLOT1");
         return (shaders != nullptr && std::strtoull(shaders, nullptr, 16) != 0) || (slot != nullptr && std::strtoull(slot, nullptr, 16) != 0);
     }();
-    if (Pm4::IndirectDrawOpcode((packet[0] >> 8u) & 0xffu)) return FrozenFallback::Indirect;
+    if (Pm4::IndirectDrawOpcode((packet[0] >> 8u) & 0xffu) && !freezeIndirectDraws()) return FrozenFallback::Indirect;
     if (!bindingPlan()) return FrozenFallback::DrawCache;
     if (dumps || ShaderRecompiler::DebugProbeActive()) return FrozenFallback::Debug;
     if (device.Load() == nullptr) return FrozenFallback::NoDevice;

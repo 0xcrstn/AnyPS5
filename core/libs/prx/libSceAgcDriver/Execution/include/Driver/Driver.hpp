@@ -85,6 +85,7 @@ public:
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request);
     DrawEntryCounters DrawCacheCounters();
     BindingPlanCounters PlanCounters();
+    std::uint64_t FrozenIndirectRedos();
     DispatchCacheTotals DispatchCacheCounters();
     struct DispatchCacheFootprint {
         std::size_t entries = 0;
@@ -277,6 +278,7 @@ private:
     static void noteRecordHistory(std::uint64_t ticket, const std::shared_ptr<DrawRecordResult>& result);
     static void recordDrawInputs(const DrawInputs& inputs, DrawRecordResult& result, const std::shared_ptr<VulkanDevice>& localDevice);
     void noteDrawInputWriters(const DrawInputs& inputs, std::uint32_t queue);
+    static bool freezeIndirectDraws();
     FrozenFallback frozenFallback(std::span<const std::uint32_t> packet);
     DrawVerdict freezeDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
     static bool prepareDispatches();
