@@ -49,6 +49,10 @@ void ShaderResources::UseMirrors(Recorder& recorder) const {
     if (!bufferMirrors.empty()) Graphics::UseMirrors(recorder, bufferMirrors);
 }
 
+bool ShaderResources::HasPlacements() const {
+    return bda != nullptr && bda->HasPlacements();
+}
+
 void ShaderResources::RecordPlacementCopyBack(Recorder&, VkCommandBuffer commands) const {
     if (bda == nullptr || !bda->HasPlacements()) return;
     bda->RecordPlacementCopyBack(context, commands);

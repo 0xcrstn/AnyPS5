@@ -1652,7 +1652,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                     auto& table = tableStage(shader);
                     Require(table.mapAllocation == std::numeric_limits<std::size_t>::max(), "a stage binds two image table maps");
                     table.map = binding.guestDescriptor;
-                    allocations.push_back({0, size, false, std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT), ShaderRecompiler::DescriptorRole::ImageTableMap});
+                    allocations.push_back({0, size, false, std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, UploadMemoryProperties(context, size)), ShaderRecompiler::DescriptorRole::ImageTableMap});
                     table.mapAllocation = allocations.size() - 1u;
                     bindings.push_back({{binding.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, flags, nullptr}, {allocations.size() - 1u}});
                     continue;
@@ -3920,8 +3920,9 @@ std::size_t ShaderResources::addDataBuffer(std::span<const std::uint32_t> words)
     const auto size = words.size() * sizeof(std::uint32_t);
     Require(size <= context.limits.maxStorageBufferRange, "shader data buffer exceeds descriptor range limit");
     const bool refreshable = TemplateDataRefresh() && size <= MaxRefreshBytes;
-    auto buffer = std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (refreshable ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u));
-    std::memcpy(buffer->Bytes().data(), words.data(), size);
+    constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    auto buffer = std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (refreshable ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u), refreshable ? UploadMemoryProperties(context, size) : host);
+    WriteUpload(*buffer, 0, words.data(), size);
     Allocation allocation{0, size, false, std::move(buffer)};
     if (refreshable) allocation.dataWords.assign(words.begin(), words.end());
     allocations.push_back(std::move(allocation));
@@ -4602,7 +4603,7 @@ void ShaderResources::finishImageTables() {
         map[Abi::HeaderPoisonCount] = static_cast<std::uint32_t>(table.poison.size());
         auto& allocation = allocations.at(table.mapAllocation);
         Require(allocation.buffer != nullptr && allocation.size == map.size() * sizeof(std::uint32_t), "image table map buffer disagrees with the map");
-        std::memcpy(allocation.buffer->Bytes().data(), map.data(), allocation.size);
+        WriteUpload(*allocation.buffer, 0, map.data(), allocation.size);
         faults.push_back({IrStage(table.stage), table.program->imageTableShader, table.poison, table.messages});
         ranges.insert(ranges.end(), table.program->imageTableRanges.begin(), table.program->imageTableRanges.end());
     }

@@ -1971,13 +1971,12 @@ bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, R
 
 std::shared_ptr<Buffer> meshArgumentBuffer(const Context& context, std::span<const std::uint32_t> restartTable) {
     const auto tableBytes = restartTable.empty() ? 0u : sizeof(std::uint32_t) * (restartTable.size() + 1u);
-    auto arguments = std::make_shared<Buffer>(context, ShaderRecompiler::MeshArgumentBytes + tableBytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    auto arguments = std::make_shared<Buffer>(context, ShaderRecompiler::MeshArgumentBytes + tableBytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, UploadMemoryProperties(context, ShaderRecompiler::MeshArgumentBytes + tableBytes));
     if (!restartTable.empty()) {
         Require(restartTable.size() <= std::numeric_limits<std::uint32_t>::max(), "mesh restart table is too large");
         const auto length = static_cast<std::uint32_t>(restartTable.size());
-        auto* bytes = arguments->Bytes().data() + ShaderRecompiler::MeshArgumentBytes;
-        std::memcpy(bytes, &length, sizeof(length));
-        std::memcpy(bytes + sizeof(length), restartTable.data(), restartTable.size_bytes());
+        WriteUpload(*arguments, ShaderRecompiler::MeshArgumentBytes, &length, sizeof(length));
+        WriteUpload(*arguments, ShaderRecompiler::MeshArgumentBytes + sizeof(length), restartTable.data(), restartTable.size_bytes());
     }
     return arguments;
 }
@@ -1985,7 +1984,7 @@ std::shared_ptr<Buffer> meshArgumentBuffer(const Context& context, std::span<con
 std::shared_ptr<Buffer> directMeshArguments(const Context& context, const Pm4::DrawParameters& draw, std::span<const std::uint32_t> restartTable) {
     auto arguments = meshArgumentBuffer(context, restartTable);
     const MeshArguments resolved{0u, 0u, 0u, draw.indexCount, 0u};
-    std::memcpy(arguments->Bytes().data(), &resolved, sizeof(resolved));
+    WriteUpload(*arguments, 0, &resolved, sizeof(resolved));
     return arguments;
 }
 
@@ -2003,7 +2002,7 @@ std::shared_ptr<Buffer> recordMeshArguments(const Context& context, VkCommandBuf
     }
     const auto record = !indirect.records.empty() ? indirect.records.front() : Pm4::ReadDrawArguments(*args, 0);
     const auto resolved = ResolveMeshArguments(record, rules);
-    std::memcpy(arguments->Bytes().data(), &resolved, sizeof(resolved));
+    WriteUpload(*arguments, 0, &resolved, sizeof(resolved));
     return arguments;
 }
 
@@ -2370,7 +2369,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
-    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
+    const auto readOnlyAddressPasses = ReadOnlyAddressPassesSetting();
+    const bool knownAddressWrites = unknownMemory && readOnlyAddressPasses != ReadOnlyAddressPasses::Off && resources.KnownAddressWrites();
+    const bool unknownWrites = unknownMemory && !(knownAddressWrites && readOnlyAddressPasses == ReadOnlyAddressPasses::On);
+    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownWrites, knownAddressWrites && unknownWrites};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     parts.lap(RecordAccess);
     resources.UseMirrors(*recorder);

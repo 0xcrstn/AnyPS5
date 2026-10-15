@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -83,7 +84,13 @@ struct DescriptorRejected : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-enum class DeviceMemoryKind : std::uint8_t { Buffer, Texture, StorageTexture, Count };
+enum class DeviceMemoryKind : std::uint8_t { Buffer, Texture, StorageTexture, DepthSurface, MultisampleTarget, UnitShadow, TextureProxy, PooledBuffer, HostImport, RenderTarget, Placeholder, Presentation, Upload, Count };
+
+inline const char* DeviceMemoryKindName(DeviceMemoryKind kind) {
+    static constexpr const char* names[] = {"device buffers", "textures", "storage textures", "depth surfaces", "multisample targets", "unit shadows", "texture proxies", "pooled buffers", "host imports", "render targets", "placeholders", "presentation", "uploads"};
+    static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(DeviceMemoryKind::Count));
+    return names[static_cast<std::size_t>(kind)];
+}
 
 struct DeviceMemoryUse {
     std::uint64_t bytes = 0;
@@ -109,12 +116,58 @@ public:
         return {entry.bytes.load(std::memory_order_relaxed), entry.allocations.load(std::memory_order_relaxed)};
     }
 
+    static void Track(VkDeviceMemory memory, DeviceMemoryKind kind, bool host, std::uint64_t bytes) {
+        if (memory == VK_NULL_HANDLE) return;
+        auto& tracked = trackedMemory();
+        std::lock_guard lock(tracked.mutex);
+        const auto [it, inserted] = tracked.entries.try_emplace(memory, TrackedMemory{kind, host, bytes});
+        if (!inserted) {
+            Remove(it->second.kind, it->second.host, it->second.bytes);
+            it->second = {kind, host, bytes};
+        }
+        Add(kind, host, bytes);
+    }
+
+    static void Untrack(VkDeviceMemory memory) {
+        if (memory == VK_NULL_HANDLE) return;
+        auto& tracked = trackedMemory();
+        std::lock_guard lock(tracked.mutex);
+        const auto it = tracked.entries.find(memory);
+        if (it == tracked.entries.end()) return;
+        Remove(it->second.kind, it->second.host, it->second.bytes);
+        tracked.entries.erase(it);
+    }
+
+    static std::string Summary(bool host) {
+        std::string text;
+        for (std::size_t kind = 0; kind < Kinds; ++kind) {
+            const auto use = Live(static_cast<DeviceMemoryKind>(kind), host);
+            if (use.allocations == 0) continue;
+            if (!text.empty()) text += ", ";
+            text += std::string(DeviceMemoryKindName(static_cast<DeviceMemoryKind>(kind))) + " " + std::to_string(use.bytes >> 20u) + " MiB in " + std::to_string(use.allocations);
+        }
+        return text.empty() ? std::string("nothing") : text;
+    }
+
 private:
     struct Entry {
         std::atomic<std::uint64_t> bytes{0};
         std::atomic<std::uint64_t> allocations{0};
     };
     static constexpr std::size_t Kinds = static_cast<std::size_t>(DeviceMemoryKind::Count);
+    struct TrackedMemory {
+        DeviceMemoryKind kind;
+        bool host;
+        std::uint64_t bytes;
+    };
+    struct Tracked {
+        std::mutex mutex;
+        std::unordered_map<VkDeviceMemory, TrackedMemory> entries;
+    };
+    static Tracked& trackedMemory() {
+        static Tracked tracked;
+        return tracked;
+    }
     static std::size_t index(DeviceMemoryKind kind, bool host) { return static_cast<std::size_t>(kind) * 2 + (host ? 1 : 0); }
     static Entry* entries() {
         static Entry table[Kinds * 2];
@@ -386,10 +439,8 @@ struct Context {
             const auto count = placements.fetch_add(1) + 1;
             const auto total = placedBytes.fetch_add(bytes) + bytes;
             if (count <= 5 || (count & (count - 1)) == 0) {
-                const auto buffers = DeviceMemoryPlacements::Live(DeviceMemoryKind::Buffer, true);
-                const auto textures = DeviceMemoryPlacements::Live(DeviceMemoryKind::Texture, true);
-                const auto storage = DeviceMemoryPlacements::Live(DeviceMemoryKind::StorageTexture, true);
-                std::fprintf(stderr, "[gpu] %s: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory type %u; %llu placements of any kind since start-up, %llu MiB including freed ones; in host memory now: device buffers %llu MiB in %llu, textures %llu MiB in %llu, storage textures %llu MiB in %llu\n", what, heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), i, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u), static_cast<unsigned long long>(buffers.bytes >> 20u), static_cast<unsigned long long>(buffers.allocations), static_cast<unsigned long long>(textures.bytes >> 20u), static_cast<unsigned long long>(textures.allocations), static_cast<unsigned long long>(storage.bytes >> 20u), static_cast<unsigned long long>(storage.allocations));
+                const auto placed = DeviceMemoryPlacements::Summary(true);
+                std::fprintf(stderr, "[gpu] %s: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory type %u; %llu placements of any kind since start-up, %llu MiB including freed ones; in host memory now: %s\n", what, heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), i, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u), placed.c_str());
             }
             return i;
         }

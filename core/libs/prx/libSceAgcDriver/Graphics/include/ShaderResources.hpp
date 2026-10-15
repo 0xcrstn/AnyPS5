@@ -280,6 +280,9 @@ public:
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
+    bool KnownAddressWrites() const { return usesBda && bdaReadOnly && !guestMemory.HasCopiedWrites(); }
+    bool HasPlacements() const;
+    bool DispatchEffectsKnown() const { return tableStages.empty() && !guestMemory.HasCopiedWrites() && !HasPlacements(); }
     void UseMirrors(Recorder& recorder) const;
     void RecordPlacementCopyBack(Recorder& recorder, VkCommandBuffer commands) const;
     void PublishResidentReads(Recorder& recorder) const;
