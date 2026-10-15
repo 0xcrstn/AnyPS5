@@ -5003,6 +5003,133 @@ int coherenceResidencyTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
+int coherenceLazyReleaseTests(const Device& device, Recorder& recorder) {
+#ifndef _WIN32
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+    std::cout << "skipped, guest access protection is Windows only\n";
+    return 77;
+#else
+    using namespace AgcDriver::GuestMemory;
+    namespace Coherence = AgcDriver::Coherence;
+    const auto& base = device.GetContext();
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 2 * unit;
+    std::unique_lock gpu(GpuMutex());
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared release section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    struct Release {
+        void* block;
+        ~Release() {
+            Coherence::SetLazyReleaseModeForTests(Coherence::Mode::Reference);
+            Coherence::SetFaultsModeForTests(Coherence::Mode::Reference);
+            Coherence::ResetForTests();
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the release block refused or compared: not tested\n";
+        return 77;
+    }
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetMaterializer([](Coherence::Interval range) { StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin)); });
+    Coherence::SetLazyReleaseModeForTests(Coherence::Mode::Verify);
+    Coherence::ResetForTests();
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    const auto create = [&](std::uint64_t at) {
+        GuestTextureResource resource{};
+        resource.baseAddress = at;
+        resource.width = 128;
+        resource.height = 128;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kLinear;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        Require(DescribeSurface(resource).guestBytes == unit, "a release image does not fill its 64 KiB block");
+        return StorageTexture::Create(context, detiler, resource, 0);
+    };
+    auto covered = create(address);
+    auto uncovered = create(address + unit);
+    const auto paint = [&](const std::shared_ptr<StorageTexture>& image, std::array<float, 4> color, bool protect) {
+        Coherence::SetFaultsModeForTests(protect ? Coherence::Mode::New : Coherence::Mode::Reference);
+        const VkClearColorValue value{{color[0], color[1], color[2], color[3]}};
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+        Coherence::SetFaultsModeForTests(Coherence::Mode::New);
+    };
+    const auto* words = static_cast<const std::uint8_t*>(block);
+    paint(covered, {1.0f, 0.0f, 0.0f, 1.0f}, true);
+    Require(Coherence::CurrentCounters().liveProtections == 1, "the covered image was not protected: " + Coherence::Report());
+    const std::array<std::optional<PublishScope>, 3> flips{std::nullopt, PublishScope::Whole, PublishScope::None};
+    std::uint8_t shade = 0x20;
+    for (const auto& flip : flips) {
+        const auto value = static_cast<float>(shade) / 255.0f;
+        paint(uncovered, {value, value, value, 1.0f}, false);
+        Require(StorageTexture::AnyUnprotectedPending(), "the uncovered image is protected");
+        bool presented = false;
+        Require(StorageTexture::PresentThenStore(flip, [&] {
+            presented = true;
+            return true;
+        }), "the flip did not present");
+        Require(presented, "the flip skipped its present");
+        recorder.Sync();
+        Require(StorageTexture::FindPending(address, unit) == covered, "a lazy flip stored a protected image");
+        Require(StorageTexture::FindPending(address + unit, unit) == nullptr, "a lazy flip left an unprotected image pending");
+        Require(words[unit] == shade && words[unit + 1] == shade && words[unit + 3] == 0xff, "a lazy flip did not store the unprotected image's results");
+        shade = static_cast<std::uint8_t>(shade + 0x20);
+    }
+    gpu.unlock();
+    const auto loaded = *reinterpret_cast<volatile std::uint32_t*>(address + 0x1230);
+    gpu.lock();
+    Require(loaded == 0xff0000ffu, "a native load after a lazy flip read stale bytes under the protected image");
+    Require(StorageTexture::FindPending(address, unit) == nullptr, "a native load left the protected image pending");
+    recorder.Sync();
+    const auto counters = Coherence::CurrentCounters();
+    Require(counters.uncoveredReleases == 0 && counters.liveProtections == 0 && counters.faultsResolved == 1, "lazy release: " + Coherence::Report());
+    std::cout << "coherence lazy release: ok\n";
+    return 0;
+#endif
+}
+
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -10316,6 +10443,17 @@ int main(int argc, char** argv) {
             }
             gpu.unlock();
             const auto result = coherenceResidencyTests(device, recorder);
+            gpu.lock();
+            return result;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--coherence-lazy-release-only") {
+            if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, unit shadows or host imports are unavailable
+";
+                return 77;
+            }
+            gpu.unlock();
+            const auto result = coherenceLazyReleaseTests(device, recorder);
             gpu.lock();
             return result;
         }

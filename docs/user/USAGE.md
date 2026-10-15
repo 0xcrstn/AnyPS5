@@ -212,6 +212,8 @@ Three switches take `0` (the default), `1` or `verify`; any other value stops th
 
 `APS5_COHERENCE_RESIDENCY=1` protects the guest memory under device-resident buffer results (`APS5_LAZY_STAGING_OUT`) the same way. The title's first load or store there publishes those results into guest memory and waits for them before it proceeds. A CPU store over such results then keeps the device bytes around it instead of reaching the unsupported publish after a CPU store. `verify` stops the title when the protection is refused or does not cover whole pages. Windows only.
 
+`APS5_COHERENCE_LAZY_RELEASE=1` makes labels and flips store only the pending results whose memory the native protection does not cover. Protected results stay on the GPU until something reads them, and the title's own CPU accesses resolve them when they happen. Every `APS5_STORE_AT_FLIP` value then behaves the same, and `APS5_STORE_AT_LABEL=1` still stores everything. `verify` stops the title when a label or flip leaves results that are neither stored nor protected. The switch needs `APS5_COHERENCE_FAULTS`, and `APS5_COHERENCE_RESIDENCY` too when `APS5_LAZY_STAGING_OUT` is on; without them the title stops at start.
+
 ### Tracing system library calls
 
 Windows only. An executable converted with `--trace-imports` records the calls it makes to the libraries named in `APS5_TRACE_CALLS`, a comma-separated list such as `libkernel,libSceSaveData`, or `all`. Without the variable nothing is recorded. The crash and abort reports then end with the last 64 calls: sequence number, thread, library, import name as the executable imports it (a NID) and the caller's address. They are followed by the 32 most called imports since start-up, with their number of calls.

@@ -274,6 +274,8 @@ public:
     static bool StoreForPointerAccess(std::uint64_t address, std::size_t bytes, bool writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt);
     static void AuditPointerReads(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt);
     static void MaterializeForNativeAccess(std::uint64_t address, std::size_t bytes);
+    static std::size_t FlushUnprotected(const char* reason);
+    static bool AnyUnprotectedPending();
     // For the [hooksync] recorded-store line: images a FlushPending stored after a hook skip of
     // theirs (AccessKeptByCpu), of which by the hook for the same read site as the last skip; 10 s deltas.
     struct HookSkipCounts {

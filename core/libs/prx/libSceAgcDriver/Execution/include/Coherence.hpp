@@ -20,16 +20,19 @@ Mode DirectoryMode();
 Mode FaultsMode();
 Mode InputLeasesMode();
 Mode ResidencyMode();
+Mode LazyReleaseMode();
 void SetModesForTests(Mode audit, Mode ordering, Mode directory);
 void SetFaultsModeForTests(Mode faults);
 void SetInputLeasesModeForTests(Mode leases);
 void SetResidencyModeForTests(Mode residency);
+void SetLazyReleaseModeForTests(Mode release);
 bool Tracking();
 bool Ordering();
 bool Canonicalizing();
 bool FaultOwnership();
 bool InputLeases();
 bool Residency();
+bool LazyRelease();
 
 using Version = std::uint64_t;
 
@@ -94,6 +97,7 @@ std::optional<Writer> NewerWriter(Interval destination, Version source);
 bool CheckPublication(Source source, Version sourceVersion, Interval destination, const char* reason);
 bool CheckRead(Source newer, Version newerVersion, Interval range, const char* reader);
 void CheckDrained(bool pendingImages, bool liveShadows, const char* where, bool writeBacksOrdered = true);
+void CheckReleaseCovered(bool uncoveredImages, bool uncoveredShadows, const char* where);
 
 struct Release {
     std::uint32_t queue = 0;
@@ -145,6 +149,7 @@ struct Counters {
     std::uint64_t liveProtections = 0;
     std::uint64_t leases = 0;
     std::uint64_t leaseWaits = 0;
+    std::uint64_t uncoveredReleases = 0;
 };
 
 Counters CurrentCounters();

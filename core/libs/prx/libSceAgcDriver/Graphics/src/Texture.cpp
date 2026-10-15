@@ -3457,6 +3457,29 @@ void StorageTexture::settleProtection() {
     else Coherence::ReleaseDeviceOwned(protection);
 }
 
+std::size_t StorageTexture::FlushUnprotected(const char* reason) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        for (auto* texture : pending.textures) {
+            if (texture->accessProtection == 0 && texture->guestBytes != 0) ranges.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
+        }
+    }
+    std::size_t stored = 0;
+    for (const auto& [begin, end] : ranges) stored += FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, reason, PublishScope::Whole) ? 1 : 0;
+    return stored + PublishUnprotectedShadows(PublishReasonFor(reason));
+}
+
+bool StorageTexture::AnyUnprotectedPending() {
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    for (auto* texture : pending.textures) {
+        if (texture->accessProtection == 0) return true;
+    }
+    return false;
+}
+
 void StorageTexture::MaterializeForNativeAccess(std::uint64_t address, std::size_t bytes) {
     if (GuestMemory::GpuMutex().HeldByThisThread()) Coherence::NoteLockedFault({address, address + bytes});
     std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -3859,6 +3882,13 @@ std::optional<PublishScope> StorageTexture::StoreAtFlipRequested(const char* val
 }
 
 bool StorageTexture::PresentThenStore(std::optional<PublishScope> storeAtFlip, const std::function<bool()>& present) {
+    if (Coherence::LazyRelease()) {
+        FlushDumpSelected("flip");
+        const bool presented = present();
+        static_cast<void>(FlushUnprotected("flip"));
+        Coherence::CheckReleaseCovered(AnyUnprotectedPending(), AnyUnprotectedShadow(), "flip");
+        return presented;
+    }
     if (!storeAtFlip) FlushDumpSelected("flip");
     const bool presented = present();
     if (storeAtFlip) FlushAllPending("flip", *storeAtFlip);

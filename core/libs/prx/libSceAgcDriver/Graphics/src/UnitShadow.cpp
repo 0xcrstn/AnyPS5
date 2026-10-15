@@ -563,6 +563,42 @@ bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>
     return false;
 }
 
+std::size_t PublishUnprotectedShadows(PublishReason reason) {
+    if (!UnitShadowEnabled()) return 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    {
+        auto& registry = Registry();
+        std::lock_guard lock(registry.mutex);
+        anyOverlapping(registry, 0, std::numeric_limits<std::uint64_t>::max(), [&](const std::shared_ptr<UnitShadow>& shadow) {
+            if (shadow->liveUnits == 0) return false;
+            for (std::uint64_t unit = 0; unit < shadow->Units(); ++unit) {
+                if (!shadow->Live(unit) || shadow->protections[unit] != 0) continue;
+                const auto [begin, end] = shadow->UnitRange(unit);
+                if (end <= begin) continue;
+                if (!ranges.empty() && ranges.back().second == begin) ranges.back().second = end;
+                else ranges.emplace_back(begin, end);
+            }
+            return false;
+        });
+    }
+    std::size_t published = 0;
+    for (const auto& [begin, end] : ranges) published += PublishShadow(begin, static_cast<std::size_t>(end - begin), PublishScope::Whole, reason);
+    return published;
+}
+
+bool AnyUnprotectedShadow() {
+    if (!UnitShadowEnabled()) return false;
+    auto& registry = Registry();
+    std::lock_guard lock(registry.mutex);
+    return anyOverlapping(registry, 0, std::numeric_limits<std::uint64_t>::max(), [&](const std::shared_ptr<UnitShadow>& shadow) {
+        if (shadow->liveUnits == 0) return false;
+        for (std::uint64_t unit = 0; unit < shadow->Units(); ++unit) {
+            if (shadow->Live(unit) && shadow->protections[unit] == 0) return true;
+        }
+        return false;
+    });
+}
+
 std::size_t ForgetPublishedShadows(std::uint64_t address, std::size_t bytes) {
     if (!UnitShadowEnabled() || bytes == 0) return 0;
     const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;

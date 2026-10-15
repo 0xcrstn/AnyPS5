@@ -67,6 +67,7 @@ struct State {
     std::size_t readsReported = 0;
     std::size_t releasesReported = 0;
     std::size_t remapsReported = 0;
+    std::size_t uncoveredReported = 0;
     std::map<std::uint32_t, Version> recordedByQueue;
     std::map<std::uint32_t, std::map<std::uint32_t, Version>> imported;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -181,6 +182,13 @@ std::atomic<bool> leasesOverridden{false};
 std::atomic<Mode> overrideLeases{Mode::Reference};
 std::atomic<bool> residencyOverridden{false};
 std::atomic<Mode> overrideResidency{Mode::Reference};
+std::atomic<bool> releaseOverridden{false};
+std::atomic<Mode> overrideRelease{Mode::Reference};
+
+Mode EnvironmentRelease() {
+    static const Mode release = ParseMode("APS5_COHERENCE_LAZY_RELEASE", std::getenv("APS5_COHERENCE_LAZY_RELEASE"));
+    return release;
+}
 
 Mode EnvironmentResidency() {
     static const Mode residency = ParseMode("APS5_COHERENCE_RESIDENCY", std::getenv("APS5_COHERENCE_RESIDENCY"));
@@ -482,6 +490,19 @@ bool Residency() {
     return ResidencyMode() != Mode::Reference;
 }
 
+Mode LazyReleaseMode() {
+    return releaseOverridden.load(std::memory_order_acquire) ? overrideRelease.load(std::memory_order_acquire) : EnvironmentRelease();
+}
+
+void SetLazyReleaseModeForTests(Mode release) {
+    overrideRelease.store(release, std::memory_order_release);
+    releaseOverridden.store(true, std::memory_order_release);
+}
+
+bool LazyRelease() {
+    return LazyReleaseMode() != Mode::Reference;
+}
+
 std::uint64_t ProtectResident(Interval range, Version version) {
     if (!Residency() || range.end <= range.begin) return 0;
     return Guard(range, Source::ResidentStaging, version, false, ResidencyMode() == Mode::Verify, "APS5_COHERENCE_RESIDENCY");
@@ -755,6 +776,17 @@ void CheckDrained(bool pendingImages, bool liveShadows, const char* where, bool 
     Divergence(state, text, {}, OrderingMode() == Mode::Verify, state.releasesReported);
 }
 
+void CheckReleaseCovered(bool uncoveredImages, bool uncoveredShadows, const char* where) {
+    if (!uncoveredImages && !uncoveredShadows) return;
+    auto& state = Directory();
+    std::lock_guard lock(state.mutex);
+    ++state.counters.uncoveredReleases;
+    Note(state, EventType::Undrained, 0, 0, CurrentVersion(), 0, {0, ~std::uint64_t{0}}, where);
+    char text[256];
+    std::snprintf(text, sizeof(text), "[coherence] lazy release at %s left %s%s%s neither stored nor protected", where != nullptr ? where : "?", uncoveredImages ? "pending images" : "", uncoveredImages && uncoveredShadows ? " and " : "", uncoveredShadows ? "shadow units" : "");
+    Divergence(state, text, {}, LazyReleaseMode() == Mode::Verify, state.uncoveredReported);
+}
+
 Release SnapshotRelease(std::uint32_t queue, Interval label, std::uint64_t value, std::uint64_t labelStamp) {
     Release release{queue, label, value, labelStamp, NextVersion(), {}};
     auto& state = Directory();
@@ -825,6 +857,7 @@ void ResetForTests() {
     state.readsReported = 0;
     state.releasesReported = 0;
     state.remapsReported = 0;
+    state.uncoveredReported = 0;
     state.recordedByQueue.clear();
     state.imported.clear();
     auto& ledger = Protections();

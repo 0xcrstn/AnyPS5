@@ -343,6 +343,18 @@ void ResidencyTests() {
     SetProtectionBackend({});
 }
 
+void LazyReleaseTests() {
+    Reset(Mode::Reference, Mode::Reference);
+    SetLazyReleaseModeForTests(Mode::New);
+    Require(Throws([] { CheckReleaseCovered(true, false, "label"); }).empty(), "lazy release 1 failed an uncovered release");
+    Require(CurrentCounters().uncoveredReleases == 1, "an uncovered lazy release was not counted");
+    CheckReleaseCovered(false, false, "label");
+    Require(CurrentCounters().uncoveredReleases == 1, "a covered lazy release was counted");
+    SetLazyReleaseModeForTests(Mode::Verify);
+    Require(Throws([] { CheckReleaseCovered(false, true, "flip"); }).find("neither stored nor protected") != std::string::npos, "lazy release verify accepted a release over unprotected shadow units");
+    SetLazyReleaseModeForTests(Mode::Reference);
+}
+
 void LifetimeTests() {
     Reset(Mode::New, Mode::Reference);
     const auto before = NextVersion();
@@ -441,6 +453,7 @@ int main() {
         FaultTests();
         LeaseTests();
         ResidencyTests();
+        LazyReleaseTests();
         LifetimeTests();
         CommitSplitTests();
         EvictionTests();
