@@ -74,6 +74,10 @@ public:
         std::size_t retainedBytes, peakBytes, outstanding;
     };
     PipelineAheadStatistics PipelineAheadCounters() const;
+    struct PipelinePrewarmStatistics {
+        std::uint64_t stored, built, rejected, pending, sharedHits;
+    };
+    PipelinePrewarmStatistics PipelinePrewarmCounters() const;
     bool ImportGuestMemory(const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
     // Sends recorded work to the GPU without waiting for it. With `reapFirst` it first retires batches
     // that already finished, so the in-flight list stays short (APS5_NO_OPPORTUNISTIC_REAP=1 skips

@@ -18,7 +18,7 @@ namespace AgcDriver::Graphics {
 namespace {
 
 constexpr std::size_t SiteCount = static_cast<std::size_t>(ResidentSite::Count);
-constexpr const char* SiteNames[SiteCount] = {"hook", "scanout", "in-place", "copy-in", "address-based", "indirect", "copy", "label", "upload", "completion", "eviction", "retire", "native"};
+constexpr const char* SiteNames[SiteCount] = {"hook", "scanout", "in-place", "copy-in", "address-based", "indirect", "copy", "label", "upload", "completion", "eviction", "retire", "native", "unprotected"};
 
 struct Guarded {
     explicit Guarded(std::uint64_t protection) : protection(protection) {}
@@ -263,13 +263,17 @@ std::uint64_t publishPieces(Recorder& recorder, const std::vector<Piece>& taken,
 }
 
 bool LazyStagingOut() {
-    static const bool enabled = std::getenv("APS5_LAZY_STAGING_OUT") != nullptr && std::strcmp(std::getenv("APS5_LAZY_STAGING_OUT"), "0") != 0;
-    return enabled;
+    static const int requested = [] {
+        const char* value = std::getenv("APS5_LAZY_STAGING_OUT");
+        if (value == nullptr) return -1;
+        return std::strcmp(value, "0") != 0 ? 1 : 0;
+    }();
+    return requested < 0 ? Coherence::Residency() : requested == 1;
 }
 
 bool LazyStagingVerify() {
-    static const bool verify = LazyStagingOut() && std::getenv("APS5_LAZY_STAGING_VERIFY") != nullptr;
-    return verify;
+    static const bool verify = std::getenv("APS5_LAZY_STAGING_VERIFY") != nullptr;
+    return verify && LazyStagingOut();
 }
 
 const char* ResidentSiteName(ResidentSite site) {
@@ -293,11 +297,22 @@ void NoteDeviceResident(VkDevice device, std::uint64_t begin, std::uint64_t end,
         overBudget = registry.bufferBytes > residentBudget();
     }
     if (Coherence::Residency()) {
-        if (const auto protection = Coherence::ProtectResident({begin, end}, version); protection != 0) {
-            auto guard = std::make_shared<Guarded>(protection);
-            std::lock_guard lock(registry.mutex);
-            const auto found = registry.entries.find(begin);
-            if (found != registry.entries.end() && found->second.end == end && found->second.version == version) found->second.guard = std::move(guard);
+        constexpr std::uint64_t page = 4096;
+        bool guarded = false;
+        if (begin % page == 0 && end % page == 0) {
+            if (const auto protection = Coherence::ProtectResident({begin, end}, version); protection != 0) {
+                auto guard = std::make_shared<Guarded>(protection);
+                std::lock_guard lock(registry.mutex);
+                const auto found = registry.entries.find(begin);
+                if (found != registry.entries.end() && found->second.end == end && found->second.version == version) found->second.guard = std::move(guard);
+                guarded = true;
+            }
+        }
+        if (!guarded) {
+            auto* recorder = Recorder::Active();
+            Require(recorder != nullptr && recorder->GetContext().device == device, "publishing device-resident buffer results the guest access guards cannot cover needs their active recorder");
+            static_cast<void>(PublishDeviceResident(*recorder, begin, static_cast<std::size_t>(end - begin), ResidentSite::Unprotected));
+            return;
         }
     }
     Stats().noted.fetch_add(1, std::memory_order_relaxed);

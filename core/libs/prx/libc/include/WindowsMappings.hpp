@@ -38,10 +38,18 @@ public:
             const auto found = views.find(base);
             if (found == views.end() || found->second.resident || found->second.page->pins != 0 || !writable(found->second.protection)) return 0;
             const auto page = found->second.page;
-            for (const auto& [otherBase, other] : views) {
-                static_cast<void>(otherBase);
-                if (other.page != page && other.offset < found->second.offset + pageBytes && found->second.offset < other.offset + pageBytes && sameSection(other.section->handle, found->second.section->handle)) return 0;
+            if (page->aliasCheckedAt != viewsChanged) {
+                page->foreignAlias = false;
+                for (const auto& [otherBase, other] : views) {
+                    static_cast<void>(otherBase);
+                    if (other.page != page && other.offset < found->second.offset + pageBytes && found->second.offset < other.offset + pageBytes && sameSection(other.section->handle, found->second.section->handle)) {
+                        page->foreignAlias = true;
+                        break;
+                    }
+                }
+                page->aliasCheckedAt = viewsChanged;
             }
+            if (page->foreignAlias) return 0;
             for (const auto alias : page->aliases) {
                 const auto& view = views.at(alias);
                 const auto protection = view.protection & 0xffu;
@@ -103,7 +111,10 @@ public:
     }
 
     bool ResolveAccess(std::uintptr_t address, std::size_t bytes) {
-        if (!activeAccessResolvers().empty()) throw std::runtime_error("nested guest access resolution is not implemented");
+        if (!activeAccessResolvers().empty()) {
+            const auto bypass = resolverBypass.load(std::memory_order_acquire);
+            if (bypass == nullptr || !bypass()) throw std::runtime_error("nested guest access resolution is not implemented");
+        }
         if (bytes == 0) return true;
         if (bytes > std::numeric_limits<std::uintptr_t>::max() - address) return false;
         if (accessGuardCount.load(std::memory_order_acquire) == 0) return true;
@@ -129,11 +140,16 @@ public:
             }
             if (pending.empty()) return true;
             for (const auto& [token, guard] : pending) {
-                std::lock_guard resolving(guard->resolverMutex);
+                std::unique_lock resolving(guard->resolverMutex, std::defer_lock);
+                if (!resolving.try_lock()) {
+                    const auto bypass = resolverBypass.load(std::memory_order_acquire);
+                    if (bypass == nullptr || !bypass()) resolving.lock();
+                }
                 {
                     std::lock_guard lock(mutex);
                     if (!accessGuards.contains(token)) continue;
                 }
+                if (std::find(activeAccessResolvers().begin(), activeAccessResolvers().end(), token) != activeAccessResolvers().end()) throw std::runtime_error("a guest access resolution reached its own guarded pages for writing");
                 struct Resolving {
                     explicit Resolving(std::uint64_t token) { activeAccessResolvers().push_back(token); }
                     ~Resolving() { activeAccessResolvers().pop_back(); }
@@ -156,7 +172,7 @@ public:
 
     std::vector<std::pair<std::uintptr_t, std::size_t>> Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
-        std::lock_guard lock(mutex);
+        const auto lock = lockResolved(reinterpret_cast<std::uintptr_t>(address), bytes);
         requireAccessResolved(reinterpret_cast<std::uintptr_t>(address), bytes, true);
         collectableRanges.clear();
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
@@ -195,7 +211,7 @@ public:
     }
 
     void Reset(void* address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockResolved(reinterpret_cast<std::uintptr_t>(address), bytes);
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
@@ -255,8 +271,10 @@ public:
                         slot->saved.reset();
                     }
                     shared->aliases.push_back(base + at);
+                    if (shared->aliases.size() == 2) multiAliasPages.fetch_add(1, std::memory_order_acq_rel);
                     const auto added = views.emplace(base + at, View{shared, protection, {}, 0, owned, offset + done + at, 0, 0, true, slot}).first;
                     added->second.identity = ++viewIdentity;
+                    ++viewsChanged;
                     invalidate(*shared);
                 }
                 remember(freshRanges, base, base + runBytes);
@@ -276,8 +294,10 @@ public:
             mapShared(base, section, offset + done, guarded != 0 ? PAGE_NOACCESS : protection);
             slot->stored = true;
             shared->aliases.push_back(base);
+            if (shared->aliases.size() == 2) multiAliasPages.fetch_add(1, std::memory_order_acq_rel);
             const auto added = views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0, 0, false, slot}).first;
             added->second.identity = ++viewIdentity;
+            ++viewsChanged;
             if (guarded != 0) protectAccess(base, added->second, allSubpages);
             remember(freshRanges, base, base + pageBytes);
             invalidate(*shared);
@@ -286,7 +306,7 @@ public:
     }
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockResolved(address, bytes);
         requireAccessResolved(address, bytes, true);
         collectableRanges.clear();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
@@ -297,7 +317,7 @@ public:
     }
 
     void Pin(std::uintptr_t address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockResolved(address, bytes);
         requireAccessResolved(address, bytes, true);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& page = *it->second.page;
@@ -421,8 +441,41 @@ public:
         physical.erase(physical.lower_bound(std::make_pair(key, std::uint64_t{0})), physical.lower_bound(std::make_pair(key + 1, std::uint64_t{0})));
     }
 
+    void SetResolverBypass(bool (*bypass)()) {
+        resolverBypass.store(bypass, std::memory_order_release);
+    }
+
     void SetResolveHostWrites(bool resolve) {
         resolveHostWrites.store(resolve, std::memory_order_release);
+    }
+
+    std::size_t AliasRanges(std::uintptr_t address, std::size_t bytes, std::uintptr_t* begins, std::uintptr_t* ends, std::size_t capacity) {
+        if (bytes == 0 || multiAliasPages.load(std::memory_order_acquire) == 0) return 0;
+        if (bytes > std::numeric_limits<std::uintptr_t>::max() - address) throw std::runtime_error("guest alias range wraps its address");
+        std::lock_guard lock(mutex);
+        std::size_t count = 0;
+        const auto emit = [&](std::uintptr_t begin, std::uintptr_t end) {
+            if (count != 0 && count <= capacity && ends[count - 1] == begin) {
+                ends[count - 1] = end;
+                return;
+            }
+            if (count < capacity) {
+                begins[count] = begin;
+                ends[count] = end;
+            }
+            ++count;
+        };
+        const auto stop = address + bytes;
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < stop; ++it) {
+            const auto& aliases = it->second.page->aliases;
+            if (aliases.size() < 2) continue;
+            const auto from = std::max<std::uintptr_t>(address, it->first) - it->first;
+            const auto to = std::min<std::uintptr_t>(stop, it->first + pageBytes) - it->first;
+            for (const auto alias : aliases) {
+                if (alias != it->first) emit(alias + from, alias + to);
+            }
+        }
+        return count;
     }
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
@@ -723,6 +776,8 @@ private:
         std::uint32_t pins = 0;
         std::array<std::uint32_t, subpages> accessGuards{};
         std::array<std::uint32_t, subpages> readableGuards{};
+        std::uint64_t aliasCheckedAt = 0;
+        bool foreignAlias = false;
     };
     struct ProtectedPage {
         std::shared_ptr<SharedPage> page;
@@ -771,6 +826,22 @@ private:
         const auto watched = static_cast<std::uint8_t>(mask & ~guarded & view.armed);
         protectSubpages(base, watched, protection, "restore guest write tracking");
         protectSubpages(base, static_cast<std::uint8_t>(mask & ~guarded & ~watched), view.protection, "restore resolved guest access");
+    }
+
+    std::unique_lock<std::mutex> lockResolved(std::uintptr_t address, std::size_t bytes) {
+        std::unique_lock lock(mutex, std::defer_lock);
+        if (!resolveHostWrites.load(std::memory_order_acquire) || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address - pageBytes) {
+            lock.lock();
+            return lock;
+        }
+        const auto begin = address & ~(pageBytes - 1);
+        const auto end = (address + bytes + pageBytes - 1) & ~(pageBytes - 1);
+        for (;;) {
+            if (accessGuardCount.load(std::memory_order_acquire) != 0) static_cast<void>(ResolveAccess(begin, end - begin));
+            lock.lock();
+            if (!accessProtectedLocked(begin, end - begin)) return lock;
+            lock.unlock();
+        }
     }
 
     bool accessProtectedLocked(std::uintptr_t address, std::size_t bytes) const {
@@ -979,8 +1050,10 @@ private:
                 view.slot->saved = saved;
                 view.slot->savedOffset = page - start;
             }
-            std::erase(view.page->aliases, page);
+            if (view.page->aliases.size() == 2 && std::erase(view.page->aliases, page) != 0) multiAliasPages.fetch_sub(1, std::memory_order_acq_rel);
+            else std::erase(view.page->aliases, page);
             views.erase(found);
+            ++viewsChanged;
         }
         forget(freshRanges, start, stop);
         residentRuns.erase(run);
@@ -1121,8 +1194,10 @@ private:
                 if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(cursor), MEM_PRESERVE_PLACEHOLDER)) fail("unmap shared guest page");
                 const auto found = views.find(cursor);
                 if (found != views.end()) {
-                    std::erase(found->second.page->aliases, cursor);
+                    if (found->second.page->aliases.size() == 2 && std::erase(found->second.page->aliases, cursor) != 0) multiAliasPages.fetch_sub(1, std::memory_order_acq_rel);
+                    else std::erase(found->second.page->aliases, cursor);
                     views.erase(found);
+                    ++viewsChanged;
                     forget(freshRanges, cursor, cursor + pageBytes);
                 }
             } else if (memory.Type == MEM_PRIVATE) {
@@ -1184,8 +1259,11 @@ private:
     std::map<std::uint64_t, std::shared_ptr<AccessGuard>> accessGuards;
     std::atomic<std::size_t> accessGuardCount{0};
     std::atomic<bool> resolveHostWrites{false};
+    std::atomic<std::size_t> multiAliasPages{0};
+    std::atomic<bool (*)()> resolverBypass{nullptr};
     std::uint64_t nextAccessToken = 0;
     std::uint64_t viewIdentity = 0;
+    std::uint64_t viewsChanged = 1;
     struct ActiveAccessResolversTag {};
     static std::vector<std::uint64_t>& activeAccessResolvers() { return HostThreadLocal<std::vector<std::uint64_t>, ActiveAccessResolversTag>(); }
 

@@ -184,7 +184,7 @@ void PointPairsAt(const void* table) {
 
 void ParsesTheSwitch() {
     using AgcDriver::DriverDetail::ParseCommandProcessorReads;
-    Require(ParseCommandProcessorReads(nullptr) == CommandProcessorReads::Drain, "an unset APS5_CP_READS_OVERLAP does not drain");
+    Require(ParseCommandProcessorReads(nullptr) == CommandProcessorReads::Overlap, "an unset APS5_CP_READS_OVERLAP does not overlap");
     Require(ParseCommandProcessorReads("0") == CommandProcessorReads::Drain && ParseCommandProcessorReads("off") == CommandProcessorReads::Drain, "APS5_CP_READS_OVERLAP=0 or off does not drain");
     Require(ParseCommandProcessorReads("1") == CommandProcessorReads::Overlap && ParseCommandProcessorReads("on") == CommandProcessorReads::Overlap, "APS5_CP_READS_OVERLAP=1 or on does not overlap");
     Require(ParseCommandProcessorReads("verify") == CommandProcessorReads::Verify, "APS5_CP_READS_OVERLAP=verify does not verify");

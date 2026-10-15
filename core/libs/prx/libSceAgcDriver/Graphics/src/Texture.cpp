@@ -1440,7 +1440,8 @@ enum class PointerStores : std::uint8_t { Eager, Deferred, Verify };
 PointerStores PointerStoreMode() {
     static const PointerStores mode = [] {
         const char* text = std::getenv("APS5_DEFERRED_POINTER_STORES");
-        if (text == nullptr || std::strcmp(text, "0") == 0) return PointerStores::Eager;
+        if (text == nullptr) return PointerStores::Deferred;
+        if (std::strcmp(text, "0") == 0) return PointerStores::Eager;
         if (std::strcmp(text, "1") == 0) return PointerStores::Deferred;
         if (std::strcmp(text, "verify") == 0) return PointerStores::Verify;
         throw std::runtime_error(std::string("APS5_DEFERRED_POINTER_STORES=") + text + ": expected 0, 1 or verify");

@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <atomic>
+#include <thread>
 #include <string>
 #include <utility>
 #include <vector>
@@ -226,7 +228,6 @@ void FakeRelease(std::uint64_t token) {
         if (it->token != token) continue;
         const auto guard = *it;
         guards.erase(it);
-        guard.releaseContext(guard.context);
         return;
     }
 }
@@ -252,7 +253,7 @@ void FaultTests() {
     SetFaultsModeForTests(Mode::Reference);
     Require(ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 1) == 0, "the reference path protected guest memory");
     SetFaultsModeForTests(Mode::New);
-    Require(Throws([] { static_cast<void>(ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 1)); }).find("no guest access protection backend") != std::string::npos, "native ownership ran without a protection backend");
+    Require(ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 1) == 0 && !FaultOwnership() && !InputLeases() && !Residency() && !LazyRelease(), "native ownership was active without a protection backend");
     SetProtectionBackend({&FakeProtect, &FakeRelease});
     SetMaterializer([](Interval range) { materialized.push_back(range); });
     const auto image = ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 3);
@@ -355,6 +356,42 @@ void LazyReleaseTests() {
     SetLazyReleaseModeForTests(Mode::Reference);
 }
 
+void PriorityTests() {
+    guards.clear();
+    refuseProtection = false;
+    Reset(Mode::Reference, Mode::Reference);
+    SetFaultsModeForTests(Mode::New);
+    SetProtectionBackend({&FakeProtect, &FakeRelease});
+    static std::atomic<int> stage{0};
+    static std::atomic<int> materializations{0};
+    static thread_local bool priority = false;
+    stage = 0;
+    materializations = 0;
+    SetMaterializer([](Interval) {
+        ++materializations;
+        if (priority) return;
+        stage = 1;
+        while (stage.load() != 2) std::this_thread::yield();
+    });
+    SetFaultPriority([] { return priority; });
+    const auto protection = ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 1);
+    Require(protection != 0 && guards.size() == 1, "the priority test range was not protected");
+    const auto guard = guards[0];
+    std::thread owner([guard] { Require(guard.resolve(guard.token, guard.context), "the owning resolver refused"); });
+    while (stage.load() != 1) std::this_thread::yield();
+    priority = true;
+    Require(guard.resolve(guard.token, guard.context), "the priority resolver refused");
+    priority = false;
+    Require(guards.empty() && materializations == 2, "a priority fault waited for the resolution it overlapped instead of materializing and releasing it");
+    stage = 2;
+    owner.join();
+    Require(guards.empty() && CurrentCounters().liveProtections == 0, "the owning resolution left a guard after a priority fault finished it");
+    SetFaultPriority(nullptr);
+    SetFaultsModeForTests(Mode::Reference);
+    SetProtectionBackend({});
+    SetMaterializer(nullptr);
+}
+
 void LifetimeTests() {
     Reset(Mode::New, Mode::Reference);
     const auto before = NextVersion();
@@ -452,6 +489,7 @@ int main() {
         ReleaseTests();
         FaultTests();
         LeaseTests();
+        PriorityTests();
         ResidencyTests();
         LazyReleaseTests();
         LifetimeTests();

@@ -116,6 +116,15 @@ struct CommandProcessorReadCounters {
 
 CommandProcessorReadCounters CommandProcessorReadTotals();
 
+struct LabelRecordJobCounters {
+    std::uint64_t packets = 0;
+    std::uint64_t jobs = 0;
+    std::uint64_t labels = 0;
+    std::uint64_t endOfPipe = 0;
+};
+
+LabelRecordJobCounters LabelRecordJobTotals();
+
 inline bool OverlapsDrawRecords(std::uint32_t opcode, bool predicated, bool dispatches = false) {
     if (predicated) return false;
     if (dispatches && (opcode == 0x15 || opcode == 0x16)) return true;

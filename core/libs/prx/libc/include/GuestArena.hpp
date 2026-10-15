@@ -52,6 +52,7 @@ bool GuestArenaResidentSpan_nid_postfix(std::uintptr_t address, std::size_t byte
 void GuestArenaForgetSection_nid_postfix(void* section);
 void GuestArenaSetResolveHostWrites_nid_postfix(bool resolve);
 bool GuestArenaOpenAccessForRead_nid_postfix(std::uint64_t token);
+void GuestArenaSetResolverBypass_nid_postfix(bool (*bypass)());
 #else
 void GuestArenaSetSharedBacking_nid_postfix(SharedBackingResolver resolver);
 void GuestArenaSetSharedBackingWriter_nid_no_patch(SharedBackingWriter writer);
@@ -59,6 +60,7 @@ bool GuestArenaWriteSharedBacking_nid_no_patch(std::uintptr_t address, const voi
 bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);
 #endif
 std::size_t GuestArenaBackingRuns_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uintptr_t* begins, std::uintptr_t* ends, std::uint64_t* canonicals, std::size_t capacity);
+std::size_t GuestArenaAliasRanges_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uintptr_t* begins, std::uintptr_t* ends, std::size_t capacity);
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 

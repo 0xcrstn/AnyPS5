@@ -72,8 +72,8 @@ std::uint64_t& Driver::waitFloor() {
 WaitFloorMode Driver::waitFloorMode() {
     static const WaitFloorMode mode = [] {
         const char* value = std::getenv("APS5_WAIT_FLOOR");
-        if (value == nullptr || std::strcmp(value, "submission") == 0) return WaitFloorMode::Submission;
-        if (std::strcmp(value, "activation") == 0) return WaitFloorMode::Activation;
+        if (value == nullptr || std::strcmp(value, "activation") == 0) return WaitFloorMode::Activation;
+        if (std::strcmp(value, "submission") == 0) return WaitFloorMode::Submission;
         throw std::runtime_error(std::string("APS5_WAIT_FLOOR: unknown mode ") + value + " (activation or submission)");
     }();
     return mode;

@@ -3917,9 +3917,10 @@ void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
         ShaderResources::DrawBindingsStatistics statistics;
         const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, {}, &statistics);
         Require(bindings != nullptr && bindings->snapshots.size() == 1, "an input read over most of its bytes was not snapshotted");
-        const char* rangesOnly = std::getenv("APS5_SNAPSHOT_READ_RANGES");
-        if (rangesOnly != nullptr && std::string(rangesOnly) == "1") {
-            Require(statistics.limited == 1 && statistics.copiedBytes == 12000u && statistics.overHalfReadBytes == 0, "with APS5_SNAPSHOT_READ_RANGES=1 an input read over most of its bytes did not copy only its 12000 read bytes");
+        const char* rangesText = std::getenv("APS5_SNAPSHOT_READ_RANGES");
+        const bool rangesOnly = rangesText == nullptr || (std::string(rangesText) != "0" && std::string(rangesText) != "off");
+        if (rangesOnly) {
+            Require(statistics.limited == 1 && statistics.copiedBytes == 12000u && statistics.overHalfReadBytes == 0, "with APS5_SNAPSHOT_READ_RANGES on an input read over most of its bytes did not copy only its 12000 read bytes");
         } else {
             Require(statistics.limited == 0 && statistics.copiedBytes == elementBytes, "an input read over most of its bytes was not copied whole");
             Require(statistics.wholeCopies[static_cast<std::size_t>(ShaderResources::WholeCopy::OverHalf)] == 1 && statistics.overHalfReadBytes == 12000u, "a whole copy of an input read over most of its bytes did not count its 12000 read bytes under over half");
@@ -4722,6 +4723,7 @@ int coherenceFaultTests(const Device& device, Recorder& recorder) {
     Coherence::SetFaultsModeForTests(Coherence::Mode::New);
     Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix, &GuestArena::GuestArenaOpenAccessForRead_nid_postfix});
     Coherence::SetMaterializer([](Coherence::Interval range) { StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin)); });
+    GuestArena::GuestArenaSetResolveHostWrites_nid_postfix(true);
     Coherence::ResetForTests();
     TextureDetiler detiler(base);
     auto context = base;
@@ -4828,6 +4830,14 @@ int coherenceFaultTests(const Device& device, Recorder& recorder) {
     Require(loaded == 0x77, "a native load of an unpublished shadow unit read the stale host bytes");
     Require(!AnyShadowedOverlaps(address + unit, unit), "a native load left the shadow unit unpublished");
 
+    paint({0.0f, 1.0f, 1.0f, 1.0f});
+    gpu.unlock();
+    GuestArena::GuestArenaSetProtection_nid_postfix(address, unit, PAGE_READONLY);
+    GuestArena::GuestArenaSetProtection_nid_postfix(address, unit, PAGE_READWRITE);
+    gpu.lock();
+    Require(StorageTexture::FindPending(address, unit) == nullptr, "reprotecting memory under a protected pending image did not store the image first");
+    Require(holds(0, unit, {0, 255, 255, 255}, 0, 0), "reprotecting memory under a protected pending image lost the image's results");
+
     recorder.Sync();
     const auto counters = Coherence::CurrentCounters();
     Require(counters.faultsResolved >= 5 && counters.liveProtections == 0 && counters.lockedFaults == 0, "native access ownership: " + Coherence::Report());
@@ -4898,13 +4908,17 @@ int coherenceLeaseTests(const Device& device, Recorder& recorder) {
     });
     Coherence::ResetForTests();
     const auto copyBuffer = base.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
-    const auto read = [&](Buffer& output) {
+    const auto read = [&](Buffer& output, bool drawInput = false) {
         const auto commands = recorder.Commands();
         RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         const VkBufferCopy piece{address - import->base, 0, 16};
         copyBuffer(commands, import->buffer, output.Handle(), 1, &piece);
         RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
         recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (drawInput) {
+            Require(recorder.NoteInPlaceDrawInput(address, 16), "a draw input bound in place was refused its read lease");
+            return;
+        }
         const auto lease = Coherence::AcquireReadLease({address, address + 16}, Coherence::CurrentVersion());
         Require(lease != 0, "a read lease over shared guest memory was refused");
         recorder.OnCompleteWithoutGuestAccess([lease] { Coherence::RetireReadLease(lease); });
@@ -4929,6 +4943,17 @@ int coherenceLeaseTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     counters = Coherence::CurrentCounters();
     Require(counters.leases == 1002 && counters.leaseWaits == 1 && counters.liveProtections == 0, "unwritten leased reads waited or kept their leases: " + Coherence::Report());
+    Coherence::ResetForTests();
+    read(first, true);
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint32_t*>(address) = 0x43434343u;
+    gpu.lock();
+    read(second, true);
+    recorder.Sync();
+    Require(early[0] == 0x42 && early[3] == 0x42 && early[4] == 0x41, "a draw input bound in place saw a native write made after it was recorded");
+    Require(late[0] == 0x43 && late[3] == 0x43 && late[4] == 0x41, "a draw input bound in place after a native write missed it");
+    counters = Coherence::CurrentCounters();
+    Require(counters.leases == 2 && counters.leaseWaits == 1 && counters.liveProtections == 0, "in-place draw input leases: " + Coherence::Report());
     std::cout << "coherence input leases: ok\n";
     return 0;
 #endif
@@ -5024,6 +5049,16 @@ int coherenceResidencyTests(const Device& device, Recorder& recorder) {
     const auto loaded = *reinterpret_cast<volatile std::uint8_t*>(address + 0x8000);
     gpu.lock();
     Require(loaded == 0xa5 && !AnyDeviceResidentOverlaps(address, bytes), "a native load read host bytes under device-resident results");
+
+    {
+        auto shadow = std::make_shared<Buffer>(base, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::memset(shadow->Bytes().data(), 0x3c, bytes);
+        const auto generation = CollectWritesUncached(address, bytes);
+        NoteDeviceResident(base.device, address + 16, address + 0x1010, shadow, address, import->buffer, import->base, generation);
+        Require(!AnyDeviceResidentOverlaps(address, bytes), "device-resident results the guards cannot cover whole were kept on the device");
+        recorder.Sync();
+        Require(alias[16] == 0x3c && alias[0x100f] == 0x3c && alias[15] != 0x3c && alias[0x1010] != 0x3c, "device-resident results the guards cannot cover were not published in place of a copy-back");
+    }
 
     recorder.Sync();
     const auto counters = Coherence::CurrentCounters();
@@ -10748,7 +10783,7 @@ struct ResolveScene {
 };
 
 bool withResolveScene(const Device& device, Recorder& recorder, const std::function<bool(ResolveScene&)>& body) {
-    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0 || device.GetContext().descriptorCache == nullptr) return false;
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return false;
     constexpr std::size_t unit = 65536;
     constexpr std::size_t bytes = unit * 3;
     void* watched = AllocateWatched(bytes, unit);
@@ -10762,6 +10797,11 @@ bool withResolveScene(const Device& device, Recorder& recorder, const std::funct
     const auto address = reinterpret_cast<std::uint64_t>(block);
     auto context = device.GetContext();
     context.recorder = &recorder;
+    std::optional<DescriptorCache> descriptors;
+    if (context.descriptorCache == nullptr) {
+        descriptors.emplace(context);
+        context.descriptorCache = &*descriptors;
+    }
     TextureDetiler detiler(context);
     context.detiler = &detiler;
     {
@@ -10906,7 +10946,7 @@ bool parallelRevalidateTests(const Device& device, Recorder& recorder) {
 }
 
 bool parallelResolveTests(const Device& device, Recorder& recorder) {
-    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0 || device.GetContext().descriptorCache == nullptr) return false;
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return false;
     constexpr std::size_t unit = 65536;
     constexpr std::size_t bytes = unit * 3;
     void* watched = AllocateWatched(bytes, unit);
@@ -10920,6 +10960,11 @@ bool parallelResolveTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     auto context = device.GetContext();
     context.recorder = &recorder;
+    std::optional<DescriptorCache> descriptors;
+    if (context.descriptorCache == nullptr) {
+        descriptors.emplace(context);
+        context.descriptorCache = &*descriptors;
+    }
     TextureDetiler detiler(context);
     context.detiler = &detiler;
     {

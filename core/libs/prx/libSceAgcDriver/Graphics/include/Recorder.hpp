@@ -90,6 +90,7 @@ public:
         skipPeerOnce = true;
     }
     static bool QueueOrderVerify();
+    static void SuppressOrderWaitsForTest(bool suppress);
     struct QueueOrderStatistics {
         std::uint64_t requiredWaits = 0;
         std::uint64_t peerWaits = 0;
@@ -222,7 +223,7 @@ public:
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
     static bool VerifyInPlaceDrawInputs();
-    void NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes);
+    bool NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
     using ReadList = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
     void NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind);
@@ -664,6 +665,7 @@ private:
             std::uint64_t generation;
         };
         std::vector<InPlaceInput> inPlaceInputs;
+        std::vector<std::uint64_t> inPlaceLeases;
         struct ReadListNote {
             std::shared_ptr<const ReadList> ranges;
             std::size_t position;

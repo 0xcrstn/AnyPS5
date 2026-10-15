@@ -186,7 +186,19 @@ A title's own CPU reads of that memory are not seen, so a title that waits for a
 
 ### Guest-memory coherence checks
 
-Three switches take `0` (the default), `1` or `verify`; any other value stops the title when the GPU device is created.
+Each switch below takes `0`, `1` or `verify`. Any other value stops the title when the GPU device is created.
+- **Off by default:** `APS5_COHERENCE_AUDIT`, `APS5_COHERENCE_ORDERING`, `APS5_COHERENCE_DIRECTORY`.
+- **On by default (`1`):** `APS5_COHERENCE_FAULTS`, `APS5_COHERENCE_INPUT_LEASES`, `APS5_COHERENCE_RESIDENCY`, `APS5_COHERENCE_LAZY_RELEASE`, `APS5_DEFERRED_POINTER_STORES`. Set one to `0` to turn it off.
+
+The protection switches take effect once the GPU device installs the access guards, on Windows only. On other systems they stay inactive, except that `verify` stops the title.
+
+`APS5_DEFERRED_POINTER_STORES=1` (the default):
+- **Before any address-based shader:** only the unit shadows over its heaps are published, so the storage images pending there are no longer retiled to guest memory first.
+- **Pointer writers:** a shader that may store through pointers is tracked until it completes. A flip or address-based store of an image older than such a shader over its memory waits for a later flip. Any other store of that image first waits for the shader, so its stores are never overwritten by older results.
+- **Readers:** a shader that only reads through pointers can still see host bytes under an image whose newer results are pending.
+- **`0`:** stores every pending image over the heaps before each address-based shader, at the cost of tens of GB per 10 s in heavy scenes.
+- **`verify`:** stops the title when such an image would still be written back before the shader completed.
+- **Report:** a `[pointer-stores]` line every 10 s counts the deferred stores, the waited write-backs, and the pointer shaders that ran with pending images over their heaps.
 
 `APS5_COHERENCE_AUDIT=1` keeps a version for every GPU writer the driver records (address-based shaders that may store through pointers, and written buffer elements) and checks every store of an older GPU result into guest memory (a pending storage image, a unit shadow) against it. The first stale store prints a `[coherence] stale publication` line with the writers and stores that touched those bytes; later ones are counted on a `[coherence]` line every 10 s. An address-based shader that reads host memory under a pending image or an unpublished unit shadow prints `[coherence] stale read`. `verify` stops the title at the first stale store instead. Rendering is unchanged; the checks cost CPU time.
 
@@ -205,41 +217,63 @@ Three switches take `0` (the default), `1` or `verify`; any other value stops th
 - **File reads:** kernel file reads into such memory resolve it first.
 - **Refused ranges:** ranges the protection refuses (pinned or resident pages) keep the default behaviour.
 - **`verify`:** stops the title at a refused or partly covered range, and at a driver access to such memory made while it holds the GPU lock.
-- **Limits:** unmapping or reprotecting such memory before the driver stored it stops the title. Windows only. Each pending image costs a protection change, so expect a slowdown.
-- **Deadlock risk:** a driver thread that holds the GPU lock and touches protected memory directly, while a title thread is resolving the same pages, deadlocks. The driver does not yet resolve such ranges before taking the lock, and `verify` does not catch it. The same applies to `APS5_COHERENCE_INPUT_LEASES` and `APS5_COHERENCE_RESIDENCY`.
+- **Mapping changes:** unmapping, decommitting, reprotecting or pinning such memory first stores the GPU results over the whole pages involved, then proceeds.
+- **Limits:** Windows only. Each pending image costs a protection change.
+- **Driver accesses:** a driver thread that holds the GPU lock and touches such memory does not wait for a title thread already resolving it. It stores the results itself and releases the guard, and the title thread's resolution then finds nothing left to do.
+- **During resolution:** the range is read-only while it is resolved. Other threads' loads see the bytes from before, and their stores wait.
 
 `APS5_COHERENCE_INPUT_LEASES=1` protects the guest memory that a recorded dispatch reads in place through host imports, from recording until its batch completes. A native store into that memory waits until the recorded work has run, so the dispatch reads the bytes it was given rather than a later write. The protection covers every 4 KiB page the reads touch, so reads beside the stored bytes wait as well. Address-based heaps are not leased, because their reach is the whole heap. `verify` stops the title when a lease is refused. Windows only. Each dispatch costs a protection change, and the title's stores into memory the GPU still reads wait for the GPU.
 
-`APS5_COHERENCE_RESIDENCY=1` protects the guest memory under device-resident buffer results (`APS5_LAZY_STAGING_OUT`) the same way. The title's first load or store there publishes those results into guest memory and waits for them before it proceeds. A CPU store over such results then keeps the device bytes around it instead of reaching the unsupported publish after a CPU store. `verify` stops the title when the protection is refused or does not cover whole pages. Windows only.
+`APS5_COHERENCE_RESIDENCY=1` protects the guest memory under device-resident buffer results the same way. While it is active, `APS5_LAZY_STAGING_OUT` defaults to on, so buffer results a dispatch wrote through a staged copy stay on the device instead of being copied back after every use. Results whose pages the guards cannot cover whole are copied back at once, as before. `APS5_LAZY_STAGING_OUT=0` copies everything back. The title's first load or store there publishes those results into guest memory and waits for them before it proceeds. A CPU store over such results then keeps the device bytes around it instead of reaching the unsupported publish after a CPU store. `verify` stops the title when the protection is refused or does not cover whole pages. Windows only.
 
 `APS5_COHERENCE_LAZY_RELEASE=1` makes labels and flips store only the pending results whose memory the native protection does not cover. Protected results stay on the GPU until something reads them, and the title's own CPU accesses resolve them when they happen. Every `APS5_STORE_AT_FLIP` value then behaves the same, and `APS5_STORE_AT_LABEL=1` still stores everything. `verify` stops the title when a label or flip leaves results that are neither stored nor protected. The switch needs `APS5_COHERENCE_FAULTS`, and `APS5_COHERENCE_RESIDENCY` too when `APS5_LAZY_STAGING_OUT` is on; without them the title stops at start.
 
 ### GPU queue waits and scheduling
 
-A `WAIT_REG_MEM` on one queue may be satisfied by a label another queue recorded but the GPU has not stored yet. By default any label recorded after the waiting submission arrived counts (`APS5_WAIT_FLOOR=submission`). That rule is too loose: a later wait in the same submission can be satisfied by a value overwritten before it could have seen it. `APS5_WAIT_FLOOR=activation` counts only labels recorded after the waiting queue's previous wait. `APS5_VERIFY_WAIT_OBSERVATIONS=1` stops the title when a wait is satisfied by a value it could not have observed.
+A `WAIT_REG_MEM` on one queue may be satisfied by a label another queue recorded but the GPU has not stored yet. Only labels recorded after the wait became active count, that is after the waiting queue's previous wait (`APS5_WAIT_FLOOR=activation`, the default). `APS5_WAIT_FLOOR=submission` with `APS5_LABEL_TIMELINE=off` restores the older rule, which counts every label recorded after the waiting submission arrived; it is too loose, since a later wait in the same submission can then be satisfied by a value overwritten before it could have seen it. `APS5_VERIFY_WAIT_OBSERVATIONS=1` stops the title when a wait is satisfied by a value it could not have observed.
 
 With `APS5_COHERENCE_ORDERING=1` or `verify`, a label also waits behind the write-backs its batch still owes, so a title's own CPU loads never see a label before the results it releases. `APS5_LABEL_PUBLICATION=ordered` or `early` names the same choice; a value that contradicts `APS5_COHERENCE_ORDERING` stops the title.
 
 In runs with `APS5_PROFILE_DRAW` (as `run.ps1 -Perf` and `-Debug` set it), `APS5_TRACE_WAIT_CHAIN=1` prints a `[waitchain]` line per queue every 10 s. The line splits the time each blocked wait spent into: producer label not recorded yet, recorded but not submitted, submitted but not finished on the GPU, finished but not stored for the CPU, and stored but not seen yet. A `[labels]` line gives the same latencies over all labels. Slow-wait reports name the label that satisfied the wait.
 
 `APS5_QUEUE_SCHEDULER` chooses how the GPU queues' workers take turns:
-- `off` (the default) runs them as before.
+- `dag` (the default) runs the queues concurrently and lets a packet whose shader is still compiling wait without holding any lock.
 - `serial` runs one packet at a time across all queues; the oldest runnable submission goes next, and a queue waiting on a label gives up its turn. It is a reference for comparing results, not a fast mode.
-- `dag` runs the queues concurrently, as `off` does, and lets a packet whose shader is still compiling wait without holding any lock.
+- `off` runs the queues concurrently without the scheduler's bookkeeping, as before it existed.
 
 `APS5_QUEUE_SCHEDULER_VERIFY=1` stops the title when a queue runs a packet out of order or while it is waiting for a compile. With `APS5_PROFILE_DRAW`, a `[scheduler]` line every 10 s counts turns, hand-overs and parked packets whenever the scheduler or its verify mode is on.
 
-`APS5_LABEL_TIMELINE=on` lets a wait be satisfied by another queue's recorded label only with a proof: the label was recorded after the wait became active and covers every awaited byte, or it is the newest value and nothing wrote over it since. Anything else waits for guest memory. `verify` stops the title instead of waiting. A compare function the driver does not know stops the title in both modes. The `[waitchain]` line counts waits by proof.
+`APS5_LABEL_TIMELINE=on` (the default) lets a wait be satisfied by another queue's recorded label only with a proof: the label was recorded after the wait became active and covers every awaited byte, or it is the newest value and nothing wrote over it since. Anything else waits for guest memory. `verify` stops the title instead of waiting; `off` accepts such labels without a proof, as before. A compare function the driver does not know stops the title in both modes. The `[waitchain]` line counts waits by proof.
 
-`APS5_WAIT_BROKER=1` makes a blocked wait sleep until a label is recorded or a batch's results reach guest memory, instead of polling on a timer. It still checks again after at most `APS5_WAIT_BROKER_MAX_US` (default 2000), since stores made by the title's own CPU code wake nobody.
+The wait broker (on by default, `APS5_WAIT_BROKER=0` turns it off) makes a blocked wait sleep until a label is recorded or a batch's results reach guest memory, instead of polling on a timer. It still checks again after at most `APS5_WAIT_BROKER_MAX_US` (default 2000), since stores made by the title's own CPU code wake nobody.
 
 `APS5_QUEUE_TOPOLOGY` chooses the Vulkan queues the driver runs on. The log lists every queue family when the device is created.
-- `serial` (the default) runs everything on one queue.
-- `same-family` takes a second queue from the graphics family and records every guest queue other than 0 on it, with its own command recorder. A wait on a label the other queue recorded submits the producer first and makes the waiting queue's next batch wait for it on the GPU. Every batch also waits for the batches the other queue had already submitted. Experimental. `APS5_QUEUE_TOPOLOGY_VERIFY=1` stops the title when a batch is submitted without waiting for a producer it depends on.
+- `same-family` (the default when the graphics family has two queues and the device has timeline semaphores; otherwise the driver logs why and runs serial) takes a second queue from the graphics family and records every guest queue other than 0 on it, with its own command recorder. A wait on a label the other queue recorded submits the producer first and makes the waiting queue's next batch wait for it on the GPU. Every batch also waits for the batches the other queue had already submitted. `APS5_QUEUE_TOPOLOGY_VERIFY=1` stops the title when a batch is submitted without waiting for a producer it depends on.
+- `serial` runs everything on one queue.
 - `dedicated` checks that a compute-only family has a free queue, then stops the title: ownership transfers between queue families are not implemented.
-- An unavailable topology stops the title, naming the families that exist.
+- A topology set explicitly but unavailable stops the title, naming the families that exist.
 
-`APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. `0` (the default) turns it off. The `[labels]` line counts these submits.
+`APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. The default is 2000; `0` turns it off. The `[labels]` line counts these submits.
+
+### Draw and dispatch recording
+
+Queue 0's draws and dispatches are prepared on worker threads and recorded on a record thread by default. Each switch below is on unless it is set to `0`; switches that depend on another one are off when that one is off. The `APS5_VERIFY_*` switches stay off unless set, and stop the title on the first difference they find.
+
+- `APS5_RECORD_THREAD`: a record thread records queue 0's draws while queue 0 decodes the next packets. `APS5_RECORD_THREAD_DISPATCH` records queue 0's dispatches there too.
+- `APS5_PREPARE_AHEAD=<1-64>`: how many records queue 0 may post ahead of the record thread (by default the number of preparation workers, at least 4).
+- `APS5_PREPARE_WORKERS=<1-16>`: threads that prepare frozen draws. By default one per efficiency core on a hybrid CPU (16 on an i9-13900K), which leaves the performance cores to queue 0, the record thread and the title's own threads; otherwise half the logical processors less two. Both are capped at 16. `APS5_PREPARE_DISPATCHES` prepares queue 0's dispatches on them too.
+- `APS5_PARALLEL_RESOLVE`, `APS5_PARALLEL_REVALIDATE`, `APS5_PARALLEL_TARGETS`: the preparation workers also resolve a draw's inputs, template, pipeline, template proof and render targets; the record thread re-checks them. Verify: `APS5_VERIFY_PARALLEL_RESOLVE`, `APS5_VERIFY_PARALLEL_REVALIDATE`, `APS5_VERIFY_PARALLEL_TARGETS`.
+- `APS5_WORKER_SNAPSHOT_COPIES`: the preparation workers copy a draw's input snapshots; the record thread adopts a copy when its memory is unchanged. Verify: `APS5_VERIFY_WORKER_SNAPSHOT_COPIES`.
+- `APS5_BINDING_PLAN`, `APS5_INCREMENTAL_BINDINGS`, `APS5_INCREMENTAL_PLANS`: draws read their resource descriptors through a planned walk, and reuse the parts of it whose inputs did not change.
+- `APS5_DISPATCH_MOVED_TEMPLATES`: a dispatch whose read-only buffers moved reuses its resource template.
+- `APS5_DRAW_SNAPSHOT_ARENA` (with `APS5_DRAW_SNAPSHOT_ARENA_EXTEND_KIB`, 1024), `APS5_SNAPSHOT_READ_RANGES`, `APS5_MOVED_WORD_RING`: draw input snapshots are shared between draws, and only the ranges a shader reads are copied.
+- `APS5_EPOCH_DIRTY_SET` (with `APS5_EPOCH_DIRTY_SET_WIDEN_KIB`, 256), `APS5_COLLECT_COVERAGE`, `APS5_PRECOLLECT_ON_WORKERS`: write-tracking collects are widened, shared between the threads of a collect epoch and made early on the preparation workers.
+- `APS5_DIRTY_RECORD`: a draw that continues a render pass skips the binds that did not change.
+- `APS5_CP_READS_OVERLAP`: `SET_SH_REG_INDIRECT`, `SET_UCONFIG_REG_INDIRECT`, `SET_CONTEXT_REG_INDIRECT` and `INDEX_ATTRIBUTES_INDIRECT` read their tables when queue 0 parses them, as the command processor does, instead of waiting for the draws queued before them. Verify: `APS5_CP_READS_OVERLAP=verify` reads each table again after those draws are recorded and stops on a difference.
+
+`APS5_IN_PLACE_DRAW_INPUTS` binds read-only draw inputs through their host imports instead of snapshotting them. It is on by default whenever `APS5_COHERENCE_INPUT_LEASES` is: each input then holds a read lease until its batch completes, so a CPU store into it waits for the draw instead of reaching it, and an input whose lease is refused is snapshotted. Setting it to `1` without the leases binds the inputs unprotected (a CPU store before the GPU reads them is seen by the draw); `0` turns it off.
+
+Off by default: `APS5_CHUNKED_RECORDING=1` records a render pass's draws into secondary command buffers on a recording thread (it costs more than it saves at a few draws per pass).
 
 ### Address-based shader experiments
 
