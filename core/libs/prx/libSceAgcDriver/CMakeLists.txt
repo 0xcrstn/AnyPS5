@@ -2021,10 +2021,14 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_driver_lock_order_verify COMMAND agc_driver_tests)
     add_test(NAME agc_driver_flip_lock_order_verify COMMAND agc_driver_flip_tests)
-    set_tests_properties(agc_driver_lock_order_verify agc_driver_flip_lock_order_verify PROPERTIES
-            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_LOCK_ORDER_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_completion_watcher_lock_order_verify COMMAND agc_driver_completion_watcher_tests)
+    add_test(NAME agc_driver_same_family_missing_order_lock_order_verify COMMAND agc_driver_same_family_missing_order_tests)
+    add_test(NAME agc_driver_indirect_arguments_lock_order_verify COMMAND agc_driver_indirect_arguments_written_ahead_tests)
+    set(agcLockOrderTests agc_driver_lock_order_verify agc_driver_flip_lock_order_verify agc_driver_completion_watcher_lock_order_verify agc_driver_same_family_missing_order_lock_order_verify agc_driver_indirect_arguments_lock_order_verify)
+    set_tests_properties(${agcLockOrderTests} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_LOCK_ORDER_VERIFY=queue" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
-        set_tests_properties(agc_driver_lock_order_verify agc_driver_flip_lock_order_verify PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(${agcLockOrderTests} PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set(agcScheduleCapture "${CMAKE_CURRENT_BINARY_DIR}/aps5-schedule-capture.txt")

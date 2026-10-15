@@ -92,6 +92,9 @@ public:
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.
     void ReapRecorded();
+    void SubmitRecordedFor(std::uint32_t guestQueue, bool reapFirst);
+    void WaitIdleFor(std::uint32_t guestQueue);
+    void ReapRecordedFor(std::uint32_t guestQueue);
     std::vector<Graphics::Recorder::UnlockedWait> CompletionWaits() const;
     bool CompletionWaitsOnTimelines() const;
     bool ReapMayRetire() const;

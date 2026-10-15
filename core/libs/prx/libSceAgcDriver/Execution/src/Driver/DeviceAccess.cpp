@@ -22,13 +22,13 @@ DevicePointer::operator bool() const { return Load() != nullptr; }
 
 bool DevicePointer::operator==(std::nullptr_t) const { return Load() == nullptr; }
 
-QueueLock::QueueLock(const DevicePointer& device, std::uint32_t queue) : device(device), queue(queue) {
+QueueLock::QueueLock(const DevicePointer& device, std::uint32_t queue) : device(device), site(__builtin_return_address(0)), queue(queue) {
     lock();
 }
 
-QueueLock::QueueLock(const DevicePointer& device, std::uint32_t queue, std::defer_lock_t) : device(device), queue(queue) {}
+QueueLock::QueueLock(const DevicePointer& device, std::uint32_t queue, std::defer_lock_t) : device(device), site(__builtin_return_address(0)), queue(queue) {}
 
-QueueLock::QueueLock(const DevicePointer& device, std::uint32_t queue, std::try_to_lock_t) : device(device), queue(queue) {
+QueueLock::QueueLock(const DevicePointer& device, std::uint32_t queue, std::try_to_lock_t) : device(device), site(__builtin_return_address(0)), queue(queue) {
     try_lock();
 }
 
@@ -49,7 +49,7 @@ bool QueueLock::attach(bool tryOnly) {
                 return false;
             }
         } else {
-            recorder->Lock().lock();
+            recorder->Lock().LockFrom(site);
         }
         ++locked;
     }
@@ -57,7 +57,9 @@ bool QueueLock::attach(bool tryOnly) {
 }
 
 void QueueLock::lock() {
+    SetLockSite(site);
     GuestMemory::GpuMutex().lock();
+    SetLockSite(nullptr);
     try {
         attach(false);
     } catch (...) {
@@ -70,7 +72,10 @@ void QueueLock::lock() {
 }
 
 bool QueueLock::try_lock() {
-    if (!GuestMemory::GpuMutex().try_lock()) return false;
+    SetLockSite(site);
+    const bool locked = GuestMemory::GpuMutex().try_lock();
+    SetLockSite(nullptr);
+    if (!locked) return false;
     if (!attach(true)) {
         GuestMemory::GpuMutex().unlock();
         return false;

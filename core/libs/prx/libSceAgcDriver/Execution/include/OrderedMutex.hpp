@@ -37,10 +37,13 @@ private:
 
 const char* LockLevelName(LockLevel level);
 bool LockOrderVerify();
+bool LockOrderQueueScoped();
 void SetLockOrderVerifyForTests(bool verify);
 void CheckLockOrder(LockLevel level, std::uint64_t rank, const char* name, const void* caller = nullptr);
 std::string DescribeCode(const void* address);
-void NoteLockAcquired(const void* identity, LockLevel level, std::uint64_t rank, const char* name);
+void SetLockSite(const void* site);
+const void* LockSite();
+void NoteLockAcquired(const void* identity, LockLevel level, std::uint64_t rank, const char* name, const void* site = nullptr);
 void NoteLockReleased(const void* identity);
 
 class OrderedMutex {
@@ -50,6 +53,7 @@ public:
     OrderedMutex& operator=(const OrderedMutex&) = delete;
 
     void lock();
+    void LockFrom(const void* site);
     void LockUnderDeviceLock();
     bool try_lock();
     void unlock();
@@ -61,7 +65,7 @@ public:
     const char* Name() const { return name; }
 
 private:
-    void acquired();
+    void acquired(const void* site = nullptr);
     const LockLevel level;
     const std::uint64_t rank;
     const char* const name;

@@ -1161,9 +1161,11 @@ ThreadList<const Recorder*, 16>& GpuHeldRecorders() {
 }
 
 void LockActiveRecorders() {
+    const auto own = Recorder::PhysicalQueueOf(GuestMemory::GpuLockThreadTag());
     for (std::uint32_t queue = 0; queue < Recorder::PhysicalQueues; ++queue) {
+        if (LockOrderQueueScoped() && queue != own) continue;
         if (const auto* recorder = Recorder::Domain(queue).active) {
-            recorder->Lock().lock();
+            recorder->Lock().LockFrom(LockSite());
             GpuHeldRecorders().push_back(recorder);
         }
     }

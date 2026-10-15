@@ -48,7 +48,7 @@ int main() {
     {
         std::lock_guard d(owner);
         const auto inverted = Failure([&] { std::lock_guard b(graphics); });
-        Expect(inverted.find("APS5_LOCK_ORDER_VERIFY: graphics recorder (recorder 0) taken while holding owner (owner 0)") != std::string::npos, "a recorder taken under an owner lock was not refused");
+        Expect(inverted.find("APS5_LOCK_ORDER_VERIFY: graphics recorder (recorder 0) taken while holding owner (owner 0") != std::string::npos, "a recorder taken under an owner lock was not refused");
         Expect(graphics.try_lock(), "a try-lock out of order was refused");
         graphics.unlock();
     }

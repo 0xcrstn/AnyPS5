@@ -55,12 +55,12 @@ void Driver::execute(const Submission& submission) {
         if (suspendDrain || !deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {
             const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-            QueueLock gpuLock(device, submission.queue);
+            QueueLock gpuLock(device, suspendDrain ? QueueLock::AllQueues : submission.queue);
             const auto localDevice = device.Load();
             recordDeferredLabels(localDevice.get(), submission.queue);
             if (localDevice != nullptr) {
                 if (suspendDrain) localDevice->WaitIdle();
-                else localDevice->SubmitRecorded(submission.queue == 0);
+                else localDevice->SubmitRecordedFor(submission.queue, submission.queue == 0);
             }
             ++costs.suspends;
             if (profile) costs.suspendNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -232,7 +232,7 @@ void Driver::execute(const Submission& submission) {
                 QueueLock gpuLock(device, submission.queue);
                 const auto localDevice = device.Load();
 
-                if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
+                if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecordedFor(submission.queue, submission.queue == 0);
                 if (localDevice != nullptr) {
                     localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
                     const auto queueId = submission.queue;
@@ -363,7 +363,7 @@ void Driver::execute(const Submission& submission) {
         const auto localDevice = device.Load();
 
         recordDeferredLabels(localDevice.get(), submission.queue);
-        if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
+        if (localDevice != nullptr) localDevice->SubmitRecordedFor(submission.queue, submission.queue == 0);
     }
     endTiming.Finish();
     if (submission.rewindTail != nullptr) executeRewindTail(submission);

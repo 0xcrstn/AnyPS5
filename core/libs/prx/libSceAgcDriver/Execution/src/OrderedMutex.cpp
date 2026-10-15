@@ -26,6 +26,7 @@ struct HeldLock {
     LockLevel level;
     std::uint64_t rank;
     const char* name;
+    const void* site;
 };
 
 ThreadList<HeldLock, 32>& Held() {
@@ -57,10 +58,17 @@ std::string Backtrace(const void* caller) {
     return text;
 }
 
+const char* ConfiguredValue() {
+    static const char* value = std::getenv("APS5_LOCK_ORDER_VERIFY");
+    return value;
+}
+
 bool ConfiguredVerify() {
     static const bool verify = [] {
-        const char* value = std::getenv("APS5_LOCK_ORDER_VERIFY");
-        return value != nullptr && std::strcmp(value, "0") != 0;
+        const char* value = ConfiguredValue();
+        if (value == nullptr || std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") == 0 || std::strcmp(value, "queue") == 0) return true;
+        throw std::runtime_error(std::string("APS5_LOCK_ORDER_VERIFY: expected 0, 1 or queue, got ") + value);
     }();
     return verify;
 }
@@ -83,6 +91,23 @@ std::string DescribeCode(const void* address) {
 #endif
 }
 
+namespace {
+
+const void*& ThreadLockSite() {
+    thread_local const void* site = nullptr;
+    return site;
+}
+
+}
+
+void SetLockSite(const void* site) {
+    ThreadLockSite() = site;
+}
+
+const void* LockSite() {
+    return ThreadLockSite();
+}
+
 const char* LockLevelName(LockLevel level) {
     switch (level) {
         case LockLevel::Device: return "device";
@@ -101,6 +126,11 @@ bool LockOrderVerify() {
     return value < 0 ? ConfiguredVerify() : value != 0;
 }
 
+bool LockOrderQueueScoped() {
+    static const bool scoped = ConfiguredVerify() && std::strcmp(ConfiguredValue(), "queue") == 0;
+    return scoped;
+}
+
 void SetLockOrderVerifyForTests(bool verify) {
     VerifyOverride().store(verify ? 1 : 0, std::memory_order_release);
 }
@@ -109,7 +139,7 @@ std::string HeldOrderedLocks() {
     std::string text;
     for (const auto& lock : Held()) {
         if (!text.empty()) text += ", ";
-        text += std::string(lock.name) + " (" + LockLevelName(lock.level) + " " + std::to_string(lock.rank) + ")";
+        text += std::string(lock.name) + " (" + LockLevelName(lock.level) + " " + std::to_string(lock.rank) + (lock.site != nullptr ? ", taken at " + DescribeCode(lock.site) : std::string()) + ")";
     }
     return text.empty() ? "nothing" : text;
 }
@@ -122,8 +152,8 @@ void CheckLockOrder(LockLevel level, std::uint64_t rank, const char* name, const
     }
 }
 
-void NoteLockAcquired(const void* identity, LockLevel level, std::uint64_t rank, const char* name) {
-    Held().push_back({identity, level, rank, name});
+void NoteLockAcquired(const void* identity, LockLevel level, std::uint64_t rank, const char* name, const void* site) {
+    Held().push_back({identity, level, rank, name, site});
 }
 
 void NoteLockReleased(const void* identity) {
@@ -135,15 +165,19 @@ void NoteLockReleased(const void* identity) {
     }
 }
 
-void OrderedMutex::acquired() {
+void OrderedMutex::acquired(const void* site) {
     owner.store(ThreadIdentity(), std::memory_order_relaxed);
-    if (++depth == 1) NoteLockAcquired(this, level, rank, name);
+    if (++depth == 1) NoteLockAcquired(this, level, rank, name, site);
 }
 
 void OrderedMutex::lock() {
-    if (!HeldByThisThread()) CheckLockOrder(level, rank, name, __builtin_return_address(0));
+    LockFrom(__builtin_return_address(0));
+}
+
+void OrderedMutex::LockFrom(const void* site) {
+    if (!HeldByThisThread()) CheckLockOrder(level, rank, name, site);
     mutex.lock();
-    acquired();
+    acquired(site);
 }
 
 void OrderedMutex::LockUnderDeviceLock() {

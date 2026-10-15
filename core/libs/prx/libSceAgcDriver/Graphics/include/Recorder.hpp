@@ -82,6 +82,7 @@ public:
     }
     std::uint32_t PhysicalQueue() const { return physicalQueue; }
     bool GraphicsCapable() const { return context.graphicsQueue; }
+    VkQueue Queue() const { return context.queue; }
     OrderedMutex& Lock() const { return recordLock; }
     class Hold {
     public:

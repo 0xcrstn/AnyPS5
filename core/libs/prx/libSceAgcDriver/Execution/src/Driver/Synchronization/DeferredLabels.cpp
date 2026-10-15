@@ -227,7 +227,7 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         first = false;
         countLabelOutcome(reason);
         if (reason != 0 && reason != 5) {
-            if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+            if (reason != 1 && localDevice != nullptr) localDevice->WaitIdleFor(queue);
             GuestMemory::Write(label.address, bytes, 4);
         }
         noteLabelStore(label.address, bytes, stamp, queue);
@@ -254,7 +254,7 @@ bool Driver::recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queu
     if (localDevice == nullptr || !packetFlush || !Graphics::Recorder::PendingLabelSince().has_value()) return false;
 
     const auto submitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    localDevice->SubmitRecorded(queue == 0);
+    localDevice->SubmitRecordedFor(queue, queue == 0);
     ++packetLockSubmits;
     if (profile) packetLockSubmitUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - submitStart).count());
     return true;

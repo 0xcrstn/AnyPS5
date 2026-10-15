@@ -91,7 +91,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
 
         if (!Graphics::Recorder::PendingLabelSince().has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap())) return;
         const auto since = Graphics::Recorder::PendingLabelSince();
-        localDevice->SubmitRecorded(queue == 0);
+        localDevice->SubmitRecordedFor(queue, queue == 0);
         if (since.has_value()) {
             const auto age = static_cast<std::uint64_t>(std::max<std::int64_t>(0, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - *since).count()));
             ++agedSubmits;
@@ -107,7 +107,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         else if (!labelPacket && packetFlush) ++packetFlushes;
         else ++deadlineFlushes;
     } else if (reap) {
-        localDevice->ReapRecorded();
+        localDevice->ReapRecordedFor(queue);
         ++boundaryReaps;
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

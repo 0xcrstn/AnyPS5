@@ -2268,6 +2268,32 @@ void VulkanDevice::SubmitRecorded(bool reapFirst) {
     }
 }
 
+void VulkanDevice::SubmitRecordedFor(std::uint32_t guestQueue, bool reapFirst) {
+    if (!state->recorder) return;
+    auto& recorder = RecorderFor(guestQueue);
+    const Graphics::Recorder::Hold hold(&recorder);
+    if (reapFirst && OpportunisticReap()) recorder.Reap();
+    recorder.Submit();
+}
+
+void VulkanDevice::WaitIdleFor(std::uint32_t guestQueue) {
+    if (!state->recorder || Graphics::Recorder::PhysicalQueueOf(guestQueue) == 0) {
+        WaitIdle();
+        return;
+    }
+    auto& recorder = RecorderFor(guestQueue);
+    const Graphics::Recorder::Hold hold(&recorder);
+    if (!recorder.Idle()) Graphics::Recorder::CountSync(0, __builtin_return_address(0));
+    recorder.Sync();
+}
+
+void VulkanDevice::ReapRecordedFor(std::uint32_t guestQueue) {
+    if (!state->recorder) return;
+    auto& recorder = RecorderFor(guestQueue);
+    const Graphics::Recorder::Hold hold(&recorder);
+    recorder.Reap();
+}
+
 bool VulkanDevice::CanWaitUnlocked() const {
     return state->recorder && state->recorder->HasTimeline() && !state->computeRecorder;
 }
@@ -2342,11 +2368,12 @@ bool VulkanDevice::RecordedWritesSettled(std::uint64_t address, std::size_t byte
 }
 
 bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) const {
-    const auto holds = HoldRecorders();
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
     if (Graphics::StorageTexture::AnyPendingOverlaps(range) || Graphics::AnyShadowedOverlaps(range) || state->CopiedWriterOverlaps(address, bytes)) return true;
-    if (state->computeRecorder && (state->computeRecorder->PendingWriteOverlaps(address, bytes) || state->computeRecorder->PendingLabelIn(address, bytes))) return true;
-    return state->recorder && (state->recorder->PendingWriteOverlaps(address, bytes) || state->recorder->PendingLabelIn(address, bytes));
+    if (!state->recorder) return false;
+    if (Graphics::Recorder::SnapshotWriteOverlaps(address, bytes)) return true;
+    if (state->computeRecorder && state->computeRecorder->PendingLabelIn(address, bytes)) return true;
+    return state->recorder->PendingLabelIn(address, bytes);
 }
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {

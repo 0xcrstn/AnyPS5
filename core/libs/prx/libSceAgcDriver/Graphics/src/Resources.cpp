@@ -393,7 +393,9 @@ void CommandBatch::Wait() {
     if (result == VK_SUCCESS || result == VK_ERROR_DEVICE_LOST) pending = false;
     Check(result, "vkWaitForFences graphics");
     // Recorded batches preceded this one, so their completions (write-backs) can run now.
-    Recorder::ForEachActive([](Recorder& recorder) { recorder.Reap(); });
+    Recorder::ForEachActive([&](Recorder& recorder) {
+        if (recorder.Queue() == context.queue) recorder.Reap();
+    });
 }
 
 }

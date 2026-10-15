@@ -342,7 +342,7 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
     if (!stored) {
         ++cpuFills;
 
-        localDevice->WaitIdle();
+        localDevice->WaitIdleFor(queueId);
         static thread_local std::vector<std::byte>* blockSlot = nullptr;
         auto& block = ShaderRecompiler::ThreadOwned(blockSlot);
         const auto chunk = std::min<std::size_t>(bytes, 1u << 20u);

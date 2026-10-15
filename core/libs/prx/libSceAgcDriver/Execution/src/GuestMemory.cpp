@@ -2416,7 +2416,7 @@ void GpuMutexType::acquired() {
     owner.store(ThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        NoteLockAcquired(this, LockLevel::Device, 0, "GpuMutex");
+        NoteLockAcquired(this, LockLevel::Device, 0, "GpuMutex", LockSite());
         if (auto* hook = gpuAcquiredHook.load(std::memory_order_acquire); hook != nullptr) hook();
     }
 }

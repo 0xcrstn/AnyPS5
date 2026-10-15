@@ -43,6 +43,7 @@ public:
 private:
     bool attach(bool tryOnly);
     const DevicePointer& device;
+    const void* site = nullptr;
     const std::uint32_t queue;
     bool owned = false;
     std::shared_ptr<VulkanDevice> held;
