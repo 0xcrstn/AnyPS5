@@ -233,20 +233,54 @@ bool Exited(HANDLE native) {
     return WaitForSingleObject(native, 0) == WAIT_OBJECT_0;
 }
 
-bool RestoringContext(DWORD64 rip) {
-    static const std::array<DWORD64, 2> stubs = [] {
+struct ModuleRange {
+    DWORD64 begin = 0;
+    DWORD64 end = 0;
+
+    bool Contains(DWORD64 rip) const { return rip - begin < end - begin; }
+};
+
+ModuleRange ModuleImage(const wchar_t* name) {
+    const auto* image = reinterpret_cast<const std::byte*>(GetModuleHandleW(name));
+    if (image == nullptr) return {};
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS*>(image + dos->e_lfanew);
+    const auto begin = reinterpret_cast<DWORD64>(image);
+    return {begin, begin + headers->OptionalHeader.SizeOfImage};
+}
+
+struct UnsafeCode {
+    std::array<DWORD64, 2> continueStubs;
+    ModuleRange winpthread;
+    std::array<ModuleRange, 5> runtime;
+};
+
+const UnsafeCode& UnsafeCodeRanges() {
+    static const UnsafeCode code = [] {
         const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        return std::array<DWORD64, 2>{reinterpret_cast<DWORD64>(GetProcAddress(ntdll, "NtContinue")), reinterpret_cast<DWORD64>(GetProcAddress(ntdll, "NtContinueEx"))};
+        return UnsafeCode{
+            {reinterpret_cast<DWORD64>(GetProcAddress(ntdll, "NtContinue")), reinterpret_cast<DWORD64>(GetProcAddress(ntdll, "NtContinueEx"))},
+            ModuleImage(L"libwinpthread-1.dll"),
+            {ModuleImage(L"ntdll.dll"), ModuleImage(L"kernelbase.dll"), ModuleImage(L"kernel32.dll"), ModuleImage(L"ucrtbase.dll"), ModuleImage(L"msvcrt.dll")}};
     }();
-    for (const DWORD64 stub : stubs)
+    return code;
+}
+
+bool RestoringContext(const UnsafeCode& code, DWORD64 rip) {
+    for (const DWORD64 stub : code.continueStubs)
         if (stub != 0 && rip - stub < 0x20) return true;
     return false;
 }
 
-bool InWinpthread(DWORD64 rip) {
-    static const HMODULE winpthread = GetModuleHandleW(L"libwinpthread-1.dll");
-    MEMORY_BASIC_INFORMATION info{};
-    return winpthread != nullptr && VirtualQuery(reinterpret_cast<const void*>(rip), &info, sizeof(info)) == sizeof(info) && info.AllocationBase == winpthread;
+bool ParkedInSyscall(DWORD64 rip) {
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(rip);
+    return bytes[-2] == 0x0f && bytes[-1] == 0x05;
+}
+
+bool InRuntimeCode(const UnsafeCode& code, DWORD64 rip) {
+    for (const auto& module : code.runtime)
+        if (module.Contains(rip)) return !ParkedInSyscall(rip);
+    return false;
 }
 
 bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
@@ -257,6 +291,7 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
         return true;
     }
     const auto native = static_cast<HANDLE>(thread->nativeHandle);
+    const auto& unsafe = UnsafeCodeRanges();
     auto queued = std::make_unique<Delivery>(Delivery{handler, signum, {}, {}, 0});
     alignas(16) Delivery delivery{handler, signum, {}, {}, SaveVectors ? 1u : 0u};
     const auto retryDeadline = std::chrono::steady_clock::now() + RetryLimit;
@@ -281,9 +316,10 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
             queued.release();
             return true;
         }
-        if (!RestoringContext(delivery.context.Rip) && !InWinpthread(delivery.context.Rip)) break;
+        const auto rip = delivery.context.Rip;
+        if (!RestoringContext(unsafe, rip) && !unsafe.winpthread.Contains(rip) && !InRuntimeCode(unsafe, rip)) break;
         ResumeThread(native);
-        if (std::chrono::steady_clock::now() >= retryDeadline) throw std::runtime_error("sceKernelRaiseException: the target thread stayed inside NtContinue or winpthreads for 1 s");
+        if (std::chrono::steady_clock::now() >= retryDeadline) throw std::runtime_error("sceKernelRaiseException: the target thread stayed inside NtContinue, winpthreads or system runtime code for 1 s");
         SwitchToThread();
     }
     const DWORD64 slot = (delivery.context.Rsp - RedZone - sizeof(Delivery)) & ~static_cast<DWORD64>(15);
