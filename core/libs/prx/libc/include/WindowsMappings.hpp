@@ -160,7 +160,7 @@ public:
 
     std::vector<std::pair<std::uintptr_t, std::size_t>> Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
-        std::lock_guard lock(mutex);
+        const auto lock = lockResolved(reinterpret_cast<std::uintptr_t>(address), bytes);
         requireAccessResolved(reinterpret_cast<std::uintptr_t>(address), bytes, true);
         collectableRanges.clear();
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
@@ -199,7 +199,7 @@ public:
     }
 
     void Reset(void* address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockResolved(reinterpret_cast<std::uintptr_t>(address), bytes);
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
@@ -290,7 +290,7 @@ public:
     }
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockResolved(address, bytes);
         requireAccessResolved(address, bytes, true);
         collectableRanges.clear();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
@@ -301,7 +301,7 @@ public:
     }
 
     void Pin(std::uintptr_t address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockResolved(address, bytes);
         requireAccessResolved(address, bytes, true);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& page = *it->second.page;
@@ -779,6 +779,22 @@ private:
         const auto watched = static_cast<std::uint8_t>(mask & ~guarded & view.armed);
         protectSubpages(base, watched, protection, "restore guest write tracking");
         protectSubpages(base, static_cast<std::uint8_t>(mask & ~guarded & ~watched), view.protection, "restore resolved guest access");
+    }
+
+    std::unique_lock<std::mutex> lockResolved(std::uintptr_t address, std::size_t bytes) {
+        std::unique_lock lock(mutex, std::defer_lock);
+        if (!resolveHostWrites.load(std::memory_order_acquire) || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address - pageBytes) {
+            lock.lock();
+            return lock;
+        }
+        const auto begin = address & ~(pageBytes - 1);
+        const auto end = (address + bytes + pageBytes - 1) & ~(pageBytes - 1);
+        for (;;) {
+            if (accessGuardCount.load(std::memory_order_acquire) != 0) static_cast<void>(ResolveAccess(begin, end - begin));
+            lock.lock();
+            if (!accessProtectedLocked(begin, end - begin)) return lock;
+            lock.unlock();
+        }
     }
 
     bool accessProtectedLocked(std::uintptr_t address, std::size_t bytes) const {

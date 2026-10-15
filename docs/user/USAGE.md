@@ -217,7 +217,8 @@ The protection switches take effect once the GPU device installs the access guar
 - **File reads:** kernel file reads into such memory resolve it first.
 - **Refused ranges:** ranges the protection refuses (pinned or resident pages) keep the default behaviour.
 - **`verify`:** stops the title at a refused or partly covered range, and at a driver access to such memory made while it holds the GPU lock.
-- **Limits:** unmapping or reprotecting such memory before the driver stored it stops the title. Windows only. Each pending image costs a protection change, so expect a slowdown.
+- **Mapping changes:** unmapping, decommitting, reprotecting or pinning such memory first stores the GPU results over the whole pages involved, then proceeds.
+- **Limits:** Windows only. Each pending image costs a protection change.
 - **Driver accesses:** a driver thread that holds the GPU lock and touches such memory does not wait for a title thread already resolving it. It stores the results itself and releases the guard, and the title thread's resolution then finds nothing left to do.
 - **During resolution:** the range is read-only while it is resolved. Other threads' loads see the bytes from before, and their stores wait.
 
