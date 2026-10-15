@@ -364,6 +364,7 @@ FrozenFallback Driver::frozenFallback(std::span<const std::uint32_t> packet) {
         const char* slot = std::getenv("APS5_DUMP_DRAW_SLOT1");
         return (shaders != nullptr && std::strtoull(shaders, nullptr, 16) != 0) || (slot != nullptr && std::strtoull(slot, nullptr, 16) != 0);
     }();
+    if (Pm4::IndirectDrawOpcode((packet[0] >> 8u) & 0xffu)) return FrozenFallback::Indirect;
     if (!bindingPlan()) return FrozenFallback::DrawCache;
     if (dumps || ShaderRecompiler::DebugProbeActive()) return FrozenFallback::Debug;
     if (device.Load() == nullptr) return FrozenFallback::NoDevice;
