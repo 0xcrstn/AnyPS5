@@ -1379,6 +1379,16 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     Require(covered == (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT), "the covered mask is not reported");
     recorder.Commands(&covered);
     Require(covered == 0, "the covered mask survived a Commands() call");
+    recorder.MarkCovered(Recorder::DrawPassAccess);
+    auto start = recorder.StartDrawPass(0x5eed, false, false, PassAccess{});
+    Require(!start.continued && start.barrier == !Recorder::MergeBarriers(), "a render pass begun after a barrier that covered it recorded its own (or skipped it with elision off)");
+    recorder.Commands(&covered);
+    Require(covered == 0, "a render pass start left the covered mask set");
+    recorder.MarkCovered(Recorder::DrawPassAccess & ~VK_ACCESS_INDEX_READ_BIT);
+    start = recorder.StartDrawPass(0x5eed, true, false, PassAccess{});
+    Require(!start.continued && start.barrier, "a render pass begun after a barrier that covered only part of it skipped its own");
+    start = recorder.StartDrawPass(0x5eed, false, false, PassAccess{});
+    Require(!start.continued && start.barrier, "a render pass begun after uncovered work skipped its barrier");
     recorder.Sync();
     // The hazard tracker (counting mode only): accesses are noted without effect on the batch.
     const std::pair<std::uint64_t, std::uint64_t> range{address, address + 64};

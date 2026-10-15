@@ -1401,21 +1401,33 @@ std::uint64_t Recorder::KeyStoreSerial() {
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
     ensureOpen();
     auto& pass = open->renderPass;
+    const auto coveredStart = [&] {
+        VkAccessFlags covered = 0;
+        const auto commands = Commands(&covered);
+        const bool barrier = !MergeBarriers() || (covered & DrawPassAccess) != DrawPassAccess;
+        if (!barrier) CountMerged(CommandClass::Draw);
+        return DrawPassStart{commands, false, barrier};
+    };
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
-        const auto commands = Commands();
+        const auto start = coveredStart();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
-        return {commands, false, true};
+        return start;
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
     if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
     endOpenRenderPass(!merge);
-    const auto commands = Commands();
-    if (!elide) open->passHazards.Clear();
+    if (elide) {
+        const auto commands = Commands();
+        open->passHazards.BeginPass();
+        return {commands, false, false};
+    }
+    const auto start = coveredStart();
+    open->passHazards.Clear();
     open->passHazards.BeginPass();
-    return {commands, false, !elide};
+    return start;
 }
 
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
@@ -1443,13 +1455,15 @@ void Recorder::endOpenRenderPass(bool barrier) {
     EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
     // host sees them at the batch's fence).
+    constexpr VkAccessFlags passedAccess = DrawPassAccess | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     if (barrier) {
-        recordBarrier(open->commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recordBarrier(open->commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, passedAccess);
         CountBarriers(CommandClass::Draw);
     }
     if (pass.afterPass) pass.afterPass(open->commands);
     EndGpuTiming(pass.timing);
-    open->coveredAccess = barrier ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0;
+    constexpr VkAccessFlags storedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    open->coveredAccess = !barrier ? 0 : pass.afterPass ? storedAccess : passedAccess;
     open->hostReadOwed = true;
     pass = {};
 }
