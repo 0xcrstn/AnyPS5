@@ -4311,7 +4311,9 @@ void pointerAccessShadowTests(const Device& device, Recorder& recorder) {
     };
     write({{1.0f, 0.0f, 0.0f, 1.0f}});
     build(false, {}, false);
-    Require(StorageTexture::FindPending(address + unit, unit) == image, "an address-based build that only reads stored a pending image");
+    Require(StorageTexture::FindPending(address + unit, unit) == nullptr, "an address-based build that only reads left an image pending over its heap");
+    Require(holds({255, 0, 0, 255}), "the image stored before an address-based build that only reads did not reach its heap");
+    write({{1.0f, 0.0f, 0.0f, 1.0f}});
     build(true, {{address + unit, address + 2 * unit}}, false);
     Require(StorageTexture::FindPending(address + unit, unit) == image, "an address-based build stored the image of its own target");
     build(true, {}, false);
