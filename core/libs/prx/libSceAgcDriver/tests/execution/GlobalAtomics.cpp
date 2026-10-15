@@ -1,6 +1,8 @@
+#include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -287,17 +289,22 @@ class GuestBlock {
 public:
     explicit GuestBlock(bool writable) {
 #ifdef _WIN32
-        block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, BlockBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, BlockBytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE));
 #else
         block = static_cast<std::uint8_t*>(std::aligned_alloc(BlockBytes, BlockBytes));
 #endif
         Require(block != nullptr, "global atomics: cannot allocate the guest block");
+        watched = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
+        if (watched) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, BlockBytes);
         GuestAllocations::Mutation().Add(block, BlockBytes, true, writable, true);
     }
 
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(block);
+        if (watched) static_cast<void>(GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, BlockBytes));
     }
+
+    bool Watched() const { return watched; }
 
     GuestBlock(const GuestBlock&) = delete;
     GuestBlock& operator=(const GuestBlock&) = delete;
@@ -307,6 +314,7 @@ public:
 
 private:
     std::uint8_t* block = nullptr;
+    bool watched = false;
 };
 
 void Put(std::vector<std::uint8_t>& image, std::uint32_t offset, std::uint64_t value, std::uint32_t bytes) {
@@ -426,7 +434,10 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         GuestBlock writable(true);
-        RunAtomics(*device, writable, 32);
+        const auto placedBefore = AgcDriver::Graphics::PlacedBuilds();
+        for (std::uint32_t batch = 0; batch < 4u; ++batch) RunAtomics(*device, writable, 32);
+        if (!writable.Watched()) std::puts("write watch unavailable: placement of the atomics not checked");
+        else if (AgcDriver::Graphics::PlacementSetting() != ShaderRecompiler::BdaPlacement::Mode::Host) Require(AgcDriver::Graphics::PlacedBuilds() > placedBefore, "global atomics: a dispatch with address atomics, repeated past the mirror reuse gate, was never placed in device memory");
         std::puts("global atomics tests passed");
         return 0;
     } catch (const std::exception& error) {

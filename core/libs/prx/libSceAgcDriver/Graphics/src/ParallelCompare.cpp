@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -12,7 +13,10 @@ namespace {
 class ComparePool {
 public:
     explicit ComparePool(unsigned count) {
-        for (unsigned i = 0; i < count; ++i) std::thread([this] { work(); }).detach();
+        for (unsigned i = 0; i < count; ++i) std::thread([this] {
+            const Coherence::DriverAccessScope driverAccess;
+            work();
+        }).detach();
     }
 
     bool Run(std::span<const CompareSpan> spans, std::span<std::uint8_t> equal) {

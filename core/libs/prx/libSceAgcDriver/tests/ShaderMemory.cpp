@@ -2713,6 +2713,113 @@ void verifyDescriptorPhis() {
     expectFailure([&] { static_cast<void>(planImages(splitReloads(260u))); }, "; descriptor web: more than 512 descriptor states", "descriptor Phi: the failure did not name the state limit");
 }
 
+void verifyDescriptorTableWeb() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Format8888UNorm = 56;
+    constexpr std::uint32_t Type2D = 9;
+    struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
+    static Texture textures[4];
+    struct alignas(4096) GuestTables {
+        std::array<std::uint32_t, 4> index{};
+        std::array<std::array<std::uint32_t, 8>, 3> table{};
+        std::array<std::uint32_t, 4> output{};
+        std::array<std::uint32_t, 48> srt{};
+    };
+    static GuestTables guest;
+    const auto texture = [](const Texture& image) {
+        const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(image.bytes.data()));
+        return std::array<std::uint32_t, 8>{static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+    };
+    const auto bufferDescriptor = [](const void* base, std::uint32_t records) {
+        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(base));
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), records, 0xfacu};
+    };
+    const auto tableFirst = texture(textures[0]);
+    const auto tableSecond = texture(textures[1]);
+    const auto srtFirst = texture(textures[2]);
+    const auto srtSecond = texture(textures[3]);
+    guest.table[1] = tableFirst;
+    guest.table[2] = tableSecond;
+    const auto indexV = bufferDescriptor(guest.index.data(), static_cast<std::uint32_t>(sizeof(guest.index)));
+    const auto tableV = bufferDescriptor(guest.table.data(), static_cast<std::uint32_t>(sizeof(guest.table)));
+    const auto outputV = bufferDescriptor(guest.output.data(), 16u);
+    std::copy(outputV.begin(), outputV.end(), guest.srt.begin() + 16);
+    std::copy(indexV.begin(), indexV.end(), guest.srt.begin() + 24);
+    std::copy(tableV.begin(), tableV.end(), guest.srt.begin() + 28);
+    std::copy(srtFirst.begin(), srtFirst.end(), guest.srt.begin() + 32);
+    std::copy(srtSecond.begin(), srtSecond.end(), guest.srt.begin() + 40);
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(guest.srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    const auto makeRequest = [&](std::span<const std::uint32_t> code) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x23000u, code, 0, {}};
+        request.context.waveSize = 32u;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.target.supportedExtensions = extensions;
+        request.target.bdaAbiVersion = BdaAbi::Version;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.layout.pushConstantSizeBytes = 128;
+        return request;
+    };
+    const std::vector<std::uint32_t> prologue{0xf4080500u, 0xfa000020u, 0xf4080600u, 0xfa000040u, 0xf4080700u, 0xfa000060u, 0xf4080800u, 0xfa000070u, 0xbf8cc07fu, 0xf420090eu, 0xfa000000u, 0xbf8cc07fu, 0x9325a024u};
+    const std::vector<std::uint32_t> epilogue{0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    auto chainCode = prologue;
+    chainCode.insert(chainCode.end(), {0xf42c0210u, 0x4a000000u, 0xbf8cc07fu, 0xbf068014u, 0xbf850002u, 0xf40c0200u, 0xfa000080u, 0xbf068015u, 0xbf850002u, 0xf40c0200u, 0xfa0000a0u});
+    chainCode.insert(chainCode.end(), epilogue.begin(), epilogue.end());
+    auto chain = makeRequest(chainCode);
+    const char* direct = std::getenv("APS5_DESCRIPTOR_WEB_DIRECT");
+    if (direct != nullptr && std::string_view(direct) == "off") {
+        expectFailure([&] { static_cast<void>(GetResourcePlan(chain)); }, "GetImageResource dword 0 is not a valid runtime value", "descriptor table web: APS5_DESCRIPTOR_WEB_DIRECT=off accepted a T# Phi whose base edge is a table read");
+    } else {
+        const auto plan = GetResourcePlan(chain);
+        std::size_t columns = 0;
+        std::uint32_t columnImage = 0;
+        for (std::uint32_t image = 0; image < plan->info.images.size(); image++) {
+            const auto& column = plan->descriptorSources.at(plan->info.images[image].source).tableColumn;
+            if (column.has_value()) {
+                ++columns;
+                columnImage = image;
+                require(column->stride == 32u && column->offset == 0u && !column->address, "descriptor table web: the table edge's column does not read 32-byte T# records through the buffer");
+            }
+        }
+        require(plan->info.images.size() == 3u && columns == 1u, "descriptor table web: a T# chosen by Phis between a constant buffer table read and two SRT T#s was not planned as one table column and two SRT images");
+        require(plan->info.images[columnImage].table != NoTable, "descriptor table web: the table edge's image was not assigned a table");
+        for (const auto& [key, expected] : {std::pair{2u, tableSecond}, std::pair{1u, tableFirst}}) {
+            guest.index[0] = key;
+            auto request = makeRequest(chainCode);
+            AgcDriver::ShaderMemory memory({});
+            const auto capture = memory.Capture(request);
+            const auto& tables = capture->snapshot.tables;
+            require(tables.tables.size() == 1u && key < tables.tables[0].codes.size(), "descriptor table web: the capture has no table for the constant buffer key");
+            const auto code = tables.tables[0].codes[key];
+            require((code & ImageTableAbi::PoisonFlag) == 0u && std::equal(expected.begin(), expected.end(), tables.words.at(code).dwords.begin()), "descriptor table web: the T# of the record the constant buffer selects was not read");
+            const auto holds = [&](const std::array<std::uint32_t, 8>& words) {
+                return std::ranges::any_of(capture->snapshot.images, [&](const DescriptorValue& value) { return std::equal(words.begin(), words.end(), value.dwords.begin()); });
+            };
+            require(holds(srtFirst) && holds(srtSecond), "descriptor table web: the snapshot does not hold both SRT T#s");
+            request.context.memory = memory.Regions();
+            const auto compiled = Recompile(request, *capture);
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+            static_cast<void>(ValidateAndOptimizeSpirv(compiled->spirv, request.target.vulkanVersion, request.target.spirvVersion));
+#else
+            static_cast<void>(compiled);
+#endif
+        }
+    }
+    auto loopCode = prologue;
+    loopCode.insert(loopCode.end(), {0xf40c0200u, 0xfa000080u, 0xbe910380u, 0xbf8cc07fu, 0xf42c0a10u, 0x4a000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbe880428u, 0xbe8a042au, 0xbe8c042cu, 0xbe8e042eu, 0x80118111u, 0xbf0a8211u, 0xbf85fff1u, 0xbf810000u});
+    auto loop = makeRequest(loopCode);
+    expectFailure([&] { static_cast<void>(GetResourcePlan(loop)); }, "GetImageResource dword 0 is not a valid runtime value", "descriptor table web: a T# read in a loop before the iteration's table read replaced it was bound to the new table read");
+}
+
 void verifyUndefinedImageFormats() {
     using namespace ShaderRecompiler;
     constexpr std::uint32_t Format8888UNorm = 56;
@@ -5397,7 +5504,7 @@ void verifyBdaReadFallbackFunctions() {
 
 void verifyFunctionLdsBound() {
     using namespace ShaderRecompiler;
-    const auto build = [](const auto& body, std::uint32_t allocation = FunctionLdsDwordLimit) {
+    const auto build = [](const auto& body, std::uint32_t allocation = FunctionLdsDwordLimit, std::uint32_t unbounded = FunctionLdsDwordLimit) {
         IrProgram program;
         program.Resources().stage = IrShaderStage::Pixel;
         for (const std::uint32_t offset : {0u, 256u, 512u, 0xfffffff0u}) {
@@ -5428,7 +5535,7 @@ void verifyFunctionLdsBound() {
         auto& active = program.CreateValue(IrOpcode::Void, IrType::U1);
         active.SetImmediateBool(true);
         body(program, block, emit, constant, active);
-        return std::pair{FunctionLdsDwords(program), AnalyzeProgramRequirements(program, allocation)};
+        return std::pair{FunctionLdsDwords(program), AnalyzeProgramRequirements(program, allocation, unbounded)};
     };
 
     const auto [laneSlots, laneRequirements] = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
@@ -5519,6 +5626,10 @@ void verifyFunctionLdsBound() {
     require(allocated.functionLdsDwords == 192u && allocated.functionLdsAddresses.size() == 3u, "function LDS: lane slots inside the allocation must keep their bounded size and constant slots");
     const auto truncated = build(laneSlotsWrite, 128u).second;
     require(truncated.functionLdsDwords == 128u && truncated.functionLdsAddresses.empty(), "function LDS: lane slots past the allocation must take the allocation and keep the lane term");
+    require(build(unboundedWrite, FunctionLdsDwordLimit, 96u).second.functionLdsDwords == 96u, "function LDS: an address without a bound and no declared allocation must take the parameter space");
+    const auto parameterSlots = build(laneSlotsWrite, FunctionLdsDwordLimit, 96u).second;
+    require(parameterSlots.functionLdsDwords == 192u && parameterSlots.functionLdsAddresses.size() == 3u, "function LDS: bounded lane slots must keep their size without a declared allocation");
+    require(build(unboundedWrite, 256u, 96u).second.functionLdsDwords == 96u, "function LDS: the unbounded fallback must not exceed the declared allocation");
     bool rejected = false;
     try {
         static_cast<void>(build(unboundedWrite, 0u));
@@ -6070,6 +6181,11 @@ int main(int argc, char** argv) {
             std::cout << "Target capabilities and extensions enter the cache keys by content" << std::endl;
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--descriptor-table-web") {
+            verifyDescriptorTableWeb();
+            std::cout << "Descriptor Phis over table reads bind a table column\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--srt-read-patching") {
             verifySrtReadPatching();
             std::cout << "SRT read patching replaces repeated and multiple uses\n";
@@ -6093,6 +6209,7 @@ int main(int argc, char** argv) {
         verifyPointerImageTable();
         verifyPointerTableOffsetCarry();
         verifyDescriptorPhis();
+        verifyDescriptorTableWeb();
         verifyUndefinedImageFormats();
         verifyUniformTableImage();
         verifyLaneSelectedDescriptors();

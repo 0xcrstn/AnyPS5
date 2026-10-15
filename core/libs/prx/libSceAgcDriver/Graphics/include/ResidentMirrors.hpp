@@ -18,10 +18,15 @@ bool BufferMirrorsEnabled();
 std::shared_ptr<ResidentMirror> MirrorOfImport(const Context& context, const HostImport& import);
 VkDeviceAddress MirrorDeviceAddress(const ResidentMirror& mirror);
 ShaderRecompiler::BdaPlacement::Mode PlacementSetting();
+bool ParseDrawPlacement(const char* text);
+bool DrawPlacementEnabled();
 std::shared_ptr<ResidentMirror> PlacementOfImport(const Context& context, const HostImport& import);
+void CountPlacedBuild();
+std::uint64_t PlacedBuilds();
 VkDeviceAddress MirrorPristineAddress(const ResidentMirror& mirror);
 void RecordPlacementCopyBack(const Context& context, VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress table, bool verify);
 VkBuffer MirrorBuffer(const ResidentMirror& mirror);
+VkDeviceSize MirrorBufferOffset(const ResidentMirror& mirror);
 void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirror>> mirrors);
 void RefreshMirrorsForDirectUse(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirror>> mirrors);
 void NoteMirroredWrite(std::uint64_t begin, std::uint64_t end);
@@ -49,6 +54,7 @@ struct ResidentMirrorCounters {
     double collectMs = 0;
 };
 ResidentMirrorCounters MirrorTotals();
+void ReportMirrorsEveryBatchForTests(bool everyBatch);
 
 }
 

@@ -164,6 +164,7 @@ bool StagedDrawBuilds();
 bool VerifyStagedDrawBuilds();
 std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {});
 std::span<const std::pair<std::uint64_t, std::uint64_t>> StagedDrawReads(const ResolvedDraw& resolved);
+std::vector<std::pair<std::uint64_t, std::size_t>> ResolvedSnapshotReads(const ResolvedDraw& resolved);
 void EncodeDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const ResolvedDraw& resolved, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
 
 struct ParallelResolveCounts {

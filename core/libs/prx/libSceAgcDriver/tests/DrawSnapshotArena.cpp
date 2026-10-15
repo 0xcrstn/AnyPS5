@@ -94,7 +94,7 @@ private:
 
 class Fixture {
 public:
-    Fixture(const Context& base, std::size_t bytes, std::size_t ownOffset = 0) : context(base), bytes(bytes) {
+    Fixture(const Context& base, std::size_t bytes, std::size_t ownOffset = 0, ShaderRecompiler::ShaderStage stage = ShaderRecompiler::ShaderStage::Compute) : context(base), bytes(bytes) {
         if (context.hostImportAlignment == 0) return;
         block = AllocateWatchedBlock(bytes, 65536);
         if (block == nullptr) return;
@@ -135,8 +135,9 @@ public:
         binding.bufferWritten = {false};
         program.bindings.push_back(binding);
         if (ownOffset != 0) program.pushConstants.resize(4);
-        compute = std::make_unique<CompiledShader>(CompiledShader{ShaderRecompiler::ShaderStage::Compute, &program, 0});
-        resources = std::make_unique<ShaderResources>(context, *compute);
+        compute = std::make_unique<CompiledShader>(CompiledShader{stage, &program, 0});
+        if (stage == ShaderRecompiler::ShaderStage::Compute) resources = std::make_unique<ShaderResources>(context, *compute);
+        else resources = std::make_unique<ShaderResources>(context, std::span<const CompiledShader>(compute.get(), 1), ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>{});
     }
 
     ~Fixture() {
@@ -171,6 +172,7 @@ public:
     std::byte* Bytes(std::uint64_t offset) const { return static_cast<std::byte*>(block) + offset; }
     Recorder& GetRecorder() { return *recorder; }
     const Context& GetContext() const { return context; }
+    const ShaderResources& Resources() const { return *resources; }
 
     Snapshot Take(std::uint64_t offset, std::size_t size, Statistics* statistics = nullptr, const ShaderResources::ReadAnalysis* analysis = nullptr) {
         ShaderResources::MovedBuffer moved{0, Address() + offset, size, {}};
@@ -975,6 +977,45 @@ void PersistentSetTests(Fixture& fixture) {
     fixture.GetRecorder().Sync();
 }
 
+void DrawParamsTests(const Context& context) {
+    const bool previous = ShaderResources::DrawParamsEnabled();
+    ShaderResources::SetDrawParams(true);
+    struct Restore {
+        bool previous;
+        ~Restore() { ShaderResources::SetDrawParams(previous); }
+    } restore{previous};
+    {
+        Fixture fixture(context, std::size_t{1} << 20u, 0, ShaderRecompiler::ShaderStage::Fragment);
+        if (!fixture.Ready()) return;
+        Require(fixture.Resources().TemplateOffsets(0).size() == 1, "a read-only guest buffer of a draw is not a dynamic storage buffer");
+        std::memset(fixture.Bytes(4096), 0x21, 1024);
+        std::memset(fixture.Bytes(8192), 0x22, 1024);
+        GuestMemory::BumpCollectEpoch();
+        Statistics first{};
+        const auto a = fixture.Bindings(4096, 1024, &first);
+        Statistics second{};
+        const auto b = fixture.Bindings(8192, 1024, &second);
+        Require(a->dynamicOffsets[0].size() == 1 && a->dynamicOffsets[0][0] == a->snapshots.front().offset && b->dynamicOffsets[0].size() == 1 && b->dynamicOffsets[0][0] == b->snapshots.front().offset, "a draw's dynamic offset is not its snapshot's offset");
+        Require(Holds(a->snapshots.front(), std::byte{0x21}) && Holds(b->snapshots.front(), std::byte{0x22}), "draw parameters changed a snapshot's bytes");
+        if (a->snapshots.front().handle == b->snapshots.front().handle) Require(second.persistentSets == 1 && b->allocation.set == a->allocation.set, "two draws whose inputs sit in one arena buffer at different offsets did not share a descriptor set");
+        ShaderResources::SetRecordBindingsMode(ShaderResources::RecordBindings::Legacy);
+        Statistics legacy{};
+        const auto c = fixture.Bindings(4096, 1024, &legacy);
+        Require(legacy.persistentSets == 0 && c->allocation.set != a->allocation.set && c->dynamicOffsets[0].size() == 1 && c->dynamicOffsets[0][0] == c->snapshots.front().offset && Holds(c->snapshots.front(), std::byte{0x21}), "APS5_RECORD_BINDINGS=legacy with draw parameters bound another range or reused a set");
+        ShaderResources::SetRecordBindingsMode(ShaderResources::RecordBindings::Persistent);
+        fixture.Release();
+        fixture.GetRecorder().Sync();
+    }
+    ShaderResources::SetDrawParams(false);
+    Fixture plain(context, std::size_t{1} << 20u, 0, ShaderRecompiler::ShaderStage::Fragment);
+    if (!plain.Ready()) return;
+    Require(plain.Resources().TemplateOffsets(0).empty(), "APS5_DRAW_PARAMS=0 still made a dynamic storage buffer");
+    const auto bound = plain.Bindings(4096, 1024, nullptr);
+    Require(bound->dynamicOffsets[0].empty(), "APS5_DRAW_PARAMS=0 still gave a draw dynamic offsets");
+    plain.Release();
+    plain.GetRecorder().Sync();
+}
+
 bool RunDrawSnapshotArenaTests(const Context& context) {
     const Settings settings;
     {
@@ -994,6 +1035,7 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
         DisabledTests(fixture);
         EpochDirtySetTests(fixture);
     }
+    DrawParamsTests(context);
     EpochDirtyOwnedRangeTests(context);
     EpochDirtyReferenceTests(context);
     {

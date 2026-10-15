@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueFamilyDispatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <array>
 #include <cstdio>
 #include <iostream>
 #include <mutex>
@@ -89,6 +90,31 @@ int main() {
         context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         const auto created = AgcDriver::QueueFamilyDispatchCounts();
         Require(created.sharedBuffers == after.sharedBuffers + 1 && created.sharedImages == after.sharedImages + 1, "an exclusive buffer or image was not shared by both queue families");
+        const auto graphicsFamily = graphics.GetContext().queueFamily;
+        const auto computeFamily = context.queueFamily;
+        const auto otherFamily = context.sparseFamily;
+        const std::array<std::uint32_t, 2> listed{graphicsFamily, computeFamily};
+        bufferInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        bufferInfo.queueFamilyIndexCount = static_cast<std::uint32_t>(listed.size());
+        bufferInfo.pQueueFamilyIndices = listed.data();
+        Require(context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &bufferInfo, nullptr, &buffer) == VK_SUCCESS, "a concurrent buffer could not be created");
+        context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+        Require(AgcDriver::QueueFamilyDispatchCounts().sharedBuffers == created.sharedBuffers, "a concurrent buffer that lists both queue families was rewritten");
+        if (otherFamily != VK_QUEUE_FAMILY_IGNORED && otherFamily != graphicsFamily && otherFamily != computeFamily) {
+            const std::array<std::uint32_t, 2> partial{graphicsFamily, otherFamily};
+            bufferInfo.pQueueFamilyIndices = partial.data();
+            Require(context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &bufferInfo, nullptr, &buffer) == VK_SUCCESS, "a concurrent buffer without the compute family could not be created");
+            context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+            imageInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            imageInfo.queueFamilyIndexCount = static_cast<std::uint32_t>(partial.size());
+            imageInfo.pQueueFamilyIndices = partial.data();
+            Require(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image) == VK_SUCCESS, "a concurrent image without the compute family could not be created");
+            context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
+            const auto joined = AgcDriver::QueueFamilyDispatchCounts();
+            Require(joined.sharedBuffers == created.sharedBuffers + 1 && joined.sharedImages == created.sharedImages + 1, "a concurrent buffer or image shared with another family did not gain the compute queue family");
+        } else {
+            std::puts("no third queue family with sparse binding: joining a concurrent family list not tested");
+        }
         {
             AsQueue onCompute(0x20);
             Require(AgcDriver::Graphics::Recorder::Current() == &compute && AgcDriver::Graphics::Recorder::GraphicsRecorder() == &graphics, "graphics work from the compute queue does not go to the graphics recorder");

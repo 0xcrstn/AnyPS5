@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/EmitUnit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommandSink.hpp"
 #include <unordered_map>
@@ -31,6 +32,9 @@ class Buffer;
 class DrawSnapshotArena;
 class ChunkedRecording;
 class ChunkPool;
+class EmitRecording;
+class EmitPools;
+struct EmitTicket;
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -95,6 +99,7 @@ public:
         skipPeerOnce = true;
     }
     static bool QueueOrderVerify();
+    static bool PeerSerialization();
     static void SuppressOrderWaitsForTest(bool suppress);
     struct QueueOrderStatistics {
         std::uint64_t requiredWaits = 0;
@@ -133,11 +138,15 @@ public:
         bool continued = false;
         bool barrier = true;
     };
-    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, bool depth = false);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     std::uint64_t OpenPassSerial() const;
     static bool ChunkedRecordingEnabled();
+    static std::uint32_t EmitWorkers();
+    EmitSlot CutForEmit();
+    void PostEmitUnit(EmitUnit&& unit);
     bool ChunkPass();
+    bool EmitPass();
     CommandSink OpenChunk(const Context& drawContext, const ChunkInheritance& inheritance, const ChunkDraw& draw);
     CommandSink PassSink(const Context& drawContext, const ChunkDraw& draw);
     static void DrainChunks();
@@ -714,6 +723,7 @@ private:
         std::uint64_t traceId = 0;
         bool submitted = false;
         std::atomic<std::uint64_t> submitOrder{0};
+        std::atomic<std::uint64_t> afterPeer{0};
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
@@ -798,6 +808,8 @@ private:
         struct RenderPass {
             bool open = false;
             bool fenced = false;
+            bool fencedBesidesDepth = false;
+            bool depth = false;
             std::uint64_t key = 0;
             std::uint64_t serial = 0;
             std::uint32_t timing = NoTiming;
@@ -810,6 +822,7 @@ private:
         std::vector<const void*> dispatchOwners;
         bool dispatchBarrierPending = false;
         bool dispatchBarrierDeferred = false;
+        bool drawDepth = false;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
         // Queued DCC key stores (see QueueKeyStore).
@@ -824,6 +837,13 @@ private:
         std::vector<KeyStore> keyStores;
         std::shared_ptr<ChunkPool> chunkPool;
         std::string chunkFailure;
+        struct Slot {
+            VkCommandBuffer commands = VK_NULL_HANDLE;
+            std::shared_ptr<EmitTicket> ticket;
+        };
+        std::vector<Slot> slots;
+        std::shared_ptr<EmitPools> emitPools;
+        std::uint64_t emitIdentity = 0;
     };
     struct LabelEntry {
         std::uint32_t value;
@@ -959,7 +979,10 @@ private:
     };
     LabelPick pickLabelLocked(std::uint64_t dword, std::uint32_t tag) const;
     static std::optional<LabelHit> evaluateLabel(std::span<const LabelEntry* const> entries, std::uint64_t afterStamp, LabelRefusal* refusal);
-    static std::optional<bool> LaterLabel(const LabelEntry& first, const LabelEntry& second);
+    static std::optional<bool> LaterLabel(const LabelEntry& first, const Recorder& firstOwner, const LabelEntry& second, const Recorder& secondOwner);
+    static bool OrderedAfter(const LabelEntry& later, const Recorder& laterOwner, const LabelEntry& earlier, const Recorder& earlierOwner);
+    std::atomic<std::uint64_t> peerFloor{0};
+    void raisePeerFloor(std::uint64_t serial);
     // Whether the in-flight batch with that serial has not signaled its fence (false when it is
     // not in flight any more): what makes a wait for it a real GPU wait (ThreadHookWaits).
     bool unsignaled(std::uint64_t serial) const;
@@ -977,6 +1000,7 @@ private:
     bool skipPeerOnce = false;
     bool submittingNow = false;
     std::map<Recorder*, std::uint64_t> foreignProducers;
+    std::uint32_t submitDepth = 0;
     void noteForeignRecord();
     std::map<VkSemaphore, std::uint64_t> orderWaits;
     std::map<VkSemaphore, std::uint64_t> requiredOrder;
@@ -1063,6 +1087,11 @@ private:
     void dropSnapshotTwin(std::map<DrawSnapshotKey, SnapshotTwinEntry>::iterator entry);
     std::vector<VkCommandBuffer> sparePrologues;
     VkCommandBuffer prologueCommands();
+    std::unique_ptr<EmitRecording> emit;
+    std::vector<VkCommandBuffer> spareLedgers;
+    std::uint64_t emitIdentities = 0;
+    VkCommandBuffer takeLedger();
+    void collectEmitUnits(Batch& batch);
     mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
     mutable bool publishedWriteRangesValid = false;
     mutable bool publishedResidentWrites = false;

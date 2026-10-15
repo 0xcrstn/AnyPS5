@@ -392,6 +392,52 @@ void PriorityTests() {
     SetMaterializer(nullptr);
 }
 
+void DriverAccessTests() {
+    guards.clear();
+    materialized.clear();
+    refuseProtection = false;
+    Reset(Mode::Reference, Mode::Reference);
+    SetFaultsModeForTests(Mode::New);
+    SetProtectionBackend({&FakeProtect, &FakeRelease});
+    SetMaterializer([](Interval range) { materialized.push_back(range); });
+    Require(!InDriverAccess(), "a guest thread was in driver access");
+    const auto image = ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 1);
+    const auto overlapping = ProtectDeviceOwned({0x18000, 0x28000}, Source::ShadowUnit, 2);
+    Require(image != 0 && overlapping != 0 && guards.size() == 2, "the driver access ranges were not protected");
+    {
+        const DriverAccessScope outer;
+        const DriverAccessScope inner;
+        Require(InDriverAccess(), "a driver access scope was not entered");
+        Require(FakeFault(0x14000), "a driver fault found no guard");
+    }
+    Require(!InDriverAccess(), "a driver access scope outlived its thread body");
+    Require(materialized.empty(), "a driver thread materialized device-owned memory inside its fault");
+    Require(guards.empty() && CurrentCounters().liveProtections == 0 && CurrentCounters().driverReleases == 1 && CurrentCounters().faultsResolved == 0, "a driver fault did not release every overlapping protection: " + Report());
+    static std::atomic<int> stage{0};
+    stage = 0;
+    SetMaterializer([](Interval) {
+        stage = 1;
+        while (stage.load() != 2) std::this_thread::yield();
+    });
+    const auto blocked = ProtectDeviceOwned({0x30000, 0x40000}, Source::PendingImage, 3);
+    Require(blocked != 0 && guards.size() == 1, "the blocked range was not protected");
+    const auto guard = guards[0];
+    std::thread owner([guard] { Require(guard.resolve(guard.token, guard.context), "the owning resolver refused"); });
+    while (stage.load() != 1) std::this_thread::yield();
+    std::thread worker([guard] {
+        const DriverAccessScope driverAccess;
+        Require(guard.resolve(guard.token, guard.context), "the driver resolver refused");
+    });
+    worker.join();
+    Require(stage.load() == 1 && CurrentCounters().driverReleases == 2, "a driver fault waited for a guest resolution it overlapped");
+    stage = 2;
+    owner.join();
+    Require(guards.empty() && CurrentCounters().liveProtections == 0, "the guest resolution left a guard after a driver fault");
+    SetFaultsModeForTests(Mode::Reference);
+    SetProtectionBackend({});
+    SetMaterializer(nullptr);
+}
+
 void LifetimeTests() {
     Reset(Mode::New, Mode::Reference);
     const auto before = NextVersion();
@@ -490,6 +536,7 @@ int main() {
         FaultTests();
         LeaseTests();
         PriorityTests();
+        DriverAccessTests();
         ResidencyTests();
         LazyReleaseTests();
         LifetimeTests();

@@ -67,7 +67,7 @@ void RunBdaTableContractTests() {
     namespace Abi = ShaderRecompiler::BdaAbi;
     namespace Table = ShaderRecompiler::BdaTable;
     using AgcDriver::Graphics::Require;
-    Require(Table::ParseTranslation(nullptr) == Table::Translation::Radix && Table::ParseTranslation("legacy") == Table::Translation::Legacy && Table::ParseTranslation("radix") == Table::Translation::Radix && Table::ParseTranslation("verify") == Table::Translation::Verify, "APS5_BDA_ABI values were not parsed");
+    Require(Table::ParseTranslation(nullptr) == Table::Translation::Linear && Table::ParseTranslation("linear") == Table::Translation::Linear && Table::ParseTranslation("linear_verify") == Table::Translation::LinearVerify && Table::ParseTranslation("legacy") == Table::Translation::Legacy && Table::ParseTranslation("radix") == Table::Translation::Radix && Table::ParseTranslation("verify") == Table::Translation::Verify, "APS5_BDA_ABI values were not parsed");
     reject([] { static_cast<void>(Table::ParseTranslation("on")); }, "APS5_BDA_ABI");
     const auto tables = BdaTableFixtures();
     for (std::size_t fixture = 0; fixture < tables.size(); ++fixture) {

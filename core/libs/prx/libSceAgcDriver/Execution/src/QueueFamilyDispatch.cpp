@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -77,6 +78,7 @@ struct Dispatch {
     std::atomic<std::uint64_t> sharedBuffers{0};
     std::atomic<std::uint64_t> computeBarriers{0};
     std::atomic<std::uint64_t> narrowedBarriers{0};
+    std::atomic<std::uint64_t> bufferEpoch{1};
 };
 
 Dispatch& State() {
@@ -92,12 +94,33 @@ const DeviceDispatch& DeviceOf(VkDevice device) {
     return *found->second;
 }
 
-Buffer BufferOf(VkCommandBuffer commands) {
+struct CachedBuffer {
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    std::uint64_t epoch = 0;
+    Buffer buffer{};
+};
+
+thread_local CachedBuffer cachedBuffer;
+
+void retireCachedBuffers(Dispatch& state) {
+    state.bufferEpoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
+const Buffer* findBuffer(VkCommandBuffer commands) {
     auto& state = State();
+    const auto epoch = state.bufferEpoch.load(std::memory_order_acquire);
+    if (cachedBuffer.commands == commands && cachedBuffer.epoch == epoch) return &cachedBuffer.buffer;
     std::shared_lock lock(state.mutex);
     const auto found = state.buffers.find(commands);
-    if (found == state.buffers.end()) throw std::logic_error("queue family dispatch: a command buffer not allocated through the dispatch");
-    return found->second;
+    if (found == state.buffers.end()) return nullptr;
+    cachedBuffer = {commands, epoch, found->second};
+    return &cachedBuffer.buffer;
+}
+
+Buffer BufferOf(VkCommandBuffer commands) {
+    const auto* buffer = findBuffer(commands);
+    if (buffer == nullptr) throw std::logic_error("queue family dispatch: a command buffer not allocated through the dispatch");
+    return *buffer;
 }
 
 [[noreturn]] void GraphicsOnlyCommand(const char* name) {
@@ -146,9 +169,34 @@ TInfo Shared(const TInfo& info, const DeviceDispatch& device) {
     return shared;
 }
 
+template<typename TInfo>
+bool MissesFamilies(const TInfo& info, const DeviceDispatch& device) {
+    const std::span listed(info.pQueueFamilyIndices, info.pQueueFamilyIndices != nullptr ? info.queueFamilyIndexCount : 0u);
+    return std::ranges::any_of(device.families, [&](std::uint32_t family) { return std::ranges::find(listed, family) == listed.end(); });
+}
+
+template<typename TInfo>
+TInfo Joined(const TInfo& info, const DeviceDispatch& device, std::vector<std::uint32_t>& families) {
+    families.assign(info.pQueueFamilyIndices, info.pQueueFamilyIndices + info.queueFamilyIndexCount);
+    for (const auto family : device.families) {
+        if (std::ranges::find(families, family) == families.end()) families.push_back(family);
+    }
+    auto joined = info;
+    joined.queueFamilyIndexCount = static_cast<std::uint32_t>(families.size());
+    joined.pQueueFamilyIndices = families.data();
+    return joined;
+}
+
 VkResult VKAPI_CALL CreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* allocator, VkImage* image) {
     const auto& dispatch = DeviceOf(device);
-    if (info == nullptr || info->sharingMode != VK_SHARING_MODE_EXCLUSIVE) return dispatch.createImage(device, info, allocator, image);
+    if (info == nullptr) return dispatch.createImage(device, info, allocator, image);
+    if (info->sharingMode == VK_SHARING_MODE_CONCURRENT) {
+        if (!MissesFamilies(*info, dispatch)) return dispatch.createImage(device, info, allocator, image);
+        std::vector<std::uint32_t> families;
+        const auto joined = Joined(*info, dispatch, families);
+        State().sharedImages.fetch_add(1, std::memory_order_relaxed);
+        return dispatch.createImage(device, &joined, allocator, image);
+    }
     const auto shared = Shared(*info, dispatch);
     State().sharedImages.fetch_add(1, std::memory_order_relaxed);
     return dispatch.createImage(device, &shared, allocator, image);
@@ -156,7 +204,14 @@ VkResult VKAPI_CALL CreateImage(VkDevice device, const VkImageCreateInfo* info, 
 
 VkResult VKAPI_CALL CreateBuffer(VkDevice device, const VkBufferCreateInfo* info, const VkAllocationCallbacks* allocator, VkBuffer* buffer) {
     const auto& dispatch = DeviceOf(device);
-    if (info == nullptr || info->sharingMode != VK_SHARING_MODE_EXCLUSIVE) return dispatch.createBuffer(device, info, allocator, buffer);
+    if (info == nullptr) return dispatch.createBuffer(device, info, allocator, buffer);
+    if (info->sharingMode == VK_SHARING_MODE_CONCURRENT) {
+        if (!MissesFamilies(*info, dispatch)) return dispatch.createBuffer(device, info, allocator, buffer);
+        std::vector<std::uint32_t> families;
+        const auto joined = Joined(*info, dispatch, families);
+        State().sharedBuffers.fetch_add(1, std::memory_order_relaxed);
+        return dispatch.createBuffer(device, &joined, allocator, buffer);
+    }
     const auto shared = Shared(*info, dispatch);
     State().sharedBuffers.fetch_add(1, std::memory_order_relaxed);
     return dispatch.createBuffer(device, &shared, allocator, buffer);
@@ -170,6 +225,7 @@ VkResult VKAPI_CALL AllocateCommandBuffers(VkDevice device, const VkCommandBuffe
     std::unique_lock lock(state.mutex);
     const bool compute = state.computePools.contains(info->commandPool);
     for (std::uint32_t i = 0; i < info->commandBufferCount; ++i) state.buffers[buffers[i]] = {&dispatch, info->commandPool, compute};
+    retireCachedBuffers(state);
     return result;
 }
 
@@ -179,6 +235,7 @@ void VKAPI_CALL FreeCommandBuffers(VkDevice device, VkCommandPool pool, std::uin
         auto& state = State();
         std::unique_lock lock(state.mutex);
         for (std::uint32_t i = 0; i < count; ++i) state.buffers.erase(buffers[i]);
+        retireCachedBuffers(state);
     }
     dispatch.freeCommandBuffers(device, pool, count, buffers);
 }
@@ -190,6 +247,7 @@ void VKAPI_CALL DestroyCommandPool(VkDevice device, VkCommandPool pool, const Vk
         std::unique_lock lock(state.mutex);
         state.computePools.erase(pool);
         std::erase_if(state.buffers, [&](const auto& entry) { return entry.second.pool == pool; });
+        retireCachedBuffers(state);
     }
     dispatch.destroyCommandPool(device, pool, allocator);
 }
@@ -370,6 +428,7 @@ void RemoveQueueFamilyDispatch(VkDevice device) {
     const auto* dispatch = found->second.get();
     std::erase_if(state.buffers, [&](const auto& entry) { return entry.second.device == dispatch; });
     state.devices.erase(found);
+    retireCachedBuffers(state);
 }
 
 void RegisterComputeFamilyPool(VkCommandPool pool) {
@@ -377,13 +436,12 @@ void RegisterComputeFamilyPool(VkCommandPool pool) {
     std::unique_lock lock(state.mutex);
     if (state.devices.empty()) throw std::logic_error("queue family dispatch: a compute pool registered without a dispatch");
     state.computePools.insert(pool);
+    retireCachedBuffers(state);
 }
 
 bool ComputeFamilyCommands(VkCommandBuffer commands) {
-    auto& state = State();
-    std::shared_lock lock(state.mutex);
-    const auto found = state.buffers.find(commands);
-    return found != state.buffers.end() && found->second.compute;
+    const auto* buffer = findBuffer(commands);
+    return buffer != nullptr && buffer->compute;
 }
 
 VkPipelineStageFlags ComputeFamilyStages(VkPipelineStageFlags stages, VkPipelineStageFlags empty) {

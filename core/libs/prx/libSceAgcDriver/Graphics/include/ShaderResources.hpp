@@ -174,12 +174,16 @@ public:
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
         std::shared_ptr<const DrawBindings> persistent;
+        std::array<std::vector<std::uint32_t>, 2> dynamicOffsets;
         ~DrawBindings();
     };
     enum class RecordBindings : std::uint8_t { Legacy, Persistent };
     static RecordBindings ParseRecordBindings(const char* text);
     static RecordBindings RecordBindingsMode();
     static void SetRecordBindingsMode(RecordBindings mode);
+    static bool DrawParamsEnabled();
+    static void SetDrawParams(bool enabled);
+    std::span<const std::uint32_t> TemplateOffsets(std::size_t set) const { return templateOffsets[set]; }
     static constexpr std::size_t PersistentDrawSetSlots = 4;
     enum class WholeCopy : std::uint8_t { NotAnalysed, IndexVertex, IndexInstance, IndexMemory, IndexUserData, IndexOther, NoDrawRange, IndexAtDraw, IndexAtDrawUserWord, IndexAtDrawUnderflow, IndexAtDrawOverflow, Offset, Soffset, ScalarOffset, Wrap, Opcode, Alias, Swizzled, AddTid, BeyondFourGiB, OverHalf, Disabled, Count };
     static const char* WholeCopyName(WholeCopy reason);
@@ -286,7 +290,10 @@ public:
     bool DispatchEffectsKnown() const { return tableStages.empty() && !guestMemory.HasCopiedWrites() && !HasPlacements(); }
     bool WritesThroughPointers() const { return usesBda && !bdaReadOnly; }
     void UseMirrors(Recorder& recorder) const;
+    void UseMirrors(Recorder& recorder, std::span<const std::size_t> movedAllocations) const;
+    static void LeaseInPlaceReads(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads);
     void RecordPlacementCopyBack(Recorder& recorder, VkCommandBuffer commands) const;
+    [[nodiscard]] std::vector<DispatchFreeze::Reach> ReachableRanges() const;
     void PublishResidentReads(Recorder& recorder) const;
     void RefreshAddressUse() const;
     void RefreshMirrorsForDirectUse(Recorder& recorder) const;
@@ -301,6 +308,7 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     Recorder::BoundPlacement Placement() const { return guestMemory.Placement(); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
+    std::vector<std::pair<VkImage, bool>> PassImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
@@ -437,6 +445,7 @@ private:
         std::int64_t dataAllocation = -1;
         std::uint32_t dataByte = 0;
         std::optional<ReadAnalysis> readAnalysis;
+        std::shared_ptr<ResidentMirror> mirror;
     };
     struct DataPatch {
         std::size_t allocation;
@@ -462,6 +471,7 @@ private:
         std::vector<std::size_t> imageAllocations;
         VkDescriptorBindingFlags flags = 0;
         std::int32_t set = -1;
+        bool drawParams = false;
     };
 
     struct TableStage {
@@ -678,6 +688,7 @@ private:
         std::shared_ptr<Buffer> buffer;
         DrawSnapshotArena::Placed placed{};
     };
+    mutable std::mutex movedWordMutex;
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
     struct PersistentDrawSet {
         std::vector<std::array<std::uint64_t, 4>> key;
@@ -687,7 +698,14 @@ private:
     mutable std::vector<PersistentDrawSet> persistentDrawSets;
     mutable std::size_t persistentDrawSetNext = 0;
     mutable std::size_t movedWordBufferNext = 0;
-    mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
+    struct DrawSetShape {
+        std::array<std::vector<VkDescriptorPoolSize>, 2> sizes;
+        std::array<std::optional<std::uint32_t>, 2> variable;
+        std::array<bool, 2> used{};
+    };
+    mutable std::once_flag drawSetShapeOnce;
+    mutable DrawSetShape drawSetShape;
+    const DrawSetShape& DrawSetShapeOf() const;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
@@ -715,6 +733,8 @@ private:
         bool mipmappedImage = false;
     };
     std::vector<SamplerSource> samplerSources;
+    std::array<std::vector<std::size_t>, 2> dynamicSlots;
+    std::array<std::vector<std::uint32_t>, 2> templateOffsets;
     bool reusable = false;
     bool addressTemplate = false;
     mutable std::atomic<bool> addressUsed{false};
@@ -725,6 +745,10 @@ private:
     // no image other than the object's own sources has results pending over its surfaces and
     // regions, so those checks are skipped (see fastRevalidate).
     std::uint64_t pendingSerialSeen = 0;
+    std::vector<StorageTexture::PendingQuery> pendingProofQueries;
+    std::size_t pendingProofRegions = 0;
+    bool recordPendingAnswers();
+    bool pendingAnswersHold();
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).

@@ -987,6 +987,7 @@ std::optional<CommandProcessorRead> CommandProcessorReadOf(std::span<const std::
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     if (IndirectRegisterOpcode(opcode) && packet.size() == 5) return CommandProcessorRead{address(packet[1], packet[2]), static_cast<std::size_t>(packet[4]) * (packet[3] == 0x80000000u ? 8u : 4u)};
     if (opcode == 0x91 && packet.size() == 4) return CommandProcessorRead{address(packet[1], packet[2]) + static_cast<std::uint64_t>(packet[3] & 0xffffu) * IndexAttributesBytes, IndexAttributesBytes};
+    if (opcode == 0x22 && packet.size() == 5) return CommandProcessorRead{address(packet[1], packet[2]), 4};
     return std::nullopt;
 }
 

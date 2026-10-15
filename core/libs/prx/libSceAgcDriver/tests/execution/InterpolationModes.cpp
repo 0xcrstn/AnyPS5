@@ -132,18 +132,29 @@ RecompileResult Compile(std::uint32_t mode) {
     return result;
 }
 
-void Run(AgcDriver::VulkanDevice& device, std::uint32_t mode) {
+bool Subnormal(std::uint32_t bits) {
+    const auto magnitude = bits & 0x7fffffffu;
+    return magnitude != 0u && magnitude < 0x00800000u;
+}
+
+void Run(AgcDriver::VulkanDevice& device, std::uint32_t mode, std::uint32_t facts) {
     Data.fill(Sentinel);
     for (std::uint32_t row = 0; row < Rows.size(); ++row) std::copy(Rows[row].input.begin(), Rows[row].input.end(), Data.begin() + row * Words);
-    device.Dispatch(Compile(ModeFlags[mode]), 1u, 1u, 1u);
+    const auto specialized = facts == 0xffffffffu ? 0u : InterpolationFlushedExact | (facts << InterpolationNormalShift);
+    device.Dispatch(Compile(ModeFlags[mode] | specialized), 1u, 1u, 1u);
     device.WaitIdle();
     for (std::uint32_t row = 0; row < Rows.size(); ++row) {
         for (std::uint32_t input = 0; input < 9u; ++input) Require(Data[row * Words + input] == Rows[row].input[input], "interpolation modes changed an input");
         for (std::uint32_t op = 0; op < 3u; ++op) {
+            bool promised = true;
+            for (std::uint32_t input = 0; input < 3u; ++input) {
+                if (facts != 0xffffffffu && (facts & (1u << input)) != 0u && Subnormal(Rows[row].input[op * 3u + input])) promised = false;
+            }
+            if (!promised) continue;
             const auto actual = Data[row * Words + 9u + op];
             const auto expected = Rows[row].expected[mode][op];
             char message[200];
-            std::snprintf(message, sizeof(message), "%s, %s, row %u: got 0x%08x, expected 0x%08x", OpNames[op], ModeNames[mode], row, actual, expected);
+            std::snprintf(message, sizeof(message), "%s, %s, facts 0x%x, row %u: got 0x%08x, expected 0x%08x", OpNames[op], ModeNames[mode], facts, row, actual, expected);
             Require(actual == expected, message);
         }
     }
@@ -161,8 +172,11 @@ int main() {
             std::puts("skipped, interpolation modes require Float64");
             return VulkanTestSkipped;
         }
-        for (std::uint32_t mode = 0; mode < ModeFlags.size(); ++mode) Run(*device, mode);
-        std::puts("interpolation modes passed: 32 hardware rows, 3 ops, 8 float modes");
+        for (std::uint32_t mode = 0; mode < ModeFlags.size(); ++mode) {
+            Run(*device, mode, 0xffffffffu);
+            for (std::uint32_t facts = 0; facts < 8u; ++facts) Run(*device, mode, facts);
+        }
+        std::puts("interpolation modes passed: 32 hardware rows, 3 ops, 8 float modes, generic and with each set of input facts");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

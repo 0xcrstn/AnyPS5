@@ -40,6 +40,31 @@ inline RewriteMode FlushProofsSetting() {
     return mode;
 }
 
+inline RewriteMode BdaProvenanceSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_BDA_PROVENANCE", std::getenv("APS5_BDA_PROVENANCE"), RewriteMode::On);
+    return mode;
+}
+
+inline RewriteMode WindowRegistersSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_WINDOW_REGISTERS", std::getenv("APS5_WINDOW_REGISTERS"), RewriteMode::On);
+    return mode;
+}
+
+inline RewriteMode BallotReuseSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_BALLOT_REUSE", std::getenv("APS5_BALLOT_REUSE"), RewriteMode::On);
+    return mode;
+}
+
+inline RewriteMode InterpolationFactsSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_INTERPOLATION_FACTS", std::getenv("APS5_INTERPOLATION_FACTS"), RewriteMode::On);
+    return mode;
+}
+
+inline RewriteMode BufferSelectsSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_BUFFER_SELECTS", std::getenv("APS5_BUFFER_SELECTS"), RewriteMode::On);
+    return mode;
+}
+
 inline RewriteMode BdaSpanHelpersSetting() {
     static const RewriteMode mode = ParseRewriteMode("APS5_BDA_SPAN_HELPERS", std::getenv("APS5_BDA_SPAN_HELPERS"), RewriteMode::On);
     return mode;

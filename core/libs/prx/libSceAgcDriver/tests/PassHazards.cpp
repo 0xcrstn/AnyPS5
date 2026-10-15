@@ -219,6 +219,20 @@ void testKnownAddressWrites() {
         threw = true;
     }
     Expect(threw, "an unknown value throws");
+    Expect(ParseDepthPassMerge(nullptr) == DepthPassMerge::On && ParseDepthPassMerge("0") == DepthPassMerge::Off && ParseDepthPassMerge("verify") == DepthPassMerge::Verify, "APS5_DEPTH_PASS_MERGE values");
+    PassHazards passes;
+    passes.BeginPass();
+    Use depthPass;
+    depthPass.attachments = {{image(9), true}};
+    passes.Add(depthPass.View());
+    passes.BeginPass();
+    Use sampler;
+    sampler.images = {{image(9), false}};
+    Expect(passes.Check(sampler.View(), false) == PassHazard::Image, "sampling a depth image an earlier pass wrote is a hazard");
+    Use otherDepth;
+    otherDepth.attachments = {{image(10), true}};
+    Expect(passes.Check(otherDepth.View(), false) == PassHazard::None, "a pass on another depth image has no hazard");
+    Expect(passes.Check(depthPass.View(), false) == PassHazard::Image, "a later pass writing the same depth image needs the barrier");
 }
 
 int main() {

@@ -104,6 +104,8 @@ private:
 
 enum class CommandProcessorReads : std::uint8_t { Drain, Overlap, Verify };
 
+bool ParseMemoryPacketJobs(const char* text);
+bool MemoryPacketJobs();
 CommandProcessorReads ParseCommandProcessorReads(const char* text);
 CommandProcessorReads CommandProcessorReadsMode();
 void SetCommandProcessorReadsMode(CommandProcessorReads mode);
@@ -113,6 +115,10 @@ struct CommandProcessorReadCounters {
     std::uint64_t ahead = 0;
     std::uint64_t verified = 0;
     std::uint64_t registerState = 0;
+    std::uint64_t syncsDeferred = 0;
+    std::uint64_t syncDrains = 0;
+    std::uint64_t labelDrains = 0;
+    std::uint64_t waitsSatisfied = 0;
 };
 
 CommandProcessorReadCounters CommandProcessorReadTotals();
@@ -122,6 +128,7 @@ struct LabelRecordJobCounters {
     std::uint64_t jobs = 0;
     std::uint64_t labels = 0;
     std::uint64_t endOfPipe = 0;
+    std::uint64_t memoryPackets = 0;
 };
 
 LabelRecordJobCounters LabelRecordJobTotals();
@@ -136,6 +143,11 @@ inline bool RegisterStatePacket(std::uint32_t header) {
     default:
         return false;
     }
+}
+
+inline bool CommandProcessorSyncPacket(std::uint32_t header) {
+    const auto opcode = (header >> 8u) & 0xffu;
+    return opcode == 0x42 || opcode == 0x46 || opcode == 0x58;
 }
 
 inline bool OverlapsDrawRecords(std::uint32_t opcode, bool predicated, bool dispatches = false) {

@@ -309,8 +309,8 @@ private:
     }
 
     void copyPlane(PlaneStorage& plane, const std::shared_ptr<StorageTexture>& storage, bool stencil, bool toStorage) {
-        auto* recorder = Recorder::GraphicsRecorder();
-        Require(recorder != nullptr, "depth surface storage copies need an active recorder");
+        auto* recorder = RecorderFor(context);
+        Require(recorder != nullptr, "depth surface storage copies need an active recorder of their device");
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto bytes = static_cast<std::size_t>(target.extent.width) * target.extent.height * (stencil ? 1u : d16 ? 2u : 4u);
         if (plane.staging == nullptr) plane.staging = std::make_unique<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -562,8 +562,8 @@ public:
 
     void Copy(std::span<const LayeredSlice> slices, bool toStorage) {
         if (slices.empty()) return;
-        auto* recorder = Recorder::GraphicsRecorder();
-        Require(recorder != nullptr, "depth surface storage copies need an active recorder");
+        auto* recorder = RecorderFor(context);
+        Require(recorder != nullptr, "depth surface storage copies need an active recorder of their device");
         const auto commands = recorder->Commands();
         recorder->Keep(storage);
         const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
@@ -796,6 +796,14 @@ VkImageView PeekDepthSurfaceView(const Context& context, const DepthTarget& targ
     std::lock_guard lock(surfacesMutex());
     for (const auto& candidate : surfaces()) {
         if (candidate->context.device == context.device && sameSurface(candidate->target, target)) return candidate->view;
+    }
+    return VK_NULL_HANDLE;
+}
+
+VkImage PeekDepthSurfaceImage(const Context& context, const DepthTarget& target) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& candidate : surfaces()) {
+        if (candidate->context.device == context.device && sameSurface(candidate->target, target)) return candidate->image;
     }
     return VK_NULL_HANDLE;
 }

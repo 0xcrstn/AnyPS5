@@ -17,6 +17,7 @@ namespace AgcDriver::Graphics {
 class PipelineCache {
 public:
     static constexpr int SaveIntervalSeconds = 10;
+    static constexpr int BusyRetryMilliseconds = 100;
 
     PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties);
     ~PipelineCache();
@@ -25,6 +26,7 @@ public:
     PipelineCache& operator=(const PipelineCache&) = delete;
     VkPipelineCache Handle() const { return cache; }
     PipelineCacheSynchronization& Synchronization() { return synchronization; }
+    bool TrySave() { return save(false); }
 
 private:
     struct FileHeader {
@@ -47,7 +49,8 @@ private:
     std::optional<FileHeader> readHeader() const;
     void load(std::vector<std::byte>& initialData);
     void adoptEarlierDriverFile(const std::filesystem::path& directory, const std::string& uuid);
-    void save(bool final);
+    bool save(bool final);
+    bool snapshot(bool final, std::vector<std::byte>* data, std::size_t& liveBytes);
     void run();
 
     Context context;
@@ -58,6 +61,7 @@ private:
     std::size_t loadedBytes = 0;
     std::size_t settledBytes = 0;
     std::optional<FileHeader> settledFile;
+    std::uint64_t deferredSaves = 0;
     std::mutex mutex;
     std::condition_variable wake;
     bool stopping = false;

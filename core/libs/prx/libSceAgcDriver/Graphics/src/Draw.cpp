@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PassSignatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DefaultSwitch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/IndexBounds.hpp"
@@ -547,6 +548,7 @@ struct BoundDrawState {
     bool sets = false;
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkDescriptorSet fragmentSet = VK_NULL_HANDLE;
+    std::array<std::vector<std::uint32_t>, 2> dynamicOffsets;
     bool pushed = false;
     VkShaderStageFlags pushStages = 0;
     std::array<std::byte, PipelinePushConstantBytes> push{};
@@ -652,6 +654,7 @@ void reportRecordParts(const DrawProfile& profile, double elapsedSeconds) {
     }
     if (bindings.wholeCopies[static_cast<std::size_t>(ShaderResources::WholeCopy::OverHalf)] != 0 && r > 0 && static_cast<std::size_t>(r) < sizeof(reasons)) r += std::snprintf(reasons + r, sizeof(reasons) - static_cast<std::size_t>(r), " over half read %.1f MiB of them;", static_cast<double>(bindings.overHalfReadBytes) / 1048576.0);
     if (any) std::fprintf(stderr, "%s\n", reasons);
+    PassSignatures::Report();
 }
 
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
@@ -1802,7 +1805,15 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         countCache(&DrawProfile::uncacheable);
     }
     timer.phase(PhaseLookup);
-    if (resolved.resources == nullptr && staged != nullptr) resolved.resources = completeStagedBuild(context, state, draw, shaders, snapshots, indexBytes, staged);
+    if (resolved.resources == nullptr && staged != nullptr) {
+        resolved.resources = completeStagedBuild(context, state, draw, shaders, snapshots, indexBytes, staged);
+        if (resolved.resources != nullptr) {
+            resolved.built = &resolved.resources->Timing();
+            outcome.addressBased = resolved.resources->HoldsLease();
+            outcome.kind = !outcome.addressBased ? KindBuild : resolved.resources->WritesThroughPointers() ? KindBdaWriter : KindBda;
+            if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
+        }
+    }
     if (resolved.resources == nullptr) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.built = &resolved.resources->Timing();
@@ -2364,9 +2375,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
-    const auto passImages = resources.StorageImages();
+    const auto depthPassMerge = DepthPassMergeSetting();
+    const auto passImages = depthPassMerge != DepthPassMerge::Off ? resources.PassImages() : resources.StorageImages();
     std::vector<std::pair<VkImage, bool>> passAttachments;
-    passAttachments.reserve(record.targets.size());
+    passAttachments.reserve(record.targets.size() + 1u);
+    const VkImage depthImage = state.depth && depthPassMerge != DepthPassMerge::Off ? PeekDepthSurfaceImage(context, *state.depth) : VK_NULL_HANDLE;
+    if (depthImage != VK_NULL_HANDLE) passAttachments.emplace_back(depthImage, true);
     for (const auto& target : record.targets) {
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
@@ -2375,10 +2389,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool knownAddressWrites = unknownMemory && readOnlyAddressPasses != ReadOnlyAddressPasses::Off && resources.KnownAddressWrites();
     const bool unknownWrites = unknownMemory && !(knownAddressWrites && readOnlyAddressPasses == ReadOnlyAddressPasses::On);
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownWrites, knownAddressWrites && unknownWrites};
-    const bool fenced = state.depth.has_value() || !record.proxies.empty();
+    const bool depthFenced = state.depth.has_value() && (depthPassMerge != DepthPassMerge::On || depthImage == VK_NULL_HANDLE);
+    const bool fenced = depthFenced || !record.proxies.empty();
     parts.lap(RecordAccess);
     resources.UseMirrors(*recorder);
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess, state.depth.has_value() && record.proxies.empty());
     parts.lap(RecordPassStart);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -2410,6 +2425,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
+    PassSignatures::BeginDraw(recorder->OpenPassSerial(), reinterpret_cast<std::uint64_t>(record.framebuffer.get()) ^ (static_cast<std::uint64_t>(state.renderExtent.width) << 32u) ^ state.renderExtent.height);
     if (continued) {
         commands = recorder->PassSink(context, Recorder::ChunkedRecordingEnabled() ? chunkDrawOf(shaders, draw, record) : ChunkDraw{});
         record.pipeline->Continue(commands, state);
@@ -2444,16 +2460,18 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
         const auto fragmentSet = drawBindings->fragmentAllocation.set;
-        if (bound != nullptr && bound->sets && bound->set == set && bound->fragmentSet == fragmentSet) {
+        const auto& offsets = drawBindings->dynamicOffsets;
+        if (bound != nullptr && bound->sets && bound->set == set && bound->fragmentSet == fragmentSet && bound->dynamicOffsets == offsets) {
             ++dirtyRecordCounts().setsSkipped;
         } else {
-            if (set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, set);
-            if (fragmentSet != VK_NULL_HANDLE) commands.BindDescriptorSet(context, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, fragmentSet);
+            if (set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, set, offsets[0]);
+            if (fragmentSet != VK_NULL_HANDLE) commands.BindDescriptorSet(context, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, fragmentSet, offsets[1]);
             if (bound != nullptr) {
                 ++dirtyRecordCounts().sets;
                 bound->sets = true;
                 bound->set = set;
                 bound->fragmentSet = fragmentSet;
+                bound->dynamicOffsets = offsets;
             }
         }
     } else {
@@ -2484,6 +2502,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
     recorder->EndGpuTiming(programTiming);
+    PassSignatures::EndDraw();
     parts.lap(RecordCommands);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
@@ -2499,6 +2518,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    if (resources.HasPlacements()) resources.RecordPlacementCopyBack(*recorder, recorder->Commands());
     if (bound != nullptr) bound->pass = recorder->OpenPassSerial();
     parts.lap(RecordLeave);
     timer.phase(PhaseRecord);
@@ -3940,6 +3960,13 @@ std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const St
     counters.resolves.fetch_add(1, std::memory_order_relaxed);
     counters.resolveNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
     return resolved;
+}
+
+std::vector<std::pair<std::uint64_t, std::size_t>> ResolvedSnapshotReads(const ResolvedDraw& resolved) {
+    std::vector<std::pair<std::uint64_t, std::size_t>> reads;
+    reads.reserve(resolved.prefills.size());
+    for (const auto& prefill : resolved.prefills) reads.emplace_back(prefill.address, prefill.bytes);
+    return reads;
 }
 
 ParallelResolveCounts ParallelResolveStatistics() {

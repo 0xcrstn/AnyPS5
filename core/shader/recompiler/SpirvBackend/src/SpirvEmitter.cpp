@@ -94,9 +94,14 @@ std::uint32_t FunctionLdsAllocationDwords(const IrProgram& program, const Shader
     return std::min(inputInfo.pixel->psExtraLdsDwords, FunctionLdsDwordLimit);
 }
 
+std::uint32_t FunctionLdsUnboundedDwords(const IrProgram& program, const ShaderStageInputInfo& inputInfo) {
+    if (program.Resources().stage != IrShaderStage::Pixel || inputInfo.pixel == nullptr || inputInfo.pixel->psExtraLdsDwords != 0u) return FunctionLdsDwordLimit;
+    return std::clamp(inputInfo.pixel->inputNum * 12u, 64u, FunctionLdsDwordLimit);
 }
 
-SpirvEmitterState::SpirvEmitterState(const IrProgram& program, const ShaderStageInputInfo& inputInfo) : module(program.Resources().stage == IrShaderStage::Mesh ? 0x00010400u : 0x00010300u), program(program), inputInfo(inputInfo), requirements(AnalyzeProgramRequirements(program, FunctionLdsAllocationDwords(program, inputInfo))) {
+}
+
+SpirvEmitterState::SpirvEmitterState(const IrProgram& program, const ShaderStageInputInfo& inputInfo) : module(program.Resources().stage == IrShaderStage::Mesh ? 0x00010400u : 0x00010300u), program(program), inputInfo(inputInfo), requirements(AnalyzeProgramRequirements(program, FunctionLdsAllocationDwords(program, inputInfo), FunctionLdsUnboundedDwords(program, inputInfo))) {
 }
 
 SpirvValueEmitContext::SpirvValueEmitContext(SpirvEmitterState& state) : state(state) {
@@ -142,21 +147,52 @@ std::uint32_t SpirvValueEmitContext::HalfArg(const IrValue& inst, std::size_t in
 }
 
 std::uint32_t SpirvValueEmitContext::Ballot(const IrValue* predicate) {
+    const auto lowPredicate = otherHalf == nullptr || half == 0u ? Def(predicate) : otherHalf->Def(predicate);
+    const auto highPredicate = otherHalf == nullptr ? 0u : half == 1u ? Def(predicate) : otherHalf->Def(predicate);
+    const std::array<std::uint32_t, 3> key{state.currentLabel, lowPredicate, highPredicate};
+    std::uint32_t reused = 0;
+    if (state.ballotReuse != RewriteMode::Off) {
+        if (const auto found = state.blockBallots.find(key); found != state.blockBallots.end()) reused = found->second;
+        if (reused != 0u && state.ballotReuse == RewriteMode::On) return reused;
+    }
     const auto ballotType = TypeU32Vector(state, 4u);
     const auto scope = ConstantU32(state, spv::ScopeSubgroup);
     const auto low = state.module.AllocateId();
-    EmitSubgroupBallot(state, low, otherHalf == nullptr || half == 0u ? Def(predicate) : otherHalf->Def(predicate));
+    EmitSubgroupBallot(state, low, lowPredicate);
+    std::uint32_t ballot = 0;
     if (otherHalf == nullptr) {
-        return EmitWaveBallot(state, low);
+        ballot = EmitWaveBallot(state, low);
+    } else {
+        const auto high = state.module.AllocateId();
+        const auto lowWord = state.module.AllocateId();
+        const auto highWord = state.module.AllocateId();
+        ballot = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformBallot, ballotType, high, scope, highPredicate);
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), lowWord, low, 0u);
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), highWord, high, 0u);
+        state.module.AddFunction(spv::OpCompositeConstruct, ballotType, ballot, lowWord, highWord, ConstantU32(state, 0u), ConstantU32(state, 0u));
     }
-    const auto high = state.module.AllocateId();
-    const auto lowWord = state.module.AllocateId();
-    const auto highWord = state.module.AllocateId();
-    const auto ballot = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformBallot, ballotType, high, scope, half == 1u ? Def(predicate) : otherHalf->Def(predicate));
-    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), lowWord, low, 0u);
-    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), highWord, high, 0u);
-    state.module.AddFunction(spv::OpCompositeConstruct, ballotType, ballot, lowWord, highWord, ConstantU32(state, 0u), ConstantU32(state, 0u));
+    if (state.ballotReuse == RewriteMode::Off) return ballot;
+    if (reused == 0u) {
+        state.blockBallots.emplace(key, ballot);
+        return ballot;
+    }
+    if (state.faultBufferVariable == 0) FailEmit("APS5_BALLOT_REUSE=verify needs a fault buffer");
+    const auto word = [&](std::uint32_t vector, std::uint32_t index) {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), result, vector, index);
+        return result;
+    };
+    const auto freshLow = word(ballot, 0u);
+    const auto freshHigh = word(ballot, 1u);
+    const auto reusedLow = word(reused, 0u);
+    const auto reusedHigh = word(reused, 1u);
+    const auto differs = Binary(state, spv::OpLogicalOr, TypeBool(state), Binary(state, spv::OpINotEqual, TypeBool(state), freshLow, reusedLow), Binary(state, spv::OpINotEqual, TypeBool(state), freshHigh, reusedHigh));
+    EmitIfCondition(state, differs, [&] {
+        RecordBdaFaultWords(state, freshLow, freshHigh, reusedLow, reusedHigh, BdaAbi::FaultReason::BallotReuseMismatch);
+    });
+    state.blockBallots.erase(key);
+    state.blockBallots.emplace(std::array<std::uint32_t, 3>{state.currentLabel, lowPredicate, highPredicate}, ballot);
     return ballot;
 }
 
@@ -257,6 +293,8 @@ std::uint32_t SpirvValueEmitContext::Label(const IrBlock* block) const {
 }
 
 void PrepareRewriteVerification(IrProgram& program) {
+    if (BufferSelectsSetting() == RewriteMode::Verify && !program.Info().buffers.empty()) program.Info().usesFaultBuffer = true;
+    if (BallotReuseSetting() == RewriteMode::Verify) program.Info().usesFaultBuffer = true;
     const bool log2 = LazyLog2RepairSetting() == RewriteMode::Verify;
     const bool trig = LazyTrigSeriesSetting() == RewriteMode::Verify;
     if (!log2 && !trig) return;
@@ -295,15 +333,19 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.registrationModules = target.registrationModules;
     state.fragmentDescriptorSet = target.fragmentDescriptorSet;
     state.float16DenormPreserve = target.float16DenormPreserve;
+    state.robustBufferAccess2 = target.robustBufferAccess2;
+    state.bufferSelects = target.robustBufferAccess2 ? BufferSelectsSetting() : RewriteMode::Off;
     state.sharedFloatFunctions = target.sharedFloatFunctions.value_or(SharedFloatFunctions());
     state.outlineImageModes = target.outlineImageModes.value_or(OutlineImageModes());
     state.sharedBufferHelpers = target.sharedBufferHelpers.value_or(SharedBufferHelpers());
     state.bdaTranslation = BdaTable::TranslationSetting();
     state.bdaRelative = BdaTable::RelativeSetting();
+    state.bdaProvenance = BdaProvenanceSetting();
     state.bdaInlineFastPath = BdaTable::InlineFastPathSetting();
     state.lazyLog2Repair = LazyLog2RepairSetting();
     state.lazyTrigSeries = LazyTrigSeriesSetting();
     state.bdaSpanHelpers = BdaSpanHelpersSetting();
+    state.ballotReuse = BallotReuseSetting();
     state.bdaWriteNotes = BdaWriteNotesSetting();
     static const bool guestLines = std::getenv("APS5_SPIRV_GUEST_LINES") != nullptr;
     if (guestLines) state.guestLineFile = state.module.AddString("guest");

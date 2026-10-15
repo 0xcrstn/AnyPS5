@@ -2,7 +2,10 @@
 #include "BdaTable.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LinearSpace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -42,6 +45,7 @@ struct TableEntry {
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
     std::weak_ptr<Buffer> buffer;
     std::uint64_t spaceSerial = 0;
+    std::size_t tableBytes = 0;
 };
 
 struct TableCache {
@@ -124,6 +128,47 @@ std::uint64_t hashRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& ran
 
 }
 
+namespace {
+
+std::atomic<std::uint64_t> slabReadBuilds{0}, slabReadsVerified{0};
+
+void verifySlabReads(const Context& context, std::span<const GuestBufferMemory::SlabRead> reads) {
+    auto* recorder = Recorder::Current();
+    Require(recorder != nullptr, "APS5_BDA_SHADOW_READS=verify needs an active recorder");
+    for (const auto& read : reads) {
+        const auto bytes = read.end - read.begin;
+        const auto* import = HostImportFor(context, read.begin, static_cast<std::size_t>(bytes));
+        Require(import != nullptr, "APS5_BDA_SHADOW_READS=verify: a slab-backed range lost its host import");
+        auto scratch = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes * 2), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto commands = recorder->Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, read.slab->buffer, read.offset, scratch->Handle(), 0, bytes);
+        static_cast<void>(PublishShadow(read.begin, static_cast<std::size_t>(bytes), PublishScope::Whole, PublishReason::Pointer));
+        commands = recorder->Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, import->buffer, read.begin - import->base, scratch->Handle(), bytes, bytes);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+        recorder->MarkCovered(0);
+        recorder->Keep(scratch);
+        recorder->Keep(read.slab);
+        recorder->OnCompleteWithoutGuestAccess([scratch, bytes, address = read.begin] {
+            const auto held = scratch->Bytes();
+            if (std::memcmp(held.data(), held.data() + bytes, static_cast<std::size_t>(bytes)) != 0) {
+                char message[192];
+                std::snprintf(message, sizeof(message), "APS5_BDA_SHADOW_READS=verify: the unit shadow an address-based read of 0x%llx+0x%llx reads differs from the bytes its publish stores", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+                throw std::runtime_error(message);
+            }
+            slabReadsVerified.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+}
+
+}
+
+BdaResources::SlabReadStats BdaResources::SlabReadCounters() {
+    return {slabReadBuilds.load(std::memory_order_relaxed), slabReadsVerified.load(std::memory_order_relaxed)};
+}
+
 BdaResources::BdaResources(const Context& context) {
     static_assert(std::endian::native == std::endian::little);
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
@@ -142,6 +187,16 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cached.reset();
         }
     }
+    if (!memory.PointerWrites() && BdaShadowReads() != ShadowReads::Off) {
+        auto shadowed = memory.ShadowedRanges(cached.has_value() ? std::span<const ShaderRecompiler::BdaAbi::Range>(*cached->ranges) : std::span<const ShaderRecompiler::BdaAbi::Range>(built));
+        if (!memory.SlabReads().empty()) {
+            built = std::move(shadowed);
+            cached.reset();
+            for (const auto& read : memory.SlabReads()) slabs.push_back(read.slab);
+            slabReadBuilds.fetch_add(1, std::memory_order_relaxed);
+            if (BdaShadowReads() == ShadowReads::Verify) verifySlabReads(context, memory.SlabReads());
+        }
+    }
     if (placeWrites) {
         namespace Placement = ShaderRecompiler::BdaPlacement;
         std::vector<Placement::Entry> entries;
@@ -156,6 +211,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             std::memcpy(placement->Bytes().data() + sizeof(header), entries.data(), entries.size() * sizeof(Placement::Entry));
             for (const auto& entry : entries) placed.emplace_back(entry.begin, entry.end);
             std::sort(placed.begin(), placed.end());
+            CountPlacedBuild();
         }
     }
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
@@ -179,7 +235,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                     ++cache.hits;
                     ++cache.classes.spaceTables;
                     table = std::move(shared);
-                    tableBytes = table->Size();
+                    tableBytes = it->tableBytes;
                     cache.entries.splice(cache.entries.begin(), cache.entries, it);
                     return;
                 }
@@ -213,7 +269,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                 // same way): the next build of this space binds it by the serial.
                 if (serial != 0) it->spaceSerial = serial;
                 table = std::move(shared);
-                tableBytes = table->Size();
+                tableBytes = it->tableBytes;
                 cache.entries.splice(cache.entries.begin(), cache.entries, it);
                 return;
             }
@@ -221,12 +277,33 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         }
     }
     for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA range ends past the addresses the written-page record can hold");
-    const auto words = ShaderRecompiler::BdaTable::Build(ranges, translation);
-    if (translation != ShaderRecompiler::BdaTable::Translation::Legacy) ShaderRecompiler::BdaTable::Validate(words, translation);
+    namespace Table = ShaderRecompiler::BdaTable;
+    LinearPageCodes codes;
+    VkDeviceAddress linearBase = 0;
+    if (Table::LinearLayout(translation)) {
+        if (const auto window = LinearSpace(context)) {
+            linearBase = window->deviceBase;
+            codes = BuildLinearPageCodes(ranges, linearBase);
+        }
+    }
+    const bool linear = !codes.words.empty();
+    constexpr std::uint64_t PendingBitmap = 4;
+    const Table::LinearSpace space{linearBase + codes.guestLow, codes.guestLow, codes.guestHigh, PendingBitmap, LinearPageShift};
+    auto words = Table::Build(ranges, translation, linear ? &space : nullptr);
     Require(words.size() <= std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t), "BDA table size overflow");
     tableBytes = words.size() * sizeof(std::uint32_t);
+    const auto bitmapBytes = codes.words.size() * sizeof(std::uint32_t);
     Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
-    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, UploadMemoryProperties(context, tableBytes));
+    table = std::make_shared<Buffer>(context, tableBytes + bitmapBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (linear ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u), UploadMemoryProperties(context, tableBytes + bitmapBytes));
+    if (linear) {
+        const auto bitmap = table->DeviceAddress() + tableBytes;
+        const auto at = static_cast<std::size_t>(words[Table::RadixReservedWord]) + Table::LinearBitmapWord;
+        words[at] = static_cast<std::uint32_t>(bitmap);
+        words[at + 1] = static_cast<std::uint32_t>(bitmap >> 32u);
+        WriteUpload(*table, tableBytes, codes.words.data(), bitmapBytes);
+        CountLinearTable(codes);
+    }
+    if (translation != Table::Translation::Legacy) Table::Validate(words, translation);
     WriteUpload(*table, 0, words.data(), tableBytes);
     if (tableCacheEnabled()) {
         std::lock_guard lock(cache.mutex);
@@ -235,7 +312,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.entries.clear();
             cache.device = context.device;
         }
-        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial});
+        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial, tableBytes});
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
 }
@@ -337,10 +414,31 @@ void BdaResources::CheckFault() const {
     }
     message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::TranslationMismatch) message << "; the legacy and radix BDA translations differ for this access (APS5_BDA_ABI=verify)";
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::ProvenanceMismatch) message << "; the capability installed from this access's base resource differs from the table lookup (APS5_BDA_PROVENANCE=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RelativeMismatch) message << "; the cached BDA range capability differs from the table lookup for this access (APS5_BDA_RELATIVE=verify)";
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::BufferSelectMismatch) {
+        message.str({});
+        message << "APS5_BUFFER_SELECTS=verify: shader stage " << report.stage << " pc 0x" << std::hex << report.instruction << " read 0x" << static_cast<std::uint32_t>(report.address) << " from a buffer without branches where the guarded read gave 0x" << static_cast<std::uint32_t>(report.address >> 32u) << std::dec << " (" << report.bytes << " components)";
+        throw std::runtime_error(message.str());
+    }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::FlushProofMismatch) {
         message.str({});
         message << "APS5_FLUSH_PROOFS=verify: shader stage " << report.stage << " saw the denormal 0x" << std::hex << static_cast<std::uint32_t>(report.address) << std::dec << " where a proof said a denormal flush was unneeded";
+        throw std::runtime_error(message.str());
+    }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RegisterWindowMismatch) {
+        message.str({});
+        message << "APS5_WINDOW_REGISTERS=verify: shader stage " << report.stage << " read 0x" << std::hex << static_cast<std::uint32_t>(report.address) << " from the relative-addressing window where the register selection gave 0x" << report.bytes << std::dec;
+        throw std::runtime_error(message.str());
+    }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::BallotReuseMismatch) {
+        message.str({});
+        message << "APS5_BALLOT_REUSE=verify: shader stage " << report.stage << " balloted 0x" << std::hex << static_cast<std::uint32_t>(report.address >> 32u) << "'" << static_cast<std::uint32_t>(report.address) << " where an earlier ballot of the same value in the same block gave 0x" << report.instruction << "'" << report.bytes << std::dec;
+        throw std::runtime_error(message.str());
+    }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::InterpolationFactMismatch) {
+        message.str({});
+        message << "APS5_INTERPOLATION_FACTS=verify: shader stage " << report.stage << " passed the denormal 0x" << std::hex << static_cast<std::uint32_t>(report.address) << std::dec << " to an interpolation or fma-mix input proven not denormal";
         throw std::runtime_error(message.str());
     }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::WriteNoteMismatch) message << "; a cached write note skipped a page the written-page record does not hold (APS5_BDA_WRITE_NOTES=verify)";

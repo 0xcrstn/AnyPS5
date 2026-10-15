@@ -107,9 +107,11 @@ void Driver::reportWaitChain(std::uint32_t queue) {
         auto& scheduler = driver.Scheduler();
         if (scheduler.Active()) {
             const auto taken = scheduler.Take();
-            constexpr const char* modes[] = {"off", "serial", "dag"};
-            AgcDriver::ProfilePrint_nid_no_patch("[scheduler] (10 s) mode %s%s: %llu turns, %llu handoffs, %.1f ms waiting for a turn, %llu blocked waits released the turn, %llu parks (%llu settled at arm) parked %.1f ms\n", modes[static_cast<std::size_t>(scheduler.Mode())], scheduler.Verifying() ? " verify" : "",
-                                                 static_cast<unsigned long long>(taken.turns), static_cast<unsigned long long>(taken.handoffs), taken.turnWaitMs, static_cast<unsigned long long>(taken.blocks), static_cast<unsigned long long>(taken.parks), static_cast<unsigned long long>(taken.parksSettledAtArm), taken.parkedMs);
+            constexpr const char* modes[] = {"off", "serial", "dag", "replay"};
+            AgcDriver::ProfilePrint_nid_no_patch("[scheduler] (10 s) mode %s%s: %llu turns, %llu handoffs, %.1f ms waiting for a turn, %llu blocked waits released the turn, %llu parks (%llu settled at arm) parked %.1f ms; captured %llu turns and %llu waits; replayed %llu turns and %llu waits, %llu waits differed\n", modes[static_cast<std::size_t>(scheduler.Mode())], scheduler.Verifying() ? " verify" : "",
+                                                 static_cast<unsigned long long>(taken.turns), static_cast<unsigned long long>(taken.handoffs), taken.turnWaitMs, static_cast<unsigned long long>(taken.blocks), static_cast<unsigned long long>(taken.parks), static_cast<unsigned long long>(taken.parksSettledAtArm), taken.parkedMs,
+                                                 static_cast<unsigned long long>(taken.capturedTurns), static_cast<unsigned long long>(taken.capturedWaits), static_cast<unsigned long long>(taken.replayedTurns), static_cast<unsigned long long>(taken.replayedWaits), static_cast<unsigned long long>(taken.replayMismatches));
+            scheduler.Flush();
         }
     }
     if (!Graphics::LabelVersions::Enabled()) return;

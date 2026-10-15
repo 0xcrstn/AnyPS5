@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DispatchFreeze.hpp"
+#include "ControlFlow/RequestSerializer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CompileService.hpp"
@@ -12,6 +14,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -19,6 +24,45 @@
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+void armFreeze(std::uint64_t address, ShaderRecompiler::RecompileRequest request, const std::vector<ShaderRecompiler::MemoryRegion>& captured) {
+    static const char* directory = std::getenv("APS5_FREEZE_DISPATCH");
+    if (directory == nullptr || *directory == '\0') return;
+    static const std::pair<std::uint64_t, std::uint64_t> select = [] {
+        const char* text = std::getenv("APS5_FREEZE_SELECT");
+        if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, ~std::uint64_t{0}};
+        char* end = nullptr;
+        const auto selected = std::strtoull(text, &end, 16);
+        if (end == text || selected == 0) throw std::runtime_error("APS5_FREEZE_SELECT must be <hex address>[:<occurrence>]");
+        if (*end == '\0') return std::pair<std::uint64_t, std::uint64_t>{selected, ~std::uint64_t{0}};
+        if (*end != ':') throw std::runtime_error("APS5_FREEZE_SELECT must be <hex address>[:<occurrence>]");
+        return std::pair<std::uint64_t, std::uint64_t>{selected, std::strtoull(end + 1, nullptr, 10)};
+    }();
+    static const std::uint64_t limit = [] {
+        const char* text = std::getenv("APS5_FREEZE_LIMIT");
+        if (text == nullptr) return std::uint64_t{4};
+        char* end = nullptr;
+        const auto value = std::strtoull(text, &end, 10);
+        if (end == text || *end != '\0' || value == 0) throw std::runtime_error("APS5_FREEZE_LIMIT must be a positive count");
+        return value;
+    }();
+    static std::atomic<std::uint64_t> seen{0};
+    static std::atomic<std::uint64_t> frozen{0};
+    if (select.first != 0 && (address & 0xfffffffffull) != (select.first & 0xfffffffffull)) return;
+    const auto occurrence = seen.fetch_add(1);
+    if (select.second != ~std::uint64_t{0} && occurrence != select.second) return;
+    const auto number = frozen.fetch_add(1);
+    if (number >= limit) return;
+    request.context.memory = captured;
+    std::filesystem::create_directories(directory);
+    char name[64];
+    std::snprintf(name, sizeof(name), "freeze-%llx-%llu.aps5frz", static_cast<unsigned long long>(address), static_cast<unsigned long long>(number));
+    DispatchFreeze::Arm(std::filesystem::path(directory) / name, ShaderRecompiler::RequestSerializer{}.Serialize(request));
+}
+
+}
 
 struct Driver::DispatchInputs {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
@@ -659,9 +703,11 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
                 }
                 if (indirectArguments != 0) countIndirect(outcome.cpuReason, outcome.argumentReadMs);
             } else if (indirectArguments != 0) {
+                armFreeze(address, request, captured);
                 const auto outcome = localDevice->DispatchIndirect(compiled, indirectArguments, snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
                 countIndirect(outcome.cpuReason, outcome.argumentReadMs);
             } else {
+                armFreeze(address, request, captured);
                 localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
             }
         } catch (const std::exception& error) {

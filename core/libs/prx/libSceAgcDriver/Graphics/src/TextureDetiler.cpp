@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/TextureDetile_spv.h"
@@ -10,6 +12,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -102,8 +105,42 @@ TextureDetiler::TextureDetiler(const Context& context) : context(context) {
     }
 }
 
+TextureDetiler::TextureDetiler(const Context& context, Retired) : context(context) {
+}
+
 TextureDetiler::~TextureDetiler() {
+    if (recorded && retireToRecorders()) return;
     release();
+}
+
+bool TextureDetiler::retireToRecorders() {
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::vector<Recorder*> busy;
+    Recorder::ForEachActive([&](Recorder& recorder) {
+        if (!recorder.Idle()) busy.push_back(&recorder);
+    });
+    if (busy.empty()) return false;
+    std::shared_ptr<TextureDetiler> retired(new TextureDetiler(context, Retired{}));
+    retired->adopt(*this);
+    for (auto* recorder : busy) recorder->Keep(retired);
+    return true;
+}
+
+void TextureDetiler::adopt(TextureDetiler& other) noexcept {
+    descriptorLayout = std::exchange(other.descriptorLayout, VK_NULL_HANDLE);
+    pipelineLayout = std::exchange(other.pipelineLayout, VK_NULL_HANDLE);
+    module = std::exchange(other.module, VK_NULL_HANDLE);
+    pipelines = std::exchange(other.pipelines, {});
+    descriptorSets = std::exchange(other.descriptorSets, {});
+    cmaskDescriptorLayout = std::exchange(other.cmaskDescriptorLayout, VK_NULL_HANDLE);
+    cmaskPipelineLayout = std::exchange(other.cmaskPipelineLayout, VK_NULL_HANDLE);
+    cmaskPipeline = std::exchange(other.cmaskPipeline, VK_NULL_HANDLE);
+    cmaskDescriptorSets = std::exchange(other.cmaskDescriptorSets, {});
+    cmaskErrors = std::move(other.cmaskErrors);
+    imageDescriptorLayout = std::exchange(other.imageDescriptorLayout, VK_NULL_HANDLE);
+    imagePipelineLayout = std::exchange(other.imagePipelineLayout, VK_NULL_HANDLE);
+    imageModule = std::exchange(other.imageModule, VK_NULL_HANDLE);
+    imageDescriptorSets = std::exchange(other.imageDescriptorSets, {});
 }
 
 void TextureDetiler::release() noexcept {

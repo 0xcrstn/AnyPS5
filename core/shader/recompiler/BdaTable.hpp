@@ -15,10 +15,23 @@
 
 namespace ShaderRecompiler::BdaTable {
 
-enum class Translation : std::uint32_t { Legacy, Radix, Verify };
+enum class Translation : std::uint32_t { Legacy, Radix, Verify, Linear, LinearVerify };
 enum class Relative : std::uint32_t { Off, On, Verify };
 
 inline constexpr std::uint32_t RadixVersion = 2;
+inline constexpr std::uint32_t LinearVersion = 3;
+inline constexpr std::uint32_t LinearWords = 10;
+inline constexpr std::uint32_t LinearDeviceBaseWord = 0;
+inline constexpr std::uint32_t LinearGuestLowWord = 2;
+inline constexpr std::uint32_t LinearGuestHighWord = 4;
+inline constexpr std::uint32_t LinearBitmapWord = 6;
+inline constexpr std::uint32_t LinearPageShiftWord = 8;
+inline constexpr std::uint32_t LinearReservedWord = 9;
+inline constexpr std::uint32_t LinearPageBits = 2;
+inline constexpr std::uint32_t LinearPagesPerWord = 32u / LinearPageBits;
+inline constexpr std::uint32_t LinearFallback = 0;
+inline constexpr std::uint32_t LinearRead = 1;
+inline constexpr std::uint32_t LinearReadWrite = 2;
 inline constexpr std::uint32_t HeaderWords = sizeof(BdaAbi::Header) / sizeof(std::uint32_t);
 inline constexpr std::uint32_t WindowBaseWord = 4;
 inline constexpr std::uint32_t WindowLastWord = 6;
@@ -37,12 +50,14 @@ inline constexpr std::uint32_t SearchLimit = 4;
 inline constexpr std::uint32_t NodeBit = 0x80000000u;
 
 inline Translation ParseTranslation(const char* value) {
-    if (value == nullptr) return Translation::Radix;
+    if (value == nullptr) return Translation::Linear;
     const std::string_view text(value);
     if (text == "legacy") return Translation::Legacy;
     if (text == "radix") return Translation::Radix;
     if (text == "verify") return Translation::Verify;
-    throw std::runtime_error("APS5_BDA_ABI must be legacy, radix or verify, not \"" + std::string(text) + "\"");
+    if (text == "linear") return Translation::Linear;
+    if (text == "linear_verify") return Translation::LinearVerify;
+    throw std::runtime_error("APS5_BDA_ABI must be legacy, radix, verify, linear or linear_verify, not \"" + std::string(text) + "\"");
 }
 
 inline Translation TranslationSetting() {
@@ -89,6 +104,22 @@ inline bool InlineFastPathSetting() {
     }();
     return enabled;
 }
+
+inline bool LinearLayout(Translation translation) {
+    return translation == Translation::Linear || translation == Translation::LinearVerify;
+}
+
+inline std::uint32_t TableVersion(Translation translation) {
+    return translation == Translation::Legacy ? BdaAbi::Version : LinearLayout(translation) ? LinearVersion : RadixVersion;
+}
+
+struct LinearSpace {
+    std::uint64_t deviceBase = 0;
+    std::uint64_t guestLow = 0;
+    std::uint64_t guestHigh = 0;
+    std::uint64_t bitmapAddress = 0;
+    std::uint32_t pageShift = 16;
+};
 
 inline std::uint32_t RangeBaseWord(Translation translation) {
     return translation == Translation::Legacy ? HeaderWords : RadixRangeWord;
@@ -151,7 +182,28 @@ struct Builder {
     }
 };
 
-inline std::vector<std::uint32_t> Build(std::span<const BdaAbi::Range> ranges, Translation translation) {
+inline std::vector<std::uint32_t> BuildRadix(std::span<const BdaAbi::Range> ranges, Translation translation);
+
+inline std::vector<std::uint32_t> Build(std::span<const BdaAbi::Range> ranges, Translation translation, const LinearSpace* space = nullptr) {
+    if (!LinearLayout(translation)) {
+        if (space != nullptr) throw std::runtime_error("a linear space needs a linear BDA table");
+        return BuildRadix(ranges, translation);
+    }
+    auto words = BuildRadix(ranges, Translation::Radix);
+    const LinearSpace linear = space != nullptr ? *space : LinearSpace{};
+    if (linear.guestHigh < linear.guestLow || (linear.guestHigh != linear.guestLow && (linear.deviceBase == 0 || linear.bitmapAddress == 0)) || linear.pageShift < 12u || linear.pageShift > 32u) throw std::runtime_error("invalid BDA linear space");
+    words[0] = LinearVersion;
+    words[RadixReservedWord] = static_cast<std::uint32_t>(words.size());
+    for (const auto value : {linear.deviceBase, linear.guestLow, linear.guestHigh, linear.bitmapAddress}) {
+        words.push_back(static_cast<std::uint32_t>(value));
+        words.push_back(static_cast<std::uint32_t>(value >> 32u));
+    }
+    words.push_back(linear.pageShift);
+    words.push_back(0u);
+    return words;
+}
+
+inline std::vector<std::uint32_t> BuildRadix(std::span<const BdaAbi::Range> ranges, Translation translation) {
     if (ranges.size() > std::numeric_limits<std::uint32_t>::max() / RangeWords - RadixRangeWord) throw std::runtime_error("BDA table range count overflow");
     const auto count = static_cast<std::uint32_t>(ranges.size());
     const auto rangeBase = RangeBaseWord(translation);
@@ -218,6 +270,21 @@ inline std::uint32_t RadixSelected(std::span<const std::uint32_t> words, std::ui
 inline void Validate(std::span<const std::uint32_t> words, Translation translation) {
     const auto fail = [](const std::string& message) { throw std::runtime_error("invalid BDA table: " + message); };
     if (words.size() < HeaderWords) fail("shorter than its header");
+    if (LinearLayout(translation)) {
+        if (words.size() < RadixRangeWord + LinearWords || words[0] != LinearVersion) fail("wrong linear header");
+        const auto linearWord = static_cast<std::size_t>(words[RadixReservedWord]);
+        if (linearWord + LinearWords != words.size()) fail("the linear block does not end the table");
+        const auto at = [&](std::uint32_t word) { return static_cast<std::uint64_t>(words[linearWord + word]) | (static_cast<std::uint64_t>(words[linearWord + word + 1]) << 32u); };
+        const auto low = at(LinearGuestLowWord);
+        const auto high = at(LinearGuestHighWord);
+        const auto shift = words[linearWord + LinearPageShiftWord];
+        if (high < low || (high != low && (at(LinearDeviceBaseWord) == 0 || at(LinearBitmapWord) == 0)) || shift < 12u || shift > 32u || words[linearWord + LinearReservedWord] != 0) fail("invalid linear space");
+        std::vector<std::uint32_t> radix(words.begin(), words.begin() + static_cast<std::ptrdiff_t>(linearWord));
+        radix[0] = RadixVersion;
+        radix[RadixReservedWord] = 0;
+        Validate(radix, Translation::Radix);
+        return;
+    }
     const auto count = words[1];
     const auto rangeBase = RangeBaseWord(translation);
     if (words[2] != sizeof(BdaAbi::Range)) fail("wrong range size");

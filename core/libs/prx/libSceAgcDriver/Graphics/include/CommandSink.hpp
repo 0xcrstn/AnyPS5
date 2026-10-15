@@ -100,7 +100,7 @@ public:
     void SetDepthCompareOp(const Context& context, VkCompareOp compare) const;
     void SetDepthBoundsTestEnable(const Context& context, VkBool32 enable) const;
     void SetStencilTestEnable(const Context& context, VkBool32 enable) const;
-    void BindDescriptorSet(const Context& context, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t index, VkDescriptorSet set) const;
+    void BindDescriptorSet(const Context& context, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t index, VkDescriptorSet set, std::span<const std::uint32_t> dynamicOffsets = {}) const;
     void PushConstants(const Context& context, VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::uint32_t size, const void* values) const;
     void BindVertexBuffers(const Context& context, std::uint32_t first, std::span<const VkBuffer> buffers, std::span<const VkDeviceSize> offsets) const;
     void BindIndexBuffer(const Context& context, VkBuffer buffer, VkDeviceSize offset, VkIndexType type) const;
@@ -114,6 +114,7 @@ public:
     void DrawMeshTasksIndirect(const Context& context, VkBuffer buffer, VkDeviceSize offset, std::uint32_t count, std::uint32_t stride) const;
 
 private:
+    bool emit(ChunkCommand command, std::initializer_list<std::uint64_t> arguments, std::span<const std::uint64_t> tail = {}) const;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     CommandList* list = nullptr;
     std::uintptr_t identity = 0;

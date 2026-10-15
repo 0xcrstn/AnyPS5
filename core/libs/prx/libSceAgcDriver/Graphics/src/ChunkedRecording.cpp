@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/ChunkedRecording.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DefaultSwitch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
@@ -69,7 +70,7 @@ struct ChunkedRecording::Chunk {
     std::vector<std::size_t> canonicalMarks;
 };
 
-ChunkPool::ChunkPool(const Context& context, VkCommandPool pool) : context(context), pool(pool) {
+ChunkPool::ChunkPool(const Context& context, VkCommandPool pool, VkCommandBufferLevel level) : context(context), pool(pool), level(level) {
     this->context.bufferPool.reset();
 }
 
@@ -81,7 +82,7 @@ VkCommandBuffer ChunkPool::Take() {
     if (used == buffers.size()) {
         VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         allocation.commandPool = pool;
-        allocation.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+        allocation.level = level;
         allocation.commandBufferCount = 1;
         VkCommandBuffer commands = VK_NULL_HANDLE;
         Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &commands), "vkAllocateCommandBuffers chunk");
@@ -102,7 +103,10 @@ ChunkedRecording::ChunkedRecording(const Context& context) : context(context) {
     poolInfo.queueFamilyIndex = context.queueFamily;
     beginCommandBuffer = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer");
     endCommandBuffer = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer");
-    worker = std::thread([this] { run(); });
+    worker = std::thread([this] {
+        const Coherence::DriverAccessScope driverAccess;
+        run();
+    });
 }
 
 ChunkedRecording::~ChunkedRecording() {

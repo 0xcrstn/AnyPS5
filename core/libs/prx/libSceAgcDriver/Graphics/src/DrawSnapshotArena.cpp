@@ -477,6 +477,7 @@ std::optional<DrawSnapshotArena::Prefill> DrawSnapshotArena::PrepareCopy(std::ui
         }
         auto first = address;
         auto last = address + bytes;
+        const auto dirtySerial = GuestMemory::EpochDirtySetEnabled() ? GuestMemory::DirtySerial() : 0;
         std::uint64_t generation = 0;
         if (!ranges.has_value()) {
             const auto widenedFirst = address - (address % SegmentGranule) / alignment * alignment;
@@ -511,7 +512,7 @@ std::optional<DrawSnapshotArena::Prefill> DrawSnapshotArena::PrepareCopy(std::ui
         prefill.bytes = bytes;
         prefill.generation = generation;
         prefill.registryGeneration = registryGeneration;
-        prefill.dirtySerial = GuestMemory::EpochDirtySetEnabled() ? GuestMemory::DirtySerial() : 0;
+        prefill.dirtySerial = dirtySerial;
         target = chunk->buffer->Bytes().subspan(placement->offset, segmentBytes);
     }
     if (ranges.has_value()) {

@@ -695,6 +695,9 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             auto& prepared = *sink->inputs;
             prepared.resolved = localDevice->ResolveDraw(prepared.state->state, prepared.draw, prepared.stages, prepared.snapshots);
             for (const auto& [begin, end] : Graphics::StagedDrawReads(*prepared.resolved)) sink->reads.push_back({begin, static_cast<std::size_t>(end - begin)});
+            if (prepared.resolved != nullptr) {
+                for (const auto& [address, bytes] : Graphics::ResolvedSnapshotReads(*prepared.resolved)) sink->reads.push_back({address, bytes});
+            }
         }
         phaseTiming.Phase(DrawRowGraphics);
         timing.Mark("draw_and_resource_release");

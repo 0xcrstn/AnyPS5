@@ -247,6 +247,7 @@ private:
     void waitDrawRecords();
     void waitDrawRecordsAt(std::uint32_t opcode);
     bool overlapCommandProcessorRead(std::span<const std::uint32_t> packet);
+    bool recordsInFlight();
     void postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::string identity, std::function<void(DrawRecordResult&)> record);
     static void noteDrawRecordRecipe(DrawRecordResult& result, std::shared_ptr<const DrawRecipe> built, std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void reportDrawRecords();
@@ -442,7 +443,11 @@ private:
     };
     EndOfPipeOutcome recordEndOfPipe(VulkanDevice* localDevice, std::uint32_t queue, std::span<const std::uint32_t> packet);
     bool freezeEndOfPipe(std::uint32_t queue, std::span<const std::uint32_t> packet);
+    bool storeMemoryPacket(std::uint32_t queueId, std::span<const std::uint32_t> packet, const std::function<std::optional<Pm4::StoreWrite>(std::size_t)>& resolveStore, bool& wroteOnGpu, bool& orderedAlready);
+    bool memoryPacketJob(std::uint32_t queue, std::span<const std::uint32_t> packet);
+    bool freezeMemoryPacket(std::uint32_t queue, QueueState& state, std::span<const std::uint32_t> packet);
     void emitFrozenLabels(const std::shared_ptr<FrozenDraw>& frozen);
+    void recordMemoryPacketJob(const FrozenDraw& frozen);
     bool deferredLabelPacket(std::span<const std::uint32_t> packet) const;
     bool recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queue);
     void recordQueuedLabelsBeforeRead(std::uint32_t queue);
@@ -479,7 +484,7 @@ private:
     std::atomic<std::uint64_t> packetsDone{0};
 
     std::atomic<std::uint64_t> eventSerial{0};
-    QueueScheduler queueScheduler{QueueScheduler::ConfiguredMode(), QueueScheduler::ConfiguredVerify()};
+    QueueScheduler queueScheduler{QueueScheduler::ConfiguredMode(), QueueScheduler::ConfiguredVerify(), QueueScheduler::ConfiguredRecording()};
     std::thread batchAgeThread;
     std::mutex batchAgeMutex;
     std::condition_variable batchAgeChanged;
