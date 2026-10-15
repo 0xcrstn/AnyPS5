@@ -143,7 +143,7 @@ void IrValue::SetDetachedOperands(std::vector<IrValue*> arguments, std::vector<I
     if (IsPhi() ? phiBlocks.size() != arguments.size() : !phiBlocks.empty()) {
         throw std::runtime_error("IrValue::SetDetachedOperands phi blocks do not match the arguments");
     }
-    this->arguments = std::move(arguments);
+    this->arguments = arguments;
     this->phiBlocks = std::move(phiBlocks);
 }
 

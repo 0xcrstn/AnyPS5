@@ -227,6 +227,45 @@ void AssignUseRank(ShaderSnapshot& snapshot) {
     if (found != earlier.end()) prepared.useRank = found->second;
 }
 
+enum class PartialGroupsAhead { Known, All, None };
+
+PartialGroupsAhead PartialGroupsAheadSetting() {
+    static const PartialGroupsAhead setting = [] {
+        const char* text = std::getenv("APS5_PARTIAL_GROUPS_AHEAD");
+        if (text == nullptr || *text == '\0' || std::string_view(text) == "known") return PartialGroupsAhead::Known;
+        if (std::string_view(text) == "all") return PartialGroupsAhead::All;
+        if (std::string_view(text) == "none") return PartialGroupsAhead::None;
+        throw std::runtime_error("APS5_PARTIAL_GROUPS_AHEAD accepts known, all or none: " + std::string(text));
+    }();
+    return setting;
+}
+
+std::uint64_t partialGroupKey(std::span<const std::uint32_t> code) {
+    const auto key = ShaderRecompiler::HashBytes(std::as_bytes(code), 0x50475200u);
+    return key == 0 ? 1u : key;
+}
+
+bool PartialGroupsKnown(std::span<const std::uint32_t> code) {
+    switch (PartialGroupsAheadSetting()) {
+    case PartialGroupsAhead::All: return true;
+    case PartialGroupsAhead::None: return false;
+    case PartialGroupsAhead::Known: break;
+    }
+    return ShaderRecompiler::ShaderDiskCache::EarlierShaderUses().contains(partialGroupKey(code));
+}
+
+void NotePartialGroupUse(const ShaderSnapshot& snapshot, const ShaderRecompiler::RecompileRequest& request) {
+    if (!request.context.compute.has_value() || !request.context.compute->PartialGroups()) return;
+    const auto key = partialGroupKey(snapshot.code);
+    if (ShaderRecompiler::ShaderDiskCache::EarlierShaderUses().contains(key)) return;
+    auto& recorded = RecordedShaderUses();
+    {
+        std::lock_guard lock(recorded.mutex);
+        if (!recorded.keys.insert(key).second) return;
+    }
+    ShaderRecompiler::ShaderDiskCache::StoreShaderUse({key, 0u});
+}
+
 void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock) {
     NoteRegisteredUse(prepared);
     if (prepared.pending) PrioritizeRegistrationPreparation(prepared);
@@ -527,6 +566,10 @@ void ReportPreparedAtUse(const ShaderSnapshot& snapshot, const ShaderRecompiler:
         APS5_LOG_OUT_DEBUG("Shader 0x%llx is drawn into a layered target; preparing its layered variant at draw", static_cast<unsigned long long>(snapshot.codeAddress));
         return;
     }
+    if (!snapshot.header.empty() && request.context.compute.has_value() && request.context.compute->PartialGroups() && snapshot.prepared->partialGroupsDeferred) {
+        APS5_LOG_OUT_DEBUG("Compute shader 0x%llx is dispatched with partial thread groups; preparing that variant now and ahead of use in later runs", static_cast<unsigned long long>(snapshot.codeAddress));
+        return;
+    }
     if (!snapshot.header.empty()) {
         if (!snapshot.prepared->deferred) APS5_LOG_ERR("Shader 0x%llx stage %u has no artifact prepared at registration for the state of this draw or dispatch; preparing it at use", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<std::uint32_t>(request.shader.stage));
         return;
@@ -560,6 +603,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
         if (auto found = find()) return found;
     }
     ReportPreparedAtUse(snapshot, request);
+    NotePartialGroupUse(snapshot, request);
     auto handle = PrepareShaderWithDiagnostics(request);
     snapshot.prepared->entries.push_back({codeOffset, handle});
     return handle;
@@ -733,6 +777,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         if (auto invocation = find()) return std::move(*invocation);
     }
     ReportPreparedAtUse(snapshot, source);
+    NotePartialGroupUse(snapshot, source);
     if (!linked.code.empty()) calleePreparationsAtUse.fetch_add(1, std::memory_order_relaxed);
     auto handle = PrepareShaderWithDiagnostics(source);
     invocationRequest = source;
@@ -1304,10 +1349,12 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
         } catch (...) {
             failure = std::current_exception();
         }
-        const bool partialGroups = failure == nullptr && !skipped && PartialGroupsPossible(*plan);
+        const bool possible = failure == nullptr && !skipped && PartialGroupsPossible(*plan);
+        const bool partialGroups = possible && PartialGroupsKnown(snapshot->code);
         auto& prepared = *snapshot->prepared;
         {
             std::lock_guard lock(prepared.mutex);
+            prepared.partialGroupsDeferred = possible && !partialGroups;
             prepared.entries.insert(prepared.entries.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
             if (failure == nullptr && !skipped && !plan->abiKey.empty()) prepared.registeredAbis.push_back(std::move(plan->abiKey));
             if (skipped || (failure != nullptr && plan->budgeted)) prepared.deferred = true;
@@ -1442,6 +1489,10 @@ void NoteUserDataCallees(std::uint64_t caller, std::span<const ShaderRecompiler:
     for (auto& waiter : state.waiters) PrepareWithKnownCallees(state, waiter, caller);
 }
 
+}
+
+std::uint64_t PartialGroupKey(std::span<const std::uint32_t> code) {
+    return partialGroupKey(code);
 }
 
 void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared, bool behind) {

@@ -191,6 +191,7 @@ Vulkan pipelines are compiled on a scheduler that runs the work a queue is waiti
 - `APS5_PIPELINE_PREWARM`: the compute pipelines of earlier runs are compiled again when the device starts, before the title asks for them (needs `APS5_PIPELINE_CONTENT_DEDUP`).
 - `APS5_SPIRV_INTERN`: identical compiled shaders are kept in memory once.
 - `APS5_PIPELINE_CACHE_PROBES`: before a draw or dispatch waits for its pipeline to compile, the driver is asked to create it from the Vulkan pipeline cache only; a pipeline an earlier run compiled is then used at once (needs `VK_EXT_pipeline_creation_cache_control`).
+- `APS5_PARTIAL_GROUPS_AHEAD=known|all|none`: which compute shaders also get their partial-thread-group variant prepared ahead of use. `known` (the default) prepares it only for shaders an earlier run dispatched with partial thread groups (recorded in `shader-use.bin`); others prepare it at their first such dispatch. `all` prepares it for every compute shader, as before, which roughly doubles cold preparation work.
 - `APS5_SHARED_BUFFER_HELPERS`: formatted buffer accesses of all buffers share one function per access shape instead of one per buffer, which keeps compute shaders with many buffers smaller before specialization.
 - `APS5_OUTLINE_IMAGE_MODES`: an image access that depends on the image's run-time format calls one function per image instead of repeating every format's code at each access, which keeps very large compute shaders several times smaller.
 
