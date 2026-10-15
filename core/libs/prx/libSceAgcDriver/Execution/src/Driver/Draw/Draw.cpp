@@ -323,6 +323,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
+    if (planned) {
+        phaseTiming.Phase(DrawRowVectors);
+        memory = shaderMemory.Regions();
+        phaseTiming.Phase(DrawRowCaptureRegions);
+    }
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
     timing.Mark("shader_compile_and_link");
 
@@ -444,6 +449,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 result = *compiled;
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
             }
+            if (planned && !patched.empty()) memory = shaderMemory.Regions();
             fold(*programResults[0], direct);
             if (graphics.rectList && patched.contains(0)) buildRectList();
             snapshot();

@@ -2731,6 +2731,62 @@ void verifySingleLaneVertexWave() {
     require(withoutKey != withKey, "single-lane vertex wave: vertex subgroup support did not change the cache key");
 }
 
+void verifyTargetFeatureKey() {
+    using namespace ShaderRecompiler;
+    static constexpr std::array<std::uint32_t, 1> code{0xbf810000u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x10000u, code, 0, {}};
+    request.context.waveSize = 64;
+    std::vector<std::uint32_t> capabilities{1u, 11u, 5345u};
+    std::vector<std::string> names{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    std::vector<std::string_view> views(names.begin(), names.end());
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = views;
+    const auto build = [](const RecompileRequest& built) {
+        std::vector<std::uint64_t> full;
+        RecompileCacheKey::Build(built, full);
+        std::vector<std::uint64_t> interfaceKey;
+        RecompileCacheKey::BuildInterface(built, interfaceKey);
+        std::vector<std::uint64_t> prepared;
+        BuildPreparedShaderKey(built, prepared);
+        return std::tuple(full, interfaceKey, prepared);
+    };
+    const auto first = build(request);
+    std::vector<std::uint64_t> encoded{capabilities.size()};
+    encoded.insert(encoded.end(), capabilities.begin(), capabilities.end());
+    encoded.push_back(names.size());
+    for (const auto& name : names) {
+        encoded.push_back(name.size());
+        for (const unsigned char byte : name) encoded.push_back(byte);
+    }
+    for (const auto* key : {&std::get<0>(first), &std::get<1>(first), &std::get<2>(first)}) {
+        require(std::ranges::search(*key, encoded).size() == encoded.size(), "target key: the capabilities and extensions are not encoded word by word in the key");
+    }
+    require(build(request) == first, "target key: a repeated build changed the key");
+    const auto copiedCapabilities = capabilities;
+    const auto copiedNames = names;
+    const std::vector<std::string_view> copiedViews(copiedNames.begin(), copiedNames.end());
+    auto copied = request;
+    copied.target.supportedCapabilities = copiedCapabilities;
+    copied.target.supportedExtensions = copiedViews;
+    require(build(copied) == first, "target key: equal features in other storage built another key");
+    names[1][8] = '9';
+    const auto renamed = build(request);
+    require(std::get<0>(renamed) != std::get<0>(first) && std::get<1>(renamed) != std::get<1>(first) && std::get<2>(renamed) != std::get<2>(first), "target key: an extension renamed in place kept the key");
+    require(build(copied) == first && build(request) == renamed, "target key: alternating targets served a stale key");
+    names[1][8] = '8';
+    require(build(request) == first, "target key: restoring the extension did not restore the key");
+    capabilities.push_back(4427u);
+    request.target.supportedCapabilities = capabilities;
+    require(std::get<1>(build(request)) != std::get<1>(first), "target key: an added capability kept the key");
+    capabilities.pop_back();
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = std::span<const std::string_view>(views).first(1);
+    require(std::get<1>(build(request)) != std::get<1>(first), "target key: a dropped extension kept the key");
+    request.target.supportedExtensions = views;
+    require(std::async(std::launch::async, [&] { return build(request); }).get() == first, "target key: another thread built another key");
+}
+
 void verifyMeshConfiguration() {
     using namespace ShaderRecompiler;
     ShaderMeshInputInfo list;
@@ -5115,6 +5171,11 @@ int main(int argc, char** argv) {
             std::cout << "Values-only captures equal traced captures and materialize to the same results" << std::endl;
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--target-key") {
+            verifyTargetFeatureKey();
+            std::cout << "Target capabilities and extensions enter the cache keys by content" << std::endl;
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--srt-read-patching") {
             verifySrtReadPatching();
             std::cout << "SRT read patching replaces repeated and multiple uses\n";
@@ -5142,6 +5203,7 @@ int main(int argc, char** argv) {
         verifyNarrowVertexWave();
         verifySingleLaneVertexWave();
         verifyMeshConfiguration();
+        verifyTargetFeatureKey();
         verifyPixelInputs();
         verifyCanonicalVersion20And21Requests();
         verifyPixelRequestSerialization();

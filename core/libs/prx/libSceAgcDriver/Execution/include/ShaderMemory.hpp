@@ -117,7 +117,7 @@ private:
     std::uint32_t fetchWord(std::uint64_t address, bool wordwise);
     bool readDirect(std::uint64_t address, std::uint32_t* value);
     bool probeDirect(std::uint64_t address, std::uint64_t end);
-    std::uint8_t directPageKind(std::uint64_t base);
+    std::uint8_t directPageKind(std::uint64_t base, std::uint64_t allocation, PendingGenerationProvider provider, std::uint64_t pending);
     std::vector<ShaderRecompiler::MemoryRegion> directRegions(std::span<const std::uint32_t> indices, bool withInitial) const;
     struct DirectRead {
         std::uint64_t address;
@@ -152,6 +152,11 @@ private:
     std::uint64_t directHooked = 0;
     std::uint64_t directLookups = 0;
     std::uint64_t directMisses = 0;
+    std::uint64_t lastDirectBase = ~std::uint64_t{0};
+    std::uint64_t lastDirectAllocation = 0;
+    std::uint64_t lastDirectPending = 0;
+    PendingGenerationProvider lastDirectProvider = nullptr;
+    std::uint8_t lastDirectKind = 0;
 };
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a

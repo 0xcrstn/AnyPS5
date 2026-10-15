@@ -636,21 +636,25 @@ ShaderMemory::DirectReadCounts ShaderMemory::DirectReads() {
     return {totals.captures.load(std::memory_order_relaxed), totals.words.load(std::memory_order_relaxed), totals.hookedWords.load(std::memory_order_relaxed), totals.pageStateLookups.load(std::memory_order_relaxed), totals.pageStateMisses.load(std::memory_order_relaxed)};
 }
 
-std::uint8_t ShaderMemory::directPageKind(std::uint64_t base) {
+std::uint8_t ShaderMemory::directPageKind(std::uint64_t base, std::uint64_t allocation, PendingGenerationProvider provider, std::uint64_t pending) {
+    ++directLookups;
+    if (base == lastDirectBase && allocation == lastDirectAllocation && pending == lastDirectPending && provider == lastDirectProvider) return lastDirectKind;
     auto& cache = ThreadPageStates();
     auto& entry = cache.entries[static_cast<std::size_t>(base / PageBytes) % PageStateSlots];
-    const auto allocation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const auto provider = pendingGenerationProvider.load(std::memory_order_acquire);
-    const auto pending = provider != nullptr ? provider() : instanceSerial;
-    ++directLookups;
-    if (entry.base == base && entry.allocation == allocation && entry.pending == pending && entry.query == pendingWrite && entry.provider == provider) return entry.kind;
-    ++directMisses;
-    std::uint8_t kind = PageInaccessible;
-    if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
-        kind = pendingWrite == nullptr || pendingWrite(base, PageBytes, {}) != PendingWrite::None ? PageWordwise : PageWhole;
+    if (entry.base != base || entry.allocation != allocation || entry.pending != pending || entry.query != pendingWrite || entry.provider != provider) {
+        ++directMisses;
+        std::uint8_t kind = PageInaccessible;
+        if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
+            kind = pendingWrite == nullptr || pendingWrite(base, PageBytes, {}) != PendingWrite::None ? PageWordwise : PageWhole;
+        }
+        entry = {base, allocation, pending, pendingWrite, provider, kind};
     }
-    entry = {base, allocation, pending, pendingWrite, provider, kind};
-    return kind;
+    lastDirectBase = base;
+    lastDirectAllocation = allocation;
+    lastDirectPending = pending;
+    lastDirectProvider = provider;
+    lastDirectKind = entry.kind;
+    return entry.kind;
 }
 
 bool ShaderMemory::readDirect(std::uint64_t address, std::uint32_t* value) {
@@ -670,7 +674,7 @@ bool ShaderMemory::readDirect(std::uint64_t address, std::uint32_t* value) {
     const auto allocationBefore = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto provider = pendingGenerationProvider.load(std::memory_order_acquire);
     const auto pendingBefore = provider != nullptr ? provider() : 0;
-    const auto kind = directPageKind(address & ~static_cast<std::uint64_t>(PageBytes - 1));
+    const auto kind = directPageKind(address & ~static_cast<std::uint64_t>(PageBytes - 1), allocationBefore, provider, provider != nullptr ? pendingBefore : instanceSerial);
     std::uint32_t word = 0;
     if (kind == PageWhole) {
         GuestMemory::CheckReadGuard(address, sizeof(word));
@@ -706,10 +710,13 @@ bool ShaderMemory::readDirect(std::uint64_t address, std::uint32_t* value) {
 }
 
 bool ShaderMemory::probeDirect(std::uint64_t address, std::uint64_t end) {
+    const auto allocation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto provider = pendingGenerationProvider.load(std::memory_order_acquire);
+    const auto pending = provider != nullptr ? provider() : instanceSerial;
     while (address < end) {
         const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
         const auto pageEnd = std::min<std::uint64_t>(base + PageBytes, end);
-        if (directPageKind(base) == PageInaccessible && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(pageEnd - address))) return false;
+        if (directPageKind(base, allocation, provider, pending) == PageInaccessible && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(pageEnd - address))) return false;
         address = pageEnd;
     }
     return true;
