@@ -259,10 +259,12 @@ void IncrementalDrawsFollowWatchedTables() {
     SetVertexRecords(3);
     const auto before = Counters();
     Draw(BufferPixelCode.data(), table, 255, "the first incremental draw over a watched table");
+    Draw(BufferPixelCode.data(), table, 255, "an incremental draw after the first collect of the watched table");
+    const auto settled = Counters();
     Draw(BufferPixelCode.data(), table, 255, "an incremental draw over an unchanged watched table");
     const auto unchanged = Counters();
-    Require(unchanged.incrementalStages == before.incrementalStages + 4u, "incremental draws ran " + std::to_string(unchanged.incrementalStages - before.incrementalStages) + " incremental stages, expected 4");
-    Require(unchanged.keptReads > before.keptReads, "an incremental draw over an unchanged watched table kept no guest word");
+    Require(unchanged.incrementalStages == before.incrementalStages + 6u, "incremental draws ran " + std::to_string(unchanged.incrementalStages - before.incrementalStages) + " incremental stages, expected 6");
+    Require(unchanged.keptReads > settled.keptReads, "an incremental draw over an unchanged watched table kept no guest word (" + std::to_string(unchanged.freshReads - settled.freshReads) + " read, " + std::to_string(unchanged.keptValues - settled.keptValues) + " values kept)");
     describe(values + 4);
     Draw(BufferPixelCode.data(), table, 128, "an incremental draw whose watched table a CPU store changed");
     describe(values);
