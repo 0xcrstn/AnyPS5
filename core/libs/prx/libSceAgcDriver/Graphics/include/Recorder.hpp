@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <array>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <functional>
 #include <list>
@@ -46,8 +47,25 @@ class ChunkPool;
 // up to serial S" WITHOUT the mutex (WaitSerial), because the monotonic value cannot be reset or
 // recycled the way the pooled batch fences are, and afterwards run the completions under the mutex
 // (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
+struct RecorderDomain {
+    std::atomic<std::int64_t> pendingLabelSince{std::numeric_limits<std::int64_t>::min()};
+    std::atomic<std::uint64_t> writeGeneration{0};
+    std::atomic<std::uint64_t> publishGeneration{0};
+    std::atomic<std::uint64_t> ledgerSerial{0};
+    std::atomic<std::uint64_t> finishedBatches{0};
+    std::atomic<std::uint64_t> completionLabels{0};
+    std::atomic<std::uint64_t> writeBackCompletions{0};
+    std::atomic<std::uint64_t> workSinceSubmit{0};
+    std::mutex labelTableMutex;
+    class Recorder* labelTableOwner = nullptr;
+};
+
 class Recorder {
 public:
+    static constexpr std::uint32_t PhysicalQueues = 4;
+    static RecorderDomain& Domain(std::uint32_t physicalQueue);
+    static Recorder* ForPhysicalQueue(std::uint32_t physicalQueue);
+    std::uint32_t PhysicalQueue() const { return physicalQueue; }
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
     explicit Recorder(const Context& context, bool timelineSemaphores = false);
     ~Recorder();
@@ -871,6 +889,8 @@ private:
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
     std::uint64_t id = 0;
+    std::uint32_t physicalQueue = 0;
+    RecorderDomain& domain;
     // Every access holds the table mutex (Recorder.cpp): the recorded entries are mutated under
     // GuestMemory::GpuMutex as well, the queued ones (NoteQueuedLabel) under the table mutex alone.
     // Ordered, so a range (a noted write, PendingLabelIn) finds its dwords by lower_bound.
