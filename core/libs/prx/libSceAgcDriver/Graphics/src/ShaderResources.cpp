@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
 #include <algorithm>
 #include <type_traits>
 #include <atomic>
@@ -5047,6 +5048,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         guestMemory.ForgetPointerShadows();
         guestMemory.PointerRecorded();
         if (Coherence::Ordering()) recorder.NotePendingWrites(guestMemory.PointerHeaps());
+        for (const auto& [begin, end] : guestMemory.PointerHeaps()) NoteMirroredWrite(begin, end);
     }
     if (Coherence::Tracking() && !guestMemory.Writes().empty()) {
         std::vector<Coherence::Interval> written;
