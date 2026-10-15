@@ -1,3 +1,4 @@
+#include "BdaTable.hpp"
 #include "BdaTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -1782,8 +1783,10 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         ShaderRecompiler::BdaAbi::Header header{};
         ShaderRecompiler::BdaAbi::Range range{};
         std::memcpy(&header, table.data(), sizeof(header));
-        Require(header.version == ShaderRecompiler::BdaAbi::Version && header.count == 1 && header.entryBytes == sizeof(range), "BDA header layout mismatch");
-        std::memcpy(&range, table.data() + sizeof(header), sizeof(range));
+        const auto translation = ShaderRecompiler::BdaTable::TranslationSetting();
+        const auto version = translation == ShaderRecompiler::BdaTable::Translation::Legacy ? ShaderRecompiler::BdaAbi::Version : ShaderRecompiler::BdaTable::RadixVersion;
+        Require(header.version == version && header.count == 1 && header.entryBytes == sizeof(range), "BDA header layout mismatch");
+        std::memcpy(&range, table.data() + ShaderRecompiler::BdaTable::RangeBaseWord(translation) * sizeof(std::uint32_t), sizeof(range));
         Require(range.begin == snapshots[0].address && range.end == range.begin + source.size(), "64-bit guest address was truncated");
         const auto fault = access.bytes(access.descriptor(5).buffer);
         for (const auto byte : fault) Require(byte == std::byte{}, "fault buffer was not initialized");
