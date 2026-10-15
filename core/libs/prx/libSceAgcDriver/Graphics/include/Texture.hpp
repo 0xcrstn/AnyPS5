@@ -469,6 +469,7 @@ private:
         std::uint64_t end;
     };
     std::vector<ImportSegment> importSegments() const;
+    const HostImport* surfaceImport() const;
     PaddingSeeds paddingSeeds(std::span<const ImportSegment> segments, const std::vector<CopiedBytes>& copied) const;
     // The direct upload and GPU-direct write-back of the runs through their windows (block units);
     // both return the bytes moved. The upload reads each unit from its unit shadow while fresh,
