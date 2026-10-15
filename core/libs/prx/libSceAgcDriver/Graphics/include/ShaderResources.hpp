@@ -287,7 +287,6 @@ public:
     bool WritesThroughPointers() const { return usesBda && !bdaReadOnly; }
     void UseMirrors(Recorder& recorder) const;
     void RecordPlacementCopyBack(Recorder& recorder, VkCommandBuffer commands) const;
-    [[nodiscard]] bool HasPlacements() const;
     [[nodiscard]] std::vector<DispatchFreeze::Reach> ReachableRanges() const;
     void PublishResidentReads(Recorder& recorder) const;
     void RefreshAddressUse() const;
