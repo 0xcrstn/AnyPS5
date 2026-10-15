@@ -309,6 +309,12 @@ These switches change how recompiled shaders reach guest memory through addresse
 - `APS5_RESIDENT_MIRRORS=0|1` (default `1`): whether address-based shaders that only read host memory read device-local copies of it, refreshed from the host before each batch and after GPU writes in it.
 - `APS5_SHADER_MANIFEST=<folder>` writes one line per compiled shader with its address and instruction counts; `APS5_SHADER_MANIFEST_SPIRV=all` (or comma-separated hexadecimal addresses) also writes the shaders. `APS5_SPIRV_GUEST_LINES=1` tags shaders with guest program counters for GPU profilers.
 
+### GPU placement and render pass experiments
+
+These switches are on by default (`1`); `0` turns one off, and any other value than those shown stops the title at start.
+
+- `APS5_DEVICE_UPLOADS=0|1|verify`: whether buffers the driver only writes from the CPU and the GPU reads (address tables, shader data of up to 64 KiB, image table maps, mesh arguments) go to video memory the CPU can write directly, instead of system memory the GPU reads over PCIe. It needs a device-local, host-visible memory heap of at least 1 GiB (resizable BAR); without one the buffers stay in system memory and the `[uploads]` line counts them. `verify` reads each write back and stops the title if it differs.
+
 ### Tracing system library calls
 
 Windows only. An executable converted with `--trace-imports` records the calls it makes to the libraries named in `APS5_TRACE_CALLS`, a comma-separated list such as `libkernel,libSceSaveData`, or `all`. Without the variable nothing is recorded. The crash and abort reports then end with the last 64 calls: sequence number, thread, library, import name as the executable imports it (a NID) and the caller's address. They are followed by the 32 most called imports since start-up, with their number of calls.

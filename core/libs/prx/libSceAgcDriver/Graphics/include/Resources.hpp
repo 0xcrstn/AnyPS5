@@ -78,6 +78,23 @@ void CopyBuffer(const Context& context, VkCommandBuffer commands, VkBuffer sourc
 // Records a global memory barrier.
 void RecordMemoryBarrier(const Context& context, VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess);
 
+enum class UploadPlacement { Host, Device, Verify };
+
+struct UploadCounters {
+    std::uint64_t placed = 0;
+    std::uint64_t placedBytes = 0;
+    std::uint64_t hostFallbacks = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t verifiedBytes = 0;
+};
+
+UploadPlacement ParseUploadPlacement(const char* text);
+UploadPlacement UploadPlacementSetting();
+VkMemoryPropertyFlags SelectUploadProperties(const VkPhysicalDeviceMemoryProperties& memory, UploadPlacement placement);
+VkMemoryPropertyFlags UploadMemoryProperties(const Context& context, std::size_t bytes);
+void WriteUpload(Buffer& buffer, std::size_t offset, const void* source, std::size_t bytes);
+UploadCounters UploadTotals();
+
 // Resolves every DeviceFunctions entry point of the context's device (once, at device setup).
 void FillDeviceFunctions(const Context& context, DeviceFunctions& functions);
 

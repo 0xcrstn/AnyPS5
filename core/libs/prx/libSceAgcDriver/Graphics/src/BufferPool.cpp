@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -225,6 +226,10 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
         if (now - lastReport > std::chrono::seconds(10)) {
             lastReport = now;
             AgcDriver::ProfilePrint_nid_no_patch("[bufferpool] small: %llu hits, %llu misses (%llu of a size evicted earlier), %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses (%llu of a size evicted earlier), %llu evictions, %zu retained (%.0f MiB of %llu)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu)\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.missesEvicted), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.missesEvicted), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.budget >> 20u), sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u));
+            static UploadCounters previous{};
+            const auto uploads = UploadTotals();
+            AgcDriver::ProfilePrint_nid_no_patch("[uploads] device-local upload buffers%s: %llu placed (%.1f MiB), %llu left in host memory (no large device-local host-visible heap); verify%s: %llu writes (%.1f MiB) read back\n", UploadPlacementSetting() == UploadPlacement::Host ? " (off)" : "", static_cast<unsigned long long>(uploads.placed - previous.placed), static_cast<double>(uploads.placedBytes - previous.placedBytes) / 1048576.0, static_cast<unsigned long long>(uploads.hostFallbacks - previous.hostFallbacks), UploadPlacementSetting() == UploadPlacement::Verify ? "" : " (off)", static_cast<unsigned long long>(uploads.verified - previous.verified), static_cast<double>(uploads.verifiedBytes - previous.verifiedBytes) / 1048576.0);
+            previous = uploads;
         }
     }
     auto& tier = tierFor(capacity, properties);
