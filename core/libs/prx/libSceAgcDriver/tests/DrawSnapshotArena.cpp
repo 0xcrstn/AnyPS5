@@ -354,7 +354,8 @@ void ExtendedPartialTests(Fixture& fixture) {
     fixture.Release();
 }
 
-void MovedWordTests(Fixture& fixture) {
+void MovedWordTests(Fixture& fixture, bool ring) {
+    ShaderResources::SetMovedWordRing(ring);
     ShaderRecompiler::RecompileResult program;
     ShaderRecompiler::DescriptorBinding binding;
     binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
@@ -375,17 +376,21 @@ void MovedWordTests(Fixture& fixture) {
         Require(bindings != nullptr && bindings->snapshots.size() == 1, "moved words were not snapshotted");
         Require(statistics.reused == (reused ? 1u : 0u) && statistics.copied == (reused ? 0u : 1u) && statistics.copiedBytes == (reused ? 0u : 16u), "moved-word copy accounting used an invalidated cache iterator");
         Require(std::memcmp(bindings->snapshots.front().bytes.data(), moved.words.data(), 16) == 0, "moved-word cache rollover served another value");
+        Require(!ring || (bindings->snapshots.front().buffer == nullptr && bindings->snapshots.front().offset % fixture.GetContext().limits.minStorageBufferOffsetAlignment == 0), "ring-placed moved words were not bound at an aligned ring offset");
         held.push_back(bindings);
         return bindings->snapshots.front();
     };
     const auto original = take(1, false);
     for (std::uint32_t value = 2; value <= 8; ++value) take(value, false);
-    for (std::uint32_t value = 1; value <= 8; ++value) take(value, true);
+    const auto again = take(1, true);
+    Require(again.handle == original.handle && again.offset == original.offset, "reused moved words were not bound where they were placed");
+    for (std::uint32_t value = 2; value <= 8; ++value) take(value, true);
     for (std::uint32_t value = 9; value <= 16; ++value) take(value, false);
     for (std::uint32_t value = 9; value <= 16; ++value) take(value, true);
     const auto replaced = take(1, false);
     const std::array<std::uint32_t, 4> originalWords{1u, 2u, 3u, 4u};
-    Require(original.handle != replaced.handle && std::memcmp(original.bytes.data(), originalWords.data(), sizeof(originalWords)) == 0, "moved-word eviction overwrote a snapshot an earlier draw owns");
+    Require((original.handle != replaced.handle || original.offset != replaced.offset) && std::memcmp(original.bytes.data(), originalWords.data(), sizeof(originalWords)) == 0, "moved-word eviction overwrote a snapshot an earlier draw owns");
+    ShaderResources::SetMovedWordRing(false);
 }
 
 void ContentTests(Fixture& fixture) {
@@ -873,7 +878,8 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
             return false;
         }
         ContentTests(fixture);
-        MovedWordTests(fixture);
+        MovedWordTests(fixture, false);
+        MovedWordTests(fixture, true);
         PendingWriteTests(fixture);
         GpuReadTests(fixture);
         DeviceTwinTests(fixture);

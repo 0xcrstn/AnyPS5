@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include <array>
 #include <chrono>
 #include <list>
@@ -198,6 +199,7 @@ public:
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsStatistics* statistics = nullptr, const DrawIndexRanges* drawRanges = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     static std::size_t MaxDrawSnapshotBytes();
+    static void SetMovedWordRing(bool enabled);
     static std::optional<ByteRanges> GuestReadRanges(std::span<const std::uint32_t> words, const ShaderRecompiler::BufferReadRanges* ranges, std::uint64_t size, WholeCopy* reason = nullptr, const DrawIndexRanges* drawRanges = nullptr);
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
@@ -535,6 +537,7 @@ private:
         std::vector<std::uint32_t> words;
         std::size_t size;
         std::shared_ptr<Buffer> buffer;
+        DrawSnapshotArena::Placed placed{};
     };
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
     mutable std::size_t movedWordBufferNext = 0;
