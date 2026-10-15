@@ -330,6 +330,22 @@ void RunBdaExecutionTests(const Context& context) {
             span(4, -8, 0b0001u, coherent, stops, {0, 0, 0, 0}, Abi::FaultReason::Overflow, 4, 0);
         }
     }
+    Buffer lower(context, 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    Buffer upper(context, 3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    lower.Bytes()[0] = std::byte{0x61};
+    lower.Bytes()[1] = std::byte{0x62};
+    upper.Bytes()[0] = std::byte{0x71};
+    upper.Bytes()[1] = std::byte{0x72};
+    upper.Bytes()[2] = std::byte{0x73};
+    const auto separate = ranges;
+    constexpr std::uint64_t overlapping = 0x7fff9abc0001ULL;
+    ranges = {{{overlapping, overlapping + 2, lower.DeviceAddress(), Abi::Read, 0}, {overlapping + 1, overlapping + 4, upper.DeviceAddress(), Abi::Read, 0}}};
+    run(overlapping, 8, 0x61, static_cast<Abi::FaultReason>(0));
+    run(overlapping + 1, 8, 0x71, static_cast<Abi::FaultReason>(0));
+    run(overlapping, 32, 0x73727161, static_cast<Abi::FaultReason>(0));
+    run(overlapping + 2, 16, 0x7372, static_cast<Abi::FaultReason>(0));
+    run(overlapping + 4, 8, 0, Abi::FaultReason::Unmapped);
+    ranges = separate;
     ranges[0].permissions = 0;
     run(guest, 8, 0, Abi::FaultReason::Permission);
     RunBdaDwordWriteTests(context);

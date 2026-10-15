@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchRelocation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareWorkers.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CacheSizing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
@@ -158,6 +160,10 @@ private:
     static bool verifyIncrementalBindings();
     static ShaderMemory::IncrementalState& incrementalBinding(const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::span<const std::uint32_t> userData);
     void noteIncrementalStage(const ShaderRecompiler::SrtTapeInstance& instance, bool verified, bool stale);
+    static bool incrementalPlans();
+    static bool verifyIncrementalPlans();
+    static ShaderMemory::PlanInstance& resourcePlanInstance(const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::uint32_t pushOffset, std::span<const std::uint32_t> userData);
+    void notePlanInstance(const ShaderMemory::PlanCapture& capture, bool verified, bool stale);
     static std::uint64_t drawDecodeKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
     void reportBindingPlan();
     static bool verifyDrawEntries();
@@ -219,18 +225,53 @@ private:
     };
     static DrawRecordState& drawRecordState();
     static bool recordThread();
+    static std::uint32_t prepareAhead();
     static void runDrawRecords();
     bool deferDrawRecords(std::uint32_t queue) const;
     static bool recordDispatches();
     bool deferDispatchRecords(std::uint32_t queue) const;
     void deferRecord(const std::function<void()>& prepare);
+    void deferAhead(const std::function<void()>& prepare);
     static std::string recordIdentity(const Submission& submission, const char* what, std::uint64_t program);
-    bool settleDrawRecords(std::span<const Graphics::GuestMemorySnapshot> reads);
+    bool settleDrawRecords(std::span<const Graphics::GuestMemorySnapshot> reads, bool drain = false);
+    bool settleAhead(std::span<const Graphics::GuestMemorySnapshot> reads, bool drain);
     void finishDrawRecords();
     void waitDrawRecords();
     void postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::string identity, std::function<void(DrawRecordResult&)> record);
     static void noteDrawRecordRecipe(DrawRecordResult& result, std::shared_ptr<const DrawRecipe> built, std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void reportDrawRecords();
+    struct DrawInputs;
+    struct FrozenDraw;
+    struct PreparedFrozenDraw;
+    struct FrozenSink {
+        bool inOrder = false;
+        FrozenFallback refused = FrozenFallback::None;
+        std::shared_ptr<DrawInputs> inputs;
+        std::vector<PreparedRead> reads;
+        std::uint64_t program = 0;
+        bool Refuse(FrozenFallback reason) {
+            if (inOrder) return false;
+            refused = reason;
+            return true;
+        }
+    };
+    using FrozenPipeline = OrderedPrepare<std::shared_ptr<FrozenDraw>, std::shared_ptr<PreparedFrozenDraw>>;
+    static std::uint32_t prepareWorkers();
+    static bool parallelResolve();
+    static std::uint32_t frozenBound();
+    static FrozenPipeline& frozenDraws();
+    static FrozenSink*& frozenSink();
+    static bool& frozenProducer();
+    static void startDrawRecords();
+    static void noteRecordHistory(std::uint64_t ticket, const std::shared_ptr<DrawRecordResult>& result);
+    static void recordDrawInputs(const DrawInputs& inputs, DrawRecordResult& result, const std::shared_ptr<VulkanDevice>& localDevice);
+    void noteDrawInputWriters(const DrawInputs& inputs, std::uint32_t queue);
+    FrozenFallback frozenFallback(std::span<const std::uint32_t> packet);
+    DrawVerdict freezeDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
+    std::shared_ptr<PreparedFrozenDraw> prepareFrozen(const FrozenDraw& frozen, bool inOrder);
+    void emitFrozen(const std::shared_ptr<FrozenDraw>& frozen, std::optional<std::shared_ptr<PreparedFrozenDraw>>& prepared, std::exception_ptr error);
+    void drainFrozen(bool records);
+    void mergeFrozenRecords();
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
@@ -435,6 +476,9 @@ private:
     std::vector<std::uint64_t> drawStageDonorKeys;
     std::mutex drawCacheMutex;
     std::shared_ptr<DrawRecordResult> drawRecordResult;
+    PrepareAheadWindow<DrawRecordResult> drawRecordWindow;
+    std::mutex frozenPostedMutex;
+    std::vector<std::shared_ptr<DrawRecordResult>> frozenPosted;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     std::optional<DrawKeySightings> drawKeySightings;
     std::optional<DrawKeySightings> drawShapeSightings;

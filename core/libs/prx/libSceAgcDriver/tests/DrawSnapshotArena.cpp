@@ -589,6 +589,28 @@ void DeviceTwinTests(Fixture& fixture) {
     DrawSnapshotArena::SetDeviceTwins(false);
 }
 
+void InPlaceTests(Fixture& fixture) {
+    const bool previous = ShaderResources::InPlaceDrawInputsEnabled();
+    ShaderResources::SetInPlaceDrawInputs(true);
+    DrawSnapshotArena::SetEnabled(true);
+    auto& recorder = fixture.GetRecorder();
+    std::memset(fixture.Bytes(49152), 0x3c, 1024);
+    GuestMemory::BumpCollectEpoch();
+    Require(fixture.TakeOwn() == nullptr, "an in-place template input was snapshotted");
+    Statistics moved{};
+    const auto snapshot = fixture.Take(49152, 1024, &moved);
+    Require(snapshot.inPlace && snapshot.buffer == nullptr && snapshot.bytes.data() == fixture.Bytes(49152) && snapshot.bytes.size() == 1024 && moved.inPlace == 1 && moved.copied == 0, "a moved read-only input was not bound through its host import");
+    Require(snapshot.offset % fixture.GetContext().limits.minStorageBufferOffsetAlignment == 0, "an in-place input was bound at a misaligned offset");
+    Require(recorder.PendingReadOverlaps(fixture.Address() + 49152, 1024), "an in-place input was not noted as a pending read");
+    ShaderResources::SetInPlaceDrawInputs(false);
+    Statistics copied{};
+    const auto snapshotted = fixture.Take(49152, 1024, &copied);
+    Require(!snapshotted.inPlace && snapshotted.bytes.data() != fixture.Bytes(49152) && copied.inPlace == 0 && Holds(snapshotted, std::byte{0x3c}), "the switch off still bound the input in place");
+    fixture.Release();
+    recorder.Sync();
+    ShaderResources::SetInPlaceDrawInputs(previous);
+}
+
 void DisabledTests(Fixture& fixture) {
     DrawSnapshotArena::SetEnabled(false);
     std::memset(fixture.Bytes(32768), 0x5a, 1024);
@@ -883,6 +905,7 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
         PendingWriteTests(fixture);
         GpuReadTests(fixture);
         DeviceTwinTests(fixture);
+        InPlaceTests(fixture);
         DisabledTests(fixture);
         EpochDirtySetTests(fixture);
     }

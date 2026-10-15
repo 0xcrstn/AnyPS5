@@ -165,6 +165,8 @@ public:
     enum class ReadKind : std::uint8_t { DispatchElement = 0, GpuCopy, AddressBased, Indirect, StorageUpload, CopySource, DrawInput, Count };
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
+    static bool VerifyInPlaceDrawInputs();
+    void NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
     using ReadList = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
     void NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind);
@@ -413,6 +415,9 @@ public:
     // labels waiting in completion actions (the CPU must reap their batch for them to land);
     static std::uint64_t PendingCompletionLabels();
     static std::uint64_t KeyStoreSerial();
+    static std::uint64_t LedgerSerial();
+    static std::uint64_t FinishedBatches();
+    static bool AccessNeedsFlush(std::uint64_t address, std::size_t bytes);
     // write-back completions (OnComplete) of unfinished batches: a reaper retires them when every
     // worker sleeps, as for the labels above;
     static std::uint64_t PendingWriteBackCompletions();
@@ -595,6 +600,12 @@ private:
             ReadKind kind;
         };
         std::vector<Read> reads;
+        struct InPlaceInput {
+            std::uint64_t begin;
+            std::uint64_t end;
+            std::uint64_t generation;
+        };
+        std::vector<InPlaceInput> inPlaceInputs;
         struct ReadListNote {
             std::shared_ptr<const ReadList> ranges;
             std::size_t position;

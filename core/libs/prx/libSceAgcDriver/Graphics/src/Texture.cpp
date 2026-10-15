@@ -1601,6 +1601,7 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
     const bool volume = descriptor.dimension == TextureDimension::k3D;
     Require((depthSlice == 0 && layers == 1) || (volume && mip == 0 && layers != 0 && depthSlice + layers - 1u <= descriptor.depthOrLastArray), "attachment slice is outside the storage image");
     Require(layer == 0 || (!volume && descriptor.dimension == TextureDimension::k2DArray && descriptor.baseArray + layer <= descriptor.depthOrLastArray), "attachment layer is outside the storage image");
+    std::lock_guard lock(attachmentViewsMutex);
     const auto found = attachmentViews.find({format, mip, depthSlice, layers, layer});
     if (found != attachmentViews.end()) return found->second;
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
@@ -1616,6 +1617,12 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView attachment");
     attachmentViews.emplace(std::tuple{format, mip, depthSlice, layers, layer}, created);
     return created;
+}
+
+VkImageView StorageTexture::FindAttachmentView(VkFormat format, std::uint32_t mip, std::uint32_t depthSlice, std::uint32_t layers, std::uint32_t layer) const {
+    std::lock_guard lock(attachmentViewsMutex);
+    const auto found = attachmentViews.find({format, mip, depthSlice, layers, layer});
+    return found != attachmentViews.end() ? found->second : VK_NULL_HANDLE;
 }
 
 VkImageView StorageTexture::AttachmentProxyView() {

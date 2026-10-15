@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <array>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -122,6 +124,62 @@ void CountDrawSkip(DrawSkip kind, double us);
 std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters();
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
+
+enum class ResolveSerial : std::uint8_t { Ledger, WriteGeneration, FinishedBatches, TrackerGeneration, DirtySerial, PendingSerial, StorageCache, Allocations, KeyStores, ResourceCache, Count };
+const char* ResolveSerialName(ResolveSerial serial);
+struct ResolveStamp {
+    std::array<std::uint64_t, static_cast<std::size_t>(ResolveSerial::Count)> values{};
+    std::uint64_t Of(ResolveSerial serial) const { return values[static_cast<std::size_t>(serial)]; }
+    static ResolveStamp Now();
+};
+inline std::uint32_t ChangedSerials(const ResolveStamp& resolved, const ResolveStamp& encoded) {
+    std::uint32_t changed = 0;
+    for (std::size_t i = 0; i < resolved.values.size(); ++i) {
+        if (resolved.values[i] != encoded.values[i]) changed |= 1u << i;
+    }
+    return changed;
+}
+
+bool ParallelTargetsRequested();
+bool VerifyParallelTargets();
+enum class TargetVerdict : std::uint8_t { Held, Adopted, Disabled, Threw, NoPipeline, NotResident, Multisampled, ArraySlice, Proxied, NotCached, NoView, NoDepth, NoFramebuffer, ResidentDiffers, DepthDiffers, PipelineDiffers, Count };
+const char* TargetVerdictName(TargetVerdict verdict);
+
+enum class ResolveRefusal : std::uint8_t { None, Unsupported, NoRecorder, NeedsSync, NotInPlace, ZeroFill, Threw, Uncacheable, TemplateMiss, MovedRefused, NoInputs, Count };
+enum class ResolveRedo : std::uint8_t { None, Device, NotRecordable, InputPending, InputImport, IndexData, CacheChanged, PipelineState, Count };
+const char* ResolveRefusalName(ResolveRefusal refusal);
+const char* ResolveRedoName(ResolveRedo redo);
+
+struct ResolvedDraw;
+bool ParallelResolveRequested();
+bool VerifyParallelResolve();
+bool ParallelRevalidateRequested();
+bool VerifyParallelRevalidate();
+std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+void EncodeDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const ResolvedDraw& resolved, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+
+struct ParallelResolveCounts {
+    std::uint64_t resolves = 0;
+    std::uint64_t resolveNs = 0;
+    std::uint64_t inputsResolved = 0;
+    std::uint64_t resourcesResolved = 0;
+    std::uint64_t pipelinesResolved = 0;
+    std::uint64_t encodes = 0;
+    std::uint64_t encodeNs = 0;
+    std::uint64_t inputsAdopted = 0;
+    std::uint64_t resourcesAdopted = 0;
+    std::uint64_t pipelinesAdopted = 0;
+    std::uint64_t verified = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(TargetVerdict::Count)> targets{};
+    std::uint64_t targetsVerified = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ResolveRefusal::Count)> inputRefusals{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ResolveRefusal::Count)> resourceRefusals{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ResolveRedo::Count)> redos{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ResolveSerial::Count)> moved{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::EpochProofVerdict::Count)> revalidations{};
+    std::uint64_t revalidationsVerified = 0;
+};
+ParallelResolveCounts ParallelResolveStatistics();
 
 }
 

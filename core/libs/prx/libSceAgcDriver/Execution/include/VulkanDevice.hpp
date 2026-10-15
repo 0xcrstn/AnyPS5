@@ -290,6 +290,14 @@ public:
     // Whether compute templates refresh their data buffers with a hit's words instead of keying
     // them (APS5_NO_TEMPLATE_DATA_REFRESH unset); the driver's data-only hits require it.
     static bool TemplateDataRefresh();
+    static bool MovedDispatchTemplates();
+    struct MovedTemplateStatistics {
+        std::uint64_t hits = 0;
+        std::uint64_t buffers = 0;
+        std::uint64_t refused = 0;
+        std::uint64_t verified = 0;
+    };
+    static MovedTemplateStatistics MovedTemplateCounters();
     // The driver's recipe events for the [recipe] line: a restart after Rebuild, an attach; the
     // rows are the dispatch, indirect and draw kinds. NoteDrawRecipeMiss files a draw hit's
     // pre-check miss made in the driver (no recipe for the matched variants, or a device mismatch).
@@ -301,7 +309,8 @@ public:
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
-    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const Graphics::ResolvedDraw* resolved = nullptr);
+    std::shared_ptr<const Graphics::ResolvedDraw> ResolveDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders);
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after

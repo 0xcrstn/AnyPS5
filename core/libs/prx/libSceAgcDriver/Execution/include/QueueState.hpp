@@ -81,9 +81,20 @@ public:
     using iterator = const_iterator;
 
     Registers() = default;
-    Registers(const Registers&) = default;
-    Registers& operator=(const Registers&) = default;
-    Registers(Registers&& other) noexcept : values(std::move(other.values)), present(std::move(other.present)), entries(std::exchange(other.entries, 0)), mask(std::move(other.mask)), fingerprint(std::exchange(other.fingerprint, 0)) {}
+    Registers(const Registers& other) : values(other.values), present(other.present), entries(other.entries), mask(other.mask), fingerprint(other.fingerprint) {}
+    Registers& operator=(const Registers& other) {
+        if (this == &other) return *this;
+        values = other.values;
+        present = other.present;
+        entries = other.entries;
+        mask = other.mask;
+        fingerprint = other.fingerprint;
+        changed = true;
+        return *this;
+    }
+    Registers(Registers&& other) noexcept : values(std::move(other.values)), present(std::move(other.present)), entries(std::exchange(other.entries, 0)), mask(std::move(other.mask)), fingerprint(std::exchange(other.fingerprint, 0)) {
+        other.changed = true;
+    }
     Registers& operator=(Registers&& other) noexcept {
         if (this == &other) return *this;
         values = std::move(other.values);
@@ -91,6 +102,8 @@ public:
         entries = std::exchange(other.entries, 0);
         mask = std::move(other.mask);
         fingerprint = std::exchange(other.fingerprint, 0);
+        changed = true;
+        other.changed = true;
         return *this;
     }
     Registers(std::initializer_list<std::pair<std::uint32_t, std::uint32_t>> entries) {
@@ -114,8 +127,11 @@ public:
         }
     }
     std::size_t size() const { return entries; }
+    bool Changed() const { return changed; }
+    void MarkUnchanged() { changed = false; }
     bool empty() const { return entries == 0; }
     void clear() {
+        changed = true;
         values.clear();
         present.clear();
         entries = 0;
@@ -130,6 +146,7 @@ public:
     std::pair<const_iterator, bool> insert_or_assign(std::uint32_t offset, std::uint32_t value) {
         if (contains(offset)) {
             if (values[offset] == value) return {const_iterator{this, offset}, false};
+            changed = true;
             changeFingerprint(offset, values[offset]);
             values[offset] = value;
             changeFingerprint(offset, value);
@@ -153,6 +170,7 @@ public:
     }
     std::size_t erase(std::uint32_t offset) {
         if (!contains(offset)) return 0;
+        changed = true;
         changeFingerprint(offset, values[offset]);
         present[offset / 64] &= ~(std::uint64_t{1} << (offset % 64));
         --entries;
@@ -193,6 +211,7 @@ private:
     }
     static constexpr std::size_t End = ~std::size_t{0};
     std::uint32_t& mark(std::uint32_t offset) {
+        changed = true;
         if (offset >= values.size()) {
             const auto words = static_cast<std::size_t>(offset) / 64 + 1;
             values.resize(words * 64, 0);
@@ -215,6 +234,7 @@ private:
     std::size_t entries = 0;
     mutable std::shared_ptr<const Mask> mask;
     mutable std::uint64_t fingerprint = 0;
+    bool changed = true;
 };
 
 inline Registers BuildInitialContextRegisters() {

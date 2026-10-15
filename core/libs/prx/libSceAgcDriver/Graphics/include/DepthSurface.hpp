@@ -15,6 +15,7 @@ class Texture;
 class StorageTexture;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
+VkImageView PeekDepthSurfaceView(const Context& context, const DepthTarget& target);
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples);
 std::uint64_t DepthSurfacesSerial();
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);

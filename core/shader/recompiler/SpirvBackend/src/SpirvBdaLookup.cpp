@@ -20,6 +20,67 @@ void ReturnBdaZeroIf(SpirvEmitterState& state, std::uint32_t condition) {
     EmitLabel(state, next);
 }
 
+bool BdaRangeCacheEnabled() {
+    static const bool enabled = std::getenv("APS5_BDA_RANGE_CACHE") != nullptr;
+    return enabled;
+}
+
+bool BdaRangeCacheVerified() {
+    static const bool verified = std::getenv("APS5_VERIFY_BDA_RANGE_CACHE") != nullptr;
+    return verified;
+}
+
+void DefineBdaRangeCache(SpirvEmitterState& state) {
+    if (state.bdaRangeCache[0] != 0) return;
+    const auto address = TypePointer(state, spv::StorageClassPrivate, TypeScalarU64(state));
+    for (std::size_t index = 0; index < 3; ++index) {
+        state.bdaRangeCache[index] = state.module.DefineInitializedGlobalVariable(address, spv::StorageClassPrivate, BdaConstant(state, 0u));
+    }
+    state.bdaRangeCache[3] = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate, ConstantU32(state, 0u));
+    state.module.AddName(state.bdaRangeCache[0], "bda_range_cache_begin");
+    state.module.AddName(state.bdaRangeCache[1], "bda_range_cache_end");
+    state.module.AddName(state.bdaRangeCache[2], "bda_range_cache_base");
+    state.module.AddName(state.bdaRangeCache[3], "bda_range_cache_permissions");
+}
+
+struct BdaRangeCacheHit {
+    std::uint32_t hit = 0;
+    std::uint32_t result = 0;
+};
+
+BdaRangeCacheHit EmitBdaRangeCacheProbe(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t permission) {
+    DefineBdaRangeCache(state);
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    const auto load = [&](std::uint32_t type, std::uint32_t variable) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, type, value, variable);
+        return value;
+    };
+    const auto begin = load(u64, state.bdaRangeCache[0]);
+    const auto finish = load(u64, state.bdaRangeCache[1]);
+    const auto base = load(u64, state.bdaRangeCache[2]);
+    const auto permissions = load(u32, state.bdaRangeCache[3]);
+    const auto wide = Unary(state, spv::OpUConvert, u64, bytes);
+    const auto end = binary(spv::OpIAdd, u64, address, wide);
+    const auto result = binary(spv::OpIAdd, u64, base, binary(spv::OpISub, u64, address, begin));
+    const auto deviceEnd = binary(spv::OpIAdd, u64, result, wide);
+    auto hit = binary(spv::OpINotEqual, boolean, bytes, ConstantU32(state, 0u));
+    for (const auto condition : {
+             binary(spv::OpUGreaterThan, boolean, end, address),
+             binary(spv::OpUGreaterThanEqual, boolean, address, begin),
+             binary(spv::OpULessThanEqual, boolean, end, finish),
+             binary(spv::OpIEqual, boolean, binary(spv::OpBitwiseAnd, u32, permissions, ConstantU32(state, permission)), ConstantU32(state, permission)),
+             binary(spv::OpUGreaterThanEqual, boolean, result, base),
+             binary(spv::OpUGreaterThan, boolean, deviceEnd, result),
+         }) {
+        hit = binary(spv::OpLogicalAnd, boolean, hit, condition);
+    }
+    return {hit, result};
+}
+
 // (u64 address, u32 bytes, u32 instruction) -> u64 device address of the range holding all the bytes,
 std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read) {
     const auto u32 = TypeU32(state);
@@ -63,6 +124,21 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         state.module.AddFunction(spv::OpReturnValue, BdaConstant(state, 0u));
         EmitLabel(state, next);
     };
+    const bool cached = BdaRangeCacheEnabled();
+    const bool verified = cached && BdaRangeCacheVerified();
+    BdaRangeCacheHit cache;
+    if (cached) {
+        cache = EmitBdaRangeCacheProbe(state, address, bytes, permission);
+        if (!verified) {
+            const auto hit = state.module.AllocateId();
+            const auto next = state.module.AllocateId();
+            state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
+            state.module.AddFunction(spv::OpBranchConditional, cache.hit, hit, next);
+            EmitLabel(state, hit);
+            state.module.AddFunction(spv::OpReturnValue, cache.result);
+            EmitLabel(state, next);
+        }
+    }
     const auto length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
     fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
@@ -124,6 +200,25 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         {binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow},
     });
+    if (verified) {
+        const auto mismatch = binary(spv::OpLogicalAnd, boolean, cache.hit, binary(spv::OpINotEqual, boolean, cache.result, result));
+        if (state.faultBufferVariable != 0) {
+            ReturnBdaFailureIf(state, mismatch, address, bytes, instruction, BdaAbi::FaultReason::RangeCacheMismatch);
+        } else {
+            ReturnBdaZeroIf(state, mismatch);
+        }
+    }
+    if (cached) {
+        const auto last = binary(spv::OpISub, u32, count, constant(1));
+        const auto following = Select(state, u32, binary(spv::OpULessThan, boolean, index, count), index, last);
+        const auto followingBegin = BdaLoadAddress(state, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, following, constant(8))));
+        const auto nextBegin = Select(state, u64, binary(spv::OpULessThan, boolean, index, count), followingBegin, BdaConstant(state, ~std::uint64_t{0}));
+        const auto unique = Select(state, u64, binary(spv::OpULessThan, boolean, nextBegin, finish), nextBegin, finish);
+        state.module.AddFunction(spv::OpStore, state.bdaRangeCache[0], begin);
+        state.module.AddFunction(spv::OpStore, state.bdaRangeCache[1], unique);
+        state.module.AddFunction(spv::OpStore, state.bdaRangeCache[2], base);
+        state.module.AddFunction(spv::OpStore, state.bdaRangeCache[3], permissions);
+    }
     state.module.AddFunction(spv::OpReturnValue, result);
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;

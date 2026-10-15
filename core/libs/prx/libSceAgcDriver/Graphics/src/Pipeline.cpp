@@ -669,8 +669,24 @@ VkPipelineLayout Pipeline::Layout() const {
     return layout;
 }
 
+std::shared_ptr<Framebuffer> Pipeline::FindFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers) {
+    if (targets.size() != attachments || owners.size() != colorAttachments) return nullptr;
+    if (std::any_of(owners.begin(), owners.end(), [](const std::shared_ptr<StorageTexture>& owner) { return owner == nullptr; })) return nullptr;
+    std::lock_guard lock(framebufferMutex);
+    for (auto it = framebuffers.begin(); it != framebuffers.end(); ++it) {
+        if (it->extent.width != extent.width || it->extent.height != extent.height || it->layers != layers || !std::equal(it->views.begin(), it->views.end(), targets.begin(), targets.end())) continue;
+        bool same = true;
+        for (std::size_t i = 0; i < owners.size() && same; ++i) same = it->owned[i] && it->owners[i].lock().get() == owners[i].get();
+        if (!same) continue;
+        std::rotate(it, std::next(it), framebuffers.end());
+        return framebuffers.back().framebuffer;
+    }
+    return nullptr;
+}
+
 std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers, std::span<const std::uint8_t> persistent) {
     Require(targets.size() == attachments && owners.size() == colorAttachments, "render targets do not match the pipeline's attachments");
+    std::lock_guard lock(framebufferMutex);
     bool resident = true;
     for (std::size_t i = 0; i < owners.size(); ++i) resident = resident && (owners[i] != nullptr || (i < persistent.size() && persistent[i] != 0));
     if (resident) {
@@ -1110,6 +1126,20 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         ++store.evicted;
     }
     return pipeline;
+}
+
+std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
+    if (disabled) return nullptr;
+    auto& store = Pipelines();
+    std::lock_guard lock(store.mutex);
+    auto& key = store.scratchKey;
+    pipelineKey(key, context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout);
+    if (key.empty()) return nullptr;
+    const auto found = store.index.find(hashKey(key));
+    if (found == store.index.end() || found->second->key != key || !alive(*found->second, context)) return nullptr;
+    store.entries.splice(store.entries.end(), store.entries, found->second);
+    return found->second->pipeline;
 }
 
 void ClearCachedPipelines(VkDevice device) {

@@ -4,6 +4,7 @@
 #include "UserDataUse.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -132,11 +133,15 @@ inline constexpr std::size_t SnapshotParts = static_cast<std::size_t>(SnapshotPa
 inline constexpr const char* SnapshotPartNames[SnapshotParts] = {"none", "buffer descriptor", "image descriptor", "sampler", "flat SRT data word (pure leaf)", "flat SRT other word", "user data", "uniform fill", "poisoned read", "null-root reads", "result only"};
 SnapshotPart FirstSnapshotDifference(const ShaderRecompiler::ResourceCapture& full, const ShaderRecompiler::ResourceSnapshot& planned);
 [[noreturn]] void ThrowIncrementalMismatch(std::uint32_t queue, std::uint64_t submission, std::size_t packetOffset, std::size_t stage, std::uint64_t program);
+[[noreturn]] void ThrowPlanInstanceMismatch(std::uint32_t queue, std::uint64_t submission, std::size_t packetOffset, std::size_t stage, std::uint64_t program, const ShaderMemory::PlanCapture& capture, const ShaderRecompiler::ResourceSnapshot& full, const ShaderRecompiler::ResourceSnapshot& served);
 [[noreturn]] void ThrowStageMismatch(std::uint32_t queue, std::uint64_t submission, std::size_t packetOffset, std::size_t stage, std::uint64_t program, SnapshotPart part);
 
 struct BindingPlanCounters {
     std::uint64_t draws = 0, decodeHits = 0, decodeMisses = 0, decodesPatched = 0, stages = 0, templateHits = 0, keyWords = 0, valueWords = 0, verifiedStages = 0, stageMismatches = 0, verifiedDecodes = 0, decodeMismatches = 0;
     std::uint64_t incrementalStages = 0, keptReads = 0, freshReads = 0, keptValues = 0, incrementalVerified = 0, incrementalStale = 0;
+    std::uint64_t planStages = 0, planNodesKept = 0, planNodesFresh = 0, planVerified = 0, planStale = 0;
+    std::array<std::uint64_t, ShaderMemory::PlanOutcomes> planOutcomes{};
+    std::array<std::uint64_t, ShaderMemory::PlanFallbacks> planFallbacks{};
     std::array<std::uint64_t, SnapshotParts> mismatchParts{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };

@@ -3635,7 +3635,7 @@ void VulkanDevice::PrewarmDrawPipeline(const Graphics::State& graphics, std::spa
     Graphics::PrewarmPipeline(graphicsContext(), graphics, shaders);
 }
 
-void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
+void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const Graphics::ResolvedDraw* resolved) {
     for (const auto& shader : shaders) {
         require(shader.program != nullptr, "missing compiled shader");
         ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
@@ -3645,8 +3645,17 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
     const auto context = graphicsContext();
-    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
+    if (resolved != nullptr) Graphics::EncodeDraw(context, graphics, draw, shaders, snapshots, *resolved, recipe);
+    else Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
+}
+
+std::shared_ptr<const Graphics::ResolvedDraw> VulkanDevice::ResolveDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) {
+    for (const auto& shader : shaders) {
+        require(shader.program != nullptr, "missing compiled shader");
+        ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
+    }
+    return Graphics::ResolveDraw(graphicsContext(), graphics, draw, shaders);
 }
 
 namespace {
@@ -3671,8 +3680,36 @@ bool TemplateDataRefresh() {
 // The content key of a compute stage, naming the device: the cache is process-wide and the driver
 // replaces the headless device with the windowed one while workers may still use the old one, so
 // the key names the device that built the entry (its descriptor set and pooled buffers belong to it).
+bool MovedTemplatesSwitch() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_DISPATCH_MOVED_TEMPLATES");
+        return text != nullptr && std::strcmp(text, "0") != 0 && TemplateDataRefresh();
+    }();
+    return enabled;
+}
+
+bool VerifyMovedTemplates() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_DISPATCH_MOVED_TEMPLATES");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+struct MovedTemplateTotals {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> buffers{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::uint64_t> verified{0};
+};
+
+MovedTemplateTotals& MovedTemplates() {
+    static MovedTemplateTotals totals;
+    return totals;
+}
+
 ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, VkDevice device) {
-    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh());
+    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), MovedTemplatesSwitch());
     const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
     key.push_back(static_cast<std::uint32_t>(deviceHandle));
     key.push_back(static_cast<std::uint32_t>(deviceHandle >> 32u));
@@ -4065,6 +4102,8 @@ struct RecordedDispatch {
     // Whether the data refresh recorded anything.
     bool refreshed = false;
     bool resourceKeyMatched = false;
+    std::shared_ptr<Graphics::ShaderResources::DrawBindings> movedSet = {};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> movedReads = {};
 };
 
 VkDevice VulkanDevice::Device() const {
@@ -4083,6 +4122,15 @@ bool VulkanDevice::VerifyRecipes() {
 
 bool VulkanDevice::TemplateDataRefresh() {
     return AgcDriver::TemplateDataRefresh();
+}
+
+bool VulkanDevice::MovedDispatchTemplates() {
+    return MovedTemplatesSwitch();
+}
+
+VulkanDevice::MovedTemplateStatistics VulkanDevice::MovedTemplateCounters() {
+    auto& totals = MovedTemplates();
+    return {totals.hits.load(std::memory_order_relaxed), totals.buffers.load(std::memory_order_relaxed), totals.refused.load(std::memory_order_relaxed), totals.verified.load(std::memory_order_relaxed)};
 }
 
 void VulkanDevice::NoteRecipe(RecipeEvent event, bool indirect) {
@@ -4514,7 +4562,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // the label).
     const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
         const auto bytes = static_cast<std::size_t>(end - begin);
-        return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
+        const bool moved = std::any_of(record.movedReads.begin(), record.movedReads.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return begin < range.second && range.first < end; });
+        return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes) || moved || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
     };
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
@@ -4548,7 +4597,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             const std::pair<std::uint64_t, std::uint64_t> argumentRange{arguments, arguments + 12};
             recorder.NoteAccess(CommandClass::IndirectArguments, Graphics::Recorder::Access{std::span(&argumentRange, 1), {}, {}, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT});
         }
-        const auto reads = resources.InPlaceReads();
+        auto reads = resources.InPlaceReads();
+        reads.insert(reads.end(), record.movedReads.begin(), record.movedReads.end());
         const auto images = resources.StorageImages();
         recorder.NoteAccess(CommandClass::DispatchLeading, Graphics::Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, resources.HoldsLease()});
     }
@@ -4576,7 +4626,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         ++d.preBarriersRecorded;
     }
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
-    resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
+    if (record.movedSet != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.movedSet->allocation.set, 0, nullptr);
+    else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
         auto memory = state->WorkgroupMemoryFor(context, record.x, record.y, record.z, dwords);
         context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
@@ -4627,6 +4678,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.MarkCovered(dispatchedAccess);
     recordStep(PhaseRecordBind);
     resources.MarkGpuWrites(recorder);
+    if (!record.movedReads.empty()) recorder.NotePendingReads(record.movedReads, Graphics::Recorder::ReadKind::DispatchElement);
     recordStep(PhaseRecordMarks);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.
@@ -4693,6 +4745,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // dispatch's words at the record (ShaderResources::RefreshData).
     bool fromCache = false;
     double revalidateMs = 0;
+    std::shared_ptr<Graphics::ShaderResources::DrawBindings> movedSet;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> movedReads;
     // The batches the pre-sync (PrepareDispatch) waited for are reaped first: their completions
     // (CPU write-backs) land before stage B or a cached object's Revalidate reads, and the flush
     // hook then finds nothing pending over their surfaces.
@@ -4771,9 +4825,37 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
         if (cached != nullptr) {
             if (cached->Revalidate(shaders[0])) {
-                resources = std::move(cached);
-                fromCache = true;
-                ++d.cacheHits;
+                std::optional<std::vector<Graphics::ShaderResources::MovedDispatchBuffer>> moved;
+                if (MovedTemplatesSwitch()) moved = cached->MovedDispatchBuffers(shaders[0], *state->recorder);
+                if (MovedTemplatesSwitch() && !moved.has_value()) {
+                    MovedTemplates().refused.fetch_add(1, std::memory_order_relaxed);
+                    cached = nullptr;
+                } else {
+                    if (moved.has_value() && !moved->empty()) {
+                        movedSet = cached->BindMovedDispatchBuffers(*state->recorder, *moved);
+                        for (const auto& entry : *moved) movedReads.emplace_back(entry.begin, entry.begin + entry.view.range);
+                        if (VerifyMovedTemplates()) {
+                            auto fresh = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0);
+                            const auto expected = fresh->GuestBufferViews();
+                            const auto served = cached->GuestBufferViews(*moved);
+                            state->recorder->Keep(std::move(fresh));
+                            if (expected != served) {
+                                std::size_t index = 0;
+                                while (index < expected.size() && index < served.size() && expected[index] == served[index]) ++index;
+                                char text[320];
+                                if (index < expected.size() && index < served.size()) std::snprintf(text, sizeof(text), "Vulkan dispatch: APS5_VERIFY_DISPATCH_MOVED_TEMPLATES: program 0x%llx guest buffer %zu binds 0x%llx+0x%llx (view 0x%llx+0x%llx), a fresh build 0x%llx+0x%llx (view 0x%llx+0x%llx)", static_cast<unsigned long long>(programAddress), index, static_cast<unsigned long long>(served[index].address), static_cast<unsigned long long>(served[index].size), static_cast<unsigned long long>(served[index].begin), static_cast<unsigned long long>(served[index].range), static_cast<unsigned long long>(expected[index].address), static_cast<unsigned long long>(expected[index].size), static_cast<unsigned long long>(expected[index].begin), static_cast<unsigned long long>(expected[index].range));
+                                else std::snprintf(text, sizeof(text), "Vulkan dispatch: APS5_VERIFY_DISPATCH_MOVED_TEMPLATES: program 0x%llx binds %zu guest buffers, a fresh build %zu", static_cast<unsigned long long>(programAddress), served.size(), expected.size());
+                                throw std::runtime_error(text);
+                            }
+                            MovedTemplates().verified.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        MovedTemplates().hits.fetch_add(1, std::memory_order_relaxed);
+                        MovedTemplates().buffers.fetch_add(moved->size(), std::memory_order_relaxed);
+                    }
+                    resources = std::move(cached);
+                    fromCache = true;
+                    ++d.cacheHits;
+                }
             } else {
                 state->resourceCache.Remove(contentKey, cached.get());
                 ++d.cacheInvalidated;
@@ -4813,6 +4895,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         d.cacheReport = std::chrono::steady_clock::now();
         AgcDriver::ProfilePrint_nid_no_patch("[rescache] %llu hits, %llu misses, %llu invalidated, %zu entries (dispatch + draw); template hits: %llu refreshed the data buffers (revalidate %.1f ms), %llu had the same words; Find calls %llu, Touch calls %llu\n", static_cast<unsigned long long>(d.cacheHits), static_cast<unsigned long long>(d.cacheMisses), static_cast<unsigned long long>(d.cacheInvalidated), state->resourceCache.Size(), static_cast<unsigned long long>(d.templateRefreshed), d.templateRevalidateMs, static_cast<unsigned long long>(d.templateSameWords), static_cast<unsigned long long>(ResourceCache::Finds()), static_cast<unsigned long long>(ResourceCache::Touches()));
         AgcDriver::ProfilePrint_nid_no_patch("%s", state->resourceCache.Report().c_str());
+        if (MovedTemplatesSwitch()) {
+            const auto moved = MovedDispatchTemplates() ? MovedTemplateCounters() : MovedTemplateStatistics{};
+            AgcDriver::ProfilePrint_nid_no_patch("[rescache] moved read-only buffers (dispatch, cumulative): %llu template hits rebound %llu moved buffers, %llu hits refused (a moved buffer not bindable as a build would bind it), %llu verified against a fresh build\n", static_cast<unsigned long long>(moved.hits), static_cast<unsigned long long>(moved.buffers), static_cast<unsigned long long>(moved.refused), static_cast<unsigned long long>(moved.verified));
+        }
         AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call: %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu; compute pipelines created %llu (%llu under the GPU mutex)\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped), static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(computePipelinesCreatedLocked.load(std::memory_order_relaxed)));
         reportRecipes();
     }
@@ -4830,6 +4916,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     IndirectOutcome outcome{0, 0};
     RecordedDispatch record{&context, &shaders[0], resources, objects, pushStages, &pushBytes, x, y, z, arguments, nullptr, programAddress, fromCache && TemplateDataRefresh() ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::None, 0, revalidateMs, &timer};
     record.resourceKeyMatched = fromCache;
+    record.movedSet = movedSet;
+    record.movedReads = movedReads;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
@@ -4883,7 +4971,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // object the resource cache serves under this content key (reusable: no lease, no copied
     // writes, every direct region import- or mirror-served), so a hit's proof is the template's
     // Revalidate and nothing needs completion work.
-    if (recipeOut != nullptr && DispatchRecipes() && cacheable && resources->Reusable() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty()) {
+    if (recipeOut != nullptr && DispatchRecipes() && cacheable && resources->Reusable() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty() && movedSet == nullptr) {
         auto recipe = std::make_shared<Recipe>();
         recipe->device = state->device;
         recipe->templateRef = resources;

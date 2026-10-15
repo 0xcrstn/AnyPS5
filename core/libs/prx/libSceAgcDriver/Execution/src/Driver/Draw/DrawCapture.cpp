@@ -51,11 +51,18 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     };
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> planValues;
     ShaderMemory::IncrementalState* incremental = nullptr;
+    ShaderMemory::PlanInstance* planInstance = nullptr;
+    ShaderMemory::PlanCapture planCapture;
     if (bindingPlan() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0) {
-        if (incrementalBindings() && invocation.Handle() != nullptr) incremental = &incrementalBinding(invocation.Handle(), invocation.Request().context.userData);
+        if (incrementalPlans() && invocation.Handle() != nullptr) planInstance = &resourcePlanInstance(invocation.Handle(), pushOffset, invocation.Request().context.userData);
+        else if (incrementalBindings() && invocation.Handle() != nullptr) incremental = &incrementalBinding(invocation.Handle(), invocation.Request().context.userData);
         planValues = [&] {
             const SampledReadScope sampling(evidenceReads);
             try {
+                if (planInstance != nullptr) {
+                    planCapture = shaderMemory.CapturePlanned(invocation, *planInstance, verifyIncrementalPlans());
+                    return planCapture.values;
+                }
                 return incremental != nullptr ? shaderMemory.CaptureValues(invocation, *incremental) : shaderMemory.CaptureValues(invocation);
             } catch (const std::exception& error) {
                 throw named(error);
@@ -64,6 +71,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }
     const bool planned = planValues != nullptr && (planValues->plan == nullptr || !ShaderMemory::UsesImageTables(*planValues->plan));
     if (!planned && incremental != nullptr) *incremental = {};
+    if (!planned && planInstance != nullptr) *planInstance = {};
     if (planned) {
         const auto& values = planValues;
         phaseTiming.Phase(DrawRowCapture);
@@ -109,6 +117,27 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
                 phaseTiming.Phase(DrawRowStageVerify);
             }
             noteIncrementalStage(*incremental->instance, verified, stale);
+        }
+        if (planInstance != nullptr) {
+            const bool verified = verifyIncrementalPlans();
+            bool stale = false;
+            if (verified) {
+                std::vector<ShaderRecompiler::MemoryRegion> code;
+                for (const auto& region : program.memory) {
+                    if (!region.bytes.empty()) code.push_back(region);
+                }
+                ShaderMemory reference(code, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+                const auto fresh = reference.CaptureValues(invocation);
+                if (!SameSnapshot(fresh->snapshot, values->snapshot)) {
+                    stale = !ShaderMemory::PlanReadsCurrent(*planInstance);
+                    if (!stale) {
+                        notePlanInstance(planCapture, true, false);
+                        ThrowPlanInstanceMismatch(submission.queue, submission.serial, currentPacketOffset(), i, program.binary.codeAddress, planCapture, fresh->snapshot, values->snapshot);
+                    }
+                }
+                phaseTiming.Phase(DrawRowStageVerify);
+            }
+            notePlanInstance(planCapture, verified, stale);
         }
         bool mismatch = false;
         auto part = SnapshotPart::None;

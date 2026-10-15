@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include <mutex>
 #include <set>
 
 namespace AgcDriver::Graphics {
@@ -48,6 +49,7 @@ public:
     Pipeline& operator=(const Pipeline&) = delete;
     VkPipelineLayout Layout() const;
     std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers = 1, std::span<const std::uint8_t> persistent = {});
+    std::shared_ptr<Framebuffer> FindFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers = 1);
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
     void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by
@@ -93,6 +95,7 @@ private:
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::vector<std::uint32_t> colorSlots;
     bool sampleLocationsEnabled = false;
+    std::mutex framebufferMutex;
     std::vector<CachedFramebuffer> framebuffers;
 };
 
@@ -115,6 +118,7 @@ bool SplitsSets(const Context& context, std::span<const CompiledShader> shaders)
 // Destroys the cached pipelines of a device; to be called before the device goes away. Without it,
 // entries of a gone device are recognised by their buffer pool (made and reset with the device, so
 // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.
+std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
 void ClearCachedPipelines(VkDevice device);
 bool HasStencil(VkFormat format);
 // Device limit checks of the viewport, which is dynamic state and so no longer checked by Pipeline.

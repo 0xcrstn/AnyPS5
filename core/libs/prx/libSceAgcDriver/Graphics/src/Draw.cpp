@@ -19,6 +19,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
@@ -37,6 +38,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 
@@ -620,7 +622,7 @@ void reportRecordParts(const DrawProfile& profile, double elapsedSeconds) {
         const auto snapshotDraws = profile.bindingDraws != 0 ? static_cast<double>(profile.bindingDraws) : 1.0;
         const auto twins = Recorder::TwinCounters();
         static Recorder::SnapshotTwinCounters reportedTwins{};
-        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw; %llu copies limited to the read ranges, %.1f KiB left uncopied per such draw), %llu skipped, %llu descriptor writes; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.limited), static_cast<double>(bindings.uncopiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw; %llu copies limited to the read ranges, %.1f KiB left uncopied per such draw), %llu skipped, %llu bound in place (%.1f MiB), %llu descriptor writes; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.limited), static_cast<double>(bindings.uncopiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.inPlace), static_cast<double>(bindings.inPlaceBytes) / 1048576.0, static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
         if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) {
             std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; device twins%s: %llu snapshot reads bound to one (%.1f MiB), %llu made (%.1f MiB copied in batch prologues), %llu refreshed by changed blocks (%.1f MiB), %llu evicted, %llu reads of unkept snapshots", Recorder::SnapshotTwinsEnabled() ? "" : " (off)", static_cast<unsigned long long>(twins.bound - reportedTwins.bound), static_cast<double>(twins.boundBytes - reportedTwins.boundBytes) / 1048576.0, static_cast<unsigned long long>(twins.made - reportedTwins.made), static_cast<double>(twins.madeBytes - reportedTwins.madeBytes) / 1048576.0, static_cast<unsigned long long>(twins.patched - reportedTwins.patched), static_cast<double>(twins.patchedBytes - reportedTwins.patchedBytes) / 1048576.0, static_cast<unsigned long long>(twins.dropped - reportedTwins.dropped), static_cast<unsigned long long>(twins.unkept - reportedTwins.unkept));
         }
@@ -685,6 +687,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         profile.bindings.reused += bindings.reused;
         profile.bindings.copied += bindings.copied;
         profile.bindings.skipped += bindings.skipped;
+        profile.bindings.inPlace += bindings.inPlace;
+        profile.bindings.inPlaceBytes += bindings.inPlaceBytes;
         profile.bindings.copiedBytes += bindings.copiedBytes;
         profile.bindings.descriptorWrites += bindings.descriptorWrites;
         profile.bindings.limited += bindings.limited;
@@ -1215,6 +1219,77 @@ struct DrawInputs {
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
 
+struct InputImport {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    std::uint64_t base = 0;
+};
+
+std::optional<InputImport> inPlaceInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
+    if (const auto* import = InPlaceDrawInput(context, address, bytes, alignment)) return InputImport{import->buffer, import->base};
+    return std::nullopt;
+}
+
+struct ResolveRefused {
+    ResolveRefusal reason;
+};
+
+struct InPlaceInput {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    std::uint64_t base = 0;
+};
+
+struct KeptIndex {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    Recorder::SnapshotUse use = Recorder::SnapshotUse::Index16;
+    std::uint64_t generation = 0;
+    std::uint64_t registryGeneration = 0;
+    std::optional<std::uint32_t> highest;
+};
+
+struct InputResolve {
+    std::vector<InPlaceInput> inPlace;
+    std::optional<KeptIndex> keptIndex;
+    bool indexRead = false;
+    std::uint64_t indexAddress = 0;
+    std::size_t indexBytes = 0;
+    std::uint64_t indexGeneration = 0;
+
+    [[noreturn]] static void Refuse(ResolveRefusal reason) {
+        throw ResolveRefused{reason};
+    }
+
+    std::optional<InputImport> InPlace(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
+        if (context.recorder == nullptr || bytes == 0) Refuse(ResolveRefusal::NotInPlace);
+        if (Recorder::AccessNeedsFlush(address, bytes)) Refuse(ResolveRefusal::NeedsSync);
+        const auto found = ImportedHostRange(context, address, bytes);
+        if (!found.has_value() || (address - found->base) % alignment != 0) Refuse(ResolveRefusal::NotInPlace);
+        inPlace.push_back({address, bytes, found->buffer, found->base});
+        return InputImport{found->buffer, found->base};
+    }
+
+    InPlaceIndices IndexRange(std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
+        const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(address), bytes);
+        const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        indexRead = true;
+        indexAddress = address;
+        indexBytes = bytes;
+        indexGeneration = GuestMemory::CollectWrites(address, bytes);
+        InPlaceIndices indices;
+        if (bytes < Recorder::KeptIndexRangeIndices * indexSize) {
+            indices.highest = HighestDrawIndex(range, indexSize, skipRestart);
+            return indices;
+        }
+        const auto use = indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
+        indices.generation = indexGeneration;
+        indices.highest = HighestDrawIndex(range, indexSize, skipRestart);
+        keptIndex = KeptIndex{address, bytes, use, indexGeneration, registryGeneration, indices.highest};
+        return indices;
+    }
+};
+
 std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRecompiler::VertexAttribute& attribute) {
     auto zero = std::make_shared<Buffer>(context, DecodeVertexFormat(attribute).bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     std::fill(zero->Bytes().begin(), zero->Bytes().end(), std::byte{0});
@@ -1224,7 +1299,7 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRec
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, InputResolve* resolve = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1299,14 +1374,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
-        const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
+        auto import = resolve != nullptr ? resolve->InPlace(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize) : inPlaceInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
-        if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        if (!import.has_value()) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
         std::optional<std::uint32_t> lowest;
-        if (import != nullptr) {
-            const auto inPlace = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart);
+        if (import.has_value()) {
+            const auto inPlace = resolve != nullptr ? resolve->IndexRange(draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart) : InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart);
             highest = inPlace.highest;
             if (highest) lowest = KnownLowestDrawIndex(draw.indexAddress, std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart, inPlace.generation);
         } else if (!copy.reused) {
@@ -1321,18 +1396,19 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.nothing = true;
             return inputs;
         }
-        if (import == nullptr) lowest = KnownLowestDrawIndex(draw.indexAddress, copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart, copy.generation);
+        if (!import.has_value()) lowest = KnownLowestDrawIndex(draw.indexAddress, copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart, copy.generation);
         constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
         if (const auto zeroFrom = state.stages.mesh ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
             if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
+                if (resolve != nullptr) InputResolve::Refuse(ResolveRefusal::ZeroFill);
                 GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
                 auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
                 const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));
                 GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
                 highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
                 if (lowest) lowest = std::min(*lowest, limit);
-                import = nullptr;
+                import.reset();
                 copy = DrawInputCopy{};
                 copy.buffer = std::move(clamped);
                 if (!highest) {
@@ -1346,10 +1422,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.maxIndex = *highest;
         inputs.minIndex = std::min(lowest.value_or(0u), *highest);
         if (skipRestart && state.stages.mesh && state.stages.mesh->inputPrimitive == 6) {
-            const auto indexSpan = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
+            const auto indexSpan = import.has_value() ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
             inputs.restartTable = MeshRestartTable(indexSpan, draw.indexSize);
         }
-        if (import != nullptr) {
+        if (import.has_value()) {
             inputs.indexHandle = import->buffer;
             inputs.indexOffset = draw.indexAddress - import->base;
             inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
@@ -1419,12 +1495,13 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
-        if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range])) {
+        if (const auto import = resolve != nullptr ? resolve->InPlace(context, begin, bytes, plan.alignments[range]) : inPlaceInput(context, begin, bytes, plan.alignments[range])) {
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(begin - import->base);
             inputs.inPlaceReads.emplace_back(begin, end);
             continue;
         }
+        if (resolve != nullptr) InputResolve::Refuse(ResolveRefusal::NotInPlace);
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         if (copy.reused) inputs.reusedCopies.push_back({begin, Recorder::SnapshotUse::Vertex, copy.buffer});
@@ -1433,6 +1510,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
     std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    if (resolve != nullptr && !soloFetches.empty()) InputResolve::Refuse(ResolveRefusal::ZeroFill);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
@@ -1623,7 +1701,27 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
+bool drawResourcesCacheable(std::span<const CompiledShader> shaders, bool recordable) {
+    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
+    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    return recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+}
+
+bool trimDrawKey() {
+    static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    return trimKey;
+}
+
+struct FoundTemplate {
+    const ResourceCache::Key* key = nullptr;
+    std::shared_ptr<ShaderResources> cached;
+    const ShaderResources::MovedReadOnlyPlan* plan = nullptr;
+    const ShaderResources::EpochProofResult* proof = nullptr;
+};
+
+bool revalidateAdopted(ShaderResources& cached, std::span<const CompiledShader> shaders, const ShaderResources::EpochProofResult& proof, const State& state, const Pm4::DrawParameters& draw);
+
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const FoundTemplate* found = nullptr) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -1632,21 +1730,19 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // object must never do. Revalidate proves a hit by texture identity, which needs the texture
     // caches. Push constants still come from this draw's stages. APS5_NO_DRAW_RESOURCE_CACHE=1
     // builds every draw's resources as before.
-    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
-    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     // The render target and index ranges stay out of the key (see DrawResourceKey); a hit repeats
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
-    static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
-    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    const bool trimKey = trimDrawKey();
+    resolved.cacheable = drawResourcesCacheable(shaders, recordable);
     if (resolved.cacheable) {
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
-            const bool valid = cached->Revalidate(shaders);
+        resolved.contentKey = found != nullptr ? *found->key : DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        if (auto cached = found != nullptr ? found->cached : SharedResourceCache().Find(resolved.contentKey)) {
+            const bool valid = found != nullptr && found->proof != nullptr ? revalidateAdopted(*cached, shaders, *found->proof, state, draw) : cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
-            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            if (valid && recorder != nullptr) moved = found != nullptr ? cached->CheckMovedReadOnlyBuffers(*found->plan, *recorder) : cached->MovedReadOnlyBuffers(shaders, *recorder);
             if (moved.has_value()) {
-                if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                if (trimKey && found == nullptr) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
@@ -2139,6 +2235,10 @@ Recorder::BoundPlacement drawPlacement(const ShaderResources& resources, const S
     if (bindings != nullptr) {
         for (const auto& snapshot : bindings->snapshots) {
             const auto bytes = static_cast<std::uint64_t>(snapshot.bytes.size());
+            if (snapshot.inPlace) {
+                placement.inPlace += bytes;
+                continue;
+            }
             if (snapshot.address != 0) placement.inPlace -= std::min(placement.inPlace, bytes);
             (snapshot.twin != nullptr ? placement.device : placement.hostCopies) += bytes;
         }
@@ -2407,7 +2507,422 @@ void PrewarmPipeline(const Context& context, const State& state, std::span<const
     CachedPipeline(context, pipelineState, vertexInput, described.View(), shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+const char* ResolveSerialName(ResolveSerial serial) {
+    constexpr std::array<const char*, static_cast<std::size_t>(ResolveSerial::Count)> names{"ledger", "write generation", "finished batches", "tracker generation", "dirty serial", "pending images", "storage cache", "allocations", "key stores", "resource cache"};
+    return names.at(static_cast<std::size_t>(serial));
+}
+
+const char* ResolveRefusalName(ResolveRefusal refusal) {
+    constexpr std::array<const char*, static_cast<std::size_t>(ResolveRefusal::Count)> names{"none", "unsupported draw", "no recorder", "needs a sync", "not in place", "zero fill", "threw", "uncacheable", "template miss", "moved buffers refused", "no inputs"};
+    return names.at(static_cast<std::size_t>(refusal));
+}
+
+const char* ResolveRedoName(ResolveRedo redo) {
+    constexpr std::array<const char*, static_cast<std::size_t>(ResolveRedo::Count)> names{"none", "device", "not recordable", "input pending", "input import", "index data", "resource cache changed", "pipeline state"};
+    return names.at(static_cast<std::size_t>(redo));
+}
+
+bool ParallelTargetsRequested() {
+    static const bool requested = [] {
+        const char* text = std::getenv("APS5_PARALLEL_TARGETS");
+        if (text == nullptr || std::strcmp(text, "0") == 0) return false;
+        if (ParallelResolveRequested()) return true;
+        std::fprintf(stderr, "[record-thread] APS5_PARALLEL_TARGETS ignored: it needs APS5_PARALLEL_RESOLVE\n");
+        return false;
+    }();
+    return requested;
+}
+
+bool VerifyParallelTargets() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_PARALLEL_TARGETS");
+        return ParallelTargetsRequested() && text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+const char* TargetVerdictName(TargetVerdict verdict) {
+    constexpr std::array<const char*, static_cast<std::size_t>(TargetVerdict::Count)> names{"held", "adopted", "disabled", "threw", "no pipeline", "not resident", "multisampled", "array slice", "attachment proxy", "not cached", "no view yet", "no depth surface", "no framebuffer yet", "resident differs", "depth view differs", "pipeline differs"};
+    return names.at(static_cast<std::size_t>(verdict));
+}
+
+ResolveStamp ResolveStamp::Now() {
+    ResolveStamp stamp;
+    const auto set = [&stamp](ResolveSerial serial, std::uint64_t value) { stamp.values[static_cast<std::size_t>(serial)] = value; };
+    set(ResolveSerial::WriteGeneration, Recorder::WriteGeneration());
+    set(ResolveSerial::FinishedBatches, Recorder::FinishedBatches());
+    set(ResolveSerial::Ledger, Recorder::LedgerSerial());
+    set(ResolveSerial::TrackerGeneration, GuestMemory::TrackerGeneration());
+    set(ResolveSerial::DirtySerial, GuestMemory::DirtySerial());
+    set(ResolveSerial::PendingSerial, StorageTexture::PendingSerial());
+    set(ResolveSerial::StorageCache, StorageCacheSerial());
+    set(ResolveSerial::Allocations, GuestAllocations::GuestAllocationsGeneration_nid_postfix());
+    set(ResolveSerial::KeyStores, Recorder::KeyStoreSerial());
+    set(ResolveSerial::ResourceCache, SharedResourceCache().Serial());
+    return stamp;
+}
+
+bool ParallelResolveRequested() {
+    static const bool requested = [] {
+        const char* text = std::getenv("APS5_PARALLEL_RESOLVE");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return requested;
+}
+
+bool VerifyParallelResolve() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_PARALLEL_RESOLVE");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+bool ParallelRevalidateRequested() {
+    static const bool requested = [] {
+        const char* text = std::getenv("APS5_PARALLEL_REVALIDATE");
+        if (text == nullptr || std::strcmp(text, "0") == 0) return false;
+        if (ParallelResolveRequested()) return true;
+        std::fprintf(stderr, "[record-thread] APS5_PARALLEL_REVALIDATE ignored: it needs APS5_PARALLEL_RESOLVE\n");
+        return false;
+    }();
+    return requested;
+}
+
+bool VerifyParallelRevalidate() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_PARALLEL_REVALIDATE");
+        return ParallelRevalidateRequested() && text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+struct ResolvedDraw {
+    VkDevice device = VK_NULL_HANDLE;
+    ResolveStamp stamp;
+    ResolveRefusal inputsRefusal = ResolveRefusal::Unsupported;
+    DrawInputs inputs;
+    bool validateMemoized = false;
+    bool validateHit = false;
+    std::vector<InPlaceInput> inPlace;
+    std::optional<KeptIndex> keptIndex;
+    bool indexRead = false;
+    std::uint64_t indexAddress = 0;
+    std::size_t indexBytes = 0;
+    std::uint64_t indexGeneration = 0;
+    ResolveRefusal resourcesRefusal = ResolveRefusal::Unsupported;
+    ResourceCache::Key key;
+    std::uint64_t cacheSerial = 0;
+    std::shared_ptr<ShaderResources> resources;
+    std::optional<ShaderResources::MovedReadOnlyPlan> plan;
+    struct Targets {
+        TargetVerdict verdict = TargetVerdict::Disabled;
+        std::vector<std::shared_ptr<StorageTexture>> residents;
+        std::vector<VkImageView> views;
+        VkImageView depthView = VK_NULL_HANDLE;
+        std::shared_ptr<Framebuffer> framebuffer;
+    } targets;
+    std::shared_ptr<Pipeline> pipeline;
+    std::vector<std::uint8_t> proxied;
+    ShaderResources::EpochProofResult epochProof;
+};
+
+namespace {
+
+constexpr std::size_t ResolveRefusalCount = static_cast<std::size_t>(ResolveRefusal::Count);
+constexpr std::size_t ResolveRedoCount = static_cast<std::size_t>(ResolveRedo::Count);
+constexpr std::size_t TargetVerdictCount = static_cast<std::size_t>(TargetVerdict::Count);
+constexpr std::size_t ResolveSerialCount = static_cast<std::size_t>(ResolveSerial::Count);
+constexpr std::size_t EpochVerdictCount = static_cast<std::size_t>(ShaderResources::EpochProofVerdict::Count);
+
+struct ResolveCounters {
+    std::atomic<std::uint64_t> resolves{0};
+    std::atomic<std::uint64_t> resolveNs{0};
+    std::atomic<std::uint64_t> inputsResolved{0};
+    std::atomic<std::uint64_t> resourcesResolved{0};
+    std::atomic<std::uint64_t> pipelinesResolved{0};
+    std::atomic<std::uint64_t> encodes{0};
+    std::atomic<std::uint64_t> encodeNs{0};
+    std::atomic<std::uint64_t> inputsAdopted{0};
+    std::atomic<std::uint64_t> resourcesAdopted{0};
+    std::atomic<std::uint64_t> pipelinesAdopted{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::array<std::atomic<std::uint64_t>, TargetVerdictCount> targets{};
+    std::atomic<std::uint64_t> targetsVerified{0};
+    std::array<std::atomic<std::uint64_t>, ResolveRefusalCount> inputRefusals{};
+    std::array<std::atomic<std::uint64_t>, ResolveRefusalCount> resourceRefusals{};
+    std::array<std::atomic<std::uint64_t>, ResolveRedoCount> redos{};
+    std::array<std::atomic<std::uint64_t>, ResolveSerialCount> moved{};
+    std::array<std::atomic<std::uint64_t>, EpochVerdictCount> revalidations{};
+    std::atomic<std::uint64_t> revalidationsVerified{0};
+};
+
+ResolveCounters& resolveCounters() {
+    static ResolveCounters counters;
+    return counters;
+}
+
+void countRedo(ResolveRedo redo) {
+    resolveCounters().redos[static_cast<std::size_t>(redo)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string drawIdentity(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    char text[256];
+    std::snprintf(text, sizeof(text), "draw of program 0x%llx (%u indices from 0x%llx, %u instances, color target 0x%llx)", static_cast<unsigned long long>(shaders.empty() ? 0 : shaders.back().programAddress), draw.indexCount, static_cast<unsigned long long>(draw.indexAddress), draw.instanceCount, static_cast<unsigned long long>(state.color.address));
+    return text;
+}
+
+[[noreturn]] void resolveDiffers(const char* what, const std::string& identity) {
+    throw std::logic_error(std::string("APS5_VERIFY_PARALLEL_RESOLVE: the worker's resolve differs from the serial resolve in ") + what + " for the " + identity);
+}
+
+[[noreturn]] void targetsDiffer(const char* what, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    throw std::logic_error(std::string("APS5_VERIFY_PARALLEL_TARGETS: the worker's targets differ from the serial targets in ") + what + " for the " + drawIdentity(state, draw, shaders));
+}
+
+void resolveTargets(const Context& context, const State& state, ResolvedDraw& resolved) {
+    auto& targets = resolved.targets;
+    const auto refuse = [&targets](TargetVerdict verdict) {
+        targets = {};
+        targets.verdict = verdict;
+    };
+    if (resolved.pipeline == nullptr) return refuse(TargetVerdict::NoPipeline);
+    static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
+    if (!residentTargets || context.detiler == nullptr) return refuse(TargetVerdict::NotResident);
+    try {
+        targets.residents.reserve(state.colors.size());
+        targets.views.reserve(state.colors.size());
+        for (const auto& color : state.colors) {
+            if (color.samples > 1) return refuse(TargetVerdict::Multisampled);
+            if (color.tileMode == ColorTileMode::Linear) return refuse(TargetVerdict::NotResident);
+            if (color.arrayLastSlice != 0) return refuse(TargetVerdict::ArraySlice);
+            if (AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED) return refuse(TargetVerdict::Proxied);
+            auto resident = PeekStorageSurface(context, SurfaceForTarget(color));
+            if (resident == nullptr || !resident->Attachable() || (color.dccAddress != 0 && resident->Descriptor().dccAddress != color.dccAddress)) return refuse(TargetVerdict::NotCached);
+            const auto view = resident->FindAttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice);
+            if (view == VK_NULL_HANDLE) return refuse(TargetVerdict::NoView);
+            targets.views.push_back(view);
+            targets.residents.push_back(std::move(resident));
+        }
+        auto views = targets.views;
+        if (state.depth) {
+            targets.depthView = PeekDepthSurfaceView(context, *state.depth);
+            if (targets.depthView == VK_NULL_HANDLE) return refuse(TargetVerdict::NoDepth);
+            views.push_back(targets.depthView);
+        }
+        targets.framebuffer = resolved.pipeline->FindFramebuffer(views, targets.residents, state.renderExtent, state.renderLayers);
+        if (targets.framebuffer == nullptr) return refuse(TargetVerdict::NoFramebuffer);
+        targets.verdict = TargetVerdict::Held;
+    } catch (const std::exception&) {
+        refuse(TargetVerdict::Threw);
+    }
+}
+
+void requireSameInputs(const DrawInputs& serial, const DrawInputs& resolved, const std::string& identity) {
+    if (serial.nothing != resolved.nothing) resolveDiffers("the empty-draw decision", identity);
+    if (serial.nothing) return;
+    if (serial.indexBytes != resolved.indexBytes || serial.indexHandle != resolved.indexHandle || serial.indexOffset != resolved.indexOffset) resolveDiffers("the index buffer", identity);
+    if (serial.minIndex != resolved.minIndex || serial.maxIndex != resolved.maxIndex) resolveDiffers("the index bounds", identity);
+    if (serial.vertexHandles.size() != resolved.vertexHandles.size() || serial.vertexOffsets != resolved.vertexOffsets || serial.vertexBuffers.size() != resolved.vertexBuffers.size()) resolveDiffers("the vertex bindings", identity);
+    const auto owned = [](const DrawInputs& inputs, VkBuffer handle) {
+        return std::any_of(inputs.vertexBuffers.begin(), inputs.vertexBuffers.end(), [&](const std::shared_ptr<Buffer>& buffer) { return buffer != nullptr && buffer->Handle() == handle; });
+    };
+    for (std::size_t i = 0; i < serial.vertexHandles.size(); ++i) {
+        const bool serialOwned = owned(serial, serial.vertexHandles[i]);
+        if (serialOwned != owned(resolved, resolved.vertexHandles[i]) || (!serialOwned && serial.vertexHandles[i] != resolved.vertexHandles[i])) resolveDiffers("a vertex buffer handle", identity);
+    }
+    if (serial.inPlaceReads != resolved.inPlaceReads || !serial.reusedCopies.empty() || !resolved.reusedCopies.empty()) resolveDiffers("the in-place reads", identity);
+    if (serial.fragmentOutputs != resolved.fragmentOutputs || serial.shaderStages != resolved.shaderStages || serial.meshGroups != resolved.meshGroups || serial.restartTable != resolved.restartTable) resolveDiffers("the fragment outputs or stages", identity);
+    const auto& serialLayout = serial.VertexLayout();
+    const auto& resolvedLayout = resolved.VertexLayout();
+    if (serialLayout.bindings.size() != resolvedLayout.bindings.size() || serialLayout.attributes.size() != resolvedLayout.attributes.size()) resolveDiffers("the vertex input layout", identity);
+}
+
+void requireSameResources(const ResolvedResources& serial, const ResolvedResources& resolved, const std::string& identity) {
+    if (serial.resources != resolved.resources || serial.cacheable != resolved.cacheable || serial.contentKey != resolved.contentKey) resolveDiffers("the resource template", identity);
+    if (serial.moved.size() != resolved.moved.size()) resolveDiffers("the moved buffers", identity);
+    for (std::size_t i = 0; i < serial.moved.size(); ++i) {
+        const auto& first = serial.moved[i];
+        const auto& second = resolved.moved[i];
+        if (first.allocation != second.allocation || first.address != second.address || first.size != second.size || first.words != second.words) resolveDiffers("a moved buffer", identity);
+    }
+}
+
+bool revalidateAdopted(ShaderResources& cached, std::span<const CompiledShader> shaders, const ShaderResources::EpochProofResult& proof, const State& state, const Pm4::DrawParameters& draw) {
+    auto& counters = resolveCounters();
+    const bool verify = VerifyParallelRevalidate();
+    const auto verdict = cached.AdoptEpochProof(proof, !verify);
+    counters.revalidations[static_cast<std::size_t>(verdict)].fetch_add(1, std::memory_order_relaxed);
+    if (!verify) return verdict == ShaderResources::EpochProofVerdict::Adopted || cached.Revalidate(shaders);
+    ShaderResources::ProofReport report;
+    const bool valid = cached.Revalidate(shaders, &report);
+    if (verdict == ShaderResources::EpochProofVerdict::Adopted) {
+        if (!valid || report.path != ShaderResources::ProofPath::EpochSkip) throw std::logic_error(std::string("APS5_VERIFY_PARALLEL_REVALIDATE: the worker's epoch proof was adopted, but the serial Revalidate ") + (valid ? "took another proof path" : "refused the template") + " for the " + drawIdentity(state, draw, shaders));
+        counters.revalidationsVerified.fetch_add(1, std::memory_order_relaxed);
+    }
+    return valid;
+}
+
+ResolveRedo adoptDrawInputs(const Context& context, const ResolvedDraw& early) {
+    auto* recorder = context.recorder;
+    if (early.device != context.device || (!early.inPlace.empty() && recorder == nullptr)) return ResolveRedo::Device;
+    for (const auto& input : early.inPlace) {
+        GuestMemory::FlushGpuWrites(input.address, input.bytes);
+        if (recorder->PendingWriteOverlaps(input.address, input.bytes) || recorder->PendingLabelIn(input.address, input.bytes) || recorder->QueuedStoreOverlaps(input.address, input.bytes)) return ResolveRedo::InputPending;
+        const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(input.address, input.bytes); };
+        if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return ResolveRedo::InputPending;
+        const auto drawWriters = DrawCopiedWriters();
+        if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return ResolveRedo::InputPending;
+        const auto* import = HostImportFor(context, input.address, input.bytes);
+        if (import == nullptr || import->buffer != input.buffer || import->base != input.base) return ResolveRedo::InputImport;
+    }
+    if (early.indexRead) {
+        const bool written = Recorder::WriteGeneration() != early.stamp.Of(ResolveSerial::WriteGeneration);
+        const bool finished = Recorder::FinishedBatches() != early.stamp.Of(ResolveSerial::FinishedBatches);
+        if (written && finished) return ResolveRedo::IndexData;
+        if (early.indexGeneration != 0 && !GuestMemory::UnchangedSince(early.indexAddress, early.indexBytes, early.indexGeneration)) return ResolveRedo::IndexData;
+    }
+    for (std::size_t i = 0; i < early.inPlace.size(); ++i) {
+        const auto& input = early.inPlace[i];
+        recorder->NotePendingRead(input.address, input.bytes, Recorder::ReadKind::DrawInput);
+        if (i == 0 && early.indexRead && early.keptIndex.has_value() && input.address == early.indexAddress) {
+            const auto& kept = *early.keptIndex;
+            recorder->KeepHighestIndex(kept.address, kept.bytes, kept.use, kept.generation, kept.registryGeneration, kept.highest);
+        }
+    }
+    return ResolveRedo::None;
+}
+
+DrawInputs encodeDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const ResolvedDraw& early, bool& adopted) {
+    adopted = false;
+    if (early.inputsRefusal == ResolveRefusal::None) {
+        const auto redo = adoptDrawInputs(context, early);
+        if (redo == ResolveRedo::None) adopted = true;
+        else countRedo(redo);
+    }
+    if (!adopted) return prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    resolveCounters().inputsAdopted.fetch_add(1, std::memory_order_relaxed);
+    outcome.validateMemoized = early.validateMemoized;
+    outcome.validateHit = early.validateHit;
+    timer.phase(PhaseVertex);
+    auto inputs = early.inputs;
+    if (VerifyParallelResolve()) {
+        DrawOutcome serialOutcome;
+        DrawTimer serialTimer(false);
+        const auto serial = prepareDrawInputs(context, state, draw, shaders, serialOutcome, serialTimer, nullptr);
+        requireSameInputs(serial, inputs, drawIdentity(state, draw, shaders));
+        resolveCounters().verified.fetch_add(1, std::memory_order_relaxed);
+    }
+    return inputs;
+}
+
+ResolvedResources encodeDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const ResolvedDraw& early) {
+    bool adopted = false;
+    if (early.resourcesRefusal == ResolveRefusal::None && early.resources != nullptr && early.plan.has_value()) {
+        if (early.device != context.device) countRedo(ResolveRedo::Device);
+        else if (!drawResourcesCacheable(shaders, recordable)) countRedo(ResolveRedo::NotRecordable);
+        else if (SharedResourceCache().Serial() != early.cacheSerial && SharedResourceCache().Find(early.key) != early.resources) countRedo(ResolveRedo::CacheChanged);
+        else adopted = true;
+    }
+    if (!adopted) return resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    resolveCounters().resourcesAdopted.fetch_add(1, std::memory_order_relaxed);
+    const FoundTemplate found{&early.key, early.resources, &*early.plan, ParallelRevalidateRequested() ? &early.epochProof : nullptr};
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, &found);
+    if (VerifyParallelResolve()) {
+        DrawOutcome serialOutcome;
+        DrawTimer serialTimer(false);
+        const auto serial = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, serialOutcome, serialTimer);
+        requireSameResources(serial, resolved, drawIdentity(state, draw, shaders));
+    }
+    return resolved;
+}
+
+bool adoptsPipeline(const ResolvedDraw& early, bool inputsAdopted, bool leanSingle, const ShaderResources* resources, std::span<const std::uint8_t> proxied) {
+    if (early.pipeline == nullptr) return false;
+    const bool same = inputsAdopted && leanSingle && resources == early.resources.get() && std::ranges::equal(proxied, early.proxied);
+    if (!same) {
+        countRedo(ResolveRedo::PipelineState);
+        return false;
+    }
+    resolveCounters().pipelinesAdopted.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+template <std::size_t Count>
+std::string countList(const std::array<std::atomic<std::uint64_t>, Count>& values, std::array<std::uint64_t, Count>& last, const char* (*name)(std::size_t), std::size_t first) {
+    std::string text;
+    for (std::size_t i = first; i < Count; ++i) {
+        const auto value = values[i].load(std::memory_order_relaxed);
+        const auto delta = value - last[i];
+        last[i] = value;
+        if (delta == 0) continue;
+        text += std::string(text.empty() ? " " : ", ") + name(i) + " " + std::to_string(delta);
+    }
+    return text.empty() ? std::string(" none") : text;
+}
+
+const char* refusalAt(std::size_t index) {
+    return ResolveRefusalName(static_cast<ResolveRefusal>(index));
+}
+
+const char* redoAt(std::size_t index) {
+    return ResolveRedoName(static_cast<ResolveRedo>(index));
+}
+
+const char* targetVerdictAt(std::size_t index) {
+    return TargetVerdictName(static_cast<TargetVerdict>(index));
+}
+
+const char* serialAt(std::size_t index) {
+    return ResolveSerialName(static_cast<ResolveSerial>(index));
+}
+
+const char* epochVerdictAt(std::size_t index) {
+    return ShaderResources::EpochProofVerdictName(static_cast<ShaderResources::EpochProofVerdict>(index));
+}
+
+std::string verifiedSince(const std::atomic<std::uint64_t>& value, std::uint64_t& last) {
+    const auto current = value.load(std::memory_order_relaxed);
+    const auto delta = current - last;
+    last = current;
+    return std::to_string(delta);
+}
+
+void reportParallelResolve() {
+    static std::mutex reportMutex;
+    std::unique_lock lock(reportMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    static auto lastReport = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    const auto seconds = std::chrono::duration<double>(now - lastReport).count();
+    lastReport = now;
+    auto& counters = resolveCounters();
+    static std::array<std::uint64_t, 11> last{};
+    const std::array<std::uint64_t, 11> values{counters.resolves.load(), counters.resolveNs.load(), counters.inputsResolved.load(), counters.resourcesResolved.load(), counters.pipelinesResolved.load(), counters.encodes.load(), counters.encodeNs.load(), counters.inputsAdopted.load(), counters.resourcesAdopted.load(), counters.pipelinesAdopted.load(), counters.verified.load()};
+    std::array<std::uint64_t, 11> delta{};
+    for (std::size_t i = 0; i < values.size(); ++i) delta[i] = values[i] - last[i];
+    last = values;
+    static std::array<std::uint64_t, ResolveRefusalCount> lastInputs{};
+    static std::array<std::uint64_t, ResolveRefusalCount> lastResources{};
+    static std::array<std::uint64_t, ResolveRedoCount> lastRedos{};
+    static std::array<std::uint64_t, ResolveSerialCount> lastMoved{};
+    const auto inputs = countList(counters.inputRefusals, lastInputs, refusalAt, 1);
+    const auto resources = countList(counters.resourceRefusals, lastResources, refusalAt, 1);
+    const auto redos = countList(counters.redos, lastRedos, redoAt, 1);
+    const auto moved = countList(counters.moved, lastMoved, serialAt, 0);
+    std::string pieces;
+    static std::array<std::uint64_t, EpochVerdictCount> lastRevalidations{};
+    static std::uint64_t lastRevalidationsVerified = 0;
+    if (ParallelRevalidateRequested()) pieces += "; template proofs from the workers by verdict:" + countList(counters.revalidations, lastRevalidations, epochVerdictAt, 1) + ", verified " + verifiedSince(counters.revalidationsVerified, lastRevalidationsVerified);
+    const auto perDraw = [](std::uint64_t ns, std::uint64_t count) { return count != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(count) : 0.0; };
+    static std::array<std::uint64_t, TargetVerdictCount> lastTargets{};
+    static std::uint64_t lastTargetsVerified = 0;
+    if (ParallelTargetsRequested()) pieces += "; targets from the workers by verdict:" + countList(counters.targets, lastTargets, targetVerdictAt, 1) + ", verified " + verifiedSince(counters.targetsVerified, lastTargetsVerified);
+    AgcDriver::ProfilePrint_nid_no_patch("[parallel-resolve] %.3f s: %llu resolved on workers (%.2f us each): inputs %llu, templates %llu, pipelines %llu; %llu encodes (%.2f us each): inputs adopted %llu, templates adopted %llu, pipelines adopted %llu, verified %llu; inputs resolved in encode by reason:%s; templates resolved in encode by reason:%s; redone in encode by reason:%s; serials moved between resolve and encode:%s%s\n", seconds, static_cast<unsigned long long>(delta[0]), perDraw(delta[1], delta[0]), static_cast<unsigned long long>(delta[2]), static_cast<unsigned long long>(delta[3]), static_cast<unsigned long long>(delta[4]), static_cast<unsigned long long>(delta[5]), perDraw(delta[6], delta[5]), static_cast<unsigned long long>(delta[7]), static_cast<unsigned long long>(delta[8]), static_cast<unsigned long long>(delta[9]), static_cast<unsigned long long>(delta[10]), inputs.c_str(), resources.c_str(), redos.c_str(), moved.c_str(), pieces.c_str());
+}
+
+void drawBody(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const ResolvedDraw* early) {
     std::vector<std::uint32_t> stencilReferences;
     for (const auto& shader : shaders) {
         if (shader.program != nullptr && !shader.program->stencilReferences.empty()) {
@@ -2445,7 +2960,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    bool inputsAdopted = false;
+    auto inputs = early != nullptr ? encodeDrawInputs(context, state, draw, shaders, outcome, timer, *early, inputsAdopted) : prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -2480,6 +2996,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     forgetContinuedTargets();
     std::vector<TargetBinding> targets(state.colors.size());
     std::vector<VkImageView> targetViews;
+    const auto* earlyTargets = early != nullptr && ParallelTargetsRequested() ? &early->targets : nullptr;
+    auto targetVerdict = earlyTargets != nullptr ? earlyTargets->verdict : TargetVerdict::Disabled;
+    if (targetVerdict == TargetVerdict::Held && earlyTargets->residents.size() != state.colors.size()) targetVerdict = TargetVerdict::ResidentDiffers;
+    std::size_t adoptedViews = 0;
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
@@ -2523,6 +3043,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
+            if (targetVerdict == TargetVerdict::Held && !binding.proxied && earlyTargets->residents[index] == binding.resident) {
+                targetViews.push_back(earlyTargets->views[index]);
+                ++adoptedViews;
+                if (VerifyParallelTargets() && binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice) != targetViews.back()) targetsDiffer("an attachment view", state, draw, shaders);
+                continue;
+            }
             targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
             continue;
         }
@@ -2565,11 +3091,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto targetsEpoch = continuedTargetsEnabled() ? GuestMemory::CollectEpoch() : 0;
     const auto targetsGeneration = targetsEpoch != 0 ? GuestMemory::TrackerGeneration() : 0;
     if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth));
+    if (targetVerdict == TargetVerdict::Held && adoptedViews != state.colors.size()) targetVerdict = TargetVerdict::ResidentDiffers;
+    if (targetVerdict == TargetVerdict::Held && state.depth && targetViews.back() != earlyTargets->depthView) targetVerdict = TargetVerdict::DepthDiffers;
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    auto resolved = early != nullptr ? encodeDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, *early) : resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {
@@ -2740,7 +3268,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         Require(!selectedPipeline->SplitsFaces() && !selectedPipeline->SplitsSecondChannel(), "stencil replay refuses pipeline face or channel splits");
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
-    auto pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    std::vector<std::uint8_t> proxiedTargets;
+    if (early != nullptr) {
+        for (const auto& binding : targets) proxiedTargets.push_back(binding.proxied ? 1u : 0u);
+    }
+    const bool adoptPipeline = early != nullptr && adoptsPipeline(*early, inputsAdopted, lean && stencilReplay.empty(), resources.get(), proxiedTargets);
+    auto pipeline = stencilReplay.empty() ? (adoptPipeline ? early->pipeline : CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) : stencilReplay.front().second;
+    if (adoptPipeline && VerifyParallelResolve() && CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, VK_IMAGE_LAYOUT_GENERAL) != pipeline) resolveDiffers("the pipeline", drawIdentity(state, draw, shaders));
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;
@@ -2751,7 +3285,16 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         owners.push_back(binding.resident);
         persistent.push_back(binding.multisampled ? 1u : 0u);
     }
-    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, state.renderLayers, persistent);
+    if (targetVerdict == TargetVerdict::Held && pipeline != early->pipeline) targetVerdict = TargetVerdict::PipelineDiffers;
+    auto framebuffer = targetVerdict == TargetVerdict::Held ? earlyTargets->framebuffer : pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, state.renderLayers, persistent);
+    if (targetVerdict == TargetVerdict::Held) {
+        targetVerdict = TargetVerdict::Adopted;
+        if (VerifyParallelTargets()) {
+            if (pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, state.renderLayers, persistent) != framebuffer) targetsDiffer("the framebuffer", state, draw, shaders);
+            resolveCounters().targetsVerified.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (earlyTargets != nullptr) resolveCounters().targets[static_cast<std::size_t>(targetVerdict)].fetch_add(1, std::memory_order_relaxed);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
@@ -3061,6 +3604,153 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         report(" synchronous");
     }
     APS5_LOG_CHARS_OUT_DEBUG("Draw finished");
+}
+
+
+}
+
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+    drawBody(context, state, draw, shaders, snapshots, recipeOut, nullptr);
+}
+
+void EncodeDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const ResolvedDraw& resolved, std::shared_ptr<const DrawRecipe>* recipe) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto start = std::chrono::steady_clock::now();
+    auto& counters = resolveCounters();
+    if (profile) {
+        const auto changed = ChangedSerials(resolved.stamp, ResolveStamp::Now());
+        for (std::size_t i = 0; i < ResolveSerialCount; ++i) {
+            if ((changed >> i) & 1u) counters.moved[i].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    drawBody(context, state, draw, shaders, snapshots, recipe, &resolved);
+    counters.encodes.fetch_add(1, std::memory_order_relaxed);
+    counters.encodeNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    if (profile) reportParallelResolve();
+}
+
+std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    const auto start = std::chrono::steady_clock::now();
+    auto resolved = std::make_shared<ResolvedDraw>();
+    resolved->device = context.device;
+    resolved->stamp = ResolveStamp::Now();
+    auto& counters = resolveCounters();
+    const bool stencil = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program == nullptr || !shader.program->stencilReferences.empty(); });
+    if (context.recorder == nullptr) {
+        resolved->inputsRefusal = ResolveRefusal::NoRecorder;
+        resolved->resourcesRefusal = ResolveRefusal::NoRecorder;
+    } else if (shaders.empty() || stencil || draw.indirect.has_value() || state.stages.mesh || state.rectList || context.descriptorCache == nullptr || DumpTargetLimit() != 0 || !RecordDraws()) {
+        resolved->inputsRefusal = ResolveRefusal::Unsupported;
+        resolved->resourcesRefusal = ResolveRefusal::Unsupported;
+    } else {
+        try {
+            InputResolve resolve;
+            DrawOutcome outcome;
+            DrawTimer timer(false);
+            auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, &resolve);
+            resolved->inputs = std::move(inputs);
+            resolved->validateMemoized = outcome.validateMemoized;
+            resolved->validateHit = outcome.validateHit;
+            resolved->inPlace = std::move(resolve.inPlace);
+            resolved->keptIndex = std::move(resolve.keptIndex);
+            resolved->indexRead = resolve.indexRead;
+            resolved->indexAddress = resolve.indexAddress;
+            resolved->indexBytes = resolve.indexBytes;
+            resolved->indexGeneration = resolve.indexGeneration;
+            resolved->inputsRefusal = ResolveRefusal::None;
+        } catch (const ResolveRefused& refused) {
+            resolved->inputsRefusal = refused.reason;
+        } catch (const std::exception&) {
+            resolved->inputsRefusal = ResolveRefusal::Threw;
+        } catch (...) {
+            resolved->inputsRefusal = ResolveRefusal::Threw;
+        }
+        try {
+            const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+            if (!drawResourcesCacheable(shaders, true)) {
+                resolved->resourcesRefusal = ResolveRefusal::Uncacheable;
+            } else {
+                auto key = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimDrawKey());
+                const auto cacheSerial = SharedResourceCache().Serial();
+                auto cached = SharedResourceCache().Find(key);
+                if (cached == nullptr) {
+                    resolved->resourcesRefusal = ResolveRefusal::TemplateMiss;
+                } else if (auto plan = cached->PlanMovedReadOnlyBuffers(shaders); !plan.has_value()) {
+                    resolved->resourcesRefusal = ResolveRefusal::MovedRefused;
+                } else {
+                    if (trimDrawKey()) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                    resolved->key = std::move(key);
+                    resolved->cacheSerial = cacheSerial;
+                    resolved->resources = std::move(cached);
+                    resolved->plan = std::move(plan);
+                    resolved->resourcesRefusal = ResolveRefusal::None;
+                    if (ParallelRevalidateRequested()) resolved->epochProof = resolved->resources->ResolveEpochProof();
+                }
+            }
+        } catch (const std::exception&) {
+            resolved->resources = nullptr;
+            resolved->plan.reset();
+            resolved->resourcesRefusal = ResolveRefusal::Threw;
+        }
+        static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
+        if (resolved->inputsRefusal == ResolveRefusal::None && resolved->resourcesRefusal == ResolveRefusal::None && !resolved->inputs.nothing && !drawTransitions) {
+            try {
+                auto masked = maskedState(state, resolved->inputs.fragmentOutputs);
+                std::vector<std::uint8_t> proxied(state.colors.size(), 0u);
+                for (std::size_t index = 0; index < state.colors.size(); ++index) {
+                    if (state.colors[index].samples > 1) continue;
+                    const auto proxy = AttachmentProxyFormat(context, state.colors[index].format);
+                    if (proxy == VK_FORMAT_UNDEFINED) continue;
+                    proxied[index] = 1u;
+                    if (!masked.has_value()) masked = state;
+                    masked->colors[index].format = proxy;
+                    masked->blends.at(state.colors[index].exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
+                }
+                const State& pipelineState = masked.has_value() ? *masked : state;
+                resolved->pipeline = FindCachedPipeline(context, pipelineState, resolved->inputs.VertexLayout(), *resolved->resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+                resolved->proxied = std::move(proxied);
+            } catch (const std::exception&) {
+                resolved->pipeline = nullptr;
+                resolved->proxied.clear();
+            }
+        }
+        if (ParallelTargetsRequested()) resolveTargets(context, state, *resolved);
+    }
+    counters.inputRefusals[static_cast<std::size_t>(resolved->inputsRefusal)].fetch_add(1, std::memory_order_relaxed);
+    counters.resourceRefusals[static_cast<std::size_t>(resolved->resourcesRefusal)].fetch_add(1, std::memory_order_relaxed);
+    if (resolved->inputsRefusal == ResolveRefusal::None) counters.inputsResolved.fetch_add(1, std::memory_order_relaxed);
+    if (resolved->resourcesRefusal == ResolveRefusal::None) counters.resourcesResolved.fetch_add(1, std::memory_order_relaxed);
+    if (resolved->pipeline != nullptr) counters.pipelinesResolved.fetch_add(1, std::memory_order_relaxed);
+    counters.resolves.fetch_add(1, std::memory_order_relaxed);
+    counters.resolveNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    return resolved;
+}
+
+ParallelResolveCounts ParallelResolveStatistics() {
+    const auto& counters = resolveCounters();
+    ParallelResolveCounts counts;
+    counts.resolves = counters.resolves.load();
+    counts.resolveNs = counters.resolveNs.load();
+    counts.inputsResolved = counters.inputsResolved.load();
+    counts.resourcesResolved = counters.resourcesResolved.load();
+    counts.pipelinesResolved = counters.pipelinesResolved.load();
+    counts.encodes = counters.encodes.load();
+    counts.encodeNs = counters.encodeNs.load();
+    counts.inputsAdopted = counters.inputsAdopted.load();
+    counts.resourcesAdopted = counters.resourcesAdopted.load();
+    counts.pipelinesAdopted = counters.pipelinesAdopted.load();
+    counts.verified = counters.verified.load();
+    for (std::size_t i = 0; i < TargetVerdictCount; ++i) counts.targets[i] = counters.targets[i].load();
+    counts.targetsVerified = counters.targetsVerified.load();
+    for (std::size_t i = 0; i < ResolveRefusalCount; ++i) {
+        counts.inputRefusals[i] = counters.inputRefusals[i].load();
+        counts.resourceRefusals[i] = counters.resourceRefusals[i].load();
+    }
+    for (std::size_t i = 0; i < ResolveRedoCount; ++i) counts.redos[i] = counters.redos[i].load();
+    for (std::size_t i = 0; i < ResolveSerialCount; ++i) counts.moved[i] = counters.moved[i].load();
+    for (std::size_t i = 0; i < EpochVerdictCount; ++i) counts.revalidations[i] = counters.revalidations[i].load();
+    counts.revalidationsVerified = counters.revalidationsVerified.load();
+    return counts;
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {

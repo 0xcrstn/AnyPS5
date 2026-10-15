@@ -46,6 +46,42 @@ void ThrowIncrementalMismatch(std::uint32_t queue, std::uint64_t submission, std
     throw std::runtime_error("AGC driver: incremental bindings verify: queue " + std::to_string(queue) + " submission " + std::to_string(submission) + " packet at dword " + std::to_string(packetOffset) + ": stage " + std::to_string(stage) + " (program " + HexText(program) + ") kept values that differ from a full values capture of the same guest words");
 }
 
+void ThrowPlanInstanceMismatch(std::uint32_t queue, std::uint64_t submission, std::size_t packetOffset, std::size_t stage, std::uint64_t program, const ShaderMemory::PlanCapture& capture, const ShaderRecompiler::ResourceSnapshot& full, const ShaderRecompiler::ResourceSnapshot& served) {
+    std::string where = "a part outside the descriptors, flat SRT and user data";
+    const auto descriptors = [&](const char* kind, const std::vector<ShaderRecompiler::DescriptorValue>& a, const std::vector<ShaderRecompiler::DescriptorValue>& b) {
+        if (a.size() != b.size()) {
+            where = std::string(kind) + " count " + std::to_string(b.size()) + " (full " + std::to_string(a.size()) + ")";
+            return true;
+        }
+        for (std::size_t index = 0; index < a.size(); ++index) {
+            if (a[index].dwordCount != b[index].dwordCount) {
+                where = std::string(kind) + " " + std::to_string(index) + " width " + std::to_string(b[index].dwordCount) + " (full " + std::to_string(a[index].dwordCount) + ")";
+                return true;
+            }
+            for (std::size_t word = 0; word < a[index].dwords.size(); ++word) {
+                if (a[index].dwords[word] == b[index].dwords[word]) continue;
+                where = std::string(kind) + " " + std::to_string(index) + " word " + std::to_string(word) + ": served " + HexText(b[index].dwords[word]) + ", full " + HexText(a[index].dwords[word]);
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto words = [&](const char* kind, const std::vector<std::uint32_t>& a, const std::vector<std::uint32_t>& b) {
+        for (std::size_t index = 0; index < a.size() || index < b.size(); ++index) {
+            if (index < a.size() && index < b.size() && a[index] == b[index]) continue;
+            where = std::string(kind) + " " + std::to_string(index) + ": served " + (index < b.size() ? HexText(b[index]) : std::string("none")) + ", full " + (index < a.size() ? HexText(a[index]) : std::string("none"));
+            return true;
+        }
+        return false;
+    };
+    if (!descriptors("buffer descriptor", full.buffers, served.buffers) && !descriptors("image descriptor", full.images, served.images) && !descriptors("sampler", full.samplers, served.samplers) && !words("flat SRT slot", full.flattenedSrt, served.flattenedSrt) && !words("user data word", full.userData, served.userData)) {
+        if (!(full.uniformFill == served.uniformFill)) where = "uniform fill";
+        else if (full.srtPoison != served.srtPoison) where = "poisoned reads";
+        else if (full.nullRootReads != served.nullRootReads) where = "null-root reads";
+    }
+    throw std::runtime_error("AGC driver: incremental plans verify: queue " + std::to_string(queue) + " submission " + std::to_string(submission) + " packet at dword " + std::to_string(packetOffset) + ": stage " + std::to_string(stage) + " (program " + HexText(program) + ") " + ShaderMemory::PlanOutcomeNames[static_cast<std::size_t>(capture.outcome)] + " (" + ShaderMemory::PlanFallbackNames[static_cast<std::size_t>(capture.fallback)] + ") differs from a full values capture of the same guest words, first in " + where);
+}
+
 void ThrowStageMismatch(std::uint32_t queue, std::uint64_t submission, std::size_t packetOffset, std::size_t stage, std::uint64_t program, SnapshotPart part) {
     const auto index = static_cast<std::size_t>(part) < SnapshotParts ? static_cast<std::size_t>(part) : 0;
     throw std::runtime_error("AGC driver: binding plan verify: queue " + std::to_string(queue) + " submission " + std::to_string(submission) + " packet at dword " + std::to_string(packetOffset) + ": stage " + std::to_string(stage) + " (program " + HexText(program) + ") differs from the full capture and materialize, first in: " + SnapshotPartNames[index]);
@@ -181,6 +217,81 @@ void Driver::noteIncrementalStage(const ShaderRecompiler::SrtTapeInstance& insta
     if (stale) ++counters.incrementalStale;
 }
 
+bool Driver::incrementalPlans() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_INCREMENTAL_PLANS");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool Driver::verifyIncrementalPlans() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_INCREMENTAL_PLANS");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+ShaderMemory::PlanInstance& Driver::resourcePlanInstance(const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::uint32_t pushOffset, std::span<const std::uint32_t> userData) {
+    struct Way {
+        std::uint32_t pushOffset = 0;
+        ShaderMemory::PlanInstance instance;
+        std::uint64_t used = 0;
+    };
+    constexpr std::size_t Ways = 4;
+    constexpr std::size_t Shaders = 1024;
+    struct Table {
+        std::unordered_map<const ShaderRecompiler::SourceHandle*, std::array<Way, Ways>> shaders;
+        std::uint64_t clock = 0;
+    };
+    struct PlanTableStorage {};
+    auto& table = HostThreadLocal<Table, PlanTableStorage>();
+    auto found = table.shaders.find(handle.get());
+    if (found == table.shaders.end()) {
+        if (table.shaders.size() >= Shaders) table.shaders.clear();
+        found = table.shaders.try_emplace(handle.get()).first;
+    }
+    auto& ways = found->second;
+    Way* chosen = nullptr;
+    std::size_t best = 0;
+    Way* victim = &ways.front();
+    for (auto& way : ways) {
+        if (way.instance.handle == nullptr) {
+            if (victim->instance.handle != nullptr) victim = &way;
+            continue;
+        }
+        if (victim->instance.handle != nullptr && way.used < victim->used) victim = &way;
+        if (way.instance.handle != handle || way.pushOffset != pushOffset) continue;
+        std::size_t same = 0;
+        for (std::size_t index = 0; index < way.instance.userData.size() && index < userData.size(); ++index) same += way.instance.userData[index] == userData[index] ? 1u : 0u;
+        if (chosen == nullptr || same > best) {
+            chosen = &way;
+            best = same;
+        }
+    }
+    if (chosen == nullptr || (best == 0 && victim->instance.handle == nullptr)) {
+        *victim = Way{};
+        victim->pushOffset = pushOffset;
+        victim->instance.handle = handle;
+        chosen = victim;
+    }
+    chosen->used = ++table.clock;
+    return chosen->instance;
+}
+
+void Driver::notePlanInstance(const ShaderMemory::PlanCapture& capture, bool verified, bool stale) {
+    std::lock_guard lock(bindingPlanMutex);
+    auto& counters = bindingPlanCounters;
+    ++counters.planStages;
+    counters.planNodesKept += capture.nodesKept;
+    counters.planNodesFresh += capture.nodesFresh;
+    ++counters.planOutcomes[static_cast<std::size_t>(capture.outcome)];
+    ++counters.planFallbacks[static_cast<std::size_t>(capture.fallback)];
+    if (verified) ++counters.planVerified;
+    if (stale) ++counters.planStale;
+}
+
 void Driver::planDrawDecode(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches, bool profile) {
     static const bool userWordsKeyed = std::getenv("APS5_BINDING_PLAN_KEY_USER_WORDS") != nullptr;
     const auto key = userWordsKeyed ? drawRegisterKey(queue, *submission.shaders, deviceSerial) : drawDecodeKey(queue, *submission.shaders, deviceSerial);
@@ -282,6 +393,16 @@ void Driver::reportBindingPlan() {
     const auto storage = ShaderRecompiler::GetMaterializeValuesCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[binding-plan-storage] process cumulative: %llu pooled results created, %llu storage reuses, %llu releases not retained; currently %llu bytes retained\n", static_cast<unsigned long long>(storage.storageCreated), static_cast<unsigned long long>(storage.storageReused), static_cast<unsigned long long>(storage.storageRefused), static_cast<unsigned long long>(storage.storageRetainedBytes));
     if (counters.incrementalStages != 0) AgcDriver::ProfilePrint_nid_no_patch("[binding-plan-incremental] (10 s) %llu stages: %llu guest words kept, %llu read, %llu values kept; verify: %llu stages compared, %llu served stale words a CPU store had changed within the collect epoch\n", static_cast<unsigned long long>(counters.incrementalStages), static_cast<unsigned long long>(counters.keptReads), static_cast<unsigned long long>(counters.freshReads), static_cast<unsigned long long>(counters.keptValues), static_cast<unsigned long long>(counters.incrementalVerified), static_cast<unsigned long long>(counters.incrementalStale));
+    if (counters.planStages != 0) {
+        std::string outcomes;
+        for (std::size_t outcome = 0; outcome < ShaderMemory::PlanOutcomes; ++outcome) outcomes += std::string(outcomes.empty() ? "" : ", ") + ShaderMemory::PlanOutcomeNames[outcome] + " " + std::to_string(counters.planOutcomes[outcome]);
+        std::string fallbacks;
+        for (std::size_t reason = 1; reason < ShaderMemory::PlanFallbacks; ++reason) {
+            if (counters.planFallbacks[reason] == 0) continue;
+            fallbacks += std::string(fallbacks.empty() ? "" : ", ") + ShaderMemory::PlanFallbackNames[reason] + " " + std::to_string(counters.planFallbacks[reason]);
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[binding-plan-instances] (10 s) %llu stages: %s; not reused because: %s; nodes kept %llu, re-read %llu; verify: %llu stages compared, %llu served words a CPU store had changed within the collect epoch\n", static_cast<unsigned long long>(counters.planStages), outcomes.c_str(), fallbacks.empty() ? "nothing" : fallbacks.c_str(), static_cast<unsigned long long>(counters.planNodesKept), static_cast<unsigned long long>(counters.planNodesFresh), static_cast<unsigned long long>(counters.planVerified), static_cast<unsigned long long>(counters.planStale));
+    }
     counters = {};
     counters.lastReport = now;
 }
