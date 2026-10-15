@@ -575,6 +575,7 @@ add_test_executable(shader_spirv_call_specialization_tests EXCLUDE_FROM_ALL
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler/SpirvBackend/src/SpirvSpecialization.cpp)
 target_include_directories(shader_spirv_call_specialization_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler/SpirvBackend/include
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler/IntermediateRepresentation/include
         ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR})
 target_compile_features(shader_spirv_call_specialization_tests PRIVATE cxx_std_20)
 target_link_libraries(shader_spirv_call_specialization_tests PRIVATE libc)
@@ -1130,6 +1131,13 @@ add_test_executable(agc_formatted_buffer_once_tests EXCLUDE_FROM_ALL tests/Forma
 target_link_libraries(agc_formatted_buffer_once_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_formatted_buffer_once_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_formatted_buffer_once_tests)
+
+if(WIN32)
+    add_test_executable(shader_corpus EXCLUDE_FROM_ALL tests/ShaderCorpus.cpp)
+    target_link_libraries(shader_corpus PRIVATE shader_recompiler_agc_driver libc psapi)
+    set_target_properties(shader_corpus PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(shader_corpus)
+endif()
 
 add_test_executable(agc_fma_mix_once_tests EXCLUDE_FROM_ALL tests/FmaMixOnce.cpp)
 target_link_libraries(agc_fma_mix_once_tests PRIVATE shader_recompiler_agc_driver libc)

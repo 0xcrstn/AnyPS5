@@ -1,4 +1,5 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <bit>
 #include <iomanip>
@@ -21,18 +22,35 @@ namespace {
 template<typename TNode>
 class IdIndex {
 public:
+    IdIndex() : storage(threadStorage()) {
+        if (storage.active) throw std::logic_error("IdIndex storage is already in use on this thread");
+        storage.active = true;
+        if (++storage.generation == 0u) {
+            std::fill(storage.stamps.begin(), storage.stamps.end(), 0u);
+            storage.generation = 1u;
+        }
+    }
+    ~IdIndex() {
+        storage.active = false;
+    }
+    IdIndex(const IdIndex&) = delete;
+    IdIndex& operator=(const IdIndex&) = delete;
+
     bool emplace(const TNode* node, std::size_t index) {
         const auto id = static_cast<std::size_t>(node->Id());
-        if (id >= nodes.size()) {
-            nodes.resize(id + 1u, nullptr);
-            indices.resize(id + 1u, 0u);
+        if (id >= storage.stamps.size()) {
+            const auto size = std::max(id + 1u, storage.stamps.size() * 2u);
+            storage.stamps.resize(size, 0u);
+            storage.nodes.resize(size, nullptr);
+            storage.indices.resize(size, 0u);
         }
-        if (nodes[id] == nullptr) {
-            nodes[id] = node;
-            indices[id] = index;
+        if (storage.stamps[id] != storage.generation) {
+            storage.stamps[id] = storage.generation;
+            storage.nodes[id] = node;
+            storage.indices[id] = index;
             return true;
         }
-        if (nodes[id] == node) {
+        if (storage.nodes[id] == node) {
             return false;
         }
         return others.emplace(node, index).second;
@@ -43,17 +61,30 @@ public:
     }
 
     [[nodiscard]] std::size_t at(const TNode* node) const {
-        return owns(node) ? indices[node->Id()] : others.at(node);
+        return owns(node) ? storage.indices[node->Id()] : others.at(node);
     }
 
 private:
-    [[nodiscard]] bool owns(const TNode* node) const {
-        const auto id = static_cast<std::size_t>(node->Id());
-        return id < nodes.size() && nodes[id] == node;
+    struct Storage {
+        std::vector<std::uint32_t> stamps;
+        std::vector<const TNode*> nodes;
+        std::vector<std::size_t> indices;
+        std::uint32_t generation = 0;
+        bool active = false;
+    };
+
+    struct StorageTag {};
+
+    static Storage& threadStorage() {
+        return HostThreadLocal<Storage, StorageTag>();
     }
 
-    std::vector<const TNode*> nodes;
-    std::vector<std::size_t> indices;
+    [[nodiscard]] bool owns(const TNode* node) const {
+        const auto id = static_cast<std::size_t>(node->Id());
+        return id < storage.stamps.size() && storage.stamps[id] == storage.generation && storage.nodes[id] == node;
+    }
+
+    Storage& storage;
     std::unordered_map<const TNode*, std::size_t> others;
 };
 

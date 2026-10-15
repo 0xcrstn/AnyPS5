@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <iterator>
 #include <memory>
 #include <stdexcept>
@@ -23,6 +24,9 @@ public:
     using const_iterator = const TElement*;
 
     IrSmallVector() = default;
+    template<typename TIterator>
+    IrSmallVector(TIterator from, TIterator to) { assign(from, to); }
+    IrSmallVector(std::initializer_list<TElement> values) { assign(values.begin(), values.end()); }
     IrSmallVector(const IrSmallVector& other) { assign(other.begin(), other.end()); }
     IrSmallVector& operator=(const IrSmallVector& other) {
         if (this != &other) assign(other.begin(), other.end());
@@ -83,7 +87,7 @@ public:
     void pop_back() { --count; }
     void clear() { count = 0; }
     void reserve(size_type wanted) {
-        if (wanted > capacity) grow(wanted);
+        if (wanted > capacity) grow(std::max<size_type>(wanted, static_cast<size_type>(capacity) * 2u));
     }
     iterator erase(const_iterator position) {
         auto* first = storage();
@@ -101,6 +105,18 @@ public:
         return first + index;
     }
     template<typename TIterator>
+    iterator insert(const_iterator position, TIterator from, TIterator to) {
+        const auto index = static_cast<size_type>(position - storage());
+        const auto added = static_cast<size_type>(std::distance(from, to));
+        reserve(count + added);
+        auto* first = storage();
+        std::copy_backward(first + index, first + count, first + count + added);
+        std::copy(from, to, first + index);
+        count += static_cast<std::uint32_t>(added);
+        return first + index;
+    }
+    iterator insert(const_iterator position, std::initializer_list<TElement> values) { return insert(position, values.begin(), values.end()); }
+    template<typename TIterator>
     void assign(TIterator from, TIterator to) {
         const auto wanted = static_cast<size_type>(std::distance(from, to));
         count = 0;
@@ -111,6 +127,7 @@ public:
     [[nodiscard]] std::vector<TElement> ToVector() const { return std::vector<TElement>(begin(), end()); }
     operator std::vector<TElement>() const { return ToVector(); }
     [[nodiscard]] bool operator==(const IrSmallVector& other) const { return std::equal(begin(), end(), other.begin(), other.end()); }
+    [[nodiscard]] bool operator<(const IrSmallVector& other) const { return std::lexicographical_compare(begin(), end(), other.begin(), other.end()); }
     [[nodiscard]] bool operator==(const std::vector<TElement>& other) const { return std::equal(begin(), end(), other.begin(), other.end()); }
 
 private:
