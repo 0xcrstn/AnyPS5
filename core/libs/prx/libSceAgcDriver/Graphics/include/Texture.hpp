@@ -66,6 +66,7 @@ struct OwnedImage {
     Context context;
     VkImage image;
     VkDeviceMemory memory;
+    DeviceMemoryPlacement placement;
 };
 
 class Texture {
@@ -191,6 +192,7 @@ public:
     // buffer's format and mark the image dirty like a storage write.
     bool Attachable() const { return attachable; }
     VkImageView AttachmentView(VkFormat format, std::uint32_t mip = 0, std::uint32_t depthSlice = 0, std::uint32_t layers = 1, std::uint32_t layer = 0);
+    VkImageView FindAttachmentView(VkFormat format, std::uint32_t mip = 0, std::uint32_t depthSlice = 0, std::uint32_t layers = 1, std::uint32_t layer = 0) const;
     VkImageView AttachmentProxyView();
     void RecordAttachmentProxyLoad(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
     void RecordAttachmentProxyStore(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
@@ -273,6 +275,9 @@ public:
     static bool PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason = "memory access");
     static bool StoreForPointerAccess(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt);
     static void AuditPointerReads(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt);
+    static void MaterializeForNativeAccess(std::uint64_t address, std::size_t bytes);
+    static std::size_t FlushUnprotected(const char* reason);
+    static bool AnyUnprotectedPending();
     // For the [hooksync] recorded-store line: images a FlushPending stored after a hook skip of
     // theirs (AccessKeptByCpu), of which by the hook for the same read site as the last skip; 10 s deltas.
     struct HookSkipCounts {
@@ -609,6 +614,7 @@ private:
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize memoryBytes = 0;
+    DeviceMemoryPlacement placement;
     VkImageView view = VK_NULL_HANDLE;
     std::uint32_t defaultMip = 0;
     std::map<std::uint32_t, VkImageView> extraViews;
@@ -620,6 +626,7 @@ private:
     std::int8_t singlePassState = -1;
     bool attachable = false;
     std::map<std::tuple<VkFormat, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> attachmentViews;
+    mutable std::mutex attachmentViewsMutex;
     VkImage proxyImage = VK_NULL_HANDLE;
     VkDeviceMemory proxyMemory = VK_NULL_HANDLE;
     VkImageView proxyView = VK_NULL_HANDLE;
@@ -628,6 +635,8 @@ private:
     bool dirty = false;
     std::uint64_t version = 0;
     Coherence::Version coherenceVersion = 0;
+    std::uint64_t accessProtection = 0;
+    void settleProtection();
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     std::vector<bool> layerOriginal;
     std::map<std::uint64_t, std::uint64_t> keptAtUnwatch;

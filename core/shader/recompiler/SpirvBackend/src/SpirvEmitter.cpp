@@ -12,11 +12,22 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <SpirvBackend/SpirvEmitterInstructions.hpp>
 
 namespace ShaderRecompiler {
 
 namespace {
+
+bool SharedFloatFunctions() {
+    static const bool shared = [] {
+        const char* value = std::getenv("APS5_NO_SHARED_FLOAT_FUNCTIONS");
+        if (value == nullptr || std::string_view(value) == "0") return true;
+        if (std::string_view(value) == "1") return false;
+        throw std::invalid_argument("APS5_NO_SHARED_FLOAT_FUNCTIONS accepts only 0 or 1");
+    }();
+    return shared;
+}
 
 [[noreturn]] void FailProgram(const IrProgram& program, const char* reason) {
     throw std::runtime_error("SPIR-V emission failed: hash=0x" + std::to_string(program.Resources().shaderHash) + " stage=" + std::to_string(static_cast<unsigned>(program.Resources().stage)) + " reason=" + reason);
@@ -268,7 +279,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.registrationModules = target.registrationModules;
     state.fragmentDescriptorSet = target.fragmentDescriptorSet;
     state.float16DenormPreserve = target.float16DenormPreserve;
-    state.sharedFloatFunctions = std::getenv("APS5_NO_SHARED_FLOAT_FUNCTIONS") == nullptr;
+    state.sharedFloatFunctions = target.sharedFloatFunctions.value_or(SharedFloatFunctions());
     state.bdaTranslation = BdaTable::TranslationSetting();
     state.bdaRelative = BdaTable::RelativeSetting();
     state.bdaInlineFastPath = BdaTable::InlineFastPathSetting();

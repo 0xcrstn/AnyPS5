@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -20,12 +21,13 @@ constexpr std::size_t RingEvents = 4096;
 constexpr std::size_t MaxCommitted = 65536;
 constexpr std::size_t ReportedDivergences = 16;
 constexpr std::size_t TraceEvents = 24;
+constexpr std::uint64_t ProtectionGranule = 4096;
 
 enum class EventType : std::uint8_t { Reserve, Recorded, Complete, Commit, Abandon, Publish, StalePublish, StaleRead, Undrained, Remapped };
 
 constexpr const char* EventNames[] = {"reserve", "recorded", "complete", "commit", "abandon", "publish", "stale-publish", "stale-read", "undrained", "remapped"};
-constexpr const char* ProducerNames[] = {"pointer-writer", "element-writer"};
-constexpr const char* SourceNames[] = {"pending-image", "shadow-unit", "resident-staging"};
+constexpr const char* ProducerNames[] = {"pointer-writer", "element-writer", "label-store"};
+constexpr const char* SourceNames[] = {"pending-image", "shadow-unit", "resident-staging", "read-lease"};
 
 struct Event {
     std::uint64_t serial = 0;
@@ -65,6 +67,7 @@ struct State {
     std::size_t readsReported = 0;
     std::size_t releasesReported = 0;
     std::size_t remapsReported = 0;
+    std::size_t uncoveredReported = 0;
     std::map<std::uint32_t, Version> recordedByQueue;
     std::map<std::uint32_t, std::map<std::uint32_t, Version>> imported;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -86,6 +89,155 @@ struct Modes {
 
 std::atomic<bool> overridden{false};
 Modes overrideModes{Mode::Reference, Mode::Reference, Mode::Reference};
+std::atomic<bool> faultsOverridden{false};
+std::atomic<Mode> overrideFaults{Mode::Reference};
+
+struct Protection {
+    std::uint64_t token = 0;
+    Interval range;
+    Source source = Source::PendingImage;
+    Version version = 0;
+};
+
+struct Ledger {
+    std::mutex mutex;
+    std::map<std::uint64_t, Protection> live;
+    std::uint64_t next = 0;
+    ProtectionBackend backend;
+    Materializer materializer = nullptr;
+    Materializer waiter = nullptr;
+    std::uint64_t protections = 0;
+    std::uint64_t leases = 0;
+    std::uint64_t leaseWaits = 0;
+    std::uint64_t refused = 0;
+    std::uint64_t partial = 0;
+    std::uint64_t resolved = 0;
+    std::uint64_t locked = 0;
+};
+
+Ledger& Protections() {
+    static Ledger ledger;
+    return ledger;
+}
+
+struct ResolverContext {
+    std::uint64_t protection;
+};
+
+[[noreturn]] void AbortInFault(const char* what, Interval range, const char* detail) {
+    std::fprintf(stderr, "[coherence] %s [0x%llx, 0x%llx): %s\n", what, static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end), detail);
+    std::fflush(stderr);
+    std::abort();
+}
+
+bool ResolveProtection(std::uint64_t token, void* context) {
+    const auto id = static_cast<ResolverContext*>(context)->protection;
+    auto& ledger = Protections();
+    Interval range;
+    Materializer materializer = nullptr;
+    ProtectionBackend backend;
+    bool live = false;
+    bool lease = false;
+    {
+        std::lock_guard lock(ledger.mutex);
+        backend = ledger.backend;
+        const auto found = ledger.live.find(id);
+        if (found != ledger.live.end()) {
+            live = true;
+            range = found->second.range;
+            lease = found->second.source == Source::ReadLease;
+            materializer = lease ? ledger.waiter : ledger.materializer;
+        }
+    }
+    if (live) {
+        try {
+            if (materializer == nullptr) throw std::runtime_error(lease ? "no lease waiter is installed" : "no materializer is installed");
+            materializer(range);
+        } catch (const std::exception& error) {
+            AbortInFault(lease ? "a native access to guest memory under a read lease could not wait for its readers" : "native access to device-owned guest memory could not be materialized", range, error.what());
+        }
+        std::lock_guard lock(ledger.mutex);
+        ledger.live.erase(id);
+        ++(lease ? ledger.leaseWaits : ledger.resolved);
+    }
+    if (backend.release != nullptr) backend.release(token);
+    return true;
+}
+
+void ReleaseResolverContext(void* context) {
+    delete static_cast<ResolverContext*>(context);
+}
+
+Mode EnvironmentFaults() {
+    static const Mode faults = ParseMode("APS5_COHERENCE_FAULTS", std::getenv("APS5_COHERENCE_FAULTS"));
+    return faults;
+}
+
+Mode EnvironmentLeases() {
+    static const Mode leases = ParseMode("APS5_COHERENCE_INPUT_LEASES", std::getenv("APS5_COHERENCE_INPUT_LEASES"));
+    return leases;
+}
+
+std::atomic<bool> leasesOverridden{false};
+std::atomic<Mode> overrideLeases{Mode::Reference};
+std::atomic<bool> residencyOverridden{false};
+std::atomic<Mode> overrideResidency{Mode::Reference};
+std::atomic<bool> releaseOverridden{false};
+std::atomic<Mode> overrideRelease{Mode::Reference};
+
+Mode EnvironmentRelease() {
+    static const Mode release = ParseMode("APS5_COHERENCE_LAZY_RELEASE", std::getenv("APS5_COHERENCE_LAZY_RELEASE"));
+    return release;
+}
+
+Mode EnvironmentResidency() {
+    static const Mode residency = ParseMode("APS5_COHERENCE_RESIDENCY", std::getenv("APS5_COHERENCE_RESIDENCY"));
+    return residency;
+}
+
+std::uint64_t Guard(Interval range, Source source, Version version, bool outward, bool verify, const char* variable) {
+    const auto begin = outward ? range.begin & ~(ProtectionGranule - 1) : (range.begin + ProtectionGranule - 1) & ~(ProtectionGranule - 1);
+    const auto end = outward ? (range.end + ProtectionGranule - 1) & ~(ProtectionGranule - 1) : range.end & ~(ProtectionGranule - 1);
+    const bool whole = begin == range.begin && end == range.end;
+    auto& ledger = Protections();
+    ProtectionBackend backend;
+    std::uint64_t id = 0;
+    {
+        std::lock_guard lock(ledger.mutex);
+        backend = ledger.backend;
+        if (backend.protect == nullptr || backend.release == nullptr) throw std::runtime_error(std::string(variable) + ": no guest access protection backend is installed");
+        if (!whole && !outward) ++ledger.partial;
+    }
+    if (verify && !whole && !outward) {
+        char text[192];
+        std::snprintf(text, sizeof(text), "%s=verify: device-owned guest memory [0x%llx, 0x%llx) does not fill whole protection pages", variable, static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end));
+        throw std::runtime_error(text);
+    }
+    if (begin >= end) return 0;
+    {
+        std::lock_guard lock(ledger.mutex);
+        id = ++ledger.next;
+        ledger.live.emplace(id, Protection{0, {begin, end}, source, version});
+    }
+    auto context = std::make_unique<ResolverContext>(ResolverContext{id});
+    const auto token = backend.protect(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin), &ResolveProtection, context.get(), &ReleaseResolverContext);
+    if (token != 0) static_cast<void>(context.release());
+    std::unique_lock lock(ledger.mutex);
+    if (token == 0) {
+        ledger.live.erase(id);
+        ++ledger.refused;
+        lock.unlock();
+        if (!verify) return 0;
+        char text[192];
+        std::snprintf(text, sizeof(text), "%s=verify: guest memory [0x%llx, 0x%llx) refused access protection", variable, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end));
+        throw std::runtime_error(text);
+    }
+    ++(source == Source::ReadLease ? ledger.leases : ledger.protections);
+    const auto found = ledger.live.find(id);
+    if (found == ledger.live.end()) return 0;
+    found->second.token = token;
+    return id;
+}
 
 const Modes& EnvironmentModes() {
     static const Modes modes{ParseMode("APS5_COHERENCE_AUDIT", std::getenv("APS5_COHERENCE_AUDIT")), ParseMode("APS5_COHERENCE_ORDERING", std::getenv("APS5_COHERENCE_ORDERING")), ParseMode("APS5_COHERENCE_DIRECTORY", std::getenv("APS5_COHERENCE_DIRECTORY"))};
@@ -264,6 +416,121 @@ Mode OrderingMode() {
 
 Mode DirectoryMode() {
     return CurrentModes().directory;
+}
+
+Mode FaultsMode() {
+    return faultsOverridden.load(std::memory_order_acquire) ? overrideFaults.load(std::memory_order_acquire) : EnvironmentFaults();
+}
+
+void SetFaultsModeForTests(Mode faults) {
+    overrideFaults.store(faults, std::memory_order_release);
+    faultsOverridden.store(true, std::memory_order_release);
+}
+
+bool FaultOwnership() {
+    return FaultsMode() != Mode::Reference;
+}
+
+void SetProtectionBackend(ProtectionBackend backend) {
+    auto& ledger = Protections();
+    std::lock_guard lock(ledger.mutex);
+    ledger.backend = backend;
+}
+
+void SetMaterializer(Materializer materializer) {
+    auto& ledger = Protections();
+    std::lock_guard lock(ledger.mutex);
+    ledger.materializer = materializer;
+}
+
+std::uint64_t ProtectDeviceOwned(Interval range, Source source, Version version) {
+    if (!FaultOwnership() || range.end <= range.begin) return 0;
+    if (source == Source::ReadLease) throw std::runtime_error("coherence: a read lease is not device-owned memory");
+    return Guard(range, source, version, false, FaultsMode() == Mode::Verify, "APS5_COHERENCE_FAULTS");
+}
+
+Mode InputLeasesMode() {
+    return leasesOverridden.load(std::memory_order_acquire) ? overrideLeases.load(std::memory_order_acquire) : EnvironmentLeases();
+}
+
+void SetInputLeasesModeForTests(Mode leases) {
+    overrideLeases.store(leases, std::memory_order_release);
+    leasesOverridden.store(true, std::memory_order_release);
+}
+
+bool InputLeases() {
+    return InputLeasesMode() != Mode::Reference;
+}
+
+void SetLeaseWaiter(Materializer waiter) {
+    auto& ledger = Protections();
+    std::lock_guard lock(ledger.mutex);
+    ledger.waiter = waiter;
+}
+
+std::uint64_t AcquireReadLease(Interval range, Version version) {
+    if (!InputLeases() || range.end <= range.begin) return 0;
+    return Guard(range, Source::ReadLease, version, true, InputLeasesMode() == Mode::Verify, "APS5_COHERENCE_INPUT_LEASES");
+}
+
+void RetireReadLease(std::uint64_t lease) {
+    ReleaseDeviceOwned(lease);
+}
+
+Mode ResidencyMode() {
+    return residencyOverridden.load(std::memory_order_acquire) ? overrideResidency.load(std::memory_order_acquire) : EnvironmentResidency();
+}
+
+void SetResidencyModeForTests(Mode residency) {
+    overrideResidency.store(residency, std::memory_order_release);
+    residencyOverridden.store(true, std::memory_order_release);
+}
+
+bool Residency() {
+    return ResidencyMode() != Mode::Reference;
+}
+
+Mode LazyReleaseMode() {
+    return releaseOverridden.load(std::memory_order_acquire) ? overrideRelease.load(std::memory_order_acquire) : EnvironmentRelease();
+}
+
+void SetLazyReleaseModeForTests(Mode release) {
+    overrideRelease.store(release, std::memory_order_release);
+    releaseOverridden.store(true, std::memory_order_release);
+}
+
+bool LazyRelease() {
+    return LazyReleaseMode() != Mode::Reference;
+}
+
+std::uint64_t ProtectResident(Interval range, Version version) {
+    if (!Residency() || range.end <= range.begin) return 0;
+    return Guard(range, Source::ResidentStaging, version, false, ResidencyMode() == Mode::Verify, "APS5_COHERENCE_RESIDENCY");
+}
+
+void ReleaseDeviceOwned(std::uint64_t protection) {
+    if (protection == 0) return;
+    auto& ledger = Protections();
+    std::uint64_t token = 0;
+    ProtectionBackend backend;
+    {
+        std::lock_guard lock(ledger.mutex);
+        const auto found = ledger.live.find(protection);
+        if (found == ledger.live.end()) return;
+        token = found->second.token;
+        backend = ledger.backend;
+        ledger.live.erase(found);
+    }
+    if (token != 0 && backend.release != nullptr) backend.release(token);
+}
+
+void NoteLockedFault(Interval range) {
+    auto& ledger = Protections();
+    {
+        std::lock_guard lock(ledger.mutex);
+        ++ledger.locked;
+    }
+    if (FaultsMode() == Mode::Verify) AbortInFault("APS5_COHERENCE_FAULTS=verify: the driver touched device-owned guest memory while holding the GPU mutex", range, "a driver access must resolve its range first");
 }
 
 void SetModesForTests(Mode audit, Mode ordering, Mode directory) {
@@ -509,6 +776,17 @@ void CheckDrained(bool pendingImages, bool liveShadows, const char* where, bool 
     Divergence(state, text, {}, OrderingMode() == Mode::Verify, state.releasesReported);
 }
 
+void CheckReleaseCovered(bool uncoveredImages, bool uncoveredShadows, const char* where) {
+    if (!uncoveredImages && !uncoveredShadows) return;
+    auto& state = Directory();
+    std::lock_guard lock(state.mutex);
+    ++state.counters.uncoveredReleases;
+    Note(state, EventType::Undrained, 0, 0, CurrentVersion(), 0, {0, ~std::uint64_t{0}}, where);
+    char text[256];
+    std::snprintf(text, sizeof(text), "[coherence] lazy release at %s left %s%s%s neither stored nor protected", where != nullptr ? where : "?", uncoveredImages ? "pending images" : "", uncoveredImages && uncoveredShadows ? " and " : "", uncoveredShadows ? "shadow units" : "");
+    Divergence(state, text, {}, LazyReleaseMode() == Mode::Verify, state.uncoveredReported);
+}
+
 Release SnapshotRelease(std::uint32_t queue, Interval label, std::uint64_t value, std::uint64_t labelStamp) {
     Release release{queue, label, value, labelStamp, NextVersion(), {}};
     auto& state = Directory();
@@ -541,6 +819,16 @@ Counters CurrentCounters() {
     auto counters = state.counters;
     counters.committedIntervals = state.committed.size();
     counters.activeWriters = state.active.size();
+    auto& ledger = Protections();
+    std::lock_guard protections(ledger.mutex);
+    counters.protections = ledger.protections;
+    counters.refusedProtections = ledger.refused;
+    counters.partialProtections = ledger.partial;
+    counters.faultsResolved = ledger.resolved;
+    counters.lockedFaults = ledger.locked;
+    counters.liveProtections = ledger.live.size();
+    counters.leases = ledger.leases;
+    counters.leaseWaits = ledger.leaseWaits;
     return counters;
 }
 
@@ -569,8 +857,19 @@ void ResetForTests() {
     state.readsReported = 0;
     state.releasesReported = 0;
     state.remapsReported = 0;
+    state.uncoveredReported = 0;
     state.recordedByQueue.clear();
     state.imported.clear();
+    auto& ledger = Protections();
+    std::lock_guard protections(ledger.mutex);
+    ledger.live.clear();
+    ledger.protections = 0;
+    ledger.refused = 0;
+    ledger.partial = 0;
+    ledger.resolved = 0;
+    ledger.locked = 0;
+    ledger.leases = 0;
+    ledger.leaseWaits = 0;
 }
 
 }

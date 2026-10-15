@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/SlowReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreationTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -14,7 +16,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
+#include <future>
 #include <list>
+#include <span>
+#include <string>
 #include <mutex>
 #include <string_view>
 #include <type_traits>
@@ -176,6 +182,11 @@ void ValidateSampleMask(const Context& context, const State& state, std::span<co
 }
 
 namespace {
+
+bool VerifyPipelineModes() {
+    static const bool verify = std::getenv("APS5_VERIFY_PIPELINE_MODES") != nullptr;
+    return verify;
+}
 
 thread_local bool prebuilding = false;
 thread_local bool prebuilt = false;
@@ -443,6 +454,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             colorSlots.assign(state.blends.size(), ~0u);
             for (std::uint32_t index = 0; index < state.colors.size(); ++index) colorSlots.at(state.colors[index].exportIndex) = index;
             this->attachmentLayout = attachmentLayout;
+            renderingColorFormats = renderingColors;
+            renderingSamples = static_cast<VkSampleCountFlagBits>(state.samples);
         }
         VkRenderPassCreateInfo passInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
         passInfo.attachmentCount = static_cast<std::uint32_t>(colors.size());
@@ -589,10 +602,41 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             if (!builds.empty()) described += "; " + builds;
             return described;
         });
-        if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
-        else {
+        const auto traceStages = [&](ShaderCompileTrace::Event& event) {
+            if (!event.Active()) return;
+            for (std::size_t index = 0; index < shaders.size(); ++index) {
+                const auto prefix = "stage" + std::to_string(index);
+                event.Text(prefix + "_kind", StageName(shaders[index].stage)).Hex(prefix + "_address", shaders[index].programAddress).Number(prefix + "_spirv_words", shaders[index].program->spirv.size()).Hex(prefix + "_spirv_hash", ShaderCompileTrace::HashOf(shaders[index].program->spirv.Words()));
+            }
+            event.Hex("layout_key", ShaderCompileTrace::HashOf(std::span<const std::byte>(keys.layout))).Flag("libraries", libraries).Flag("gpu_mutex_held", GuestMemory::GpuMutex().HeldByThisThread());
+        };
+        if (libraries) {
+            ShaderCompileTrace::Event linkEvent("pipeline.graphics_from_libraries");
+            traceStages(linkEvent);
+            pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+            if (VerifyPipelineModes()) {
+                VkPipeline monolithic = VK_NULL_HANDLE;
+                VkResult created;
+                {
+                    auto pipelineCacheLock = context.LockPipelineCacheForUse();
+                    created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &monolithic);
+                }
+                Require(created == VK_SUCCESS, "APS5_VERIFY_PIPELINE_MODES: the monolithic form of a library-linked pipeline failed with VkResult " + std::to_string(static_cast<int>(created)));
+                context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, monolithic, nullptr);
+                if (optimized != nullptr) {
+                    WaitForOptimizedPipelines(context.device);
+                    Require(optimized->state.load() != OptimizedPipeline::Failed, "APS5_VERIFY_PIPELINE_MODES: link-time optimization failed with VkResult " + std::to_string(static_cast<int>(optimized->failure.load())));
+                }
+            }
+        } else {
+            PipelineCreationTrace trace("pipeline.graphics", context.pipelineCreationFeedback, pipelineInfo.stageCount);
+            traceStages(trace.Event());
+            trace.Chain(pipelineInfo);
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
-            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+            const auto created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline);
+            trace.Created(created);
+            trace.Unchain(pipelineInfo);
+            Check(created, "vkCreateGraphicsPipelines");
         }
         if (alternateAlpha) {
             blend.pAttachments = secondChannels.data();
@@ -669,8 +713,24 @@ VkPipelineLayout Pipeline::Layout() const {
     return layout;
 }
 
+std::shared_ptr<Framebuffer> Pipeline::FindFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers) {
+    if (targets.size() != attachments || owners.size() != colorAttachments) return nullptr;
+    if (std::any_of(owners.begin(), owners.end(), [](const std::shared_ptr<StorageTexture>& owner) { return owner == nullptr; })) return nullptr;
+    std::lock_guard lock(framebufferMutex);
+    for (auto it = framebuffers.begin(); it != framebuffers.end(); ++it) {
+        if (it->extent.width != extent.width || it->extent.height != extent.height || it->layers != layers || !std::equal(it->views.begin(), it->views.end(), targets.begin(), targets.end())) continue;
+        bool same = true;
+        for (std::size_t i = 0; i < owners.size() && same; ++i) same = it->owned[i] && it->owners[i].lock().get() == owners[i].get();
+        if (!same) continue;
+        std::rotate(it, std::next(it), framebuffers.end());
+        return framebuffers.back().framebuffer;
+    }
+    return nullptr;
+}
+
 std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers, std::span<const std::uint8_t> persistent) {
     Require(targets.size() == attachments && owners.size() == colorAttachments, "render targets do not match the pipeline's attachments");
+    std::lock_guard lock(framebufferMutex);
     bool resident = true;
     for (std::size_t i = 0; i < owners.size(); ++i) resident = resident && (owners[i] != nullptr || (i < persistent.size() && persistent[i] != 0));
     if (resident) {
@@ -715,6 +775,30 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
 }
 
 void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const {
+    BeginPass(commands, framebuffer, extent, state, false);
+    apply(commands, state, false);
+}
+
+void Pipeline::BeginInside(const CommandSink& commands, const State& state) const {
+    apply(commands, state, false);
+}
+
+ChunkInheritance Pipeline::Inheritance(const Framebuffer& framebuffer) const {
+    ChunkInheritance inheritance;
+    if (dynamicRendering) {
+        inheritance.rendering = true;
+        inheritance.colorFormats = renderingColorFormats;
+        inheritance.depthFormat = depthFormat;
+        inheritance.stencilFormat = depthFormat != VK_FORMAT_UNDEFINED && HasStencil(depthFormat) ? depthFormat : VK_FORMAT_UNDEFINED;
+        inheritance.samples = renderingSamples;
+        return inheritance;
+    }
+    inheritance.renderPass = renderPass;
+    inheritance.framebuffer = framebuffer.Handle();
+    return inheritance;
+}
+
+void Pipeline::BeginPass(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, bool secondary) const {
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
         Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
@@ -734,6 +818,7 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
             depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         }
         VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+        if (secondary) rendering.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT_KHR;
         rendering.renderArea = {{0, 0}, extent};
         rendering.layerCount = state.renderLayers;
         rendering.colorAttachmentCount = static_cast<std::uint32_t>(colors.size());
@@ -741,7 +826,6 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
         if (depthFormat != VK_FORMAT_UNDEFINED) rendering.pDepthAttachment = &depth;
         if (depthFormat != VK_FORMAT_UNDEFINED && HasStencil(depthFormat)) rendering.pStencilAttachment = &depth;
         context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
-        apply(commands, state, false);
         return;
     }
     VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -759,14 +843,13 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     sampleLocations.postSubpassSampleLocationsCount = 1;
     sampleLocations.pPostSubpassSampleLocations = &post;
     if (sampleLocationsEnabled) begin.pNext = &sampleLocations;
-    context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
-    apply(commands, state, false);
+    context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, secondary ? VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS : VK_SUBPASS_CONTENTS_INLINE);
 }
 
 namespace {
 
 struct RecordedDrawState {
-    VkCommandBuffer commands = VK_NULL_HANDLE;
+    std::uintptr_t identity = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkViewport viewport{};
     VkRect2D scissor{};
@@ -791,21 +874,21 @@ bool filterDrawState() {
 
 }
 
-void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
+void Pipeline::Continue(const CommandSink& commands, const State& state) const {
     auto& recorded = recordedDrawState();
-    apply(commands, state, filterDrawState() && libraries && recorded.commands == commands);
+    apply(commands, state, filterDrawState() && libraries && recorded.identity == commands.Identity());
 }
 
-void Pipeline::apply(VkCommandBuffer commands, const State& state, bool known) const {
+void Pipeline::apply(const CommandSink& commands, const State& state, bool known) const {
     auto& recorded = recordedDrawState();
-    known = known && recorded.commands == commands;
+    known = known && recorded.identity == commands.Identity();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
     const auto bound = best != VK_NULL_HANDLE ? best : pipeline;
-    if (!known || recorded.pipeline != bound) context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, bound);
-    if (!known || std::memcmp(&recorded.viewport, &state.viewport, sizeof(VkViewport)) != 0) context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
-    if (!known || std::memcmp(&recorded.scissor, &state.scissor, sizeof(VkRect2D)) != 0) context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
-    if (state.stencilReplayReference) context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
-    recorded.commands = libraries && !stencilReplay ? commands : VK_NULL_HANDLE;
+    if (!known || recorded.pipeline != bound) commands.BindPipeline(context, VK_PIPELINE_BIND_POINT_GRAPHICS, bound);
+    if (!known || std::memcmp(&recorded.viewport, &state.viewport, sizeof(VkViewport)) != 0) commands.SetViewport(context, state.viewport);
+    if (!known || std::memcmp(&recorded.scissor, &state.scissor, sizeof(VkRect2D)) != 0) commands.SetScissor(context, state.scissor);
+    if (state.stencilReplayReference) commands.SetStencilReference(context, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
+    recorded.identity = libraries && !stencilReplay ? commands.Identity() : 0;
     recorded.pipeline = bound;
     recorded.viewport = state.viewport;
     recorded.scissor = state.scissor;
@@ -813,12 +896,12 @@ void Pipeline::apply(VkCommandBuffer commands, const State& state, bool known) c
         setLibraryState(commands, state, known);
         return;
     }
-    if (depthBias) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
+    if (depthBias) commands.SetDepthBias(context, HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
     if (!depthBounds) return;
-    context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
+    commands.SetDepthBounds(context, state.minDepthBounds, state.maxDepthBounds);
 }
 
-void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state, bool known) const {
+void Pipeline::setLibraryState(const CommandSink& commands, const State& state, bool known) const {
     auto& recorded = recordedDrawState();
     const bool depth = state.depth.has_value();
     const auto update = [&](auto& held, const auto& value) {
@@ -826,56 +909,56 @@ void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state, boo
         held = value;
         return true;
     };
-    if (update(recorded.cullMode, state.cullMode)) context.Resolved(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT")(commands, state.cullMode);
-    if (update(recorded.frontFace, state.frontFace)) context.Resolved(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT")(commands, state.frontFace);
+    if (update(recorded.cullMode, state.cullMode)) commands.SetCullMode(context, state.cullMode);
+    if (update(recorded.frontFace, state.frontFace)) commands.SetFrontFace(context, state.frontFace);
     const std::array<float, 3> bias{depthBias ? HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant) : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f};
-    if (update(recorded.depthBias, bias)) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, bias[0], bias[1], bias[2]);
+    if (update(recorded.depthBias, bias)) commands.SetDepthBias(context, bias[0], bias[1], bias[2]);
     const std::array<float, 2> bounds{depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f};
-    if (update(recorded.depthBounds, bounds)) context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, bounds[0], bounds[1]);
+    if (update(recorded.depthBounds, bounds)) commands.SetDepthBounds(context, bounds[0], bounds[1]);
     const VkBool32 depthTest = depth && state.depthTest, depthWrite = depth && state.depthWrite, boundsTest = depthBounds, stencilTest = depth && state.stencilTest;
-    if (update(recorded.depthTest, depthTest)) context.Resolved(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT")(commands, depthTest);
-    if (update(recorded.depthWrite, depthWrite)) context.Resolved(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT")(commands, depthWrite);
+    if (update(recorded.depthTest, depthTest)) commands.SetDepthTestEnable(context, depthTest);
+    if (update(recorded.depthWrite, depthWrite)) commands.SetDepthWriteEnable(context, depthWrite);
     const VkCompareOp compare = depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS;
-    if (update(recorded.depthCompare, compare)) context.Resolved(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT")(commands, compare);
-    if (update(recorded.depthBoundsTest, boundsTest)) context.Resolved(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT")(commands, boundsTest);
-    if (update(recorded.stencilTest, stencilTest)) context.Resolved(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, stencilTest);
+    if (update(recorded.depthCompare, compare)) commands.SetDepthCompareOp(context, compare);
+    if (update(recorded.depthBoundsTest, boundsTest)) commands.SetDepthBoundsTestEnable(context, boundsTest);
+    if (update(recorded.stencilTest, stencilTest)) commands.SetStencilTestEnable(context, stencilTest);
     const auto stencil = [&](std::size_t slot, VkStencilFaceFlags face, const VkStencilOpState& op) {
         auto& held = recorded.stencil[slot];
         const bool all = !known;
-        if (all || held.failOp != op.failOp || held.passOp != op.passOp || held.depthFailOp != op.depthFailOp || held.compareOp != op.compareOp) context.Resolved(&DeviceFunctions::cmdSetStencilOp, "vkCmdSetStencilOpEXT")(commands, face, op.failOp, op.passOp, op.depthFailOp, op.compareOp);
-        if (all || held.compareMask != op.compareMask) context.Resolved(&DeviceFunctions::cmdSetStencilCompareMask, "vkCmdSetStencilCompareMask")(commands, face, op.compareMask);
-        if (all || held.writeMask != op.writeMask) context.Resolved(&DeviceFunctions::cmdSetStencilWriteMask, "vkCmdSetStencilWriteMask")(commands, face, op.writeMask);
-        if (all || held.reference != op.reference) context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, face, op.reference);
+        if (all || held.failOp != op.failOp || held.passOp != op.passOp || held.depthFailOp != op.depthFailOp || held.compareOp != op.compareOp) commands.SetStencilOp(context, face, op.failOp, op.passOp, op.depthFailOp, op.compareOp);
+        if (all || held.compareMask != op.compareMask) commands.SetStencilCompareMask(context, face, op.compareMask);
+        if (all || held.writeMask != op.writeMask) commands.SetStencilWriteMask(context, face, op.writeMask);
+        if (all || held.reference != op.reference) commands.SetStencilReference(context, face, op.reference);
         held = op;
     };
     stencil(0, VK_STENCIL_FACE_FRONT_BIT, depth ? state.stencilFront : VkStencilOpState{});
     stencil(1, VK_STENCIL_FACE_BACK_BIT, depth ? state.stencilBack : VkStencilOpState{});
 }
 
-void Pipeline::ContinueSecondChannel(VkCommandBuffer commands) const {
-    recordedDrawState().commands = VK_NULL_HANDLE;
+void Pipeline::ContinueSecondChannel(const CommandSink& commands) const {
+    recordedDrawState().identity = 0;
     Require(secondChannel != VK_NULL_HANDLE, "the pipeline blends every channel in one pass");
-    context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, secondChannel);
+    commands.BindPipeline(context, VK_PIPELINE_BIND_POINT_GRAPHICS, secondChannel);
 }
 
-void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state) const {
-    recordedDrawState().commands = VK_NULL_HANDLE;
+void Pipeline::ContinueBackFaces(const CommandSink& commands, const State& state) const {
+    recordedDrawState().identity = 0;
     Require(backFaces != VK_NULL_HANDLE, "the pipeline draws both faces in one pass");
-    context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, backFaces);
-    context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
-    context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, HostDepthBiasConstant(context, state.depth->format, state.backDepthBiasConstant), state.depthBiasClamp, state.backDepthBiasSlope);
-    if (depthBounds) context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
+    commands.BindPipeline(context, VK_PIPELINE_BIND_POINT_GRAPHICS, backFaces);
+    commands.SetViewport(context, state.viewport);
+    commands.SetScissor(context, state.scissor);
+    commands.SetDepthBias(context, HostDepthBiasConstant(context, state.depth->format, state.backDepthBiasConstant), state.depthBiasClamp, state.backDepthBiasSlope);
+    if (depthBounds) commands.SetDepthBounds(context, state.minDepthBounds, state.maxDepthBounds);
 }
 
-void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
+void Pipeline::PushConstants(const CommandSink& commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
     if (stages == 0) return;
     if (dynamicRendering) {
-        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, pushStagesOf(context), 0, PipelinePushSlotBytes, bytes.data());
-        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes, bytes.data() + PipelinePushSlotBytes);
+        commands.PushConstants(context, layout, pushStagesOf(context), 0, PipelinePushSlotBytes, bytes.data());
+        commands.PushConstants(context, layout, VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes, bytes.data() + PipelinePushSlotBytes);
         return;
     }
-    context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, stages, 0, PipelinePushSlotBytes, bytes.data());
+    commands.PushConstants(context, layout, stages, 0, PipelinePushSlotBytes, bytes.data());
 }
 
 namespace {
@@ -1011,10 +1094,18 @@ struct PipelineStore {
         std::shared_ptr<Pipeline> pipeline;
     };
     std::mutex mutex;
-    std::vector<std::byte> scratchKey;
     // Least recently used first.
     std::list<Entry> entries;
     std::unordered_map<std::uint64_t, std::list<Entry>::iterator> index;
+    struct Pending {
+        VkDevice device;
+        std::vector<std::byte> key;
+        std::shared_future<std::shared_ptr<Pipeline>> result;
+        std::shared_ptr<CompileTicket> ticket;
+    };
+    std::unordered_map<std::uint64_t, Pending> pending;
+    std::condition_variable settled;
+    std::uint64_t joined = 0;
     std::uint64_t hits = 0;
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
@@ -1051,8 +1142,8 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
-    store.hits = store.misses = store.uncached = store.evicted = 0;
+    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %llu joined a build in flight, %zu cached, %zu building\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), static_cast<unsigned long long>(store.joined), store.entries.size(), store.pending.size());
+    store.hits = store.misses = store.uncached = store.evicted = store.joined = 0;
 }
 
 }
@@ -1062,16 +1153,26 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 }
 
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    const auto build = [&] {
+        if (context.pipelineBuildRunner == nullptr) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+        std::size_t words = 0;
+        for (const auto& shader : shaders) words += shader.program != nullptr ? shader.program->spirv.WordCount() : 0u;
+        std::shared_ptr<Pipeline> built;
+        context.pipelineBuildRunner(context.pipelineBuildOwner, words * sizeof(std::uint32_t) * 8u, [&] { built = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout); });
+        Require(built != nullptr, "graphics pipeline build ran without producing a pipeline");
+        return built;
+    };
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
-    if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (disabled) return build();
     auto& store = Pipelines();
-    std::lock_guard lock(store.mutex);
+    std::unique_lock lock(store.mutex);
     reportPipelines(store);
-    auto& key = store.scratchKey;
+    std::vector<std::byte> key;
     pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
     if (key.empty()) {
         ++store.uncached;
-        return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+        if (context.pipelineBuildRunner != nullptr) lock.unlock();
+        return build();
     }
     const auto hash = hashKey(key);
     if (const auto found = store.index.find(hash); found != store.index.end()) {
@@ -1088,8 +1189,20 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         } else {
             // A different configuration with the same hash keeps the resident entry; this one stays private.
             ++store.uncached;
-            return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+            if (context.pipelineBuildRunner != nullptr) lock.unlock();
+            return build();
         }
+    }
+    if (const auto building = store.pending.find(hash); building != store.pending.end()) {
+        if (building->second.key != key) {
+            ++store.uncached;
+            if (context.pipelineBuildRunner != nullptr) lock.unlock();
+            return build();
+        }
+        ++store.joined;
+        auto result = building->second.result;
+        lock.unlock();
+        return result.get();
     }
     ++store.misses;
     // Entries of another device belong to one the driver replaced (it does so under the GpuMutex
@@ -1097,24 +1210,177 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
     }
-    auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
-    store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
-    store.index[hash] = std::prev(store.entries.end());
+    const auto publish = [&](const std::shared_ptr<Pipeline>& pipeline) {
+        if (!store.index.contains(hash)) {
+            store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
+            store.index[hash] = std::prev(store.entries.end());
+        }
+        constexpr std::size_t bound = 1024;
+        while (store.entries.size() > bound) {
+            const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
+            if (victim == store.entries.end()) break;
+            store.index.erase(victim->hash);
+            store.entries.erase(victim);
+            ++store.evicted;
+        }
+    };
+    if (context.pipelineBuildRunner == nullptr) {
+        auto pipeline = build();
+        publish(pipeline);
+        return pipeline;
+    }
+    std::promise<std::shared_ptr<Pipeline>> promise;
+    store.pending.emplace(hash, PipelineStore::Pending{context.device, key, promise.get_future().share(), nullptr});
+    lock.unlock();
+    std::shared_ptr<Pipeline> pipeline;
+    try {
+        pipeline = build();
+    } catch (...) {
+        lock.lock();
+        store.pending.erase(hash);
+        store.settled.notify_all();
+        lock.unlock();
+        promise.set_exception(std::current_exception());
+        throw;
+    }
+    lock.lock();
+    store.pending.erase(hash);
+    store.settled.notify_all();
+    publish(pipeline);
+    lock.unlock();
+    promise.set_value(pipeline);
+    return pipeline;
+}
+
+namespace {
+
+void publishPipeline(PipelineStore& store, const Context& context, std::uint64_t hash, const std::vector<std::byte>& key, const std::shared_ptr<Pipeline>& pipeline) {
+    if (!store.index.contains(hash)) {
+        store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
+        store.index[hash] = std::prev(store.entries.end());
+    }
     constexpr std::size_t bound = 1024;
     while (store.entries.size() > bound) {
-        // Only an entry no recorded draw still holds may go (Kept keeps its shared_ptr until the fence).
         const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
         if (victim == store.entries.end()) break;
         store.index.erase(victim->hash);
         store.entries.erase(victim);
         ++store.evicted;
     }
-    return pipeline;
+}
+
+struct PipelineBuildInputs {
+    Context context;
+    State state;
+    VertexInputLayout vertexInput;
+    std::vector<std::uint32_t> mainKey;
+    std::vector<std::uint32_t> fragmentKey;
+    PipelineSetLayouts layouts;
+    std::vector<ShaderRecompiler::RecompileResult> programs;
+    std::vector<std::vector<std::byte>> pushConstants;
+    std::vector<CompiledShader> shaders;
+    VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+};
+
+std::shared_ptr<PipelineBuildInputs> ownBuildInputs(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    auto inputs = std::make_shared<PipelineBuildInputs>();
+    inputs->context = context;
+    inputs->state = state;
+    inputs->vertexInput = vertexInput;
+    inputs->mainKey.assign(resources.mainKey.begin(), resources.mainKey.end());
+    inputs->fragmentKey.assign(resources.fragmentKey.begin(), resources.fragmentKey.end());
+    inputs->layouts = resources;
+    inputs->layouts.mainKey = inputs->mainKey;
+    inputs->layouts.fragmentKey = inputs->fragmentKey;
+    inputs->programs.reserve(shaders.size());
+    inputs->pushConstants.reserve(shaders.size());
+    for (const auto& shader : shaders) {
+        Require(shader.program != nullptr, "a graphics pipeline build needs every stage's program");
+        inputs->programs.push_back(*shader.program);
+        inputs->pushConstants.emplace_back(shader.pushConstants.begin(), shader.pushConstants.end());
+    }
+    for (std::size_t index = 0; index < shaders.size(); ++index) {
+        auto shader = shaders[index];
+        shader.program = &inputs->programs[index];
+        shader.pushConstants = inputs->pushConstants[index];
+        inputs->shaders.push_back(shader);
+    }
+    inputs->attachmentLayout = attachmentLayout;
+    return inputs;
+}
+
+}
+
+std::shared_ptr<CompileTicket> TryCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
+    if (disabled || context.pipelineBuildSubmitter == nullptr) return nullptr;
+    auto& store = Pipelines();
+    std::unique_lock lock(store.mutex);
+    std::vector<std::byte> key;
+    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (key.empty()) return nullptr;
+    const auto hash = hashKey(key);
+    if (const auto found = store.index.find(hash); found != store.index.end()) {
+        if (found->second->key != key || alive(*found->second, context)) return nullptr;
+        abandon(store, found->second);
+    }
+    if (const auto building = store.pending.find(hash); building != store.pending.end()) return building->second.key == key ? building->second.ticket : nullptr;
+    ++store.misses;
+    for (auto it = store.entries.begin(); it != store.entries.end();) {
+        it = alive(*it, context) ? std::next(it) : abandon(store, it);
+    }
+    auto inputs = ownBuildInputs(context, state, vertexInput, resources, shaders, attachmentLayout);
+    std::size_t words = 0;
+    for (const auto& program : inputs->programs) words += program.spirv.WordCount();
+    auto promise = std::make_shared<std::promise<std::shared_ptr<Pipeline>>>();
+    auto& pending = store.pending.emplace(hash, PipelineStore::Pending{context.device, key, promise->get_future().share(), nullptr}).first->second;
+    pending.ticket = context.pipelineBuildSubmitter(context.pipelineBuildOwner, words * sizeof(std::uint32_t) * 8u, [inputs, promise, hash, key] {
+        auto& owner = Pipelines();
+        std::shared_ptr<Pipeline> pipeline;
+        try {
+            pipeline = std::make_shared<Pipeline>(inputs->context, inputs->state, inputs->vertexInput, inputs->layouts, inputs->shaders, inputs->attachmentLayout);
+        } catch (...) {
+            {
+                std::lock_guard failed(owner.mutex);
+                owner.pending.erase(hash);
+                owner.settled.notify_all();
+            }
+            promise->set_exception(std::current_exception());
+            throw;
+        }
+        {
+            std::lock_guard built(owner.mutex);
+            owner.pending.erase(hash);
+            owner.settled.notify_all();
+            publishPipeline(owner, inputs->context, hash, key, pipeline);
+        }
+        promise->set_value(pipeline);
+    });
+    if (pending.ticket == nullptr) {
+        store.pending.erase(hash);
+        return nullptr;
+    }
+    return pending.ticket;
+}
+
+std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
+    if (disabled) return nullptr;
+    std::vector<std::byte> key;
+    pipelineKey(key, context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout);
+    if (key.empty()) return nullptr;
+    auto& store = Pipelines();
+    std::lock_guard lock(store.mutex);
+    const auto found = store.index.find(hashKey(key));
+    if (found == store.index.end() || found->second->key != key || !alive(*found->second, context)) return nullptr;
+    store.entries.splice(store.entries.end(), store.entries, found->second);
+    return found->second->pipeline;
 }
 
 void ClearCachedPipelines(VkDevice device) {
     auto& store = Pipelines();
-    std::lock_guard lock(store.mutex);
+    std::unique_lock lock(store.mutex);
+    store.settled.wait(lock, [&] { return std::none_of(store.pending.begin(), store.pending.end(), [&](const auto& building) { return building.second.device == device; }); });
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         if (it->device != device) {
             ++it;
@@ -1123,6 +1389,7 @@ void ClearCachedPipelines(VkDevice device) {
         store.index.erase(it->hash);
         it = store.entries.erase(it);
     }
+    lock.unlock();
     ClearPipelineLibraries(device);
 }
 

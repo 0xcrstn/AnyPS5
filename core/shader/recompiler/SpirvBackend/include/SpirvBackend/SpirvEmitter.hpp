@@ -5,6 +5,7 @@
 #include "Optimization/BindingAllocator.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <cstdint>
+#include <optional>
 #include <vector>
 #include <span>
 #include <string_view>
@@ -24,6 +25,7 @@ struct SpirvTargetOptions {
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
+    std::optional<bool> sharedFloatFunctions;
 };
 
 void PrepareRewriteVerification(IrProgram& program);

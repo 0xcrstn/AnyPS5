@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include <algorithm>
 #include <type_traits>
 #include <atomic>
@@ -1129,6 +1130,16 @@ bool StorageImagesCached(const Context& context, std::span<const StorageTexture*
 
 std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, const GuestTextureResource& resource) {
     return cachedStorageTexture(context, {}, resource, 0);
+}
+
+std::shared_ptr<StorageTexture> PeekStorageSurface(const Context& context, const GuestTextureResource& resource) {
+    static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if (disabled || resource.dimension == TextureDimension::k2DMsaa || resource.mipCount > AllocatedLevels(resource) || ExtendedChains().any.load(std::memory_order_acquire)) return nullptr;
+    const StorageKey key{context.device, SurfaceKey(context, resource)};
+    auto& cache = StorageTextures();
+    std::lock_guard lock(cache.mutex);
+    const auto it = findStorage(cache, key);
+    return it != cache.entries.end() ? it->texture : nullptr;
 }
 
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress) {
@@ -2459,7 +2470,7 @@ bool EpochRevalidate() {
 
 // Turns the lookups' records into this object's per-texture validation records (see
 // ValidatedSurface); the last record of an object is the freshest.
-bool ShaderResources::epochProofHolds() {
+bool ShaderResources::epochProofScalarsHold() {
     if (!epochProof.valid) return false;
     const auto epoch = GuestMemory::CollectEpoch();
     if (epoch == 0 || epoch != epochProof.epoch) return false;
@@ -2467,7 +2478,11 @@ bool ShaderResources::epochProofHolds() {
     if (Recorder::KeyStoreSerial() != epochProof.keyStores || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != epochProof.registry || DepthSurfaceSerial() != epochProof.depth || StorageCacheSerial() != epochProof.storageCache) return false;
     if (!HostImportsUnchanged(context, importsProof)) return false;
     if ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0) return false;
-    if (guestMemory.HasStagedRegions()) return false;
+    return !guestMemory.HasStagedRegions();
+}
+
+bool ShaderResources::epochProofHolds() {
+    if (!epochProofScalarsHold()) return false;
     std::uint64_t through = 0;
     if (!GuestMemory::UnchangedSinceDirtySerial(proofRanges, epochProof.dirtySerial, &through)) return false;
     epochProof.dirtySerial = through;
@@ -2482,6 +2497,57 @@ void ShaderResources::recordEpochProof(std::uint64_t dirtySerial) {
         if (texture != nullptr && texture->IsDepthCopy()) return;
     }
     epochProof = {true, epoch, dirtySerial, Recorder::KeyStoreSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfaceSerial(), StorageCacheSerial()};
+}
+
+const char* ShaderResources::EpochProofVerdictName(EpochProofVerdict verdict) {
+    constexpr std::array<const char*, static_cast<std::size_t>(EpochProofVerdict::Count)> names{"held", "adopted", "disabled", "template busy", "no epoch proof", "dirty on the worker", "template proved again", "serials moved", "dirty since the worker"};
+    return names.at(static_cast<std::size_t>(verdict));
+}
+
+ShaderResources::EpochProofResult ShaderResources::ResolveEpochProof() const {
+    EpochProofResult result;
+    if (!reusable || !ParallelRevalidateRequested() || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return result;
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::uint64_t serial = 0;
+    {
+        std::unique_lock lock(proofMutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            result.verdict = EpochProofVerdict::Busy;
+            return result;
+        }
+        if (!epochProof.valid || pendingSerialSeen == 0) {
+            result.verdict = EpochProofVerdict::NoProof;
+            return result;
+        }
+        ranges.assign(proofRanges.begin(), proofRanges.end());
+        serial = epochProof.dirtySerial;
+        result.basis = proofBasis;
+    }
+    std::uint64_t through = 0;
+    if (!GuestMemory::UnchangedSinceDirtySerial(ranges, serial, &through)) {
+        result.verdict = EpochProofVerdict::Dirty;
+        return result;
+    }
+    result.dirtyThrough = through;
+    result.verdict = EpochProofVerdict::Held;
+    return result;
+}
+
+ShaderResources::EpochProofVerdict ShaderResources::AdoptEpochProof(const EpochProofResult& result, bool apply) {
+    if (result.verdict != EpochProofVerdict::Held) return result.verdict;
+    const auto start = std::chrono::steady_clock::now();
+    if (!reusable || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return EpochProofVerdict::Disabled;
+    std::lock_guard lock(proofMutex);
+    if (proofBasis != result.basis) return EpochProofVerdict::Basis;
+    if (!epochProofScalarsHold()) return EpochProofVerdict::Stamps;
+    std::uint64_t through = 0;
+    if (!GuestMemory::UnchangedSinceDirtySerial(proofRanges, std::max(epochProof.dirtySerial, result.dirtyThrough), &through)) return EpochProofVerdict::DirtyTail;
+    if (!apply) return EpochProofVerdict::Adopted;
+    epochProof.dirtySerial = through;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) countRevalidate(true, true, start, true);
+    else Revalidations().epochSkips.fetch_add(1, std::memory_order_relaxed);
+    return EpochProofVerdict::Adopted;
 }
 
 std::uint64_t ShaderResources::EpochSkips() {
@@ -2863,6 +2929,8 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    std::unique_lock<std::recursive_mutex> proofLock(proofMutex, std::defer_lock);
+    if (ParallelRevalidateRequested()) proofLock.lock();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto dirtySerialBefore = GuestMemory::DirtySerial();
@@ -2878,6 +2946,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         epochSkip = true;
     }
+    ++proofBasis;
     for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     for (const auto& range : describedRanges) {
         CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
@@ -3348,6 +3417,7 @@ void ResourceCache::noteMiss(const Key& key) {
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
     if (!resources->HasCachedStorageImages()) return;
+    serial.fetch_add(1, std::memory_order_acq_rel);
     if (const auto found = index.find(key); found != index.end()) {
         if (evicted != nullptr) evicted->push_back(std::move(found->second->resources));
         bytes -= found->second->bytes;
@@ -3365,6 +3435,7 @@ void ResourceCache::evictOverLimit(std::vector<std::shared_ptr<ShaderResources>>
     while (sizing.OverLimit(entries.size(), bytes)) {
         auto& last = entries.back();
         sizing.Evicted(CacheSizing::KeyHash(last.key.data(), last.key.size()));
+        serial.fetch_add(1, std::memory_order_acq_rel);
         if (evicted != nullptr) evicted->push_back(std::move(last.resources));
         bytes -= last.bytes;
         index.erase(last.key);
@@ -3381,6 +3452,7 @@ void ResourceCache::evictOverLimit(std::vector<std::shared_ptr<ShaderResources>>
         }
         tables -= elements;
         sizing.Evicted(CacheSizing::KeyHash(it->key.data(), it->key.size()));
+        serial.fetch_add(1, std::memory_order_acq_rel);
         if (evicted != nullptr) evicted->push_back(std::move(it->resources));
         bytes -= it->bytes;
         index.erase(it->key);
@@ -3404,6 +3476,7 @@ void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
+        serial.fetch_add(1, std::memory_order_acq_rel);
         if (evicted != nullptr) evicted->push_back(std::move(it->resources));
         bytes -= it->bytes;
         index.erase(it->key);
@@ -3430,6 +3503,7 @@ std::uint64_t ResourceCache::Touches() {
 
 void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
+    serial.fetch_add(1, std::memory_order_acq_rel);
     index.clear();
     entries.clear();
     bytes = 0;
@@ -3502,6 +3576,7 @@ std::uint64_t ResourceCache::TableElements() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
+    serial.fetch_add(1, std::memory_order_acq_rel);
     bytes -= found->second->bytes;
     entries.erase(found->second);
     index.erase(found);
@@ -3647,6 +3722,24 @@ DescriptorCache::Stats DescriptorCache::Counters() const {
     return stats;
 }
 
+namespace {
+
+std::size_t BoundGuestBytes(std::uint64_t address, std::uint64_t byteSize, std::uint64_t stride) {
+    auto size = static_cast<std::size_t>(byteSize);
+    if (stride != 0) {
+        constexpr std::uint64_t GuestPageBytes = 0x4000;
+        const auto end = address + size;
+        const auto overhang = end % GuestPageBytes;
+        if (overhang != 0 && overhang < stride) {
+            const auto allocationEnd = RegisteredReadableEnd(address);
+            if (allocationEnd > address && allocationEnd < end && end - allocationEnd < stride) size = static_cast<std::size_t>(allocationEnd - address);
+        }
+    }
+    return size;
+}
+
+}
+
 std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read) {
     Require(words.size() == 4, "buffer descriptor must contain four DWORDs");
     Require((words[1] & 0x40000000u) == 0, "buffer descriptor has reserved bits set");
@@ -3660,16 +3753,7 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
     }
     Require(byteSize <= context.limits.maxStorageBufferRange, "shader buffer exceeds descriptor range limit");
     Require(byteSize <= std::numeric_limits<std::size_t>::max(), "shader buffer size exceeds host address space");
-    auto size = static_cast<std::size_t>(byteSize);
-    if (const std::uint64_t stride = descriptor.Stride(); stride != 0) {
-        constexpr std::uint64_t GuestPageBytes = 0x4000;
-        const auto end = address + size;
-        const auto overhang = end % GuestPageBytes;
-        if (overhang != 0 && overhang < stride) {
-            const auto allocationEnd = RegisteredReadableEnd(address);
-            if (allocationEnd > address && allocationEnd < end && end - allocationEnd < stride) size = static_cast<std::size_t>(allocationEnd - address);
-        }
-    }
+    const auto size = BoundGuestBytes(address, byteSize, descriptor.Stride());
     Require(target == nullptr || !overlap(address, size, target->address, target->bytes), "shader buffer aliases the render target");
     // APS5_ALL_BUFFERS_WRITTEN=1: every element is noted as written, as before bufferWritten existed.
     static const bool allWritten = std::getenv("APS5_ALL_BUFFERS_WRITTEN") != nullptr;
@@ -4596,6 +4680,156 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
     return moved;
 }
 
+std::optional<ShaderResources::MovedReadOnlyPlan> ShaderResources::PlanMovedReadOnlyBuffers(std::span<const CompiledShader> shaders) const {
+    MovedReadOnlyPlan plan;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return plan;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) return std::nullopt;
+        for (const auto& binding : shader.program->bindings) {
+            if (DataRole(binding.role)) {
+                const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+                if (kept == bindings.end() || kept->allocations.size() != 1) return std::nullopt;
+                const auto index = kept->allocations.front();
+                const auto& item = allocations[index];
+                if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return std::nullopt;
+                const bool patched = std::any_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == index; });
+                const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
+                if (same) continue;
+                if (item.dataWords.empty() && patched) return std::nullopt;
+                plan.moved.push_back({index, 0, item.size, binding.guestDescriptor});
+                continue;
+            }
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+            if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return std::nullopt;
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+                const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+                const auto address = descriptor.Base48();
+                const auto size = descriptor.GetSize();
+                const auto index = kept->allocations[element];
+                const auto& item = allocations[index];
+                const bool empty = size == 0 || address == 0;
+                if (!item.guest) {
+                    if (empty) continue;
+                    return std::nullopt;
+                }
+                if (item.address == address && item.size == size) continue;
+                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
+                const auto begin = address - item.adjustment;
+                const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+                plan.checks.emplace_back(begin, bytes);
+                MovedBuffer entry{index, address, static_cast<std::size_t>(size)};
+                entry.readAnalysis = ElementReadAnalysis(binding, element);
+                plan.moved.push_back(std::move(entry));
+            }
+        }
+    }
+    return plan;
+}
+
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::CheckMovedReadOnlyBuffers(const MovedReadOnlyPlan& plan, Recorder& recorder) const {
+    for (const auto& [begin, bytes] : plan.checks) {
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
+        if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
+    }
+    return plan.moved;
+}
+
+std::optional<std::vector<ShaderResources::MovedDispatchBuffer>> ShaderResources::MovedDispatchBuffers(const CompiledShader& shader, Recorder& recorder) const {
+    std::vector<MovedDispatchBuffer> moved;
+    if (shader.program == nullptr || usesBda || fragment.set != VK_NULL_HANDLE || splitSets) return std::nullopt;
+    if (_set == VK_NULL_HANDLE) return moved;
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+    for (const auto& binding : shader.program->bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+        const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+        if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return std::nullopt;
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+            const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+            const auto address = descriptor.Base48();
+            const auto byteSize = descriptor.GetSize();
+            const auto index = kept->allocations[element];
+            const auto& item = allocations[index];
+            const bool empty = byteSize == 0 || address == 0;
+            if (!item.guest) {
+                if (empty) continue;
+                return std::nullopt;
+            }
+            if (empty || (words[1] & 0x40000000u) != 0 || descriptor.Type() != 0u || byteSize > context.limits.maxStorageBufferRange || address < item.adjustment) return std::nullopt;
+            const auto size = BoundGuestBytes(address, byteSize, descriptor.Stride());
+            if (item.address == address && item.size == size) continue;
+            const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+            if (written || item.written) return std::nullopt;
+            const auto begin = address - item.adjustment;
+            const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
+            if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || recorder.PendingLabelIn(begin, bytes) || recorder.QueuedStoreOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes) || AnyDeviceResidentOverlaps(begin, bytes)) return std::nullopt;
+            if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), [&](const std::shared_ptr<ShaderResources>& writer) { return writer != nullptr && writer->WritesOverlap(begin, bytes); })) return std::nullopt;
+            GuestMemory::FlushGpuWrites(begin, bytes);
+            const auto* import = HostImportFor(context, begin, bytes);
+            if (import == nullptr || begin < import->base || (address - import->base) % alignment != item.adjustment || bytes > import->bytes - (begin - import->base) || bytes > context.limits.maxStorageBufferRange) return std::nullopt;
+            moved.push_back({index, address, size, {import->buffer, begin - import->base, bytes}, begin});
+        }
+    }
+    return moved;
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::BindMovedDispatchBuffers(Recorder& recorder, std::span<const MovedDispatchBuffer> moved) const {
+    Require(context.descriptorCache != nullptr, "moved dispatch buffers require a descriptor cache");
+    Require(_set != VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE && !splitSets, "moved dispatch buffers need the template's single descriptor set");
+    std::map<VkDescriptorType, std::uint32_t> counts;
+    for (const auto& binding : bindings) counts[binding.layout.descriptorType] += (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+    std::vector<VkDescriptorPoolSize> sizes;
+    for (const auto& [type, count] : counts) {
+        if (count != 0) sizes.push_back({type, count});
+    }
+    const auto variable = tableBindings[0] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[0]].imageAllocations.size()))) : std::nullopt;
+    auto result = std::make_shared<DrawBindings>();
+    result->cache = context.descriptorCache;
+    result->allocation = result->cache->Allocate(_layout, sizes, updateAfterBind, variable);
+    Require(result->allocation.set != VK_NULL_HANDLE, "moved dispatch buffer descriptor allocation failed");
+    auto buffers = descriptorBuffers;
+    auto writes = descriptorWrites;
+    auto nextWrite = writes.begin();
+    for (const auto& binding : bindings) {
+        while (nextWrite != writes.end() && nextWrite->dstBinding == binding.layout.binding) {
+            auto& write = *nextWrite++;
+            write.dstSet = result->allocation.set;
+            if (binding.allocations.empty()) continue;
+            const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+            write.pBufferInfo = buffers.data() + offset;
+            for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+                const auto found = std::find_if(moved.begin(), moved.end(), [&](const MovedDispatchBuffer& entry) { return entry.allocation == binding.allocations[element]; });
+                if (found != moved.end()) buffers[offset + element] = found->view;
+            }
+        }
+    }
+    Require(nextWrite == writes.end(), "moved dispatch buffer writes disagree with their descriptor bindings");
+    context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    recorder.Keep(result);
+    return result;
+}
+
+std::vector<ShaderResources::GuestBufferView> ShaderResources::GuestBufferViews(std::span<const MovedDispatchBuffer> moved) const {
+    std::vector<GuestBufferView> views;
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        if (!item.guest) continue;
+        const auto found = std::find_if(moved.begin(), moved.end(), [&](const MovedDispatchBuffer& entry) { return entry.allocation == index; });
+        if (found != moved.end()) {
+            views.push_back({found->address, found->size, false, found->begin, found->view.range});
+            continue;
+        }
+        std::uint32_t adjustment = 0;
+        const auto descriptor = guestMemory.Descriptor(item.address, item.size, adjustment);
+        views.push_back({item.address, item.size, item.written, item.address - adjustment, descriptor.range});
+    }
+    return views;
+}
+
 std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
     const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
@@ -4617,6 +4851,15 @@ bool MovedWordRing() {
     return MovedWordRingFlag().load(std::memory_order_relaxed);
 }
 
+std::atomic<bool>& InPlaceDrawInputsFlag() {
+    static std::atomic<bool> flag{std::getenv("APS5_IN_PLACE_DRAW_INPUTS") != nullptr && std::strcmp(std::getenv("APS5_IN_PLACE_DRAW_INPUTS"), "0") != 0};
+    return flag;
+}
+
+bool InPlaceDrawInputs() {
+    return InPlaceDrawInputsFlag().load(std::memory_order_relaxed);
+}
+
 bool AddressBasedDrawSnapshots() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_BDA_DRAW_SNAPSHOTS");
@@ -4624,6 +4867,14 @@ bool AddressBasedDrawSnapshots() {
     }();
     return enabled;
 }
+}
+
+void ShaderResources::SetInPlaceDrawInputs(bool enabled) {
+    InPlaceDrawInputsFlag().store(enabled, std::memory_order_relaxed);
+}
+
+bool ShaderResources::InPlaceDrawInputsEnabled() {
+    return InPlaceDrawInputs();
 }
 
 void ShaderResources::SetMovedWordRing(bool enabled) {
@@ -4828,6 +5079,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (statistics != nullptr) ++statistics->skipped;
                 continue;
             }
+            if (InPlaceDrawInputs()) {
+                recorder.NoteInPlaceDrawInput(item.address, item.size);
+                if (statistics != nullptr) {
+                    ++statistics->inPlace;
+                    statistics->inPlaceBytes += item.size;
+                }
+                continue;
+            }
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
@@ -4836,6 +5095,19 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             continue;
         }
         lap(&DrawBindingsStatistics::checkUs);
+        if (override != moved.end() && InPlaceDrawInputs()) {
+            if (const auto* import = InPlaceDrawInput(context, begin, bytes, std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4))) {
+                selected.push_back(index);
+                result->snapshots.push_back({begin, nullptr, {}, import->buffer, begin - import->base, std::span<const std::byte>(reinterpret_cast<const std::byte*>(begin), bytes), true});
+                recorder.NoteInPlaceDrawInput(begin, bytes);
+                if (statistics != nullptr) {
+                    ++statistics->inPlace;
+                    statistics->inPlaceBytes += bytes;
+                }
+                lap(&DrawBindingsStatistics::lookupUs);
+                continue;
+            }
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         std::optional<ByteRanges> readRanges;
         std::size_t covered = 0;
@@ -5010,9 +5282,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return result;
 }
 
-void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
-    if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
-    if (fragment.set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, 0, nullptr);
+void ShaderResources::Bind(const CommandSink& commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
+    if (_set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, bindPoint, layout, 0, _set);
+    if (fragment.set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, fragment.set);
 }
 
 namespace {
@@ -5043,6 +5315,15 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         recorder.NotePendingReads(split->own, kind);
     } else {
         recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+    }
+    if (Coherence::InputLeases() && kind == Recorder::ReadKind::DispatchElement) {
+        std::vector<std::uint64_t> leases;
+        for (const auto& [begin, end] : guestMemory.InPlaceReads()) {
+            if (const auto lease = Coherence::AcquireReadLease({begin, end}, Coherence::CurrentVersion()); lease != 0) leases.push_back(lease);
+        }
+        if (!leases.empty()) recorder.OnCompleteWithoutGuestAccess([leases] {
+            for (const auto lease : leases) Coherence::RetireReadLease(lease);
+        });
     }
     if (usesBda && !bdaReadOnly) {
         guestMemory.ForgetPointerShadows();

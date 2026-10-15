@@ -412,6 +412,7 @@ void Driver::enqueue(Submission submission) {
     for (const auto dword : submission.labelWrites) ++worker.unfinishedWrites[dword];
     worker.pending.push_back(std::move(submission));
     worker.queued.fetch_add(1, std::memory_order_acq_rel);
+    if (const auto bound = batchAgeBound(); bound.count() != 0 && !batchAgeThread.joinable()) batchAgeThread = std::thread([this, bound] { runBatchAge(bound); });
     if (!worker.thread.joinable()) worker.thread = std::thread([this, queue] {
         char role[32];
         std::snprintf(role, sizeof(role), "queue 0x%x worker", queue);

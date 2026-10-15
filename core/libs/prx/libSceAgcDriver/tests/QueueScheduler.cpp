@@ -1,0 +1,246 @@
+#include "prx/libSceAgcDriver/Execution/include/QueueScheduler.hpp"
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <functional>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+using AgcDriver::ParkedOp;
+using AgcDriver::QueueScheduler;
+using AgcDriver::SchedulerMode;
+
+namespace {
+
+int failures = 0;
+
+void Expect(bool condition, const char* what) {
+    if (condition) return;
+    std::fprintf(stderr, "FAIL: %s\n", what);
+    ++failures;
+}
+
+template<typename TAction>
+std::string Failure(TAction action) {
+    try {
+        action();
+    } catch (const std::exception& error) {
+        return error.what();
+    }
+    return {};
+}
+
+bool WaitUntil(const std::function<bool()>& done) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done()) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+void TestModes() {
+    Expect(QueueScheduler::ParseMode(nullptr) == SchedulerMode::Off, "an unset scheduler mode is off");
+    Expect(QueueScheduler::ParseMode("off") == SchedulerMode::Off, "off parses");
+    Expect(QueueScheduler::ParseMode("serial") == SchedulerMode::Serial, "serial parses");
+    Expect(QueueScheduler::ParseMode("dag") == SchedulerMode::Dag, "dag parses");
+    Expect(!Failure([] { QueueScheduler::ParseMode("fast"); }).empty(), "an unknown scheduler mode throws");
+    QueueScheduler off(SchedulerMode::Off, false);
+    Expect(!off.Active(), "the off scheduler is inactive");
+    const auto turn = off.Begin(0, 1, 0, 1);
+    Expect(off.Holder() == QueueScheduler::NoQueue, "the off scheduler grants no turn");
+}
+
+void TestSerialExclusion() {
+    QueueScheduler scheduler(SchedulerMode::Serial, true);
+    std::atomic<int> inside{0};
+    std::atomic<bool> overlapped{false};
+    std::vector<std::thread> workers;
+    for (std::uint32_t queue = 0; queue < 4; ++queue) {
+        workers.emplace_back([&, queue] {
+            for (std::size_t cursor = 0; cursor < 200; ++cursor) {
+                const auto turn = scheduler.Begin(queue, 1, cursor, queue + 1);
+                if (inside.fetch_add(1) != 0) overlapped = true;
+                std::this_thread::yield();
+                inside.fetch_sub(1);
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    Expect(!overlapped.load(), "two streams ran a packet at once in serial mode");
+    const auto statistics = scheduler.Take();
+    Expect(statistics.turns == 800, "every packet took one turn");
+}
+
+void TestRunnableHeadOrder() {
+    QueueScheduler scheduler(SchedulerMode::Serial, false);
+    std::mutex orderMutex;
+    std::vector<std::uint32_t> order;
+    auto first = std::make_unique<QueueScheduler::Turn>(scheduler.Begin(1, 1, 0, 10));
+    const auto request = [&](std::uint32_t queue, std::uint64_t received) {
+        const auto turn = scheduler.Begin(queue, 1, 0, received);
+        std::lock_guard lock(orderMutex);
+        order.push_back(queue);
+    };
+    std::thread later(request, 2, 30);
+    std::thread older(request, 3, 20);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    first.reset();
+    later.join();
+    older.join();
+    Expect(order.size() == 2 && order[0] == 3 && order[1] == 2, "the serial turn went to a later head before the oldest runnable head");
+}
+
+void TestBlockReleasesTurn() {
+    QueueScheduler scheduler(SchedulerMode::Serial, false);
+    std::atomic<bool> otherRan{false};
+    {
+        const auto turn = scheduler.Begin(1, 1, 0, 1);
+        {
+            const auto blocked = scheduler.Block(1);
+            Expect(scheduler.Holder() == QueueScheduler::NoQueue, "a blocked stream kept the serial turn");
+            std::thread other([&] {
+                const auto otherTurn = scheduler.Begin(2, 1, 0, 2);
+                otherRan = true;
+            });
+            other.join();
+        }
+        Expect(otherRan.load(), "another stream could not run while the holder was blocked");
+        Expect(scheduler.Holder() == 1, "a stream did not get its turn back after its block");
+    }
+    Expect(scheduler.Holder() == QueueScheduler::NoQueue, "the turn was not released at the end of the packet");
+}
+
+void TestParkResume() {
+    QueueScheduler scheduler(SchedulerMode::Serial, true);
+    std::function<void()> wake;
+    std::mutex wakeMutex;
+    std::atomic<bool> resumed{false};
+    std::atomic<bool> otherRan{false};
+    std::thread parker([&] {
+        const auto turn = scheduler.Begin(1, 1, 0, 1);
+        ParkedOp op;
+        op.queue = 1;
+        op.submission = 1;
+        op.what = "draw at dword 0";
+        op.arm = [&](std::function<void()> callback) {
+            std::lock_guard lock(wakeMutex);
+            wake = std::move(callback);
+            return true;
+        };
+        op.resume = [&] {
+            Expect(scheduler.Holder() == 1, "a parked op resumed without its serial turn");
+            resumed = true;
+        };
+        scheduler.Park(std::move(op));
+    });
+    Expect(WaitUntil([&] { std::lock_guard lock(wakeMutex); return static_cast<bool>(wake); }), "the parked op was never armed");
+    {
+        const auto turn = scheduler.Begin(2, 1, 0, 2);
+        otherRan = true;
+    }
+    Expect(!resumed.load(), "a parked op resumed before its ticket settled");
+    {
+        std::lock_guard lock(wakeMutex);
+        wake();
+    }
+    parker.join();
+    Expect(otherRan.load() && resumed.load(), "a parked stream blocked another stream or never resumed");
+
+    bool inline_ = false;
+    {
+        const auto turn = scheduler.Begin(1, 1, 1, 1);
+        ParkedOp settled;
+        settled.queue = 1;
+        settled.arm = [](std::function<void()>) { return false; };
+        settled.resume = [&] { inline_ = true; };
+        scheduler.Park(std::move(settled));
+    }
+    Expect(inline_, "an op parked on a settled ticket did not resume");
+    const auto statistics = scheduler.Take();
+    Expect(statistics.parks == 2 && statistics.parksSettledAtArm == 1, "park statistics are wrong");
+}
+
+void TestParkFailure() {
+    QueueScheduler scheduler(SchedulerMode::Dag, false);
+    ParkedOp failing;
+    failing.queue = 3;
+    failing.arm = [](std::function<void()>) { return false; };
+    failing.resume = [] { throw std::runtime_error("pipeline compile failed"); };
+    Expect(Failure([&] { scheduler.Park(std::move(failing)); }) == "pipeline compile failed", "a parked op's failure did not reach its stream");
+
+    std::atomic<bool> armed{false};
+    std::string closed;
+    std::thread parker([&] {
+        ParkedOp never;
+        never.queue = 4;
+        never.arm = [&](std::function<void()>) { armed = true; return true; };
+        never.resume = [] {};
+        closed = Failure([&] { scheduler.Park(std::move(never)); });
+    });
+    Expect(WaitUntil([&] { return armed.load(); }), "the parked op was never armed");
+    scheduler.Close(std::make_exception_ptr(std::runtime_error("driver shutting down")));
+    parker.join();
+    Expect(closed == "driver shutting down", "closing the scheduler did not fail a parked stream");
+    Expect(!Failure([&] { scheduler.Begin(4, 2, 0, 9); }).empty(), "a closed scheduler began a packet");
+}
+
+void TestDagRunsConcurrently() {
+    QueueScheduler scheduler(SchedulerMode::Dag, false);
+    std::atomic<int> inside{0};
+    std::atomic<bool> together{false};
+    std::vector<std::thread> workers;
+    for (std::uint32_t queue = 0; queue < 2; ++queue) {
+        workers.emplace_back([&, queue] {
+            const auto turn = scheduler.Begin(queue, 1, 0, queue);
+            inside.fetch_add(1);
+            if (WaitUntil([&] { return inside.load() == 2; })) together = true;
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    Expect(together.load(), "dag mode serialized two streams");
+}
+
+void TestVerifyInjection() {
+    QueueScheduler scheduler(SchedulerMode::Dag, true);
+    { const auto turn = scheduler.Begin(5, 2, 10, 1); }
+    const auto reordered = Failure([&] { scheduler.Begin(5, 2, 4, 1); });
+    Expect(reordered.find("APS5_QUEUE_SCHEDULER_VERIFY") != std::string::npos, "verify mode accepted a stream running a packet out of order");
+    const auto older = Failure([&] { scheduler.Begin(5, 1, 20, 1); });
+    Expect(older.find("APS5_QUEUE_SCHEDULER_VERIFY") != std::string::npos, "verify mode accepted an older submission after a newer one");
+
+    std::string whileParked;
+    ParkedOp op;
+    op.queue = 6;
+    op.arm = [&](std::function<void()>) {
+        whileParked = Failure([&] { scheduler.Begin(6, 1, 0, 1); });
+        return false;
+    };
+    op.resume = [] {};
+    scheduler.Park(std::move(op));
+    Expect(whileParked.find("APS5_QUEUE_SCHEDULER_VERIFY") != std::string::npos, "verify mode let a parked stream begin another packet");
+
+    QueueScheduler unverified(SchedulerMode::Dag, false);
+    { const auto turn = unverified.Begin(5, 2, 10, 1); }
+    Expect(Failure([&] { unverified.Begin(5, 2, 4, 1); }).empty(), "the order check ran without verify mode");
+}
+
+}
+
+int main() {
+    TestModes();
+    TestSerialExclusion();
+    TestRunnableHeadOrder();
+    TestBlockReleasesTurn();
+    TestParkResume();
+    TestParkFailure();
+    TestDagRunsConcurrently();
+    TestVerifyInjection();
+    if (failures != 0) return 1;
+    std::puts("queue scheduler tests passed");
+    return 0;
+}

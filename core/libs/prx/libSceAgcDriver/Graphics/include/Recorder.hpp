@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommandSink.hpp"
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <array>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <functional>
 #include <list>
@@ -27,6 +29,8 @@ namespace AgcDriver::Graphics {
 
 class Buffer;
 class DrawSnapshotArena;
+class ChunkedRecording;
+class ChunkPool;
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -43,8 +47,25 @@ class DrawSnapshotArena;
 // up to serial S" WITHOUT the mutex (WaitSerial), because the monotonic value cannot be reset or
 // recycled the way the pooled batch fences are, and afterwards run the completions under the mutex
 // (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
+struct RecorderDomain {
+    std::atomic<std::int64_t> pendingLabelSince{std::numeric_limits<std::int64_t>::min()};
+    std::atomic<std::uint64_t> writeGeneration{0};
+    std::atomic<std::uint64_t> publishGeneration{0};
+    std::atomic<std::uint64_t> ledgerSerial{0};
+    std::atomic<std::uint64_t> finishedBatches{0};
+    std::atomic<std::uint64_t> completionLabels{0};
+    std::atomic<std::uint64_t> writeBackCompletions{0};
+    std::atomic<std::uint64_t> workSinceSubmit{0};
+    std::mutex labelTableMutex;
+    class Recorder* labelTableOwner = nullptr;
+};
+
 class Recorder {
 public:
+    static constexpr std::uint32_t PhysicalQueues = 4;
+    static RecorderDomain& Domain(std::uint32_t physicalQueue);
+    static Recorder* ForPhysicalQueue(std::uint32_t physicalQueue);
+    std::uint32_t PhysicalQueue() const { return physicalQueue; }
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
     explicit Recorder(const Context& context, bool timelineSemaphores = false);
     ~Recorder();
@@ -72,6 +93,11 @@ public:
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     std::uint64_t OpenPassSerial() const;
+    static bool ChunkedRecordingEnabled();
+    bool ChunkPass();
+    CommandSink OpenChunk(const Context& drawContext, const ChunkInheritance& inheritance, const ChunkDraw& draw);
+    CommandSink PassSink(const Context& drawContext, const ChunkDraw& draw);
+    static void DrainChunks();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
     // label store (RecordStore), or before a command that writes or reads a queued range (the
@@ -93,6 +119,8 @@ public:
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     bool HasGuestCompletions() const;
+    bool GuestWriteBacksOwed() const;
+    static bool LabelPublicationOrdered();
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
@@ -165,6 +193,8 @@ public:
     enum class ReadKind : std::uint8_t { DispatchElement = 0, GpuCopy, AddressBased, Indirect, StorageUpload, CopySource, DrawInput, Count };
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
+    static bool VerifyInPlaceDrawInputs();
+    void NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
     using ReadList = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
     void NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind);
@@ -413,6 +443,9 @@ public:
     // labels waiting in completion actions (the CPU must reap their batch for them to land);
     static std::uint64_t PendingCompletionLabels();
     static std::uint64_t KeyStoreSerial();
+    static std::uint64_t LedgerSerial();
+    static std::uint64_t FinishedBatches();
+    static bool AccessNeedsFlush(std::uint64_t address, std::size_t bytes);
     // write-back completions (OnComplete) of unfinished batches: a reaper retires them when every
     // worker sleeps, as for the labels above;
     static std::uint64_t PendingWriteBackCompletions();
@@ -585,6 +618,7 @@ private:
         std::unordered_set<const void*> keptOwners;
         std::vector<std::function<void()>> completions;
         bool guestCompletions = false;
+        bool guestWriteBacks = false;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
@@ -595,6 +629,12 @@ private:
             ReadKind kind;
         };
         std::vector<Read> reads;
+        struct InPlaceInput {
+            std::uint64_t begin;
+            std::uint64_t end;
+            std::uint64_t generation;
+        };
+        std::vector<InPlaceInput> inPlaceInputs;
         struct ReadListNote {
             std::shared_ptr<const ReadList> ranges;
             std::size_t position;
@@ -630,6 +670,7 @@ private:
         // Dword addresses this batch noted in the label table (removed when it finishes).
         std::vector<std::uint64_t> labelDwords;
         std::vector<std::multimap<std::uint64_t, std::uint64_t>::iterator> wideLabels;
+        std::vector<std::uint64_t> labelStamps;
         // Labels stored by this batch's completion actions (see AfterCompletions); subtracted from
         // the lock-free pending count when the batch finishes, whether or not its completions ran.
         std::uint32_t completionLabelCount = 0;
@@ -692,6 +733,8 @@ private:
             std::uint64_t serial = 0;
             std::uint32_t timing = NoTiming;
             std::function<void(VkCommandBuffer)> afterPass;
+            bool chunked = false;
+            ChunkInheritance inheritance;
         } renderPass;
         PassHazards passHazards;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
@@ -706,6 +749,8 @@ private:
             std::uint64_t end;
         };
         std::vector<KeyStore> keyStores;
+        std::shared_ptr<ChunkPool> chunkPool;
+        std::string chunkFailure;
     };
     struct LabelEntry {
         std::uint32_t value;
@@ -778,6 +823,8 @@ private:
     PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
     PFN_vkCmdPushConstants cmdPushConstants = nullptr;
     PFN_vkCmdDispatch cmdDispatch = nullptr;
+    PFN_vkCmdExecuteCommands cmdExecuteCommands = nullptr;
+    std::unique_ptr<ChunkedRecording> chunks;
     template<typename TFunction>
     TFunction function(TFunction resolved, const char* name) const {
         return resolved != nullptr ? resolved : context.Function<TFunction>(name);
@@ -842,6 +889,8 @@ private:
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
     std::uint64_t id = 0;
+    std::uint32_t physicalQueue = 0;
+    RecorderDomain& domain;
     // Every access holds the table mutex (Recorder.cpp): the recorded entries are mutated under
     // GuestMemory::GpuMutex as well, the queued ones (NoteQueuedLabel) under the table mutex alone.
     // Ordered, so a range (a noted write, PendingLabelIn) finds its dwords by lower_bound.

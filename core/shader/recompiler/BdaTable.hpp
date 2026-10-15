@@ -59,9 +59,25 @@ inline Relative ParseRelative(const char* value) {
     throw std::runtime_error("APS5_BDA_RELATIVE must be off, on or verify, not \"" + std::string(text) + "\"");
 }
 
+inline bool RangeCacheVerified() {
+    static const bool verified = std::getenv("APS5_BDA_RANGE_CACHE") != nullptr && std::getenv("APS5_VERIFY_BDA_RANGE_CACHE") != nullptr;
+    return verified;
+}
+
 inline Relative RelativeSetting() {
-    static const Relative relative = ParseRelative(std::getenv("APS5_BDA_RELATIVE"));
+    static const Relative relative = [] {
+        const char* explicitValue = std::getenv("APS5_BDA_RELATIVE");
+        const auto parsed = ParseRelative(explicitValue);
+        if (std::getenv("APS5_BDA_RANGE_CACHE") == nullptr) return parsed;
+        const auto implied = RangeCacheVerified() ? Relative::Verify : Relative::On;
+        if (explicitValue != nullptr && parsed != implied) throw std::runtime_error("APS5_BDA_RANGE_CACHE selects APS5_BDA_RELATIVE=" + std::string(implied == Relative::Verify ? "verify" : "on") + ", which conflicts with APS5_BDA_RELATIVE=" + explicitValue);
+        return implied;
+    }();
     return relative;
+}
+
+inline BdaAbi::FaultReason RelativeMismatchReason() {
+    return RangeCacheVerified() ? BdaAbi::FaultReason::RangeCacheMismatch : BdaAbi::FaultReason::RelativeMismatch;
 }
 
 inline bool InlineFastPathSetting() {

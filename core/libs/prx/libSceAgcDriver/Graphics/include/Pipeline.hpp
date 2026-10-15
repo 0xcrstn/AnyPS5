@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include <mutex>
 #include <set>
 
 namespace AgcDriver::Graphics {
@@ -48,17 +49,21 @@ public:
     Pipeline& operator=(const Pipeline&) = delete;
     VkPipelineLayout Layout() const;
     std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers = 1, std::span<const std::uint8_t> persistent = {});
+    std::shared_ptr<Framebuffer> FindFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers = 1);
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
     void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const;
+    void BeginPass(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, bool secondary) const;
+    void BeginInside(const CommandSink& commands, const State& state) const;
+    ChunkInheritance Inheritance(const Framebuffer& framebuffer) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by
     // construction: the attachment formats alone decide).
-    void Continue(VkCommandBuffer commands, const State& state) const;
+    void Continue(const CommandSink& commands, const State& state) const;
     bool SplitsFaces() const { return backFaces != VK_NULL_HANDLE; }
     bool Optimized() const { return optimized != nullptr && optimized->handle.load() != VK_NULL_HANDLE; }
-    void ContinueBackFaces(VkCommandBuffer commands, const State& state) const;
+    void ContinueBackFaces(const CommandSink& commands, const State& state) const;
     bool SplitsSecondChannel() const { return secondChannel != VK_NULL_HANDLE; }
-    void ContinueSecondChannel(VkCommandBuffer commands) const;
-    void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
+    void ContinueSecondChannel(const CommandSink& commands) const;
+    void PushConstants(const CommandSink& commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
 
@@ -72,8 +77,8 @@ private:
         std::shared_ptr<Framebuffer> framebuffer;
     };
     void release() noexcept;
-    void setLibraryState(VkCommandBuffer commands, const State& state, bool known) const;
-    void apply(VkCommandBuffer commands, const State& state, bool known) const;
+    void setLibraryState(const CommandSink& commands, const State& state, bool known) const;
+    void apply(const CommandSink& commands, const State& state, bool known) const;
     Context context;
     std::vector<VkShaderModule> _modules;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -92,7 +97,10 @@ private:
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::vector<std::uint32_t> colorSlots;
+    std::vector<VkFormat> renderingColorFormats;
+    VkSampleCountFlagBits renderingSamples = VK_SAMPLE_COUNT_1_BIT;
     bool sampleLocationsEnabled = false;
+    std::mutex framebufferMutex;
     std::vector<CachedFramebuffer> framebuffers;
 };
 
@@ -115,6 +123,8 @@ bool SplitsSets(const Context& context, std::span<const CompiledShader> shaders)
 // Destroys the cached pipelines of a device; to be called before the device goes away. Without it,
 // entries of a gone device are recognised by their buffer pool (made and reset with the device, so
 // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.
+std::shared_ptr<CompileTicket> TryCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
 void ClearCachedPipelines(VkDevice device);
 bool HasStencil(VkFormat format);
 // Device limit checks of the viewport, which is dynamic state and so no longer checked by Pipeline.

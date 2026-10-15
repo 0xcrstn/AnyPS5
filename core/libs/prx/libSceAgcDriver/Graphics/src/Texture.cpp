@@ -349,6 +349,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "texture");
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
+        owned->placement = DeviceMemoryPlacement(DeviceMemoryKind::Texture, context.HostPlaced(allocation.memoryTypeIndex), requirements.size);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
 
         {
@@ -1210,6 +1211,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         memoryBytes = requirements.size;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "storage texture");
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory storage texture");
+        placement = DeviceMemoryPlacement(DeviceMemoryKind::StorageTexture, context.HostPlaced(allocation.memoryTypeIndex), requirements.size);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
     } catch (...) {
         release();
@@ -1601,6 +1603,7 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
     const bool volume = descriptor.dimension == TextureDimension::k3D;
     Require((depthSlice == 0 && layers == 1) || (volume && mip == 0 && layers != 0 && depthSlice + layers - 1u <= descriptor.depthOrLastArray), "attachment slice is outside the storage image");
     Require(layer == 0 || (!volume && descriptor.dimension == TextureDimension::k2DArray && descriptor.baseArray + layer <= descriptor.depthOrLastArray), "attachment layer is outside the storage image");
+    std::lock_guard lock(attachmentViewsMutex);
     const auto found = attachmentViews.find({format, mip, depthSlice, layers, layer});
     if (found != attachmentViews.end()) return found->second;
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
@@ -1616,6 +1619,12 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView attachment");
     attachmentViews.emplace(std::tuple{format, mip, depthSlice, layers, layer}, created);
     return created;
+}
+
+VkImageView StorageTexture::FindAttachmentView(VkFormat format, std::uint32_t mip, std::uint32_t depthSlice, std::uint32_t layers, std::uint32_t layer) const {
+    std::lock_guard lock(attachmentViewsMutex);
+    const auto found = attachmentViews.find({format, mip, depthSlice, layers, layer});
+    return found != attachmentViews.end() ? found->second : VK_NULL_HANDLE;
 }
 
 VkImageView StorageTexture::AttachmentProxyView() {
@@ -3378,6 +3387,7 @@ void StorageTexture::refreshGeneration() {
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     if (Coherence::Tracking()) coherenceVersion = Coherence::NextVersion();
+    if (Coherence::FaultOwnership() && accessProtection == 0 && guestBytes != 0) accessProtection = Coherence::ProtectDeviceOwned({descriptor.baseAddress, descriptor.baseAddress + guestBytes}, Coherence::Source::PendingImage, coherenceVersion);
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (!handedFrom.empty()) supersedeHandedFrom(first, count);
     std::vector<bool> unsaved(trackedLayers, false);
@@ -3430,14 +3440,63 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
 }
 
 void StorageTexture::reconcilePending() {
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        const bool any = anyLayerPending();
+        if (any == dirty) return;
+        dirty = any;
+        if (any) pending.textures.push_back(this);
+        else pending.textures.remove(this);
+        BumpPendingSerial();
+    }
+    settleProtection();
+}
+
+void StorageTexture::settleProtection() {
+    if (accessProtection == 0) return;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        if (anyLayerPending()) return;
+    }
+    const auto protection = std::exchange(accessProtection, 0);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    if (auto* recorder = Recorder::Active()) recorder->OnCompleteWithoutGuestAccess([protection] { Coherence::ReleaseDeviceOwned(protection); });
+    else Coherence::ReleaseDeviceOwned(protection);
+}
+
+std::size_t StorageTexture::FlushUnprotected(const char* reason) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        for (auto* texture : pending.textures) {
+            if (texture->accessProtection == 0 && texture->guestBytes != 0) ranges.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
+        }
+    }
+    std::size_t stored = 0;
+    for (const auto& [begin, end] : ranges) stored += FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, reason, PublishScope::Whole) ? 1 : 0;
+    return stored + PublishUnprotectedShadows(PublishReasonFor(reason));
+}
+
+bool StorageTexture::AnyUnprotectedPending() {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
-    const bool any = anyLayerPending();
-    if (any == dirty) return;
-    dirty = any;
-    if (any) pending.textures.push_back(this);
-    else pending.textures.remove(this);
-    BumpPendingSerial();
+    for (auto* texture : pending.textures) {
+        if (texture->accessProtection == 0) return true;
+    }
+    return false;
+}
+
+void StorageTexture::MaterializeForNativeAccess(std::uint64_t address, std::size_t bytes) {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) Coherence::NoteLockedFault({address, address + bytes});
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    static_cast<void>(FlushPending(address, bytes, nullptr, "native access", PublishScope::Whole));
+    if (auto* recorder = Recorder::Active()) {
+        if (AnyDeviceResident()) static_cast<void>(PublishDeviceResident(*recorder, address, bytes, ResidentSite::Native));
+        recorder->Sync();
+    }
 }
 
 void StorageTexture::Flush() {
@@ -3831,6 +3890,13 @@ std::optional<PublishScope> StorageTexture::StoreAtFlipRequested(const char* val
 }
 
 bool StorageTexture::PresentThenStore(std::optional<PublishScope> storeAtFlip, const std::function<bool()>& present) {
+    if (Coherence::LazyRelease()) {
+        FlushDumpSelected("flip");
+        const bool presented = present();
+        static_cast<void>(FlushUnprotected("flip"));
+        Coherence::CheckReleaseCovered(AnyUnprotectedPending(), AnyUnprotectedShadow(), "flip");
+        return presented;
+    }
     if (!storeAtFlip) FlushDumpSelected("flip");
     const bool presented = present();
     if (storeAtFlip) FlushAllPending("flip", *storeAtFlip);
@@ -5623,6 +5689,7 @@ StorageTexture::~StorageTexture() {
             if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx destroyed with GPU results pending\n", static_cast<unsigned long long>(descriptor.baseAddress));
         }
     }
+    Coherence::ReleaseDeviceOwned(std::exchange(accessProtection, 0));
     release();
     original = std::vector<std::byte>();
     generationBaseline = std::vector<std::byte>();
@@ -5650,6 +5717,7 @@ void StorageTexture::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    placement.Reset();
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

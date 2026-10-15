@@ -15,7 +15,12 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
+
+namespace AgcDriver {
+class CompileTicket;
+}
 
 namespace AgcDriver::Graphics {
 
@@ -76,6 +81,77 @@ inline void Require(bool condition, const char* reason) {
 
 struct DescriptorRejected : std::runtime_error {
     using std::runtime_error::runtime_error;
+};
+
+enum class DeviceMemoryKind : std::uint8_t { Buffer, Texture, StorageTexture, Count };
+
+struct DeviceMemoryUse {
+    std::uint64_t bytes = 0;
+    std::uint64_t allocations = 0;
+};
+
+class DeviceMemoryPlacements {
+public:
+    static void Add(DeviceMemoryKind kind, bool host, std::uint64_t bytes) {
+        auto& entry = entries()[index(kind, host)];
+        entry.bytes.fetch_add(bytes, std::memory_order_relaxed);
+        entry.allocations.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    static void Remove(DeviceMemoryKind kind, bool host, std::uint64_t bytes) {
+        auto& entry = entries()[index(kind, host)];
+        entry.bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        entry.allocations.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    static DeviceMemoryUse Live(DeviceMemoryKind kind, bool host) {
+        const auto& entry = entries()[index(kind, host)];
+        return {entry.bytes.load(std::memory_order_relaxed), entry.allocations.load(std::memory_order_relaxed)};
+    }
+
+private:
+    struct Entry {
+        std::atomic<std::uint64_t> bytes{0};
+        std::atomic<std::uint64_t> allocations{0};
+    };
+    static constexpr std::size_t Kinds = static_cast<std::size_t>(DeviceMemoryKind::Count);
+    static std::size_t index(DeviceMemoryKind kind, bool host) { return static_cast<std::size_t>(kind) * 2 + (host ? 1 : 0); }
+    static Entry* entries() {
+        static Entry table[Kinds * 2];
+        return table;
+    }
+};
+
+class DeviceMemoryPlacement {
+public:
+    DeviceMemoryPlacement() = default;
+    DeviceMemoryPlacement(DeviceMemoryKind kind, bool host, std::uint64_t bytes) : kind(kind), host(host), bytes(bytes), counted(true) {
+        DeviceMemoryPlacements::Add(kind, host, bytes);
+    }
+    DeviceMemoryPlacement(const DeviceMemoryPlacement&) = delete;
+    DeviceMemoryPlacement& operator=(const DeviceMemoryPlacement&) = delete;
+    DeviceMemoryPlacement(DeviceMemoryPlacement&& other) noexcept : kind(other.kind), host(other.host), bytes(other.bytes), counted(std::exchange(other.counted, false)) {}
+    DeviceMemoryPlacement& operator=(DeviceMemoryPlacement&& other) noexcept {
+        if (this != &other) {
+            Reset();
+            kind = other.kind;
+            host = other.host;
+            bytes = other.bytes;
+            counted = std::exchange(other.counted, false);
+        }
+        return *this;
+    }
+    ~DeviceMemoryPlacement() { Reset(); }
+    void Reset() noexcept {
+        if (counted) DeviceMemoryPlacements::Remove(kind, host, bytes);
+        counted = false;
+    }
+
+private:
+    DeviceMemoryKind kind = DeviceMemoryKind::Buffer;
+    bool host = false;
+    std::uint64_t bytes = 0;
+    bool counted = false;
 };
 
 // Device entry points resolved once per device (VulkanDevice's State fills it after setup): the
@@ -219,6 +295,7 @@ struct Context {
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
+    bool pipelineCreationFeedback = false;
     bool graphicsPipelineLibrary = false;
     bool pipelineLinkTimeOptimization = true;
     std::uint32_t srgbDecodeFormats = 0;
@@ -228,6 +305,9 @@ struct Context {
     VkSampleCountFlags sampleLocationSampleCounts = 0;
     VkSampleCountFlags sampleLocationGridSampleCounts = 0;
     PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
+    void* pipelineBuildOwner = nullptr;
+    void (*pipelineBuildRunner)(void* owner, std::size_t reservedBytes, const std::function<void()>& build) = nullptr;
+    std::shared_ptr<CompileTicket> (*pipelineBuildSubmitter)(void* owner, std::size_t reservedBytes, std::function<void()> build) = nullptr;
 
     PipelineCacheSynchronization::PipelineUseLock LockPipelineCacheForUse() const {
         return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
@@ -284,6 +364,10 @@ struct Context {
         return type;
     }
 
+    bool HostPlaced(std::uint32_t type) const {
+        return (memory.memoryHeaps[memory.memoryTypes[type].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0;
+    }
+
     std::uint32_t DeviceMemoryType(std::uint32_t mask, VkDeviceSize bytes, const char* what) const {
         const auto type = MemoryType(mask, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (memoryProperties2 == nullptr || physical == VK_NULL_HANDLE) return type;
@@ -300,7 +384,12 @@ struct Context {
             static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
             const auto count = placements.fetch_add(1) + 1;
             const auto total = placedBytes.fetch_add(bytes) + bytes;
-            if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] %s: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory type %u; %llu such allocations, %llu MiB\n", what, heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), i, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
+            if (count <= 5 || (count & (count - 1)) == 0) {
+                const auto buffers = DeviceMemoryPlacements::Live(DeviceMemoryKind::Buffer, true);
+                const auto textures = DeviceMemoryPlacements::Live(DeviceMemoryKind::Texture, true);
+                const auto storage = DeviceMemoryPlacements::Live(DeviceMemoryKind::StorageTexture, true);
+                std::fprintf(stderr, "[gpu] %s: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory type %u; %llu placements of any kind since start-up, %llu MiB including freed ones; in host memory now: device buffers %llu MiB in %llu, textures %llu MiB in %llu, storage textures %llu MiB in %llu\n", what, heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), i, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u), static_cast<unsigned long long>(buffers.bytes >> 20u), static_cast<unsigned long long>(buffers.allocations), static_cast<unsigned long long>(textures.bytes >> 20u), static_cast<unsigned long long>(textures.allocations), static_cast<unsigned long long>(storage.bytes >> 20u), static_cast<unsigned long long>(storage.allocations));
+            }
             return i;
         }
         return type;

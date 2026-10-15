@@ -33,10 +33,13 @@ struct PipelineLibraryKeys {
 std::span<const VkDynamicState> PipelineLibraryDynamicStates();
 
 struct OptimizedPipeline {
+    enum State : int { Pending, Ready, Failed, Released };
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkDestroyPipeline destroy = nullptr;
     std::atomic<VkPipeline> handle{VK_NULL_HANDLE};
     std::atomic<bool> released{false};
+    std::atomic<int> state{Pending};
+    std::atomic<VkResult> failure{VK_SUCCESS};
     void Release() noexcept;
 };
 
@@ -54,6 +57,8 @@ struct PipelineLibraryCounters {
     std::array<std::uint64_t, 4> built{};
     std::uint64_t linked = 0;
     std::uint64_t optimized = 0;
+    std::uint64_t optimizationFailed = 0;
+    std::array<std::uint64_t, 4> joinedParts{};
     std::array<std::uint64_t, 4> shaders{};
     std::array<std::uint64_t, 4> rebuiltForState{};
     std::array<std::uint64_t, 4> rebuiltForLayout{};

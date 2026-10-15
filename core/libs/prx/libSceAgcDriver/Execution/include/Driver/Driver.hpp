@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchRelocation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareWorkers.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CacheSizing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
@@ -16,6 +18,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
+#include "prx/libSceAgcDriver/Execution/include/QueueScheduler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -38,6 +42,7 @@
 #include <span>
 #include <stop_token>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -52,6 +57,8 @@ namespace AgcDriver::DriverDetail {
 class Driver {
 public:
     static Driver& Get();
+    void ParkPacket(ParkedOp op);
+    QueueScheduler& Scheduler() { return queueScheduler; }
     static std::uint64_t GpuMapImportThreads();
     ~Driver();
     void Shutdown();
@@ -158,6 +165,10 @@ private:
     static bool verifyIncrementalBindings();
     static ShaderMemory::IncrementalState& incrementalBinding(const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::span<const std::uint32_t> userData);
     void noteIncrementalStage(const ShaderRecompiler::SrtTapeInstance& instance, bool verified, bool stale);
+    static bool incrementalPlans();
+    static bool verifyIncrementalPlans();
+    static ShaderMemory::PlanInstance& resourcePlanInstance(const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::uint32_t pushOffset, std::span<const std::uint32_t> userData);
+    void notePlanInstance(const ShaderMemory::PlanCapture& capture, bool verified, bool stale);
     static std::uint64_t drawDecodeKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
     void reportBindingPlan();
     static bool verifyDrawEntries();
@@ -219,27 +230,73 @@ private:
     };
     static DrawRecordState& drawRecordState();
     static bool recordThread();
+    static std::uint32_t prepareAhead();
     static void runDrawRecords();
     bool deferDrawRecords(std::uint32_t queue) const;
     static bool recordDispatches();
     bool deferDispatchRecords(std::uint32_t queue) const;
     void deferRecord(const std::function<void()>& prepare);
+    void deferAhead(const std::function<void()>& prepare);
     static std::string recordIdentity(const Submission& submission, const char* what, std::uint64_t program);
-    bool settleDrawRecords(std::span<const Graphics::GuestMemorySnapshot> reads);
+    bool settleDrawRecords(std::span<const Graphics::GuestMemorySnapshot> reads, bool drain = false);
+    bool settleAhead(std::span<const Graphics::GuestMemorySnapshot> reads, bool drain);
     void finishDrawRecords();
     void waitDrawRecords();
     void postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::string identity, std::function<void(DrawRecordResult&)> record);
     static void noteDrawRecordRecipe(DrawRecordResult& result, std::shared_ptr<const DrawRecipe> built, std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void reportDrawRecords();
+    struct DrawInputs;
+    struct DispatchInputs;
+    struct FrozenDraw;
+    struct PreparedFrozenDraw;
+    struct FrozenSink {
+        bool inOrder = false;
+        FrozenFallback refused = FrozenFallback::None;
+        std::shared_ptr<DrawInputs> inputs;
+        std::shared_ptr<DispatchInputs> dispatchInputs;
+        std::vector<PreparedRead> reads;
+        std::uint64_t program = 0;
+        bool Refuse(FrozenFallback reason) {
+            if (inOrder) return false;
+            refused = reason;
+            return true;
+        }
+    };
+    using FrozenPipeline = OrderedPrepare<std::shared_ptr<FrozenDraw>, std::shared_ptr<PreparedFrozenDraw>>;
+    static std::uint32_t prepareWorkers();
+    static bool parallelResolve();
+    static std::uint32_t frozenBound();
+    static FrozenPipeline& frozenDraws();
+    static FrozenSink*& frozenSink();
+    static bool& frozenProducer();
+    static void startDrawRecords();
+    static void noteRecordHistory(std::uint64_t ticket, const std::shared_ptr<DrawRecordResult>& result);
+    static void recordDrawInputs(const DrawInputs& inputs, DrawRecordResult& result, const std::shared_ptr<VulkanDevice>& localDevice);
+    void noteDrawInputWriters(const DrawInputs& inputs, std::uint32_t queue);
+    FrozenFallback frozenFallback(std::span<const std::uint32_t> packet);
+    DrawVerdict freezeDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
+    static bool prepareDispatches();
+    static bool verifyPrepareDispatches();
+    static FrozenFallback dispatchHleFallback(const Registers& shader, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::uint64_t indirectArguments);
+    FrozenFallback dispatchFrozenFallback(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments);
+    void freezeDispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments, std::chrono::steady_clock::time_point begin);
+    static void recordDispatchInputs(DispatchInputs& inputs, const std::shared_ptr<VulkanDevice>& localDevice);
+    void noteDispatchInputWriters(const DispatchInputs& inputs, std::uint32_t queue);
+    static bool staleDispatchInputs(const DispatchInputs& adopted, const DispatchInputs& fresh, const std::function<bool(std::uint64_t, std::size_t)>& touchedEarlier);
+    std::shared_ptr<PreparedFrozenDraw> prepareFrozen(const FrozenDraw& frozen, bool inOrder);
+    void emitFrozen(const std::shared_ptr<FrozenDraw>& frozen, std::optional<std::shared_ptr<PreparedFrozenDraw>>& prepared, std::exception_ptr error);
+    void drainFrozen(bool records);
+    void mergeFrozenRecords();
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
     static PendingDrawPhases& pendingDrawPhases();
     void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures);
     void noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
-    bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer = nullptr);
+    std::optional<StoredMatch> storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp);
     static void traceLabel(std::span<const std::uint32_t> packet, std::uint32_t queue);
     std::string describeWait(std::span<const std::uint32_t> packet);
+    static std::string describeObservedChain(std::uint64_t target);
     static std::array<WriteRecord, 16384>& writeHistory();
     static std::size_t& writeCursor();
     static void dumpPackets(std::span<const std::uint32_t> commands, const std::uint32_t* guest = nullptr);
@@ -312,9 +369,22 @@ private:
         std::array<std::uint32_t, 8> words;
         std::size_t count;
         std::uint64_t received;
+        WaitObservation observation;
     };
     static std::vector<PendingWait>& pendingWaits();
-    static void notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received);
+    static void notePendingWait(std::span<const std::uint32_t> packet, const WaitObservation& observation);
+    static std::uint64_t& waitFloor();
+    static WaitFloorMode waitFloorMode();
+    static bool verifyWaitObservations();
+    static LabelTimelineMode labelTimelineMode();
+    static std::chrono::microseconds batchAgeBound();
+    void runBatchAge(std::chrono::microseconds bound) noexcept;
+    void dischargeWait(WaitObservation& observation, std::span<const std::uint32_t> packet);
+    void noteWaitChain(const WaitObservation& observation, std::span<const std::uint32_t> packet);
+    void noteRelease(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
+    void importRelease(const WaitObservation& observation);
+    static WaitObservation& lastObservation();
+    static void reportWaitChain(std::uint32_t queue);
     void landPendingWaits(std::uint32_t queue);
     struct ResolvedDispatch {
         std::uint64_t address = 0, key = 0, indirectArguments = 0;
@@ -391,6 +461,12 @@ private:
     std::atomic<std::uint64_t> packetsDone{0};
 
     std::atomic<std::uint64_t> eventSerial{0};
+    QueueScheduler queueScheduler{QueueScheduler::ConfiguredMode(), QueueScheduler::ConfiguredVerify()};
+    std::thread batchAgeThread;
+    std::mutex batchAgeMutex;
+    std::condition_variable batchAgeChanged;
+    std::atomic<std::uint64_t> batchAgeSubmits{0};
+    std::atomic<std::uint64_t> batchAgeChecks{0};
     alignas(64) std::shared_ptr<ShaderRegistry> shaders = std::make_shared<ShaderRegistry>();
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>> dispatchCache;
@@ -435,6 +511,9 @@ private:
     std::vector<std::uint64_t> drawStageDonorKeys;
     std::mutex drawCacheMutex;
     std::shared_ptr<DrawRecordResult> drawRecordResult;
+    PrepareAheadWindow<DrawRecordResult> drawRecordWindow;
+    std::mutex frozenPostedMutex;
+    std::vector<std::shared_ptr<DrawRecordResult>> frozenPosted;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     std::optional<DrawKeySightings> drawKeySightings;
     std::optional<DrawKeySightings> drawShapeSightings;
@@ -464,6 +543,8 @@ private:
 
     std::mutex labelStoresMutex;
     std::unordered_map<std::uint64_t, std::array<LabelStore, LabelStoreHistory>> labelStores;
+    std::mutex releasesMutex;
+    std::array<Coherence::Release, 4096> releases;
 
     std::vector<std::shared_ptr<VulkanDevice>> replacedDevices;
     std::stop_token shutdownToken = LibcShutdownToken_nid_postfix();

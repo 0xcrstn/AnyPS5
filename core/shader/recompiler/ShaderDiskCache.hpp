@@ -16,7 +16,7 @@
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-inline constexpr std::uint32_t FormatVersion = 36;
+inline constexpr std::uint32_t FormatVersion = 37;
 
 enum class LoadStatus {
     Loaded,
@@ -56,6 +56,9 @@ struct Counters {
 };
 
 [[nodiscard]] std::uint64_t SourceVersion();
+[[nodiscard]] std::uint64_t PlanSourceVersion();
+[[nodiscard]] bool LayeredCache();
+[[nodiscard]] bool SamePlan(const IrResourcePlan& reference, const IrResourcePlan& candidate);
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key);
 

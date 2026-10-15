@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include "CacheKey.hpp"
+#include "CompileTrace.hpp"
+#include "SpirvIntern.hpp"
 #include "CompiledVariant.hpp"
 #include "VertexInputSpecialization.hpp"
 #include "FragmentOutputSpecialization.hpp"
@@ -48,6 +50,7 @@
 #include "SpirvBackend/include/SpirvBackend/SpirvEmitter.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
+#include "SpirvBackend/SpirvModuleShape.hpp"
 #endif
 #include "SpirvBackend/SpirvMemory/SpirvInputOutput.hpp"
 #include "Translation/include/Translation/InstructionTranslator.hpp"
@@ -132,6 +135,23 @@ std::uint32_t DeviceMemoryLdsBytes(const RecompileRequest& request) {
 
 std::atomic<std::uint64_t> frontEndBuilds{0};
 
+std::uint64_t estimateProgramBytes(const IrProgram& program);
+
+void TraceRequest(ShaderCompileTrace::Event& event, const RecompileRequest& request) {
+    if (!event.Active()) return;
+    std::vector<std::uint64_t> interfaceKey;
+    RecompileCacheKey::BuildInterface(request, interfaceKey);
+    const std::array<std::uint32_t, 4> layout{request.layout.descriptorSet, request.layout.firstBinding, request.layout.pushConstantOffsetBytes, request.layout.pushConstantSizeBytes};
+    event.Hex("address", request.shader.codeAddress)
+        .Number("stage", static_cast<std::uint64_t>(request.shader.stage))
+        .Number("code_dwords", request.shader.code.size())
+        .Hex("code_hash", ShaderCompileTrace::HashOf(std::span<const std::uint32_t>(request.shader.code.data(), request.shader.code.size())))
+        .Hex("context_hash", RecompileCacheKey::ContextHash(request))
+        .Hex("interface_key", ShaderCompileTrace::HashOf(std::span<const std::uint64_t>(interfaceKey)))
+        .Hex("layout_key", ShaderCompileTrace::HashOf(std::span<const std::uint32_t>(layout)))
+        .Number("callees", request.context.linkedCallFallbacks.size());
+}
+
 }
 
 struct PreparedControlFlow {
@@ -196,7 +216,15 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     ++context.resourcePrograms;
     context.interfaceSource.reset();
     context.interfaceProgram.reset();
-    const auto frontend = context.AcquireFrontend(request);
+    ShaderCompileTrace::Event traced("frontend");
+    TraceRequest(traced, request);
+    const auto frontend = [&] {
+        ShaderCompileTrace::Event decodeEvent("frontend.decode_cfg");
+        const auto previous = context.frontend;
+        auto acquired = context.AcquireFrontend(request);
+        decodeEvent.Flag("reused", acquired == previous).Number("instructions", acquired->decoded.instructions.size());
+        return acquired;
+    }();
     const auto stageKind = toShaderStageKind(request.shader.stage);
     const auto inputInfo = RequestInputInfo(request);
     const auto& decoded = frontend->decoded;
@@ -223,7 +251,12 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         embeddedFetch = EmbeddedVertexFetchAnalyzer{}.Analyze(decoded, inputInfo.vertex->fetchAttribReg, inputInfo.vertex->fetchBufferReg, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), request.context.waveSize);
         translateOptions.embeddedFetch = &embeddedFetch;
     }
-    auto program = translator.Translate(decoded, cfg, translateOptions);
+    auto program = [&] {
+        ShaderCompileTrace::Event translateEvent("frontend.translate");
+        auto translated = translator.Translate(decoded, cfg, translateOptions);
+        translateEvent.Number("ir_bytes", estimateProgramBytes(translated));
+        return translated;
+    }();
     // Debug aid: APS5_DUMP_IR=<hex code address> (or "all") prints the program after each front-end pass.
     const auto dumpIr = [&](const char* pass) {
         static const std::string list = [] { const char* text = std::getenv("APS5_DUMP_IR"); return text ? std::string(text) : std::string(); }();
@@ -240,6 +273,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     constexpr ReadLaneEliminator readLaneEliminator;
     constexpr MaskedSelectEliminator maskedSelectEliminator;
     const auto simplify = [&] {
+        ShaderCompileTrace::Event simplifyEvent("frontend.simplify");
         dumpIr("translate");
         ssaBuilder.Rewrite(program);
         dumpIr("ssa");
@@ -283,6 +317,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         simplify();
     }
 
+    ShaderCompileTrace::Event lowerEvent("frontend.lower_resources");
     constexpr DenormalFlushEliminator denormalFlushEliminator;
     if (denormalFlushEliminator.Eliminate(program).removedFlushes != 0u) {
         deadCodeEliminator.Eliminate(program);
@@ -303,6 +338,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
+    if (traced.Active()) traced.Number("ir_bytes", estimateProgramBytes(program)).Flag("barycentric_retranslated", program.Metadata().barycentricEmulation);
 
     return program;
 }
@@ -486,6 +522,11 @@ public:
     }
 };
 
+bool VerifyShaderCache() {
+    static const bool verify = std::getenv("APS5_VERIFY_SHADER_CACHE") != nullptr;
+    return verify;
+}
+
 struct ResourceProgram {
     explicit ResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true) : program(std::make_unique<IrProgram>(PrepareResourceProgram(request, preparation))) {
         const auto clearRegisterState = [](const auto& storage) {
@@ -587,6 +628,12 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                 IrResourcePlan loaded;
                 if (ShaderDiskCache::LoadPlan(planKey, loaded)) {
                     loaded.shaderHash = request.shader.codeAddress;
+                    if (VerifyShaderCache()) {
+                        ShaderCompileTrace::Event verifyEvent("verify.cached_plan");
+                        TraceRequest(verifyEvent, request);
+                        const ResourceProgram fresh(request, preparation, reclaim);
+                        if (!ShaderDiskCache::SamePlan(*fresh.plan, loaded)) throw std::runtime_error("APS5_VERIFY_SHADER_CACHE: the cached resource plan of shader 0x" + std::to_string(request.shader.codeAddress) + " differs from a fresh one (plan source version " + std::to_string(ShaderDiskCache::PlanSourceVersion()) + ")");
+                    }
                     source->plan = std::make_shared<const IrResourcePlan>(std::move(loaded));
                     source->planBytes = countPlan(*source->plan);
                     source->planStored = true;
@@ -666,6 +713,39 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
     shaderInfoCollector.Collect(program, inputInfo);
 }
 
+bool VerifyShaderEmission() {
+    static const bool verify = std::getenv("APS5_VERIFY_SHADER_EMISSION") != nullptr;
+    return verify;
+}
+
+void TraceShape(ShaderCompileTrace::Event& event, std::span<const std::uint32_t> words) {
+    const auto shape = DescribeSpirvShape(words);
+    event.Number("functions", shape.functions).Number("entry_words", shape.entryFunctionWords).Number("helper_words", shape.helperFunctionWords).Number("largest_helper_words", shape.largestHelperWords).Number("switches", shape.switches).Number("switch_targets", shape.switchTargets).Number("largest_switch_targets", shape.largestSwitchTargets).Number("calls", shape.functionCalls);
+}
+
+void VerifyEmission(const RecompileRequest& request, const IrProgram& program, const ShaderStageInputInfo& inputInfo, const CompiledBindingLayout& bindings, SpirvTargetOptions options, std::span<const std::uint32_t> produced) {
+    ShaderCompileTrace::Event event("verify.emission");
+    TraceRequest(event, request);
+    constexpr SpirvEmitter spirvEmitter;
+    const auto again = spirvEmitter.Emit(program, inputInfo, bindings, options);
+    if (!std::ranges::equal(again, produced)) throw std::runtime_error("APS5_VERIFY_SHADER_EMISSION: emitting shader 0x" + std::to_string(request.shader.codeAddress) + " again from the same program produced different SPIR-V");
+    options.sharedFloatFunctions = true;
+    const auto shared = spirvEmitter.Emit(program, inputInfo, bindings, options);
+    options.sharedFloatFunctions = false;
+    const auto inPlace = spirvEmitter.Emit(program, inputInfo, bindings, options);
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    static_cast<void>(ValidateAndOptimizeSpirv(shared, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, false));
+    static_cast<void>(ValidateAndOptimizeSpirv(inPlace, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, false));
+#endif
+    if (event.Active()) {
+        event.Number("shared_words", shared.size()).Number("in_place_words", inPlace.size());
+        const auto sharedShape = DescribeSpirvShape(shared);
+        const auto inPlaceShape = DescribeSpirvShape(inPlace);
+        event.Number("shared_functions", sharedShape.functions).Number("in_place_functions", inPlaceShape.functions).Number("shared_helper_words", sharedShape.helperFunctionWords).Number("in_place_helper_words", inPlaceShape.helperFunctionWords);
+    }
+    if (const auto difference = CompareSpirvInterfaces(inPlace, shared)) throw std::runtime_error("APS5_VERIFY_SHADER_EMISSION: shared float functions change the interface of shader 0x" + std::to_string(request.shader.codeAddress) + ": " + *difference);
+}
+
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program, bool consume = false) {
     InFlightIr inFlight(estimateProgramBytes(program));
     PrepareRewriteVerification(program);
@@ -693,14 +773,25 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program,
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
     result.variantId = nextVariantId();
-    result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+    const auto emit = [&](const char* phase) {
+        ShaderCompileTrace::Event emitEvent(phase);
+        TraceRequest(emitEvent, request);
+        auto words = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+        if (emitEvent.Active()) {
+            emitEvent.Flag("registration", targetOptions.registrationModules).Number("ir_bytes", estimateProgramBytes(program)).Number("spirv_words", words.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(std::span<const std::uint32_t>(words.data(), words.size())));
+            TraceShape(emitEvent, words);
+        }
+        return words;
+    };
+    result.spirv = emit("emit.spirv");
     if (registration && result.spirv.size() > request.target.registrationWordLimit) {
         registration = false;
         program.Metadata().bindingLayoutComplete = false;
         bindings = bindingAllocator.Allocate(program, request.layout, false, stencilReplay);
         targetOptions.registrationModules = false;
-        result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+        result.spirv = emit("emit.spirv_unregistered");
     }
+    if (VerifyShaderEmission()) VerifyEmission(request, program, inputInfo, bindings, targetOptions, result.spirv.Words());
     result.registrationModule = registration;
     result.stencilReplaySafe = (request.shader.stage == ShaderStage::Vertex || stencilReplay) && StencilReplaySafe(program);
     if (stencilReplay) {
@@ -753,7 +844,12 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program,
     const bool embedded = !result.vertexInputs.empty() && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded;
     if (embedded) PrepareVertexInputSpecialization(result);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded);
+    {
+        ShaderCompileTrace::Event optimizeEvent("emit.validate_optimize");
+        const auto wordsIn = result.spirv.size();
+        result.spirv = InternSpirv(ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded));
+        if (optimizeEvent.Active()) optimizeEvent.Hex("address", request.shader.codeAddress).Flag("optimized", !embedded).Number("spirv_words_in", wordsIn).Number("spirv_words", result.spirv.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(result.spirv.Words()));
+    }
     if (embedded) {
         std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> classes{};
         for (std::uint32_t kind = 1u; kind < 3u; ++kind) {
@@ -769,7 +865,11 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program,
 
 CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, std::exception_ptr* emissionFailure = nullptr) {
     return recordEmissionFailure(emissionFailure, [&] {
-        prepareInterface(request, program);
+        {
+            ShaderCompileTrace::Event interfaceEvent("emit.interface");
+            TraceRequest(interfaceEvent, request);
+            prepareInterface(request, program);
+        }
         auto variant = emitVariant(request, program, true);
         return variant;
     });
@@ -783,6 +883,12 @@ struct SpecializedModule {
 };
 
 std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    ShaderCompileTrace::Event specializeEvent("specialize");
+    if (specializeEvent.Active()) {
+        std::vector<std::uint32_t> vector;
+        for (const auto& constant : constants) vector.insert(vector.end(), {constant.id, constant.value});
+        specializeEvent.Hex("variant", artifact.variantId).Number("spirv_words_in", artifact.spirv.size()).Hex("spirv_in_hash", ShaderCompileTrace::HashOf(artifact.spirv.Words())).Number("constants", constants.size()).Hex("specialization_hash", ShaderCompileTrace::HashOf(std::span<const std::uint32_t>(vector))).Hex("vertex_classes_hash", ShaderCompileTrace::HashOf(classes));
+    }
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
     for (const auto& constant : constants) {
@@ -877,8 +983,12 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         }
         cursor += count;
     }
-    module->spirv = std::move(materialized);
+    module->spirv = InternSpirv(std::move(materialized));
     module->specializationId = constants.empty() ? 0u : nextVariantId();
+    if (specializeEvent.Active()) {
+        const auto interned = SpirvInternTotals();
+        specializeEvent.Number("spirv_words", module->spirv.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(module->spirv.Words())).Number("intern_lookups", interned.lookups).Number("intern_shared", interned.shared).Number("intern_shared_bytes", interned.sharedBytes);
+    }
     retainedCounters().specializedModules.fetch_add(1, std::memory_order_relaxed);
     retainedCounters().specializedSpirvBytes.fetch_add(module->spirv.Words().size() * sizeof(std::uint32_t), std::memory_order_relaxed);
     return module;

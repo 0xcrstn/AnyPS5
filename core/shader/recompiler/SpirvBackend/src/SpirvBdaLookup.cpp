@@ -430,7 +430,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto failed = Binary(state, spv::OpINotEqual, boolean, reason, BdaConstant(state, 0u));
     if (relative == BdaTable::Relative::Verify) {
         const auto mismatch = Binary(state, spv::OpLogicalAnd, boolean, cached.hit, Binary(state, spv::OpLogicalOr, boolean, failed, Binary(state, spv::OpINotEqual, boolean, result, cached.result)));
-        ReturnBdaFailureIf(state, mismatch, address, bytes, instruction, BdaAbi::FaultReason::RelativeMismatch);
+        ReturnBdaFailureIf(state, mismatch, address, bytes, instruction, BdaTable::RelativeMismatchReason());
     }
     if (recordFaults) {
         const auto failedLabel = state.module.AllocateId();

@@ -25,6 +25,13 @@ class StorageTexture;
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
 struct PreparedDispatch;
+
+struct PreparedCpuCopy {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::vector<std::byte> bytes;
+};
+
 struct ComputePipelineObjects;
 // The unlocked pre-checks of a recipe hit (see VulkanDevice::PrepareRecipe); opaque to callers.
 struct RecipeHit;
@@ -60,6 +67,7 @@ public:
     void WaitIdle();
     void PrepareForReplacement();
     static bool PipelineCompileAheadEnabled();
+    static bool CompileParkingEnabled();
     void BuildComputePipelineAhead(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress);
     struct PipelineAheadStatistics {
         std::uint64_t accepted, built, present, failed, refused, duplicate, demanded, cancelled, useful, joined;
@@ -252,6 +260,8 @@ public:
     // APS5_PROFILE_DRAW: the parts of a PrepareDispatch in milliseconds, in the order key, find,
     // precollect, presync, stage A (the driver's 'prepare:' rows).
     static std::span<const double, 5> PreparePhaseMs(const PreparedDispatch& prepared);
+    static std::span<const std::uint32_t> PreparedKey(const PreparedDispatch& prepared);
+    static std::vector<PreparedCpuCopy> PreparedCpuCopies(const PreparedDispatch& prepared, bool& unbounded);
     // `recipe`, when given, receives the Recipe a successful call built for its dispatch-cache
     // variant (design_cpu_final M4): only when the resource cache served or took the object
     // (reusable, cacheable) and recipes are on (APS5_NO_DISPATCH_RECIPE=1 builds none); else null.
@@ -290,6 +300,14 @@ public:
     // Whether compute templates refresh their data buffers with a hit's words instead of keying
     // them (APS5_NO_TEMPLATE_DATA_REFRESH unset); the driver's data-only hits require it.
     static bool TemplateDataRefresh();
+    static bool MovedDispatchTemplates();
+    struct MovedTemplateStatistics {
+        std::uint64_t hits = 0;
+        std::uint64_t buffers = 0;
+        std::uint64_t refused = 0;
+        std::uint64_t verified = 0;
+    };
+    static MovedTemplateStatistics MovedTemplateCounters();
     // The driver's recipe events for the [recipe] line: a restart after Rebuild, an attach; the
     // rows are the dispatch, indirect and draw kinds. NoteDrawRecipeMiss files a draw hit's
     // pre-check miss made in the driver (no recipe for the matched variants, or a device mismatch).
@@ -301,7 +319,8 @@ public:
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
-    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const Graphics::ResolvedDraw* resolved = nullptr);
+    std::shared_ptr<const Graphics::ResolvedDraw> ResolveDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders);
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
@@ -319,6 +338,9 @@ public:
     void EnqueueDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
     bool PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders);
     void PrewarmDrawPipeline(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders);
+    std::shared_ptr<CompileTicket> TryDrawPipeline(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders);
+    bool ArmCompileWait(const std::shared_ptr<CompileTicket>& ticket, std::function<void()> wake);
+    std::shared_ptr<CompileTicket> TryComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress);
 
 private:
     VulkanDevice(const PresentationWindow* window, bool compileOnly);
