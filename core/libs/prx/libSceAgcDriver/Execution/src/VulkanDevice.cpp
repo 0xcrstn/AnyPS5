@@ -1115,7 +1115,9 @@ void MaterializeNativeAccess(Coherence::Interval range) {
 void WaitForGuestReaders(Coherence::Interval range) {
     if (GuestMemory::GpuMutex().HeldByThisThread()) Coherence::NoteLockedFault(range);
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    if (auto* recorder = Graphics::Recorder::Active()) recorder->Sync();
+    for (std::uint32_t queue = 0; queue < Graphics::Recorder::PhysicalQueues; ++queue) {
+        if (auto* recorder = Graphics::Recorder::ForPhysicalQueue(queue)) recorder->Sync();
+    }
 }
 
 void InstallCoherence() {
@@ -1711,6 +1713,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         APS5_LOG_OUT("Vulkan queue families: %s; graphics family %u, sparse family %d", DescribeQueueFamilies(topologyFamilies).c_str(), family, state->sparseFamily == VK_QUEUE_FAMILY_IGNORED ? -1 : static_cast<int>(state->sparseFamily));
         const auto topology = ParseQueueTopology(std::getenv("APS5_QUEUE_TOPOLOGY"));
         const auto plan = PlanQueueTopology(topology, topologyFamilies, family, state->sparseFamily);
+        for (std::uint32_t guest = 0; guest < Graphics::Recorder::GuestQueues; ++guest) Graphics::Recorder::MapGuestQueue(guest, 0);
         if (plan.topology != QueueTopology::Serial) {
             throw std::runtime_error(std::string("APS5_QUEUE_TOPOLOGY=") + QueueTopologyName(plan.topology) + ": compute queue family " + std::to_string(plan.computeFamily) + " index " + std::to_string(plan.computeIndex) + " is available, but running guest compute queues on it needs a recorder per physical queue, which is not implemented");
         }
@@ -2245,7 +2248,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         checkDrained(true);
         return 4;
     }
-    auto& recorder = *state->recorder;
+    auto& recorder = RecorderFor(queue);
     // Batches that already finished are retired before the checks: their completions ran, so they
     // neither keep the recorder busy nor force this label behind a completion. Only for the
     // graphics worker: a reap runs completions (copied write-backs, whose guest stores can re-enter
@@ -2327,13 +2330,21 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
 
 bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirst) {
     if (!state->recorder) return false;
-    if (reapFirst && OpportunisticReap()) state->recorder->Reap();
-    return state->recorder->AfterRecordedWork(std::move(action));
+    auto& recorder = RecorderFor(GuestMemory::GpuLockThreadTag());
+    if (reapFirst && OpportunisticReap()) recorder.Reap();
+    return recorder.AfterRecordedWork(std::move(action));
+}
+
+Graphics::Recorder& VulkanDevice::RecorderFor(std::uint32_t guestQueue) const {
+    require(state->recorder != nullptr, "no command recorder exists");
+    const auto physical = Graphics::Recorder::PhysicalQueueOf(guestQueue);
+    if (physical != 0) throw std::runtime_error("guest queue " + std::to_string(guestQueue) + " maps to physical queue " + std::to_string(physical) + ", which has no recorder: recorders per physical queue are not implemented");
+    return *state->recorder;
 }
 
 bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     if (!state->recorder) return false;
-    auto& recorder = *state->recorder;
+    auto& recorder = RecorderFor(GuestMemory::GpuLockThreadTag());
     constexpr std::size_t bytes = Pm4::SampleDumpBytes;
     if (OpportunisticReap()) recorder.Reap();
     if (state->CopiedWriterOverlaps(address, bytes) || (Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes))) return false;
@@ -2352,7 +2363,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
 
 bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
     if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
-    auto& recorder = *state->recorder;
+    auto& recorder = RecorderFor(GuestMemory::GpuLockThreadTag());
     // Finished batches are retired first (one fence status check, as WriteLabelOnGpu does): their
     // completion labels landed and their copied writers are delisted, so a batch the idle GPU already
     // finished does not force a wait below. Before the import lookup: a completion may refresh the
@@ -2596,7 +2607,7 @@ VulkanDevice::CopyAliasing VulkanDevice::CopyAliasCounts() {
 VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter) {
     CopyOutcome outcome{2, false, 0, CopyOutcome::None, false, false, 0, 0, 0, 0, false};
     if (!state->recorder || bytes == 0) return outcome;
-    auto& recorder = *state->recorder;
+    auto& recorder = RecorderFor(queue);
     // Finished batches were retired by the caller (Driver.cpp copyBuffer, on the graphics worker
     // only, as WriteLabelOnGpu reaps), so their writes neither refuse the CPU copy nor force a wait.
     static const bool alwaysSync = std::getenv("APS5_COPY_SYNC") != nullptr;

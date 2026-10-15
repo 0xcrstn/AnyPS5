@@ -185,7 +185,9 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                         outcome = "copied on the GPU";
                     } else if (copied.path == 2 && !Graphics::RegisteredReadableCovers(copy->destination, copy->bytes) && !localDevice->StoresPendingOver(copy->destination, copy->bytes)) {
                         Graphics::StorageTexture::FlushPending(copy->source, copy->bytes, nullptr, "buffer copy source", Graphics::PublishScope::Whole);
-                        if (auto* recorder = Graphics::Recorder::Active()) recorder->SyncThrough(copy->source, copy->bytes);
+                        for (std::uint32_t physical = 0; physical < Graphics::Recorder::PhysicalQueues; ++physical) {
+                            if (auto* recorder = Graphics::Recorder::ForPhysicalQueue(physical)) recorder->SyncThrough(copy->source, copy->bytes);
+                        }
                         ++copiesToHostMemory;
                         orderedAlready = true;
                         drained = false;
@@ -285,7 +287,7 @@ void Driver::dumpSampleCounters(std::uint64_t address) {
     {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
-        auto* recorder = Graphics::Recorder::Active();
+        auto* recorder = Graphics::Recorder::ForPhysicalQueue(Graphics::Recorder::PhysicalQueueOf(GuestMemory::GpuLockThreadTag()));
         require(recorder != nullptr, "occlusion counters without the command recorder are not implemented");
         recorder->CountSamples();
         samples = recorder->SamplesTotal();
