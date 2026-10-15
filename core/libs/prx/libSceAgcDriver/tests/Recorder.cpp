@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ChunkedRecording.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/IndexBounds.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -52,6 +53,7 @@
 #endif
 #include <functional>
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <span>
 #include <atomic>
@@ -280,6 +282,7 @@ public:
             VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
             pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
             pool.queueFamilyIndex = family;
+            context.queueFamily = family;
             Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &pool, nullptr, &context.pool), "vkCreateCommandPool");
         } catch (...) {
             release();
@@ -10109,6 +10112,167 @@ bool parallelTargetsTests(const Device& device, Recorder& recorder) {
     });
 }
 
+template<typename THandle>
+THandle chunkHandle(std::uint64_t value) {
+    static_assert(sizeof(THandle) == sizeof(std::uint64_t));
+    return std::bit_cast<THandle>(value);
+}
+
+template<typename TException>
+bool chunkThrows(const std::function<void()>& body, std::string_view text) {
+    try {
+        body();
+    } catch (const TException& error) {
+        return std::string_view(error.what()).find(text) != std::string_view::npos;
+    }
+    return false;
+}
+
+void chunkCommandTests() {
+    Context context{};
+    CommandList list;
+    const CommandSink sink(list, 1);
+    const std::array<VkBuffer, 3> vertexBuffers{chunkHandle<VkBuffer>(0x2000), chunkHandle<VkBuffer>(0x2100), chunkHandle<VkBuffer>(0x2200)};
+    const std::array<VkDeviceSize, 3> vertexOffsets{0, 16, 0x100000000ull};
+    const std::array<std::byte, 13> pushed{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}, std::byte{5}, std::byte{6}, std::byte{7}, std::byte{8}, std::byte{9}, std::byte{10}, std::byte{11}, std::byte{12}, std::byte{13}};
+    sink.BindPipeline(context, VK_PIPELINE_BIND_POINT_GRAPHICS, chunkHandle<VkPipeline>(0x1000));
+    sink.SetViewport(context, VkViewport{1.5f, 64.0f, 64.0f, -64.0f, 0.0f, 1.0f});
+    sink.SetScissor(context, VkRect2D{{-3, 4}, {64, 32}});
+    sink.SetStencilReference(context, VK_STENCIL_FACE_FRONT_BIT, 7);
+    sink.SetStencilCompareMask(context, VK_STENCIL_FACE_BACK_BIT, 0xf0);
+    sink.SetStencilWriteMask(context, VK_STENCIL_FACE_FRONT_AND_BACK, 0x0f);
+    sink.SetStencilOp(context, VK_STENCIL_FACE_FRONT_BIT, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_INCREMENT_AND_WRAP, VK_COMPARE_OP_GREATER);
+    sink.SetCullMode(context, VK_CULL_MODE_BACK_BIT);
+    sink.SetFrontFace(context, VK_FRONT_FACE_CLOCKWISE);
+    sink.SetDepthBias(context, -2.0f, 0.25f, 1.0e-6f);
+    sink.SetDepthBounds(context, 0.125f, 0.875f);
+    sink.SetDepthTestEnable(context, VK_TRUE);
+    sink.SetDepthWriteEnable(context, VK_FALSE);
+    sink.SetDepthCompareOp(context, VK_COMPARE_OP_LESS_OR_EQUAL);
+    sink.SetDepthBoundsTestEnable(context, VK_TRUE);
+    sink.SetStencilTestEnable(context, VK_TRUE);
+    sink.BindDescriptorSet(context, VK_PIPELINE_BIND_POINT_GRAPHICS, chunkHandle<VkPipelineLayout>(0x3000), 1, chunkHandle<VkDescriptorSet>(0x3100));
+    sink.PushConstants(context, chunkHandle<VkPipelineLayout>(0x3000), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 4, static_cast<std::uint32_t>(pushed.size()), pushed.data());
+    sink.BindVertexBuffers(context, 2, vertexBuffers, vertexOffsets);
+    sink.BindIndexBuffer(context, chunkHandle<VkBuffer>(0x2300), 6, VK_INDEX_TYPE_UINT16);
+    sink.Draw(context, 3, 2, 1, 5);
+    sink.DrawIndexed(context, 6, 1, 3, -9, 4);
+    sink.DrawIndirect(context, chunkHandle<VkBuffer>(0x2400), 32, 2, 16);
+    sink.DrawIndexedIndirect(context, chunkHandle<VkBuffer>(0x2400), 64, 1, 20);
+    sink.DrawIndirectCount(context, chunkHandle<VkBuffer>(0x2400), 0, chunkHandle<VkBuffer>(0x2500), 8, 4, 16);
+    sink.DrawIndexedIndirectCount(context, chunkHandle<VkBuffer>(0x2400), 0, chunkHandle<VkBuffer>(0x2500), 12, 4, 20);
+    sink.DrawMeshTasks(context, 9, 1, 1);
+    sink.DrawMeshTasksIndirect(context, chunkHandle<VkBuffer>(0x2600), 0, 1, 12);
+    constexpr std::size_t kinds = static_cast<std::size_t>(ChunkCommand::Count) - 1;
+    CommandList canonical;
+    Require(ReplayCommands(context, VK_NULL_HANDLE, list.Words(), &canonical) == kinds, "the decoder did not read back one command per kind");
+    Require(std::ranges::equal(canonical.Words(), list.Words()), "a command list decoded and encoded again differs from the list encode wrote");
+    Require(sink.Identity() == 1 && CommandSink(VK_NULL_HANDLE).Identity() == 0, "a sink's identity is not its chunk's or its command buffer's");
+    std::vector<std::uint64_t> unknown(list.Words().begin(), list.Words().end());
+    unknown.push_back(std::uint64_t{0x7777} << 32u);
+    Require(chunkThrows<std::runtime_error>([&] { ReplayCommands(context, VK_NULL_HANDLE, unknown, nullptr); }, "unknown command"), "an unknown chunk command was not refused");
+    std::vector<std::uint64_t> truncated(list.Words().begin(), list.Words().end() - 1);
+    Require(chunkThrows<std::runtime_error>([&] { ReplayCommands(context, VK_NULL_HANDLE, truncated, nullptr); }, "runs past the end"), "a truncated chunk command list was not refused");
+    CommandList issued;
+    const CommandSink issuing(issued, 3);
+    const std::array draws{ChunkDraw{0xa0a0, 3, 1, 0x10000}, ChunkDraw{0xb0b0, 6, 2, 0x10000}};
+    std::vector<std::size_t> marks;
+    marks.push_back(issued.Words().size());
+    issuing.BindPipeline(context, VK_PIPELINE_BIND_POINT_GRAPHICS, chunkHandle<VkPipeline>(0x1000));
+    issuing.Draw(context, 3, 1, 0, 0);
+    marks.push_back(issued.Words().size());
+    issuing.BindIndexBuffer(context, chunkHandle<VkBuffer>(0x2300), 0, VK_INDEX_TYPE_UINT32);
+    issuing.DrawIndexed(context, 6, 2, 0, 0, 0);
+    CommandList recorded;
+    std::vector<std::size_t> recordedMarks;
+    for (std::size_t index = 0; index < marks.size(); ++index) {
+        const auto end = index + 1 < marks.size() ? marks[index + 1] : issued.Words().size();
+        recordedMarks.push_back(recorded.Words().size());
+        ReplayCommands(context, VK_NULL_HANDLE, issued.Words().subspan(marks[index], end - marks[index]), &recorded);
+    }
+    CompareChunkCommands(issued.Words(), marks, recorded.Words(), recordedMarks, draws);
+    std::vector<std::uint64_t> changed(recorded.Words().begin(), recorded.Words().end());
+    changed.back() ^= 1u;
+    Require(chunkThrows<std::logic_error>([&] { CompareChunkCommands(issued.Words(), marks, changed, recordedMarks, draws); }, "program 0xb0b0"), "a recorded command that differs from the issued one was not named by its draw");
+    const std::vector<std::size_t> missing{0};
+    const auto firstDraw = std::span<const std::uint64_t>(recorded.Words()).first(recordedMarks[1]);
+    Require(chunkThrows<std::logic_error>([&] { CompareChunkCommands(issued.Words(), marks, firstDraw, missing, draws); }, "program 0xb0b0"), "a draw the worker never recorded was not reported");
+    std::cout << "chunk command tests passed\n";
+}
+
+bool chunkedFailureTests(const Device& device) {
+    if (!device.Graphics()) return false;
+    const auto& context = device.GetContext();
+    ChunkedRecording recording(context);
+    std::shared_ptr<ChunkPool> pool;
+    const auto before = ChunkedRecording::Statistics();
+    auto sink = recording.Begin(context, pool, ChunkInheritance{}, ChunkDraw{0x900d, 3, 1, 0});
+    sink.SetStencilReference(context, VK_STENCIL_FACE_FRONT_AND_BACK, 1);
+    sink = recording.Next(ChunkDraw{0xbad0, 6, 1, 0});
+    sink.List()->Append(static_cast<ChunkCommand>(0x7777), {});
+    const auto failed = recording.Close();
+    Require(failed.commands == VK_NULL_HANDLE && !failed.mismatch, "a failed chunk handed out its command buffer");
+    Require(failed.failure.find("program 0xbad0") != std::string::npos && failed.failure.find("unknown command") != std::string::npos, "a chunk's recording failure did not name the failing draw: " + failed.failure);
+    const auto afterFailure = ChunkedRecording::Statistics();
+    Require(afterFailure.failures - before.failures == 1 && afterFailure.chunks - before.chunks == 1 && afterFailure.draws - before.draws == 2, "the failed chunk was not counted");
+    sink = recording.Begin(context, pool, ChunkInheritance{}, ChunkDraw{0x900d, 3, 1, 0});
+    sink.SetStencilReference(context, VK_STENCIL_FACE_FRONT_AND_BACK, 2);
+    sink.SetStencilWriteMask(context, VK_STENCIL_FACE_FRONT_AND_BACK, 0xff);
+    const auto good = recording.Close();
+    Require(good.failure.empty() && good.commands != VK_NULL_HANDLE, "a chunk recorded after a failed one in the same pool failed: " + good.failure);
+    recording.Recycle(std::move(pool));
+    sink = recording.Begin(context, pool, ChunkInheritance{}, ChunkDraw{0x900d, 3, 1, 0});
+    const auto empty = recording.Close();
+    Require(empty.failure.empty() && empty.commands == VK_NULL_HANDLE, "a chunk without draws handed out a command buffer");
+    recording.Recycle(std::move(pool));
+    std::cout << "chunked recording failure tests passed\n";
+    return true;
+}
+
+bool chunkedRecordingTests(const Device& device, Recorder& recorder) {
+    if (!Recorder::ChunkedRecordingEnabled()) {
+        std::cout << "skipped, the chunked recording test needs APS5_RECORD_THREAD=1 and APS5_CHUNKED_RECORDING=1\n";
+        return false;
+    }
+    return withResolveScene(device, recorder, [&](ResolveScene& scene) {
+        const auto& context = scene.context;
+        constexpr std::uint32_t drawsPerPass = 6;
+        scene.clear();
+        Draw(context, scene.state, scene.triangle, scene.shaders);
+        scene.check("the draw that made the resident target rendered other pixels");
+        const auto before = ChunkedRecording::Statistics();
+        scene.clear();
+        std::uint64_t passSerial = 0;
+        for (std::uint32_t index = 0; index < drawsPerPass; ++index) {
+            Draw(context, scene.state, index % 2 == 0 ? scene.triangle : scene.indexed, scene.shaders);
+            if (index == 0) passSerial = recorder.OpenPassSerial();
+            if (index == drawsPerPass / 2) Recorder::DrainChunks();
+        }
+        Require(passSerial != 0 && recorder.OpenPassSerial() == passSerial, "the scene's draws did not continue one render pass");
+        const auto onePass = ChunkedRecording::Statistics();
+        Require(onePass.chunks - before.chunks == 1 && onePass.draws - before.draws == drawsPerPass, "the draws of one render pass were not recorded into one chunk");
+        scene.check("a chunked pass of draws rendered other pixels than the inline path");
+        scene.clear();
+        const auto batch = recorder.OpenSerial();
+        for (std::uint32_t index = 0; index < drawsPerPass; ++index) Draw(context, scene.state, scene.triangle, scene.shaders);
+        const auto firstPass = recorder.OpenPassSerial();
+        const auto commands = recorder.Commands();
+        Require(firstPass != 0 && recorder.OpenPassSerial() == 0, "recording outside the pass did not end the chunked pass");
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        for (std::uint32_t index = 0; index < drawsPerPass; ++index) Draw(context, scene.state, scene.indexed, scene.shaders);
+        Require(recorder.OpenPassSerial() != 0 && recorder.OpenPassSerial() != firstPass, "the draws after the barrier did not begin a new render pass");
+        Require(recorder.OpenSerial() == batch && recorder.Recording(), "the two passes and the barrier were not recorded into one batch");
+        const auto twoPasses = ChunkedRecording::Statistics();
+        Require(twoPasses.chunks - onePass.chunks == 2 && twoPasses.draws - onePass.draws == 2 * drawsPerPass, "two passes split by a barrier were not recorded into two chunks");
+        scene.check("chunked passes split by a barrier inside one batch rendered other pixels than the inline path");
+        const auto after = ChunkedRecording::Statistics();
+        Require(after.failures == before.failures, "a chunk failed");
+        Require(!ChunkedRecording::Verify() || after.verified - before.verified == after.draws - before.draws, "APS5_VERIFY_CHUNKED_RECORDING compared fewer draws than were chunked");
+        std::cout << "chunked recording tests passed" << (ChunkedRecording::Verify() ? " (verified)" : "") << "\n";
+        return true;
+    });
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {
@@ -10118,6 +10282,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--resolve-stamp-only") {
             resolveStampTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--chunk-commands-only") {
+            chunkCommandTests();
             return 0;
         }
         std::unique_ptr<Device> created;
@@ -10169,6 +10337,9 @@ int main(int argc, char** argv) {
             framebufferMutexTests(device);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--chunked-failure-only") {
+            return chunkedFailureTests(device) ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-only") {
             descriptorPoolTests(device);
             return 0;
@@ -10213,6 +10384,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--parallel-targets-only") {
             return parallelTargetsTests(device, recorder) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--chunked-recording-only") {
+            return chunkedRecordingTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-pending-write-snapshot") {
             pendingWriteSnapshotBenchmark(recorder);

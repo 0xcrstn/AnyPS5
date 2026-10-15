@@ -157,6 +157,7 @@ bool Driver::recordThread() {
             if (frozenProducer() && prepareWorkers() != 0) Get().drainFrozen(false);
             auto& records = drawRecords();
             if (records.Pending() && !RecordQueue::OnWorker()) records.WaitIdle();
+            Graphics::Recorder::DrainChunks();
         }, [] {
             const auto& records = drawRecords();
             if (RecordQueue::OnWorker()) return false;
@@ -665,6 +666,7 @@ void Driver::waitDrawRecords() {
         else records.WaitIdle();
     }
     if (auto& state = drawRecordState(); state.active && !state.settled) state.settled = true;
+    Graphics::Recorder::DrainChunks();
     finishDrawRecords();
 }
 
