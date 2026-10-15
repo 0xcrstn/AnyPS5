@@ -4723,6 +4723,7 @@ int coherenceFaultTests(const Device& device, Recorder& recorder) {
     Coherence::SetFaultsModeForTests(Coherence::Mode::New);
     Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix, &GuestArena::GuestArenaOpenAccessForRead_nid_postfix});
     Coherence::SetMaterializer([](Coherence::Interval range) { StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin)); });
+    GuestArena::GuestArenaSetResolveHostWrites_nid_postfix(true);
     Coherence::ResetForTests();
     TextureDetiler detiler(base);
     auto context = base;
@@ -4828,6 +4829,14 @@ int coherenceFaultTests(const Device& device, Recorder& recorder) {
     gpu.lock();
     Require(loaded == 0x77, "a native load of an unpublished shadow unit read the stale host bytes");
     Require(!AnyShadowedOverlaps(address + unit, unit), "a native load left the shadow unit unpublished");
+
+    paint({0.0f, 1.0f, 1.0f, 1.0f});
+    gpu.unlock();
+    GuestArena::GuestArenaSetProtection_nid_postfix(address, unit, PAGE_READONLY);
+    GuestArena::GuestArenaSetProtection_nid_postfix(address, unit, PAGE_READWRITE);
+    gpu.lock();
+    Require(StorageTexture::FindPending(address, unit) == nullptr, "reprotecting memory under a protected pending image did not store the image first");
+    Require(holds(0, unit, {0, 255, 255, 255}, 0, 0), "reprotecting memory under a protected pending image lost the image's results");
 
     recorder.Sync();
     const auto counters = Coherence::CurrentCounters();
