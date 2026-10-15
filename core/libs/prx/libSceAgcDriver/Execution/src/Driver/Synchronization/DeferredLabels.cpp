@@ -34,7 +34,7 @@ bool LabelBatchSubmit() {
 }
 
 bool ParseLabelRecordJobs(const char* text) {
-    if (text == nullptr) return false;
+    if (text == nullptr) return true;
     const std::string_view value(text);
     if (value == "0" || value == "off") return false;
     if (value == "1" || value == "on") return true;

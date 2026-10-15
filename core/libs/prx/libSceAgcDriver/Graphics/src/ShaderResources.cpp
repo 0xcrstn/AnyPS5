@@ -4843,7 +4843,7 @@ namespace {
 bool SnapshotReadRangesOnly() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_SNAPSHOT_READ_RANGES");
-        if (text == nullptr) return false;
+        if (text == nullptr) return true;
         const std::string_view value(text);
         if (value == "0" || value == "off") return false;
         if (value == "1" || value == "on") return true;

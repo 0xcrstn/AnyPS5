@@ -187,7 +187,7 @@ std::uint32_t CentreRed(const std::string& what) {
 
 void ParsesTheSwitch() {
     using AgcDriver::DriverDetail::ParseLabelRecordJobs;
-    Require(!ParseLabelRecordJobs(nullptr) && !ParseLabelRecordJobs("0") && !ParseLabelRecordJobs("off"), "APS5_LABEL_RECORD_JOBS unset, 0 or off records labels as jobs");
+    Require(ParseLabelRecordJobs(nullptr) && !ParseLabelRecordJobs("0") && !ParseLabelRecordJobs("off"), "APS5_LABEL_RECORD_JOBS unset does not record labels as jobs, or 0 or off does");
     Require(ParseLabelRecordJobs("1") && ParseLabelRecordJobs("on"), "APS5_LABEL_RECORD_JOBS=1 or on does not record labels as jobs");
     bool refused = false;
     try {

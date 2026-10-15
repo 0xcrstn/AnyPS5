@@ -3917,9 +3917,10 @@ void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
         ShaderResources::DrawBindingsStatistics statistics;
         const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, {}, &statistics);
         Require(bindings != nullptr && bindings->snapshots.size() == 1, "an input read over most of its bytes was not snapshotted");
-        const char* rangesOnly = std::getenv("APS5_SNAPSHOT_READ_RANGES");
-        if (rangesOnly != nullptr && std::string(rangesOnly) == "1") {
-            Require(statistics.limited == 1 && statistics.copiedBytes == 12000u && statistics.overHalfReadBytes == 0, "with APS5_SNAPSHOT_READ_RANGES=1 an input read over most of its bytes did not copy only its 12000 read bytes");
+        const char* rangesText = std::getenv("APS5_SNAPSHOT_READ_RANGES");
+        const bool rangesOnly = rangesText == nullptr || (std::string(rangesText) != "0" && std::string(rangesText) != "off");
+        if (rangesOnly) {
+            Require(statistics.limited == 1 && statistics.copiedBytes == 12000u && statistics.overHalfReadBytes == 0, "with APS5_SNAPSHOT_READ_RANGES on an input read over most of its bytes did not copy only its 12000 read bytes");
         } else {
             Require(statistics.limited == 0 && statistics.copiedBytes == elementBytes, "an input read over most of its bytes was not copied whole");
             Require(statistics.wholeCopies[static_cast<std::size_t>(ShaderResources::WholeCopy::OverHalf)] == 1 && statistics.overHalfReadBytes == 12000u, "a whole copy of an input read over most of its bytes did not count its 12000 read bytes under over half");

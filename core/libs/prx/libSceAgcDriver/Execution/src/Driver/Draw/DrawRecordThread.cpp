@@ -981,7 +981,7 @@ void Driver::waitDrawRecordsAt(std::uint32_t opcode) {
 }
 
 CommandProcessorReads ParseCommandProcessorReads(const char* text) {
-    if (text == nullptr) return CommandProcessorReads::Drain;
+    if (text == nullptr) return CommandProcessorReads::Overlap;
     const std::string_view value(text);
     if (value == "0" || value == "off") return CommandProcessorReads::Drain;
     if (value == "1" || value == "on") return CommandProcessorReads::Overlap;
