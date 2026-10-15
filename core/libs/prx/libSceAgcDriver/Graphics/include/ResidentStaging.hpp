@@ -39,6 +39,8 @@ struct ResidentCounters {
     std::array<std::uint64_t, static_cast<std::size_t>(ResidentSite::Count)> publishedBytes{};
     std::uint64_t refusedStoredOver = 0;
     std::uint64_t refusedStoredOverBytes = 0;
+    std::uint64_t storedAround = 0;
+    std::uint64_t storedAroundBytes = 0;
     std::uint64_t verified = 0;
     std::uint64_t verifiedBytes = 0;
     std::uint64_t verifyDiffering = 0;

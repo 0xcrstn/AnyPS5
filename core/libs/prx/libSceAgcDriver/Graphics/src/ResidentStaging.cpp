@@ -17,7 +17,6 @@ namespace AgcDriver::Graphics {
 namespace {
 
 constexpr std::size_t SiteCount = static_cast<std::size_t>(ResidentSite::Count);
-constexpr std::uint64_t StorePageBytes = 4096;
 constexpr const char* SiteNames[SiteCount] = {"hook", "scanout", "in-place", "copy-in", "address-based", "indirect", "copy", "label", "upload", "completion", "eviction", "retire"};
 
 std::uint64_t residentBudget() {
@@ -69,7 +68,7 @@ Registry& Resident() {
 struct Statistics {
     std::atomic<std::uint64_t> noted{0}, notedBytes{0};
     std::array<std::atomic<std::uint64_t>, SiteCount> published{}, publishedBytes{};
-    std::atomic<std::uint64_t> refusedStoredOver{0}, refusedStoredOverBytes{0};
+    std::atomic<std::uint64_t> refusedStoredOver{0}, refusedStoredOverBytes{0}, storedAround{0}, storedAroundBytes{0};
     std::atomic<std::uint64_t> verified{0}, verifiedBytes{0}, verifyDiffering{0}, verifyDifferingBytes{0};
 };
 
@@ -139,6 +138,7 @@ std::uint64_t rangeEnd(std::uint64_t address, std::size_t bytes) {
 std::vector<Piece> unstoredPieces(const std::vector<Piece>& pieces, VkDevice device) {
     std::vector<Piece> kept;
     kept.reserve(pieces.size());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> newer;
     for (const auto& piece : pieces) {
         Require(piece.device == device, "publishing device-resident buffer results through another device is not implemented");
         const auto bytes = static_cast<std::size_t>(piece.end - piece.begin);
@@ -147,28 +147,30 @@ std::vector<Piece> unstoredPieces(const std::vector<Piece>& pieces, VkDevice dev
             kept.push_back(piece);
             continue;
         }
+        if (piece.generation == 0 || !GuestMemory::DriverStoresSince(piece.begin, bytes, piece.generation, newer)) {
+            Stats().refusedStoredOver.fetch_add(1, std::memory_order_relaxed);
+            Stats().refusedStoredOverBytes.fetch_add(bytes, std::memory_order_relaxed);
+            Require(false, "publishing device-resident buffer results after a CPU store or a store of unknown extent changed the range is not implemented");
+        }
         std::uint64_t dropped = 0;
-        bool extend = false;
-        for (auto from = piece.begin; from < piece.end;) {
-            const auto to = std::min(piece.end, (from / StorePageBytes + 1) * StorePageBytes);
-            if (piece.generation == 0 || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), piece.generation)) {
-                dropped += to - from;
-                extend = false;
-            } else if (extend) {
-                kept.back().end = to;
-            } else {
+        auto from = piece.begin;
+        for (const auto& [storedFrom, storedTo] : newer) {
+            if (from < storedFrom) {
                 auto part = piece;
                 part.begin = from;
-                part.end = to;
+                part.end = storedFrom;
                 kept.push_back(std::move(part));
-                extend = true;
             }
-            from = to;
+            dropped += storedTo - storedFrom;
+            from = std::max(from, storedTo);
         }
-        Stats().refusedStoredOver.fetch_add(1, std::memory_order_relaxed);
-        Stats().refusedStoredOverBytes.fetch_add(dropped, std::memory_order_relaxed);
-        static std::atomic<std::uint32_t> reports{0};
-        if (reports.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[gpu] device-resident buffer results 0x%llx+0x%llx were stored over while resident: the newer stores keep 0x%llx bytes, the rest is published\n", static_cast<unsigned long long>(piece.begin), static_cast<unsigned long long>(piece.end - piece.begin), static_cast<unsigned long long>(dropped));
+        if (from < piece.end) {
+            auto part = piece;
+            part.begin = from;
+            kept.push_back(std::move(part));
+        }
+        Stats().storedAround.fetch_add(1, std::memory_order_relaxed);
+        Stats().storedAroundBytes.fetch_add(dropped, std::memory_order_relaxed);
     }
     return kept;
 }
@@ -397,6 +399,8 @@ ResidentCounters DeviceResidentTotals() {
     }
     totals.refusedStoredOver = take(stats.refusedStoredOver);
     totals.refusedStoredOverBytes = take(stats.refusedStoredOverBytes);
+    totals.storedAround = take(stats.storedAround);
+    totals.storedAroundBytes = take(stats.storedAroundBytes);
     totals.verified = take(stats.verified);
     totals.verifiedBytes = take(stats.verifiedBytes);
     totals.verifyDiffering = take(stats.verifyDiffering);
@@ -421,7 +425,7 @@ std::string ResidentReport() {
         sites += text;
     }
     const auto notedBytes = totals.notedBytes - previous.notedBytes;
-    std::snprintf(text, sizeof(text), "; device-resident buffers%s: %llu ranges live (%.1f MiB in %.1f MiB of retained buffers), noted %llu/%.1f, published by site {%s }; refused after another writer %llu/%.1f; verify %llu/%.1f checked, %llu/%.1f differing", LazyStagingVerify() ? " (verify)" : "", static_cast<unsigned long long>(totals.live), mib(totals.liveBytes), mib(totals.liveBufferBytes), static_cast<unsigned long long>(totals.noted - previous.noted), mib(notedBytes), sites.c_str(), static_cast<unsigned long long>(totals.refusedStoredOver - previous.refusedStoredOver), mib(totals.refusedStoredOverBytes - previous.refusedStoredOverBytes), static_cast<unsigned long long>(totals.verified - previous.verified), mib(totals.verifiedBytes - previous.verifiedBytes), static_cast<unsigned long long>(totals.verifyDiffering - previous.verifyDiffering), mib(totals.verifyDifferingBytes - previous.verifyDifferingBytes));
+    std::snprintf(text, sizeof(text), "; device-resident buffers%s: %llu ranges live (%.1f MiB in %.1f MiB of retained buffers), noted %llu/%.1f, published by site {%s }; published around newer driver stores %llu (%.1f MiB kept), refused after another writer %llu/%.1f; verify %llu/%.1f checked, %llu/%.1f differing", LazyStagingVerify() ? " (verify)" : "", static_cast<unsigned long long>(totals.live), mib(totals.liveBytes), mib(totals.liveBufferBytes), static_cast<unsigned long long>(totals.noted - previous.noted), mib(notedBytes), sites.c_str(), static_cast<unsigned long long>(totals.storedAround - previous.storedAround), mib(totals.storedAroundBytes - previous.storedAroundBytes), static_cast<unsigned long long>(totals.refusedStoredOver - previous.refusedStoredOver), mib(totals.refusedStoredOverBytes - previous.refusedStoredOverBytes), static_cast<unsigned long long>(totals.verified - previous.verified), mib(totals.verifiedBytes - previous.verifiedBytes), static_cast<unsigned long long>(totals.verifyDiffering - previous.verifyDiffering), mib(totals.verifyDifferingBytes - previous.verifyDifferingBytes));
     previous = totals;
     return text;
 }

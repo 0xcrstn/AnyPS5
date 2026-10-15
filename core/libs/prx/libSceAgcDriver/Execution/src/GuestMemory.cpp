@@ -1843,6 +1843,55 @@ bool storedOverLocked(WriteTracker& tracker, std::uint64_t address, std::size_t 
 
 }
 
+bool DriverStoresSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    ranges.clear();
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+#ifdef _WIN32
+    if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes)) return false;
+#endif
+    const auto end = address + bytes;
+    const auto add = [&](std::uint64_t from, std::uint64_t to) {
+        from = std::max(from, address);
+        to = std::min(to, end);
+        if (from < to) ranges.emplace_back(from, to);
+    };
+    for (auto block = tracker.blockOf(address); block <= tracker.blockOf(end - 1); ++block) {
+        if (tracker.stampOf(block) <= generation) continue;
+        const auto begin = tracker.blockBegin(block);
+        const auto from = std::max(address, begin) - begin;
+        const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin;
+        if (const auto found = tracker.cpuPages.find(block); found != tracker.cpuPages.end()) {
+            for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) {
+                if (found->second.pages[page] > generation) return false;
+            }
+        } else if (tracker.cpuStampOf(block) > generation) {
+            return false;
+        }
+        const auto found = tracker.driverPieces.find(block);
+        if (found == tracker.driverPieces.end()) return false;
+        const auto& entry = found->second;
+        if (entry.dropped > generation) return false;
+        if (entry.whole > generation) {
+            add(begin, begin + WriteBlockBytes);
+            continue;
+        }
+        for (const auto& piece : entry.pieces) {
+            if (piece.generation > generation) add(begin + piece.begin, begin + piece.end);
+        }
+    }
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& range : ranges) {
+        if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+        else merged.push_back(range);
+    }
+    ranges = std::move(merged);
+    return true;
+}
+
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
