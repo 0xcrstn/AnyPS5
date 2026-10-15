@@ -3,7 +3,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -36,6 +38,68 @@ inline DrawPrepareStale StaleDrawPrepare(const DrawRecordEffects& effects, std::
     }
     return DrawPrepareStale::No;
 }
+
+inline DrawPrepareStale StaleAfterEach(std::span<const std::shared_ptr<const DrawRecordEffects>> jobs, std::span<const PreparedRead> reads, const std::function<bool(std::uint64_t, std::size_t)>& pendingWrite) {
+    for (const auto& job : jobs) {
+        const auto verdict = StaleDrawPrepare(*job, reads, pendingWrite);
+        if (verdict != DrawPrepareStale::No) return verdict;
+    }
+    return DrawPrepareStale::No;
+}
+
+inline std::uint64_t AheadWaitTicket(std::uint64_t posted, std::uint64_t finished, std::uint32_t depth) {
+    if (depth == 0 || posted - finished < depth) return 0;
+    return posted + 1 - depth;
+}
+
+template <class TJob>
+class PrepareAheadWindow {
+public:
+    struct Provisional {
+        std::vector<PreparedRead> reads;
+        std::vector<std::shared_ptr<const DrawRecordEffects>> earlier;
+    };
+
+    void Begin(std::uint64_t finished) {
+        start = finished;
+        while (!jobs.empty() && jobs.front()->ticket <= finished) jobs.pop_front();
+        provisional = {};
+    }
+    void Add(std::shared_ptr<TJob> job) { jobs.push_back(std::move(job)); }
+    std::uint64_t Start() const { return start; }
+    std::size_t Size() const { return jobs.size(); }
+    std::vector<std::shared_ptr<const DrawRecordEffects>> Between(std::uint64_t after, std::uint64_t through) const {
+        std::vector<std::shared_ptr<const DrawRecordEffects>> effects;
+        for (const auto& job : jobs) {
+            if (job->ticket > after && job->ticket <= through) effects.emplace_back(job, &job->effects);
+        }
+        return effects;
+    }
+    DrawPrepareStale CheckFinished(std::span<const PreparedRead> reads, std::uint64_t finished, const std::function<bool(std::uint64_t, std::size_t)>& pendingWrite) const {
+        const auto effects = Between(start, finished);
+        return StaleAfterEach(effects, reads, pendingWrite);
+    }
+    bool Touched(std::uint64_t through) const {
+        for (const auto& job : jobs) {
+            if (job->ticket <= start || job->ticket > through) continue;
+            if (job->effects.writeGenerationAfter != job->effects.writeGenerationBefore || !job->effects.stores.empty()) return true;
+        }
+        return false;
+    }
+    template <class TVisit>
+    void ForFinished(std::uint64_t finished, TVisit&& visit) {
+        for (const auto& job : jobs) {
+            if (job->ticket <= finished) visit(*job);
+        }
+    }
+    void Hold(Provisional held) { provisional = std::move(held); }
+    Provisional Take() { return std::exchange(provisional, Provisional{}); }
+
+private:
+    std::deque<std::shared_ptr<TJob>> jobs;
+    std::uint64_t start = 0;
+    Provisional provisional;
+};
 
 inline bool OverlapsDrawRecords(std::uint32_t opcode, bool predicated, bool dispatches = false) {
     if (predicated) return false;

@@ -35,6 +35,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <system_error>
 #include <thread>
@@ -1302,6 +1303,11 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
 }
 
 constexpr std::string_view NeutralSwitches[] = {
+    "APS5_COMPILE_TRACE",
+    "APS5_SHADER_CACHE_V2",
+    "APS5_SPIRV_INTERN",
+    "APS5_VERIFY_SHADER_CACHE",
+    "APS5_VERIFY_SHADER_EMISSION",
     "APS5_PROFILE_DRAW",
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",
@@ -1337,8 +1343,8 @@ std::string hex(std::uint64_t value) {
     return text;
 }
 
-std::vector<std::byte> wrapEntry(std::span<const std::byte> key, std::span<const std::byte> payload) {
-    const FileHeader header{FileMagic, FormatVersion, SourceVersion(), key.size(), payload.size(), HashBytes(key), HashBytes(payload)};
+std::vector<std::byte> wrapEntry(std::span<const std::byte> key, std::span<const std::byte> payload, std::uint64_t version = SourceVersion()) {
+    const FileHeader header{FileMagic, FormatVersion, version, key.size(), payload.size(), HashBytes(key), HashBytes(payload)};
     const auto payloadOffset = PayloadOffset(key.size());
     std::vector<std::byte> file(payloadOffset + payload.size());
     std::memcpy(file.data(), &header, sizeof(header));
@@ -1347,11 +1353,11 @@ std::vector<std::byte> wrapEntry(std::span<const std::byte> key, std::span<const
     return file;
 }
 
-LoadStatus unwrapEntry(std::span<const std::byte> file, std::span<const std::byte> key, std::span<const std::byte>& payload) {
+LoadStatus unwrapEntry(std::span<const std::byte> file, std::span<const std::byte> key, std::span<const std::byte>& payload, std::uint64_t version = SourceVersion()) {
     if (file.size() < sizeof(FileHeader)) return LoadStatus::Rejected;
     FileHeader header;
     std::memcpy(&header, file.data(), sizeof(header));
-    if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != SourceVersion()) return LoadStatus::Rejected;
+    if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != version) return LoadStatus::Rejected;
     const auto body = file.size() - sizeof(header);
     if (header.keyBytes > body) return LoadStatus::Rejected;
     const auto payloadOffset = PayloadOffset(static_cast<std::size_t>(header.keyBytes));
@@ -1373,6 +1379,7 @@ public:
         if (root.empty()) return;
         this->root = root;
         directory = root / hex(SourceVersion());
+        planDirectory = LayeredCache() ? root / ("plans-" + hex(PlanSourceVersion())) : directory;
         discoverPrebuilt();
         std::thread([this] { run(); }).detach();
     }
@@ -1382,7 +1389,7 @@ public:
 
     bool Load(std::span<const std::byte> key, CompiledVariant& variant) {
         if (loadPrebuilt(key, variant)) return true;
-        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void> owner) { return DecodeEntry(file, key, variant, std::move(owner)); }, hits, misses, loadFailures);
+        return load(directory, key, [&](std::span<const std::byte> file, std::shared_ptr<const void> owner) { return DecodeEntry(file, key, variant, std::move(owner)); }, hits, misses, loadFailures);
     }
 
     bool Reload(std::span<const std::byte> key, CompiledVariant& variant) {
@@ -1390,15 +1397,15 @@ public:
             reloads.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
-        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void> owner) { return DecodeEntry(file, key, variant, std::move(owner)); }, reloads, reloadFailures, reloadFailures);
+        return load(directory, key, [&](std::span<const std::byte> file, std::shared_ptr<const void> owner) { return DecodeEntry(file, key, variant, std::move(owner)); }, reloads, reloadFailures, reloadFailures);
     }
 
     bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
-        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanEntry(file, key, plan); }, planHits, planMisses, planLoadFailures);
+        return load(planDirectory, key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanEntry(file, key, plan); }, planHits, planMisses, planLoadFailures);
     }
 
     bool LoadPlanFailure(std::span<const std::byte> key, std::string& message) {
-        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanFailureEntry(file, key, message); }, planFailureHits, planFailureMisses, planLoadFailures);
+        return load(planDirectory, key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanFailureEntry(file, key, message); }, planFailureHits, planFailureMisses, planLoadFailures);
     }
 
     void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant, std::function<void()> stored) {
@@ -1410,7 +1417,7 @@ public:
     }
 
     bool ReloadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
-        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanEntry(file, key, plan); }, planReloads, planReloadFailures, planReloadFailures);
+        return load(planDirectory, key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanEntry(file, key, plan); }, planReloads, planReloadFailures, planReloadFailures);
     }
 
     void StoreFile(std::filesystem::path path, std::vector<std::byte> file) {
@@ -1515,7 +1522,15 @@ private:
         std::filesystem::path path;
         std::vector<std::byte> file;
         std::string failure;
+        std::size_t queuedBytes = 0;
     };
+
+    static std::size_t estimateBytes(const Job& job) {
+        std::size_t bytes = job.key.size() + job.file.size() + job.failure.size() + 4096u;
+        if (job.variant != nullptr) bytes += job.variant->artifact.spirv.size() * sizeof(std::uint32_t);
+        if (job.plan != nullptr) bytes += 64u * 1024u;
+        return bytes;
+    }
 
     bool reloadPrebuilt(std::span<const std::byte> key, CompiledVariant& variant) {
         PackLoadTimings timing;
@@ -1587,7 +1602,7 @@ private:
     }
 
     template<typename TDecode>
-    bool load(std::span<const std::byte> key, TDecode&& decode, std::atomic<std::uint64_t>& hitCount, std::atomic<std::uint64_t>& missCount, std::atomic<std::uint64_t>& failureCount) {
+    bool load(const std::filesystem::path& from, std::span<const std::byte> key, TDecode&& decode, std::atomic<std::uint64_t>& hitCount, std::atomic<std::uint64_t>& missCount, std::atomic<std::uint64_t>& failureCount) {
         const auto started = std::chrono::steady_clock::now();
         const auto name = EntryName(key);
         thread_local std::vector<std::byte>* fileSlot = nullptr;
@@ -1595,11 +1610,11 @@ private:
         bool loaded = false;
         std::span<const std::byte> bytes;
         std::shared_ptr<const void> owner;
-        if (auto mapped = MapFile(directory / name)) {
+        if (auto mapped = MapFile(from / name)) {
             bytes = mapped->Bytes();
             owner = std::move(mapped);
         }
-        const bool present = owner != nullptr || ReadWholeFile(directory / name, file);
+        const bool present = owner != nullptr || ReadWholeFile(from / name, file);
         if (owner == nullptr) bytes = file;
         if (!present) {
             missCount.fetch_add(1, std::memory_order_relaxed);
@@ -1628,8 +1643,17 @@ private:
     }
 
     void enqueue(Job job) {
+        constexpr std::size_t maxJobs = 8192;
+        constexpr std::size_t maxBytes = std::size_t{512} << 20u;
+        job.queuedBytes = estimateBytes(job);
         {
             std::lock_guard lock(mutex);
+            if (!jobs.empty() && (jobs.size() >= maxJobs || queuedBytes + job.queuedBytes > maxBytes)) {
+                const auto dropped = ++writeDrops;
+                if (dropped <= 4u || dropped % 1024u == 0u) std::fprintf(stderr, "[shader-disk-cache] write queue full (%zu entries, %.1f MiB retained): %llu entries not written so far; they stay in memory and are compiled again in a later run\n", jobs.size(), static_cast<double>(queuedBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(dropped));
+                return;
+            }
+            queuedBytes += job.queuedBytes;
             jobs.push_back(std::move(job));
         }
         wake.notify_one();
@@ -1644,6 +1668,7 @@ private:
             while (!jobs.empty()) {
                 auto job = std::move(jobs.front());
                 jobs.pop_front();
+                queuedBytes -= job.queuedBytes;
                 writing = true;
                 lock.unlock();
                 write(job);
@@ -1671,26 +1696,35 @@ private:
             return;
         }
         const auto file = job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : job.variant != nullptr ? EncodeEntry(job.key, *job.variant) : EncodePlanFailureEntry(job.key, job.failure);
-        if (!file.empty() && WriteFileAtomically(directory / EntryName(job.key), file)) {
+        const auto& target = job.variant != nullptr ? directory : planDirectory;
+        if (target != directory) {
+            std::error_code error;
+            std::filesystem::create_directories(target, error);
+        }
+        if (!file.empty() && WriteFileAtomically(target / EntryName(job.key), file)) {
             (job.plan != nullptr ? planWrites : job.variant != nullptr ? writes : planFailureWrites).fetch_add(1, std::memory_order_relaxed);
             bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
             if (job.stored) job.stored();
         } else {
             const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
-            if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", (directory / EntryName(job.key)).string().c_str());
+            if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", (target / EntryName(job.key)).string().c_str());
         }
     }
 
     void housekeeping() {
         std::error_code error;
         std::filesystem::create_directories(directory, error);
-        const auto stamp = directory / "last-used";
-        std::ofstream(stamp, std::ios::binary | std::ios::trunc).close();
-        std::filesystem::last_write_time(stamp, std::filesystem::file_time_type::clock::now(), error);
+        for (const auto& used : {directory, planDirectory}) {
+            std::filesystem::create_directories(used, error);
+            const auto stamp = used / "last-used";
+            std::ofstream(stamp, std::ios::binary | std::ios::trunc).close();
+            std::filesystem::last_write_time(stamp, std::filesystem::file_time_type::clock::now(), error);
+        }
         const auto now = std::filesystem::file_time_type::clock::now();
         for (std::filesystem::directory_iterator it(root, error), end; !error && it != end; it.increment(error)) {
-            const auto name = it->path().filename().string();
-            if (it->path() == directory || name.size() != 16 || name.find_first_not_of("0123456789abcdef") != std::string::npos || !it->is_directory(error)) continue;
+            auto name = it->path().filename().string();
+            if (name.starts_with("plans-")) name = name.substr(6);
+            if (it->path() == directory || it->path() == planDirectory || name.size() != 16 || name.find_first_not_of("0123456789abcdef") != std::string::npos || !it->is_directory(error)) continue;
             std::error_code timeError;
             auto used = std::filesystem::last_write_time(it->path() / "last-used", timeError);
             if (timeError) used = std::filesystem::last_write_time(it->path(), timeError);
@@ -1743,12 +1777,15 @@ private:
 
     std::filesystem::path root;
     std::filesystem::path directory;
+    std::filesystem::path planDirectory;
     std::vector<std::unique_ptr<CachePack>> packs;
     std::vector<std::filesystem::path> looseDirectories;
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
     std::deque<Job> jobs;
+    std::size_t queuedBytes = 0;
+    std::uint64_t writeDrops = 0;
     bool writing = false;
     std::atomic<std::uint64_t> hits{0}, misses{0}, writes{0}, loadFailures{0}, writeFailures{0}, bytesRead{0}, bytesWritten{0}, loadNanoseconds{0};
     std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0}, reloads{0}, reloadFailures{0};
@@ -1770,6 +1807,26 @@ DiskStore& store() {
 
 std::uint64_t SourceVersion() {
     return Generated::SourceVersion;
+}
+
+bool LayeredCache() {
+    static const bool layered = [] {
+        const char* value = std::getenv("APS5_SHADER_CACHE_V2");
+        if (value == nullptr || *value == '\0' || std::string_view(value) == "0") return false;
+        if (std::string_view(value) == "1") return true;
+        throw std::invalid_argument("APS5_SHADER_CACHE_V2 accepts only 0 or 1");
+    }();
+    return layered;
+}
+
+std::uint64_t PlanSourceVersion() {
+    return LayeredCache() ? Generated::FrontendSourceVersion : Generated::SourceVersion;
+}
+
+bool SamePlan(const IrResourcePlan& reference, const IrResourcePlan& candidate) {
+    std::vector<std::byte> expected, actual;
+    if (!EncodePlan(reference, expected) || !EncodePlan(candidate, actual)) throw std::runtime_error("a resource plan cannot be encoded for comparison");
+    return expected == actual;
 }
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {
@@ -1797,7 +1854,7 @@ void BuildPlanKey(const RecompileRequest& request, std::uint32_t hostSubgroupSiz
     Writer writer(key);
     writer.Value(FileMagic);
     writer.Value(FormatVersion);
-    writer.Value(SourceVersion());
+    writer.Value(PlanSourceVersion());
     writer.Value(PlanEntryKind);
     thread_local std::vector<std::uint64_t>* memoryKeySlot = nullptr;
     auto& memoryKey = ThreadOwned(memoryKeySlot);
@@ -1871,12 +1928,12 @@ bool DecodePlan(std::span<const std::byte> bytes, IrResourcePlan& plan) {
 std::vector<std::byte> EncodePlanEntry(std::span<const std::byte> key, const IrResourcePlan& plan) {
     std::vector<std::byte> payload;
     if (!EncodePlan(plan, payload)) return {};
-    return wrapEntry(key, payload);
+    return wrapEntry(key, payload, PlanSourceVersion());
 }
 
 LoadStatus DecodePlanEntry(std::span<const std::byte> file, std::span<const std::byte> key, IrResourcePlan& plan) {
     std::span<const std::byte> payload;
-    const auto status = unwrapEntry(file, key, payload);
+    const auto status = unwrapEntry(file, key, payload, PlanSourceVersion());
     if (status != LoadStatus::Loaded) return status;
     return DecodePlan(payload, plan) ? LoadStatus::Loaded : LoadStatus::Rejected;
 }
@@ -1893,12 +1950,12 @@ std::vector<std::byte> EncodePlanFailureEntry(std::span<const std::byte> key, co
     std::vector<std::byte> payload;
     Writer writer(payload);
     writer.Text(message);
-    return wrapEntry(key, payload);
+    return wrapEntry(key, payload, PlanSourceVersion());
 }
 
 LoadStatus DecodePlanFailureEntry(std::span<const std::byte> file, std::span<const std::byte> key, std::string& message) {
     std::span<const std::byte> payload;
-    const auto status = unwrapEntry(file, key, payload);
+    const auto status = unwrapEntry(file, key, payload, PlanSourceVersion());
     if (status != LoadStatus::Loaded) return status;
     Reader reader(payload);
     std::string decoded;

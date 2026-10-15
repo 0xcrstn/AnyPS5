@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ChunkedRecording.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/IndexBounds.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -55,6 +56,7 @@
 #endif
 #include <functional>
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <span>
 #include <atomic>
@@ -283,6 +285,7 @@ public:
             VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
             pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
             pool.queueFamilyIndex = family;
+            context.queueFamily = family;
             Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &pool, nullptr, &context.pool), "vkCreateCommandPool");
         } catch (...) {
             release();
@@ -8229,6 +8232,103 @@ void fmaskDecompressMsaaTests(const Device& device, Recorder& recorder) {
     std::cout << "FMASK decompress MSAA clear and resolve tests passed\n";
 }
 
+void tiledResolveTests(const Device& device, Recorder& recorder) {
+    namespace GuestMemory = AgcDriver::GuestMemory;
+    auto context = device.GetContext();
+    if ((context.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.Graphics()) {
+        std::cout << "4x color targets or graphics unavailable: CB resolves into tiled targets not tested\n";
+        return;
+    }
+    context.hostImportAlignment = 0;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    constexpr std::uint32_t side = 128;
+    constexpr std::size_t targetBytes = side * side * 4u;
+    constexpr std::size_t sourceBytes = targetBytes * 4u;
+    constexpr std::size_t bytes = targetBytes + sourceBytes + 65536u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the tiled resolve block");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Release {
+        const Context& context;
+        void* block;
+        ~Release() {
+            ClearMultisampleTargets(context.device);
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } release{context, block};
+    ColorTarget source{};
+    source.address = address + targetBytes;
+    source.surfaceAddress = source.address;
+    source.extent = {side, side};
+    source.surfaceExtent = source.extent;
+    source.format = VK_FORMAT_R8G8B8A8_UNORM;
+    source.bytes = targetBytes;
+    source.componentMapping = 0xe4u;
+    source.tileMode = ColorTileMode::RenderTarget;
+    source.samples = 4;
+    source.cmaskAddress = address + targetBytes + sourceBytes;
+    source.cmaskBytes = 4096;
+    source.cmaskFastClear = true;
+    const std::array<std::pair<ColorTileMode, std::uint32_t>, 3> modes{{{ColorTileMode::Standard4KB, 0x80402010u}, {ColorTileMode::Standard64KB, 0x10204080u}, {ColorTileMode::RenderTarget, 0x40801020u}}};
+    for (const auto& [mode, clear] : modes) {
+        const auto name = std::to_string(static_cast<std::uint32_t>(mode));
+        std::memset(block, 0x55, targetBytes);
+        std::memset(static_cast<std::byte*>(block) + targetBytes + sourceBytes, 0, 4096);
+        ColorTarget destination{};
+        destination.address = address;
+        destination.surfaceAddress = address;
+        destination.extent = {side, side};
+        destination.surfaceExtent = destination.extent;
+        destination.format = VK_FORMAT_R8G8B8A8_UNORM;
+        destination.bytes = targetBytes;
+        destination.componentMapping = 0xe4u;
+        destination.tileMode = mode;
+        source.clearWords = {clear, 0};
+        RunColorMetadataPass(context, {ColorMetadataPass::Mode::Resolve, {destination}, source});
+        std::vector<std::uint32_t> resolved(targetBytes / 4);
+        GuestMemory::Read(address, std::as_writable_bytes(std::span(resolved)));
+        const auto texels = std::ranges::count(resolved, clear);
+        Require(texels == static_cast<std::ptrdiff_t>(resolved.size()), "a CB resolve into a tile mode " + name + " target left " + std::to_string(resolved.size() - static_cast<std::size_t>(texels)) + " texels without the resolved color");
+        recorder.Sync();
+        ClearMultisampleTargets(context.device);
+        ClearCachedTextures(context.device);
+    }
+    {
+        ColorTarget destination{};
+        destination.address = address;
+        destination.extent = {side, side};
+        destination.format = VK_FORMAT_R8G8B8A8_UNORM;
+        destination.bytes = targetBytes;
+        destination.tileMode = ColorTileMode::Linear;
+        std::string message;
+        try {
+            RunColorMetadataPass(context, {ColorMetadataPass::Mode::Resolve, {destination}, source});
+        } catch (const std::exception& error) {
+            message = error.what();
+        }
+        Require(message.find("without a resident image is not implemented") != std::string::npos, "a CB resolve into a linear target did not throw: " + message);
+    }
+    recorder.Sync();
+}
+
 void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (!device.NullDescriptors()) {
@@ -10350,11 +10450,644 @@ void Run(Context context) {
 }
 #endif
 
+void resolveStampTests() {
+    const ResolveStamp first{};
+    Require(ChangedSerials(first, first) == 0, "an unchanged resolve stamp reported a change");
+    for (std::size_t i = 0; i < first.values.size(); ++i) {
+        auto moved = first;
+        ++moved.values[i];
+        Require(ChangedSerials(first, moved) == (1u << i), std::string("a change of the ") + ResolveSerialName(static_cast<ResolveSerial>(i)) + " serial was not reported alone");
+        Require(ChangedSerials(moved, first) == (1u << i), std::string("a change of the ") + ResolveSerialName(static_cast<ResolveSerial>(i)) + " serial depends on the comparison order");
+    }
+    auto both = first;
+    ++both.values[static_cast<std::size_t>(ResolveSerial::Ledger)];
+    ++both.values[static_cast<std::size_t>(ResolveSerial::ResourceCache)];
+    const auto expected = (1u << static_cast<std::size_t>(ResolveSerial::Ledger)) | (1u << static_cast<std::size_t>(ResolveSerial::ResourceCache));
+    Require(ChangedSerials(first, both) == expected, "two changed serials were not both reported");
+    Require(both.Of(ResolveSerial::Ledger) == 1 && both.Of(ResolveSerial::WriteGeneration) == 0, "ResolveStamp::Of read the wrong serial");
+    ResourceCache cache;
+    const auto before = cache.Serial();
+    cache.Remove(ResourceCache::Key{1u, 2u, 3u});
+    Require(cache.Serial() == before, "removing an absent key moved the resource cache serial");
+    Require(!cache.Touch(ResourceCache::Key{1u, 2u, 3u}) && cache.Find(ResourceCache::Key{1u, 2u, 3u}) == nullptr && cache.Serial() == before, "a lookup moved the resource cache serial");
+    cache.Clear();
+    Require(cache.Serial() == before + 1, "clearing the resource cache did not move its serial");
+    std::cout << "resolve stamp tests passed\n";
+}
+
+void ledgerSerialTests(const Device& device, Recorder& recorder) {
+    static_cast<void>(device);
+    recorder.Sync();
+    const auto moved = [](std::uint64_t before) { return Recorder::LedgerSerial() != before; };
+    auto before = Recorder::LedgerSerial();
+    Require(!recorder.PendingWriteOverlaps(0x50000, 16) && !recorder.PendingLabelIn(0x50000, 16) && !recorder.QueuedStoreOverlaps(0x50000, 16), "an idle recorder reported pending work");
+    Require(!Recorder::AccessNeedsFlush(0x50000, 16), "the hook-free flush check reported unwritten memory");
+    Require(!moved(before), "a query moved the ledger serial");
+    recorder.NotePendingWrite(0x50000, 16);
+    Require(moved(before), "a pending write note did not move the ledger serial");
+    Require(Recorder::AccessNeedsFlush(0x50008, 4) && Recorder::AccessNeedsFlush(0x4fff0, 0x20), "the hook-free flush check missed a pending write");
+    Require(!Recorder::AccessNeedsFlush(0x50010, 16) && !Recorder::AccessNeedsFlush(0x50000, 0), "the hook-free flush check reported memory beyond the pending write");
+    before = Recorder::LedgerSerial();
+    const std::array ranges{std::pair<std::uint64_t, std::uint64_t>{0x51000, 0x51010}};
+    recorder.NotePendingWrites(ranges);
+    Require(moved(before), "a pending write list did not move the ledger serial");
+    before = Recorder::LedgerSerial();
+    recorder.NotePendingFill(0x52000, 16, 0x5a);
+    Require(moved(before), "a pending fill did not move the ledger serial");
+    alignas(64) static std::array<std::byte, 64> labels{};
+    const auto labelAddress = reinterpret_cast<std::uint64_t>(labels.data());
+    const std::array value{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    before = Recorder::LedgerSerial();
+    recorder.NoteLabel(labelAddress, value, 1, 0);
+    Require(moved(before), "a label note did not move the ledger serial");
+    const auto stamp = ResolveStamp::Now();
+    Require(stamp.Of(ResolveSerial::Ledger) == Recorder::LedgerSerial() && stamp.Of(ResolveSerial::WriteGeneration) == Recorder::WriteGeneration() && stamp.Of(ResolveSerial::FinishedBatches) == Recorder::FinishedBatches() && stamp.Of(ResolveSerial::KeyStores) == Recorder::KeyStoreSerial() && stamp.Of(ResolveSerial::ResourceCache) == SharedResourceCache().Serial(), "ResolveStamp::Now did not read the current serials");
+    const auto finished = Recorder::FinishedBatches();
+    before = Recorder::LedgerSerial();
+    recorder.Sync();
+    Require(moved(before) && Recorder::FinishedBatches() > finished, "a sync of noted work did not move the ledger serial and the finished batches");
+    Require(!Recorder::AccessNeedsFlush(0x50000, 16) && !recorder.PendingWriteOverlaps(0x50000, 16), "a synced write still asked for a flush");
+    const auto changed = ChangedSerials(stamp, ResolveStamp::Now());
+    Require(((changed >> static_cast<std::size_t>(ResolveSerial::Ledger)) & 1u) != 0 && ((changed >> static_cast<std::size_t>(ResolveSerial::FinishedBatches)) & 1u) != 0, "the stamp did not see the sync");
+    before = Recorder::LedgerSerial();
+    recorder.Sync();
+    Require(moved(before), "a sync did not move the ledger serial");
+    std::cout << "ledger serial tests passed\n";
+}
+
+void framebufferMutexTests(const Device& device) {
+    std::lock_guard gpu(GpuMutex());
+    const auto& context = device.GetContext();
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { ClearCachedPipelines(device); }
+    } cleanup{context.device};
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 11;
+    fragment.variantId = 12;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.hasColorTarget = true;
+    state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    state.color.extent = {64, 64};
+    state.color.bytes = 64 * 64 * 4;
+    state.colors.push_back(state.color);
+    state.blend.colorWriteMask = 15;
+    state.blends.push_back(state.blend);
+    ShaderResources resources(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), 0, 0);
+    const auto pipeline = CachedPipeline(context, state, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    RenderTarget target(context, state.color, false);
+    const std::array views{target.View()};
+    const std::array<std::shared_ptr<StorageTexture>, 1> owners{};
+    const std::array<std::uint8_t, 1> persistent{1u};
+    const auto first = pipeline->AcquireFramebuffer(views, owners, {64, 64}, 1, persistent);
+    Require(first != nullptr && pipeline->AcquireFramebuffer(views, owners, {64, 64}, 1, persistent) == first, "a persistent framebuffer was not reused");
+    std::atomic<std::uint32_t> differing{0};
+    std::vector<std::thread> threads;
+    for (std::uint32_t thread = 0; thread < 4; ++thread) {
+        threads.emplace_back([&, thread] {
+            for (std::uint32_t i = 0; i < 2000; ++i) {
+                const VkExtent2D extent{32u + ((i + thread) % 4u) * 8u, 32u};
+                const auto other = pipeline->AcquireFramebuffer(views, owners, extent, 1, persistent);
+                if (other == nullptr || other == first) differing.fetch_add(1, std::memory_order_relaxed);
+                if (pipeline->AcquireFramebuffer(views, owners, {64, 64}, 1, persistent) != first) differing.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    Require(differing.load() == 0, "concurrent framebuffer acquisitions lost or replaced a cached framebuffer");
+    std::array<std::shared_ptr<Framebuffer>, 4> sizes;
+    for (std::uint32_t i = 0; i < sizes.size(); ++i) sizes[i] = pipeline->AcquireFramebuffer(views, owners, {32u + i * 8u, 32u}, 1, persistent);
+    for (std::uint32_t i = 0; i < sizes.size(); ++i) Require(pipeline->AcquireFramebuffer(views, owners, {32u + i * 8u, 32u}, 1, persistent) == sizes[i], "a framebuffer made by the concurrent acquisitions was not cached");
+    std::cout << "framebuffer mutex tests passed\n";
+}
+
+struct ResolveScene {
+    Context& context;
+    std::span<const CompiledShader> shaders;
+    const State& state;
+    const AgcDriver::Pm4::DrawParameters& triangle;
+    const AgcDriver::Pm4::DrawParameters& indexed;
+    std::function<void()> clear;
+    std::function<void(const char*)> check;
+};
+
+bool withResolveScene(const Device& device, Recorder& recorder, const std::function<bool(ResolveScene&)>& body) {
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0 || device.GetContext().descriptorCache == nullptr) return false;
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 3;
+    void* watched = AllocateWatched(bytes, unit);
+    std::vector<std::byte> fallback(watched == nullptr ? bytes + unit : 0);
+    auto* block = watched != nullptr ? static_cast<std::byte*>(watched) : reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(fallback.data()) + unit - 1) & ~(unit - 1));
+    struct Release {
+        void* watched;
+        ~Release() { if (watched != nullptr) ReleaseWatched(watched, bytes); }
+    } release{watched};
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    if (HostImportFor(context, address, bytes) == nullptr) return false;
+    const auto shader = [](auto& words, std::uint64_t variant) {
+        ShaderRecompiler::RecompileResult program;
+        program.spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
+        program.variantId = variant;
+        return program;
+    };
+    auto vertex = shader(VERTEXRANGE_VERT_SPV, 305);
+    auto pixel = shader(COVER_FRAG_SPV, 306);
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.color = {address, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {64, 64};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, 64, 64, -64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    const auto vertices = address + unit;
+    const auto indices = address + 2 * unit;
+    const std::array<float, 4> offset{0.5f, 0.0f, 0.0f, 0.0f};
+    for (std::size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex) AgcDriver::GuestMemory::Write(vertices + vertexIndex * 16, std::as_bytes(std::span(offset)));
+    const std::array<std::uint16_t, 3> indexWords{0, 1, 2};
+    AgcDriver::GuestMemory::Write(indices, std::as_bytes(std::span(indexWords)));
+    vertex.vertexAttributes = {ShaderRecompiler::VertexAttribute{0, 4, {{static_cast<std::uint32_t>(vertices), static_cast<std::uint32_t>(vertices >> 32u) | (16u << 16u), 3u, 77u << 12u}}, 0}};
+    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
+    auto indexed = triangle;
+    indexed.indexed = true;
+    indexed.indexSize = 2;
+    indexed.indexAddress = indices;
+    ResolveScene scene{context, shaders, state, triangle, indexed, {}, {}};
+    scene.clear = [&] {
+        std::vector<std::byte> cleared(unit);
+        AgcDriver::GuestMemory::Write(address, cleared);
+    };
+    scene.check = [&](const char* what) {
+        WaitForOptimizedPipelines(context.device);
+        std::vector<std::byte> texels(64 * 64 * 4);
+        ReadColorTarget(state.color, texels);
+        for (std::size_t y = 0; y < 64; ++y) {
+            for (std::size_t x = 0; x < 64; ++x) {
+                const auto expected = x < 16 ? std::byte{0} : std::byte{255};
+                Require(texels[(y * 64 + x) * 4] == expected, what);
+            }
+        }
+    };
+    return body(scene);
+}
+
+std::uint64_t revalidations(const ParallelResolveCounts& counts, ShaderResources::EpochProofVerdict verdict) {
+    return counts.revalidations[static_cast<std::size_t>(verdict)];
+}
+
+bool parallelRevalidateTests(const Device& device, Recorder& recorder) {
+    if (!ParallelRevalidateRequested()) {
+        std::cout << "skipped, the parallel revalidate test needs APS5_PARALLEL_RESOLVE=1 and APS5_PARALLEL_REVALIDATE=1\n";
+        return false;
+    }
+    AgcDriver::GuestMemory::SetEpochDirtySet(true);
+    return withResolveScene(device, recorder, [&](ResolveScene& scene) {
+        using Verdict = ShaderResources::EpochProofVerdict;
+        const auto& context = scene.context;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        StorageTexture::BumpPendingSerial();
+        for (int round = 0; round < 2; ++round) {
+            for (const auto* draw : {&scene.triangle, &scene.indexed}) {
+                scene.clear();
+                Draw(context, scene.state, *draw, scene.shaders);
+                scene.check("a serial draw before the resolved ones rendered other pixels");
+            }
+        }
+        const auto skipsBefore = ShaderResources::EpochSkips();
+        scene.clear();
+        Draw(context, scene.state, scene.triangle, scene.shaders);
+        scene.check("a serial draw proved by its epoch proof rendered other pixels");
+        if (ShaderResources::EpochSkips() == skipsBefore) {
+            std::cout << "skipped, the scene's template is not served by the resource cache under an epoch proof\n";
+            return false;
+        }
+        const auto before = ParallelResolveStatistics();
+        const auto first = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        const auto second = ResolveDraw(context, scene.state, scene.indexed, scene.shaders);
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *first);
+        scene.check("a draw whose template proof was adopted rendered other pixels");
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.indexed, scene.shaders, {}, *second);
+        scene.check("a second draw adopting a proof made before the first one's encode rendered other pixels");
+        const auto adopted = ParallelResolveStatistics();
+        Require(adopted.resourcesAdopted - before.resourcesAdopted == 2, "the scene's templates were not adopted from the resolve");
+        Require(revalidations(adopted, Verdict::Adopted) - revalidations(before, Verdict::Adopted) == 2, "two epoch proofs checked on the side were not both adopted at encode");
+        Require(!VerifyParallelRevalidate() || adopted.revalidationsVerified - before.revalidationsVerified == 2, "APS5_VERIFY_PARALLEL_REVALIDATE checked fewer proofs than were adopted");
+        const auto reproved = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        scene.clear();
+        Draw(context, scene.state, scene.triangle, scene.shaders);
+        scene.check("a serial draw that proved its template again rendered other pixels");
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *reproved);
+        scene.check("a draw whose proof was made before its template was proved again rendered other pixels");
+        const auto basis = ParallelResolveStatistics();
+        Require(revalidations(basis, Verdict::Basis) - revalidations(adopted, Verdict::Basis) == 1 && revalidations(basis, Verdict::Adopted) == revalidations(adopted, Verdict::Adopted), "a proof made before the template was proved again was adopted");
+        const auto stale = ResolveDraw(context, scene.state, scene.indexed, scene.shaders);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.indexed, scene.shaders, {}, *stale);
+        scene.check("a draw whose proof was refused by a new collect epoch rendered other pixels");
+        const auto stamps = ParallelResolveStatistics();
+        Require(revalidations(stamps, Verdict::Stamps) - revalidations(basis, Verdict::Stamps) == 1 && revalidations(stamps, Verdict::Adopted) == revalidations(basis, Verdict::Adopted), "a proof whose collect epoch ended between resolve and encode was adopted");
+        Require(!VerifyParallelRevalidate() || stamps.revalidationsVerified == adopted.revalidationsVerified, "APS5_VERIFY_PARALLEL_REVALIDATE counted a refused proof as verified");
+        std::cout << "parallel revalidate tests passed" << (VerifyParallelRevalidate() ? " (verified)" : "") << "\n";
+        return true;
+    });
+}
+
+bool parallelResolveTests(const Device& device, Recorder& recorder) {
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0 || device.GetContext().descriptorCache == nullptr) return false;
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 3;
+    void* watched = AllocateWatched(bytes, unit);
+    std::vector<std::byte> fallback(watched == nullptr ? bytes + unit : 0);
+    auto* block = watched != nullptr ? static_cast<std::byte*>(watched) : reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(fallback.data()) + unit - 1) & ~(unit - 1));
+    struct Release {
+        void* watched;
+        ~Release() { if (watched != nullptr) ReleaseWatched(watched, bytes); }
+    } release{watched};
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    if (HostImportFor(context, address, bytes) == nullptr) return false;
+    const auto shader = [](auto& words, std::uint64_t variant) {
+        ShaderRecompiler::RecompileResult program;
+        program.spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
+        program.variantId = variant;
+        return program;
+    };
+    auto vertex = shader(VERTEXRANGE_VERT_SPV, 303);
+    auto pixel = shader(COVER_FRAG_SPV, 304);
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.color = {address, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {64, 64};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, 64, 64, -64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    const auto vertices = address + unit;
+    const auto indices = address + 2 * unit;
+    const std::array<float, 4> offset{0.5f, 0.0f, 0.0f, 0.0f};
+    for (std::size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex) AgcDriver::GuestMemory::Write(vertices + vertexIndex * 16, std::as_bytes(std::span(offset)));
+    const std::array<std::uint16_t, 3> indexWords{0, 1, 2};
+    AgcDriver::GuestMemory::Write(indices, std::as_bytes(std::span(indexWords)));
+    vertex.vertexAttributes = {ShaderRecompiler::VertexAttribute{0, 4, {{static_cast<std::uint32_t>(vertices), static_cast<std::uint32_t>(vertices >> 32u) | (16u << 16u), 3u, 77u << 12u}}, 0}};
+    const auto check = [&](const char* what) {
+        std::vector<std::byte> texels(64 * 64 * 4);
+        ReadColorTarget(state.color, texels);
+        for (std::size_t y = 0; y < 64; ++y) {
+            for (std::size_t x = 0; x < 64; ++x) {
+                const auto expected = x < 16 ? std::byte{0} : std::byte{255};
+                Require(texels[(y * 64 + x) * 4] == expected, what);
+            }
+        }
+    };
+    const auto clear = [&] {
+        std::vector<std::byte> cleared(unit);
+        AgcDriver::GuestMemory::Write(address, cleared);
+    };
+    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
+    auto indexed = triangle;
+    indexed.indexed = true;
+    indexed.indexSize = 2;
+    indexed.indexAddress = indices;
+    const auto before = ParallelResolveStatistics();
+    for (int round = 0; round < 3; ++round) {
+        for (const auto* draw : {&triangle, &indexed}) {
+            clear();
+            const auto resolved = ResolveDraw(context, state, *draw, shaders);
+            Require(resolved != nullptr, "the resolve returned nothing");
+            EncodeDraw(context, state, *draw, shaders, {}, *resolved);
+            WaitForOptimizedPipelines(context.device);
+            const auto read = recorder.DescribePendingRead(vertices, 16);
+            Require(read.has_value() && read->kind == Recorder::ReadKind::DrawInput, "an encoded in-place vertex range was not noted as a pending draw input read");
+            check(draw == &triangle ? "a resolved and encoded draw rendered other pixels than the serial draw" : "a resolved and encoded indexed draw rendered other pixels than the serial draw");
+        }
+    }
+    clear();
+    Draw(context, state, indexed, shaders);
+    WaitForOptimizedPipelines(context.device);
+    check("the serial draw after resolved draws rendered other pixels");
+    const auto after = ParallelResolveStatistics();
+    Require(after.resolves - before.resolves == 6 && after.encodes - before.encodes == 6, "the resolves and encodes were not counted");
+    Require(after.inputsResolved - before.inputsResolved == 6 && after.inputsAdopted - before.inputsAdopted == 6, "in-place draw inputs resolved on the side were not adopted at encode");
+    Require(!VerifyParallelResolve() || after.verified - before.verified == 6, "APS5_VERIFY_PARALLEL_RESOLVE compared fewer draws than were adopted");
+    recorder.NotePendingWrite(vertices, 16);
+    const auto pending = ResolveDraw(context, state, triangle, shaders);
+    const auto refusals = ParallelResolveStatistics();
+    Require(refusals.inputRefusals[static_cast<std::size_t>(ResolveRefusal::NeedsSync)] == after.inputRefusals[static_cast<std::size_t>(ResolveRefusal::NeedsSync)] + 1, "a vertex range with a pending write was resolved in place on the side");
+    clear();
+    recorder.Sync();
+    const auto stale = ResolveDraw(context, state, indexed, shaders);
+    recorder.NotePendingWrite(indices + 4096, 16);
+    recorder.Sync();
+    EncodeDraw(context, state, indexed, shaders, {}, *stale);
+    WaitForOptimizedPipelines(context.device);
+    const auto redone = ParallelResolveStatistics();
+    Require(redone.redos[static_cast<std::size_t>(ResolveRedo::IndexData)] == refusals.redos[static_cast<std::size_t>(ResolveRedo::IndexData)] + 1 && redone.inputsAdopted == refusals.inputsAdopted, "a batch that wrote and finished between resolve and encode did not send the index bounds back to the serial resolve");
+    check("a draw whose inputs were redone in encode rendered other pixels");
+    static_cast<void>(pending);
+    std::cout << "parallel resolve tests passed (" << (after.resourcesAdopted - before.resourcesAdopted) << " templates and " << (after.pipelinesAdopted - before.pipelinesAdopted) << " pipelines adopted" << (VerifyParallelResolve() ? ", verified" : "") << ")\n";
+    return true;
+}
+
+std::uint64_t targetVerdicts(const ParallelResolveCounts& counts, TargetVerdict verdict) {
+    return counts.targets[static_cast<std::size_t>(verdict)];
+}
+
+bool parallelTargetsTests(const Device& device, Recorder& recorder) {
+    if (!ParallelTargetsRequested()) {
+        std::cout << "skipped, the parallel targets test needs APS5_PARALLEL_RESOLVE=1 and APS5_PARALLEL_TARGETS=1\n";
+        return false;
+    }
+    return withResolveScene(device, recorder, [&](ResolveScene& scene) {
+        const auto& context = scene.context;
+        scene.clear();
+        Draw(context, scene.state, scene.triangle, scene.shaders);
+        scene.check("the serial draw that made the resident target rendered other pixels");
+        const auto before = ParallelResolveStatistics();
+        const auto continued = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *continued);
+        scene.check("a draw adopting the worker's target views and framebuffer rendered other pixels");
+        const auto adopted = ParallelResolveStatistics();
+        if (adopted.pipelinesResolved == before.pipelinesResolved) {
+            std::cout << "skipped, the scene's pipeline was not resolved on the side\n";
+            return false;
+        }
+        Require(targetVerdicts(adopted, TargetVerdict::Adopted) - targetVerdicts(before, TargetVerdict::Adopted) == 1, "the resident target found on the side was not adopted at encode");
+        scene.clear();
+        Draw(context, scene.state, scene.triangle, scene.shaders);
+        const auto passBefore = recorder.OpenPassSerial();
+        const auto reusesBefore = ContinuedPassTargetReuses();
+        const auto acrossPasses = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        recorder.Sync();
+        Require(passBefore != 0 && recorder.OpenPassSerial() != passBefore, "the serial draw left no render pass open, or a sync kept it open");
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *acrossPasses);
+        scene.check("a draw whose render pass ended between resolve and encode rendered other pixels");
+        const auto passes = ParallelResolveStatistics();
+        Require(ContinuedPassTargetReuses() == reusesBefore, "a draw reused the continued-pass targets of a pass that had ended");
+        Require(targetVerdicts(passes, TargetVerdict::Adopted) - targetVerdicts(adopted, TargetVerdict::Adopted) == 1, "a target proved again in encode after its pass ended was not adopted for the same image");
+        const auto evicted = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        recorder.Sync();
+        FlushCachedTextures(context.device);
+        ClearCachedTextures(context.device);
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *evicted);
+        scene.check("a draw whose resident target was replaced between resolve and encode rendered other pixels");
+        const auto replaced = ParallelResolveStatistics();
+        Require(targetVerdicts(replaced, TargetVerdict::ResidentDiffers) - targetVerdicts(passes, TargetVerdict::ResidentDiffers) == 1 && targetVerdicts(replaced, TargetVerdict::Adopted) == targetVerdicts(passes, TargetVerdict::Adopted), "the views and framebuffer of a replaced resident target were adopted");
+        const auto expected = VerifyParallelTargets() ? targetVerdicts(replaced, TargetVerdict::Adopted) - targetVerdicts(before, TargetVerdict::Adopted) : 0;
+        Require(replaced.targetsVerified - before.targetsVerified == expected, "APS5_VERIFY_PARALLEL_TARGETS did not check exactly the adopted targets");
+        std::cout << "parallel targets tests passed" << (VerifyParallelTargets() ? " (verified)" : "") << "\n";
+        return true;
+    });
+}
+
+template<typename THandle>
+THandle chunkHandle(std::uint64_t value) {
+    static_assert(sizeof(THandle) == sizeof(std::uint64_t));
+    return std::bit_cast<THandle>(value);
+}
+
+template<typename TException>
+bool chunkThrows(const std::function<void()>& body, std::string_view text) {
+    try {
+        body();
+    } catch (const TException& error) {
+        return std::string_view(error.what()).find(text) != std::string_view::npos;
+    }
+    return false;
+}
+
+void chunkCommandTests() {
+    Context context{};
+    CommandList list;
+    const CommandSink sink(list, 1);
+    const std::array<VkBuffer, 3> vertexBuffers{chunkHandle<VkBuffer>(0x2000), chunkHandle<VkBuffer>(0x2100), chunkHandle<VkBuffer>(0x2200)};
+    const std::array<VkDeviceSize, 3> vertexOffsets{0, 16, 0x100000000ull};
+    const std::array<std::byte, 13> pushed{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}, std::byte{5}, std::byte{6}, std::byte{7}, std::byte{8}, std::byte{9}, std::byte{10}, std::byte{11}, std::byte{12}, std::byte{13}};
+    sink.BindPipeline(context, VK_PIPELINE_BIND_POINT_GRAPHICS, chunkHandle<VkPipeline>(0x1000));
+    sink.SetViewport(context, VkViewport{1.5f, 64.0f, 64.0f, -64.0f, 0.0f, 1.0f});
+    sink.SetScissor(context, VkRect2D{{-3, 4}, {64, 32}});
+    sink.SetStencilReference(context, VK_STENCIL_FACE_FRONT_BIT, 7);
+    sink.SetStencilCompareMask(context, VK_STENCIL_FACE_BACK_BIT, 0xf0);
+    sink.SetStencilWriteMask(context, VK_STENCIL_FACE_FRONT_AND_BACK, 0x0f);
+    sink.SetStencilOp(context, VK_STENCIL_FACE_FRONT_BIT, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_INCREMENT_AND_WRAP, VK_COMPARE_OP_GREATER);
+    sink.SetCullMode(context, VK_CULL_MODE_BACK_BIT);
+    sink.SetFrontFace(context, VK_FRONT_FACE_CLOCKWISE);
+    sink.SetDepthBias(context, -2.0f, 0.25f, 1.0e-6f);
+    sink.SetDepthBounds(context, 0.125f, 0.875f);
+    sink.SetDepthTestEnable(context, VK_TRUE);
+    sink.SetDepthWriteEnable(context, VK_FALSE);
+    sink.SetDepthCompareOp(context, VK_COMPARE_OP_LESS_OR_EQUAL);
+    sink.SetDepthBoundsTestEnable(context, VK_TRUE);
+    sink.SetStencilTestEnable(context, VK_TRUE);
+    sink.BindDescriptorSet(context, VK_PIPELINE_BIND_POINT_GRAPHICS, chunkHandle<VkPipelineLayout>(0x3000), 1, chunkHandle<VkDescriptorSet>(0x3100));
+    sink.PushConstants(context, chunkHandle<VkPipelineLayout>(0x3000), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 4, static_cast<std::uint32_t>(pushed.size()), pushed.data());
+    sink.BindVertexBuffers(context, 2, vertexBuffers, vertexOffsets);
+    sink.BindIndexBuffer(context, chunkHandle<VkBuffer>(0x2300), 6, VK_INDEX_TYPE_UINT16);
+    sink.Draw(context, 3, 2, 1, 5);
+    sink.DrawIndexed(context, 6, 1, 3, -9, 4);
+    sink.DrawIndirect(context, chunkHandle<VkBuffer>(0x2400), 32, 2, 16);
+    sink.DrawIndexedIndirect(context, chunkHandle<VkBuffer>(0x2400), 64, 1, 20);
+    sink.DrawIndirectCount(context, chunkHandle<VkBuffer>(0x2400), 0, chunkHandle<VkBuffer>(0x2500), 8, 4, 16);
+    sink.DrawIndexedIndirectCount(context, chunkHandle<VkBuffer>(0x2400), 0, chunkHandle<VkBuffer>(0x2500), 12, 4, 20);
+    sink.DrawMeshTasks(context, 9, 1, 1);
+    sink.DrawMeshTasksIndirect(context, chunkHandle<VkBuffer>(0x2600), 0, 1, 12);
+    constexpr std::size_t kinds = static_cast<std::size_t>(ChunkCommand::Count) - 1;
+    CommandList canonical;
+    Require(ReplayCommands(context, VK_NULL_HANDLE, list.Words(), &canonical) == kinds, "the decoder did not read back one command per kind");
+    Require(std::ranges::equal(canonical.Words(), list.Words()), "a command list decoded and encoded again differs from the list encode wrote");
+    Require(sink.Identity() == 1 && CommandSink(VK_NULL_HANDLE).Identity() == 0, "a sink's identity is not its chunk's or its command buffer's");
+    std::vector<std::uint64_t> unknown(list.Words().begin(), list.Words().end());
+    unknown.push_back(std::uint64_t{0x7777} << 32u);
+    Require(chunkThrows<std::runtime_error>([&] { ReplayCommands(context, VK_NULL_HANDLE, unknown, nullptr); }, "unknown command"), "an unknown chunk command was not refused");
+    std::vector<std::uint64_t> truncated(list.Words().begin(), list.Words().end() - 1);
+    Require(chunkThrows<std::runtime_error>([&] { ReplayCommands(context, VK_NULL_HANDLE, truncated, nullptr); }, "runs past the end"), "a truncated chunk command list was not refused");
+    CommandList issued;
+    const CommandSink issuing(issued, 3);
+    const std::array draws{ChunkDraw{0xa0a0, 3, 1, 0x10000}, ChunkDraw{0xb0b0, 6, 2, 0x10000}};
+    std::vector<std::size_t> marks;
+    marks.push_back(issued.Words().size());
+    issuing.BindPipeline(context, VK_PIPELINE_BIND_POINT_GRAPHICS, chunkHandle<VkPipeline>(0x1000));
+    issuing.Draw(context, 3, 1, 0, 0);
+    marks.push_back(issued.Words().size());
+    issuing.BindIndexBuffer(context, chunkHandle<VkBuffer>(0x2300), 0, VK_INDEX_TYPE_UINT32);
+    issuing.DrawIndexed(context, 6, 2, 0, 0, 0);
+    CommandList recorded;
+    std::vector<std::size_t> recordedMarks;
+    for (std::size_t index = 0; index < marks.size(); ++index) {
+        const auto end = index + 1 < marks.size() ? marks[index + 1] : issued.Words().size();
+        recordedMarks.push_back(recorded.Words().size());
+        ReplayCommands(context, VK_NULL_HANDLE, issued.Words().subspan(marks[index], end - marks[index]), &recorded);
+    }
+    CompareChunkCommands(issued.Words(), marks, recorded.Words(), recordedMarks, draws);
+    std::vector<std::uint64_t> changed(recorded.Words().begin(), recorded.Words().end());
+    changed.back() ^= 1u;
+    Require(chunkThrows<std::logic_error>([&] { CompareChunkCommands(issued.Words(), marks, changed, recordedMarks, draws); }, "program 0xb0b0"), "a recorded command that differs from the issued one was not named by its draw");
+    const std::vector<std::size_t> missing{0};
+    const auto firstDraw = std::span<const std::uint64_t>(recorded.Words()).first(recordedMarks[1]);
+    Require(chunkThrows<std::logic_error>([&] { CompareChunkCommands(issued.Words(), marks, firstDraw, missing, draws); }, "program 0xb0b0"), "a draw the worker never recorded was not reported");
+    std::cout << "chunk command tests passed\n";
+}
+
+bool chunkedFailureTests(const Device& device) {
+    if (!device.Graphics()) return false;
+    const auto& context = device.GetContext();
+    ChunkedRecording recording(context);
+    std::shared_ptr<ChunkPool> pool;
+    const auto before = ChunkedRecording::Statistics();
+    auto sink = recording.Begin(context, pool, ChunkInheritance{}, ChunkDraw{0x900d, 3, 1, 0});
+    sink.SetStencilReference(context, VK_STENCIL_FACE_FRONT_AND_BACK, 1);
+    sink = recording.Next(ChunkDraw{0xbad0, 6, 1, 0});
+    sink.List()->Append(static_cast<ChunkCommand>(0x7777), {});
+    const auto failed = recording.Close();
+    Require(failed.commands == VK_NULL_HANDLE && !failed.mismatch, "a failed chunk handed out its command buffer");
+    Require(failed.failure.find("program 0xbad0") != std::string::npos && failed.failure.find("unknown command") != std::string::npos, "a chunk's recording failure did not name the failing draw: " + failed.failure);
+    const auto afterFailure = ChunkedRecording::Statistics();
+    Require(afterFailure.failures - before.failures == 1 && afterFailure.chunks - before.chunks == 1 && afterFailure.draws - before.draws == 2, "the failed chunk was not counted");
+    sink = recording.Begin(context, pool, ChunkInheritance{}, ChunkDraw{0x900d, 3, 1, 0});
+    sink.SetStencilReference(context, VK_STENCIL_FACE_FRONT_AND_BACK, 2);
+    sink.SetStencilWriteMask(context, VK_STENCIL_FACE_FRONT_AND_BACK, 0xff);
+    const auto good = recording.Close();
+    Require(good.failure.empty() && good.commands != VK_NULL_HANDLE, "a chunk recorded after a failed one in the same pool failed: " + good.failure);
+    recording.Recycle(std::move(pool));
+    sink = recording.Begin(context, pool, ChunkInheritance{}, ChunkDraw{0x900d, 3, 1, 0});
+    const auto empty = recording.Close();
+    Require(empty.failure.empty() && empty.commands == VK_NULL_HANDLE, "a chunk without draws handed out a command buffer");
+    recording.Recycle(std::move(pool));
+    std::cout << "chunked recording failure tests passed\n";
+    return true;
+}
+
+bool chunkedRecordingTests(const Device& device, Recorder& recorder) {
+    if (!Recorder::ChunkedRecordingEnabled()) {
+        std::cout << "skipped, the chunked recording test needs APS5_RECORD_THREAD=1 and APS5_CHUNKED_RECORDING=1\n";
+        return false;
+    }
+    return withResolveScene(device, recorder, [&](ResolveScene& scene) {
+        const auto& context = scene.context;
+        constexpr std::uint32_t drawsPerPass = 6;
+        scene.clear();
+        Draw(context, scene.state, scene.triangle, scene.shaders);
+        scene.check("the draw that made the resident target rendered other pixels");
+        const auto before = ChunkedRecording::Statistics();
+        scene.clear();
+        std::uint64_t passSerial = 0;
+        for (std::uint32_t index = 0; index < drawsPerPass; ++index) {
+            Draw(context, scene.state, index % 2 == 0 ? scene.triangle : scene.indexed, scene.shaders);
+            if (index == 0) passSerial = recorder.OpenPassSerial();
+            if (index == drawsPerPass / 2) Recorder::DrainChunks();
+        }
+        Require(passSerial != 0 && recorder.OpenPassSerial() == passSerial, "the scene's draws did not continue one render pass");
+        const auto onePass = ChunkedRecording::Statistics();
+        Require(onePass.chunks - before.chunks == 1 && onePass.draws - before.draws == drawsPerPass, "the draws of one render pass were not recorded into one chunk");
+        scene.check("a chunked pass of draws rendered other pixels than the inline path");
+        scene.clear();
+        const auto batch = recorder.OpenSerial();
+        for (std::uint32_t index = 0; index < drawsPerPass; ++index) Draw(context, scene.state, scene.triangle, scene.shaders);
+        const auto firstPass = recorder.OpenPassSerial();
+        const auto commands = recorder.Commands();
+        Require(firstPass != 0 && recorder.OpenPassSerial() == 0, "recording outside the pass did not end the chunked pass");
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        for (std::uint32_t index = 0; index < drawsPerPass; ++index) Draw(context, scene.state, scene.indexed, scene.shaders);
+        Require(recorder.OpenPassSerial() != 0 && recorder.OpenPassSerial() != firstPass, "the draws after the barrier did not begin a new render pass");
+        Require(recorder.OpenSerial() == batch && recorder.Recording(), "the two passes and the barrier were not recorded into one batch");
+        const auto twoPasses = ChunkedRecording::Statistics();
+        Require(twoPasses.chunks - onePass.chunks == 2 && twoPasses.draws - onePass.draws == 2 * drawsPerPass, "two passes split by a barrier were not recorded into two chunks");
+        scene.check("chunked passes split by a barrier inside one batch rendered other pixels than the inline path");
+        const auto after = ChunkedRecording::Statistics();
+        Require(after.failures == before.failures, "a chunk failed");
+        Require(!ChunkedRecording::Verify() || after.verified - before.verified == after.draws - before.draws, "APS5_VERIFY_CHUNKED_RECORDING compared fewer draws than were chunked");
+        std::cout << "chunked recording tests passed" << (ChunkedRecording::Verify() ? " (verified)" : "") << "\n";
+        return true;
+    });
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {
             queuedWriteGroupTests();
             std::cout << "queued write group tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--resolve-stamp-only") {
+            resolveStampTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--chunk-commands-only") {
+            chunkCommandTests();
             return 0;
         }
         std::unique_ptr<Device> created;
@@ -10402,6 +11135,13 @@ int main(int argc, char** argv) {
             return pipelineCacheFileTests(device);
         }
 
+        if (argc == 2 && std::string_view(argv[1]) == "--framebuffer-mutex-only") {
+            framebufferMutexTests(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--chunked-failure-only") {
+            return chunkedFailureTests(device) ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-only") {
             descriptorPoolTests(device);
             return 0;
@@ -10472,9 +11212,25 @@ int main(int argc, char** argv) {
             copiedDirectOrderingTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--ledger-serial-only") {
+            ledgerSerialTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--parallel-resolve-only") {
+            return parallelResolveTests(device, recorder) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--parallel-revalidate-only") {
+            return parallelRevalidateTests(device, recorder) ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {
             pendingWriteSnapshotTests(device, recorder);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--parallel-targets-only") {
+            return parallelTargetsTests(device, recorder) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--chunked-recording-only") {
+            return chunkedRecordingTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-pending-write-snapshot") {
             pendingWriteSnapshotBenchmark(recorder);
@@ -10482,6 +11238,15 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--storage-upload-lifetime-only" || std::string_view(argv[1]) == "--storage-upload-failure-only")) {
             storageUploadLifetimeTests(device, recorder, std::string_view(argv[1]) == "--storage-upload-failure-only");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--tiled-resolve-only") {
+            if ((device.GetContext().limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.Graphics()) {
+                std::cout << "skipped, the device lacks 4x color targets or a graphics queue\n";
+                return 77;
+            }
+            tiledResolveTests(device, recorder);
+            std::cout << "CB resolves into tiled targets tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
@@ -10715,6 +11480,7 @@ int main(int argc, char** argv) {
         stagingReuseTests(device, recorder);
         depthSurfaceProofTests(device, recorder);
         multisampleGuestAccessTests(device, recorder);
+        tiledResolveTests(device, recorder);
         fmaskDecompressMsaaTests(device, recorder);
         misalignedSnapshotTests(device, recorder);
         misalignedRegionTests(device, recorder);

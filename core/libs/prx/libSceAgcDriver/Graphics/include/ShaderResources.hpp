@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommandSink.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CacheSizing.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -10,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <limits>
@@ -49,6 +51,7 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
 // The cached storage image of a surface (render targets use it as their resident image); brought up
 // to date with guest memory before it is returned.
 std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, const GuestTextureResource& resource);
+std::shared_ptr<StorageTexture> PeekStorageSurface(const Context& context, const GuestTextureResource& resource);
 // Whether `image` is still the storage cache's image of its surface (what CachedStorageSurface
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);
@@ -146,7 +149,7 @@ public:
     VkDescriptorSetLayout FragmentLayout() const { return fragment.layout; }
     bool SplitSets() const { return splitSets; }
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
-    void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
+    void Bind(const CommandSink& commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
@@ -158,6 +161,7 @@ public:
             VkBuffer handle = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
             std::span<const std::byte> bytes;
+            bool inPlace = false;
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation fragmentAllocation;
@@ -196,6 +200,8 @@ public:
         std::array<std::uint64_t, static_cast<std::size_t>(WholeCopy::Count)> wholeBytes{};
         std::uint64_t arenaHits = 0;
         std::uint64_t arenaCopies = 0;
+        std::uint64_t inPlace = 0;
+        std::uint64_t inPlaceBytes = 0;
         double checkUs = 0;
         double collectUs = 0;
         double lookupUs = 0;
@@ -207,8 +213,34 @@ public:
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsStatistics* statistics = nullptr, const DrawIndexRanges* drawRanges = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    struct MovedReadOnlyPlan {
+        std::vector<MovedBuffer> moved;
+        std::vector<std::pair<std::uint64_t, std::size_t>> checks;
+    };
+    std::optional<MovedReadOnlyPlan> PlanMovedReadOnlyBuffers(std::span<const CompiledShader> shaders) const;
+    std::optional<std::vector<MovedBuffer>> CheckMovedReadOnlyBuffers(const MovedReadOnlyPlan& plan, Recorder& recorder) const;
+    struct MovedDispatchBuffer {
+        std::size_t allocation;
+        std::uint64_t address;
+        std::size_t size;
+        VkDescriptorBufferInfo view;
+        std::uint64_t begin;
+    };
+    std::optional<std::vector<MovedDispatchBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder& recorder) const;
+    std::shared_ptr<DrawBindings> BindMovedDispatchBuffers(Recorder& recorder, std::span<const MovedDispatchBuffer> moved) const;
+    struct GuestBufferView {
+        std::uint64_t address;
+        std::size_t size;
+        bool written;
+        std::uint64_t begin;
+        VkDeviceSize range;
+        bool operator==(const GuestBufferView& other) const = default;
+    };
+    std::vector<GuestBufferView> GuestBufferViews(std::span<const MovedDispatchBuffer> moved = {}) const;
     static std::size_t MaxDrawSnapshotBytes();
     static void SetMovedWordRing(bool enabled);
+    static void SetInPlaceDrawInputs(bool enabled);
+    static bool InPlaceDrawInputsEnabled();
     static std::optional<ByteRanges> GuestReadRanges(std::span<const std::uint32_t> words, const ShaderRecompiler::BufferReadRanges* ranges, std::uint64_t size, WholeCopy* reason = nullptr, const DrawIndexRanges* drawRanges = nullptr);
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
@@ -286,6 +318,15 @@ public:
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static std::uint64_t EpochSkips();
     static std::uint64_t EpochSkipDisagreements();
+    enum class EpochProofVerdict : std::uint8_t { Held, Adopted, Disabled, Busy, NoProof, Dirty, Basis, Stamps, DirtyTail, Count };
+    static const char* EpochProofVerdictName(EpochProofVerdict verdict);
+    struct EpochProofResult {
+        EpochProofVerdict verdict = EpochProofVerdict::Disabled;
+        std::uint64_t basis = 0;
+        std::uint64_t dirtyThrough = 0;
+    };
+    EpochProofResult ResolveEpochProof() const;
+    EpochProofVerdict AdoptEpochProof(const EpochProofResult& result, bool apply);
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
@@ -538,6 +579,9 @@ private:
     };
     EpochProof epochProof;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> proofRanges;
+    mutable std::recursive_mutex proofMutex;
+    std::uint64_t proofBasis = 0;
+    bool epochProofScalarsHold();
     bool epochProofHolds();
     void recordEpochProof(std::uint64_t dirtySerial);
     Context context;
@@ -700,6 +744,7 @@ public:
     // Find and Touch calls so far (the [rescache] line: a recipe hit touches instead of finding).
     static std::uint64_t Finds();
     static std::uint64_t Touches();
+    std::uint64_t Serial() const { return serial.load(std::memory_order_acquire); }
     void Clear();
     std::size_t Size() const;
     std::uint64_t Bytes() const;
@@ -725,6 +770,7 @@ private:
         std::uint64_t bytes = 0;
     };
     mutable std::mutex mutex;
+    std::atomic<std::uint64_t> serial{0};
     std::list<Entry> entries;
     std::unordered_map<Key, std::list<Entry>::iterator, KeyHash> index;
     std::uint64_t bytes = 0;

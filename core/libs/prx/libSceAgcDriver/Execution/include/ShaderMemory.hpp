@@ -16,6 +16,7 @@ namespace ShaderRecompiler {
 struct SourceHandle;
 class PreparedShaderInvocation;
 struct IrResourcePlan;
+struct ResourceSnapshot;
 struct SrtTapeInstance;
 }
 
@@ -85,6 +86,36 @@ public:
     };
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation, IncrementalState& state);
     std::vector<std::pair<std::uint64_t, std::uint32_t>> TakeKeptWords();
+    enum class PlanFallback : std::uint8_t { None, First, Inputs, Memory, Unrecorded, ImageTables, Specialization, Count };
+    static constexpr std::size_t PlanFallbacks = static_cast<std::size_t>(PlanFallback::Count);
+    static constexpr const char* PlanFallbackNames[PlanFallbacks] = {"none", "first evaluation", "root user data changed", "read range written, pending or remapped", "previous evaluation not recorded", "image tables", "specialization words changed"};
+    enum class PlanOutcome : std::uint8_t { Reused, Patched, Reevaluated, Full, Count };
+    static constexpr std::size_t PlanOutcomes = static_cast<std::size_t>(PlanOutcome::Count);
+    static constexpr const char* PlanOutcomeNames[PlanOutcomes] = {"reused", "reused with data user words patched", "re-evaluated by node", "full capture"};
+    struct PlanInstance {
+        IncrementalState nodes;
+        std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+        std::shared_ptr<const ShaderRecompiler::ResourceCapture> values;
+        std::shared_ptr<const ShaderRecompiler::ResourceCapture> latest;
+        std::shared_ptr<const ShaderRecompiler::IrResourcePlan> rootsPlan;
+        std::vector<std::uint32_t> roots;
+        bool allRoots = true;
+        std::vector<std::uint32_t> userData;
+        std::uint64_t shaderBase = 0;
+        std::uint64_t forgetSerial = 0;
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> reads;
+    };
+    struct PlanCapture {
+        std::shared_ptr<const ShaderRecompiler::ResourceCapture> values;
+        PlanOutcome outcome = PlanOutcome::Full;
+        PlanFallback fallback = PlanFallback::None;
+        std::uint64_t nodesKept = 0;
+        std::uint64_t nodesFresh = 0;
+    };
+    PlanCapture CapturePlanned(const ShaderRecompiler::PreparedShaderInvocation& invocation, PlanInstance& instance, bool keepReads);
+    static bool PlanReadsCurrent(const PlanInstance& instance);
+    static bool SameSpecializationWords(const ShaderRecompiler::ResourceSnapshot& a, const ShaderRecompiler::ResourceSnapshot& b);
+    static void PlanRoots(const ShaderRecompiler::IrResourcePlan& plan, std::vector<std::uint32_t>& roots, bool& allRoots);
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> Regions() const;
     // The page regions read since the previous call (or construction), a word read again
     // included, the initial regions excluded: one stage's own reads on the draw path's shared
@@ -144,6 +175,7 @@ private:
         std::uint32_t word;
     };
     bool replay(std::span<const RecordedAccess> accesses, const ReplayPlan* plan = nullptr, ReplayResult* result = nullptr);
+    PlanFallback planFallback(const PlanInstance& instance, std::span<const std::uint32_t> userData, std::uint64_t shaderBase) const;
     bool probe(std::uint64_t address, std::uint64_t bytes);
     [[nodiscard]] bool overlapsInitial(std::uint64_t begin, std::uint64_t end) const;
 

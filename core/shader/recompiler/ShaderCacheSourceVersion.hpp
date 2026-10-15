@@ -8,6 +8,7 @@
 namespace ShaderRecompiler::ShaderDiskCache::Generated {
 
 extern const std::uint64_t SourceVersion;
+extern const std::uint64_t FrontendSourceVersion;
 extern const std::span<const std::string_view> RecompilerSwitches;
 
 }

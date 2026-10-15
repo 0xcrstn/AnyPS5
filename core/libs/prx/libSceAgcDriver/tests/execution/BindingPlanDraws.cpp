@@ -274,16 +274,73 @@ void IncrementalDrawsFollowWatchedTables() {
     Require(after.incrementalStale == before.incrementalStale && after.stageMismatches == before.stageMismatches, "incremental draws served stale words or differed from the full capture");
 }
 
+std::uint64_t PlanOutcomes(const BindingPlanCounters& counters, AgcDriver::ShaderMemory::PlanOutcome outcome) {
+    return counters.planOutcomes[static_cast<std::size_t>(outcome)];
+}
+
+std::uint64_t PlanFallbacks(const BindingPlanCounters& counters, AgcDriver::ShaderMemory::PlanFallback reason) {
+    return counters.planFallbacks[static_cast<std::size_t>(reason)];
+}
+
+void IncrementalPlansFollowWatchedTables() {
+    using Outcome = AgcDriver::ShaderMemory::PlanOutcome;
+    using Fallback = AgcDriver::ShaderMemory::PlanFallback;
+    auto* words = reinterpret_cast<std::uint32_t*>(AllocateWatched(Block));
+    auto* table = words;
+    auto* secondTable = words + 16;
+    auto* values = reinterpret_cast<float*>(words + 64);
+    const auto describe = [&](std::uint32_t* target, const float* data, std::uint32_t stride) {
+        const auto descriptor = BufferDescriptor(data, stride, 16u, 0x31016facu);
+        std::copy(descriptor.begin(), descriptor.end(), target);
+    };
+    std::fill_n(values, 8, 0.0f);
+    values[0] = 1.0f;
+    values[4] = 0.5f;
+    describe(table, values, 0);
+    describe(secondTable, values, 0);
+    SetVertexRecords(3);
+    const auto before = Counters();
+    Draw(BufferPixelCode.data(), table, 255, "the first planned draw over a watched table");
+    Draw(BufferPixelCode.data(), table, 255, "a planned draw after the first collect of the watched table");
+    const auto settled = Counters();
+    Draw(BufferPixelCode.data(), table, 255, "a planned draw over an unchanged watched table");
+    const auto unchanged = Counters();
+    Require(unchanged.planStages == settled.planStages + 2u, "a planned draw evaluated " + std::to_string(unchanged.planStages - settled.planStages) + " plan instances, expected 2");
+    Require(PlanOutcomes(unchanged, Outcome::Reused) == PlanOutcomes(settled, Outcome::Reused) + 1u, "a planned draw over an unchanged watched table did not reuse its pixel stage's plan instance (" + std::to_string(unchanged.planNodesFresh - settled.planNodesFresh) + " nodes re-read)");
+    describe(table, values + 4, 0);
+    Draw(BufferPixelCode.data(), table, 128, "a planned draw whose watched table a CPU store changed");
+    const auto written = Counters();
+    Require(PlanOutcomes(written, Outcome::Reused) == PlanOutcomes(unchanged, Outcome::Reused) && PlanFallbacks(written, Fallback::Memory) > PlanFallbacks(unchanged, Fallback::Memory), "a planned draw whose read range a CPU store wrote reused its plan instance");
+    describe(table, values, 0);
+    Draw(BufferPixelCode.data(), table, 255, "a planned draw whose watched table a CPU store changed back");
+    Draw(BufferPixelCode.data(), table, 255, "a planned draw over the restored watched table");
+    const auto restored = Counters();
+    Draw(BufferPixelCode.data(), secondTable, 255, "a planned draw whose table pointer user data changed");
+    const auto moved = Counters();
+    Require(PlanOutcomes(moved, Outcome::Reused) == PlanOutcomes(restored, Outcome::Reused) && PlanFallbacks(moved, Fallback::Inputs) > PlanFallbacks(restored, Fallback::Inputs), "a planned draw whose root user data changed reused its plan instance");
+    describe(table, values, 16u);
+    Draw(BufferPixelCode.data(), table, 255, "a planned draw whose buffer stride changed");
+    const auto specialized = Counters();
+    Require(PlanFallbacks(specialized, Fallback::Specialization) == PlanFallbacks(moved, Fallback::Specialization) + 1u && PlanOutcomes(specialized, Outcome::Full) == PlanOutcomes(moved, Outcome::Full) + 1u, "a planned draw whose specialization words changed did not take the full capture");
+    Require(specialized.planVerified - before.planVerified == specialized.planStages - before.planStages, "planned stages were not all verified against the full capture");
+    Require(specialized.planStale == before.planStale && specialized.stageMismatches == before.stageMismatches, "plan instances served stale words or differed from the full capture");
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
         const bool incremental = argc == 2 && std::string(argv[1]) == "incremental";
+        const bool plans = argc == 2 && std::string(argv[1]) == "plans";
         SetEnvironment("APS5_BINDING_PLAN");
         SetEnvironment("APS5_VERIFY_BINDING_PLAN");
         if (incremental) {
             SetEnvironment("APS5_INCREMENTAL_BINDINGS");
             SetEnvironment("APS5_VERIFY_INCREMENTAL_BINDINGS");
+        }
+        if (plans) {
+            SetEnvironment("APS5_INCREMENTAL_PLANS");
+            SetEnvironment("APS5_VERIFY_INCREMENTAL_PLANS");
         }
         bool libraries = false;
         {
@@ -297,6 +354,7 @@ int main(int argc, char** argv) {
         PlannedDrawsFollowTheirBuffers(libraries);
         PlannedIndirectDrawsKeepOwnedResults();
         if (incremental) IncrementalDrawsFollowWatchedTables();
+        if (plans) IncrementalPlansFollowWatchedTables();
         AgcDriverShutdown_nid_postfix();
         std::cout << "Planned draws read their buffers, reuse their decode and templates, and match the full capture " << (libraries ? "with" : "without") << " graphics pipeline libraries" << std::endl;
         return 0;

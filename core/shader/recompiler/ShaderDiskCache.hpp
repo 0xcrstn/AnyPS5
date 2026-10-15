@@ -56,6 +56,9 @@ struct Counters {
 };
 
 [[nodiscard]] std::uint64_t SourceVersion();
+[[nodiscard]] std::uint64_t PlanSourceVersion();
+[[nodiscard]] bool LayeredCache();
+[[nodiscard]] bool SamePlan(const IrResourcePlan& reference, const IrResourcePlan& candidate);
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key);
 

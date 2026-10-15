@@ -46,6 +46,7 @@ private:
     File readFile() const;
     std::optional<FileHeader> readHeader() const;
     void load(std::vector<std::byte>& initialData);
+    void adoptEarlierDriverFile(const std::filesystem::path& directory, const std::string& uuid);
     void save(bool final);
     void run();
 

@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PIPELINECOMPILEQUEUE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PIPELINECOMPILEQUEUE_HPP
 
+#include "CompileTrace.hpp"
 #include <algorithm>
 #include <condition_variable>
 #include <cstddef>
@@ -59,7 +60,7 @@ public:
 
     template<typename TPrepare>
     bool TryEnqueuePrepared(PipelineCompileKey key, std::size_t bytes, TPrepare&& prepare) {
-        Task task{key, bytes, {}};
+        Task task{key, bytes, {}, ShaderCompileTrace::Clock::now()};
         std::lock_guard lock(mutex);
         if (pending.contains(key)) {
             ++stats.duplicate;
@@ -141,6 +142,7 @@ private:
         PipelineCompileKey key;
         std::size_t bytes;
         std::function<bool()> work;
+        ShaderCompileTrace::Clock::time_point enqueued{};
     };
 
     void run() noexcept {
@@ -154,7 +156,13 @@ private:
                 queued.pop_front();
             }
             bool built = false, failed = false;
-            try { built = task.work(); } catch (...) { failed = true; }
+            {
+                ShaderCompileTrace::Event event("queue.pipeline_task");
+                event.Queued(task.enqueued).Hex("variant", task.key.first).Number("push_stages", task.key.second).Number("request_bytes", task.bytes);
+                try { built = task.work(); } catch (...) { failed = true; }
+                event.Flag("built", built);
+                if (failed) event.Fail("pipeline compile task threw");
+            }
             task.work = {};
             {
                 std::lock_guard lock(mutex);
