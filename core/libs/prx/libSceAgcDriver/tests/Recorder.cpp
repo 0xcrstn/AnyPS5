@@ -9659,8 +9659,10 @@ bool residentMirrorTests(const Device& device, Recorder& recorder, bool descript
     recorder.Sync();
     Require(same(afterLate, expected), "a GPU write after the last read of its batch left the mirror stale");
     const auto after = AgcDriver::Graphics::MirrorTotals();
-    Require(after.made - before.made <= 1 && after.uses - before.uses == 9 && after.refreshes - before.refreshes >= 8 && after.midBatchSyncs - before.midBatchSyncs == 1, "resident mirror counters do not match the reads");
-    if (const char* verify = std::getenv("APS5_VERIFY_RESIDENT_MIRRORS"); verify != nullptr && std::strcmp(verify, "0") != 0) Require(after.verified - before.verified >= 8 && after.verifyDiffering == before.verifyDiffering, "a resident mirror differed from its import at the start of a batch");
+    Require(after.made - before.made <= 1 && after.uses - before.uses == 9 && after.refreshes - before.refreshes >= 3 && after.midBatchSyncs - before.midBatchSyncs >= 4, "resident mirror counters do not match the reads");
+    Require(after.gpuWrittenRetired - before.gpuWrittenRetired == 1 && AgcDriver::Graphics::MirrorGpuWritten(*mirrors.front()), "a GPU write into a mirrored import did not retire its mirror");
+    Require(AgcDriver::Graphics::MirrorOfImport(context, *import) == nullptr && AgcDriver::Graphics::MirrorTotals().gpuWrittenRefused > after.gpuWrittenRefused, "a GPU-written import got a new resident mirror");
+    if (const char* verify = std::getenv("APS5_VERIFY_RESIDENT_MIRRORS"); verify != nullptr && std::strcmp(verify, "0") != 0) Require(after.verified - before.verified >= 3 && after.verifyDiffering == before.verifyDiffering, "a resident mirror differed from its import at the start of a batch");
     AgcDriver::Graphics::ReportMirrorsEveryBatchForTests(false);
     if (AgcDriver::Graphics::LinearSpaceEnabled(context)) Require(AgcDriver::Graphics::LinearSpaceTotals().binds > linearBefore.binds || AgcDriver::Graphics::LinearSpaceTotals().usedPages > 0, "the resident mirror was not placed in the linear address space");
     leased.WriteBack();

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LinearSpace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
@@ -43,6 +44,7 @@ struct ResidentMirror {
     std::uint64_t usedBatch = 0;
     std::uint32_t churn = 0;
     bool retired = false;
+    std::atomic<bool> gpuWritten{false};
     ResidentMirror() = default;
     ResidentMirror(const ResidentMirror&) = delete;
     ResidentMirror& operator=(const ResidentMirror&) = delete;
@@ -63,6 +65,7 @@ struct Statistics {
     std::atomic<std::uint64_t> collectNs{0};
     std::atomic<std::uint64_t> deferred{0}, denied{0}, deniedUses{0}, verified{0}, verifiedBytes{0}, verifyDiffering{0};
     std::atomic<std::uint64_t> placedBuilds{0};
+    std::atomic<std::uint64_t> gpuWrittenRetired{0}, gpuWrittenRefused{0}, gpuWrittenSyncs{0};
 };
 
 struct Seen {
@@ -84,6 +87,7 @@ struct Registry {
     std::vector<std::tuple<const Recorder*, std::uint64_t, std::uint64_t>> pointerWrites;
     std::uint64_t bytes = 0;
     std::atomic<bool> any{false};
+    GuestRangeSet gpuWritten;
 };
 
 Registry& Mirrors() {
@@ -285,6 +289,8 @@ void reportMirrors() {
     AgcDriver::ProfilePrint_nid_no_patch("[mirrors] reuse gate (after %u batches, churn limit %u): %llu deferred, %llu denied for churn, %llu uses refused while denied; verify%s: %llu checked (%llu MiB), %llu blocks differing\n", MirrorAfterBatches(), ChurnLimit(), take(Stats().deferred, deferred), take(Stats().denied, denied), take(Stats().deniedUses, deniedUses), VerifyMirrors() ? "" : " (off)", take(Stats().verified, verified), take(Stats().verifiedBytes, verifiedBytes) >> 20u, take(Stats().verifyDiffering, verifyDiffering));
     AgcDriver::ProfilePrint_nid_no_patch("[mirrors] resident read mirrors%s: %llu live (%.0f MiB), last 10 s: %llu made, %llu refused, %llu uses, %llu batch refreshes (%llu blocks, %.1f MiB copied in prologues, collect %.1f ms), %llu mid-batch syncs (%.1f MiB), %llu blocks invalidated by GPU writes\n", ResidentMirrorsEnabled() ? "" : " (off)", static_cast<unsigned long long>(totals.live), static_cast<double>(totals.liveBytes) / 1048576.0, static_cast<unsigned long long>(totals.made - previous.made), static_cast<unsigned long long>(totals.refused - previous.refused), static_cast<unsigned long long>(totals.uses - previous.uses), static_cast<unsigned long long>(totals.refreshes - previous.refreshes), static_cast<unsigned long long>(totals.refreshedBlocks - previous.refreshedBlocks), static_cast<double>(totals.refreshedBytes - previous.refreshedBytes) / 1048576.0, totals.collectMs - previous.collectMs, static_cast<unsigned long long>(totals.midBatchSyncs - previous.midBatchSyncs), static_cast<double>(totals.midBatchBytes - previous.midBatchBytes) / 1048576.0, static_cast<unsigned long long>(totals.invalidatedBlocks - previous.invalidatedBlocks));
     previous = totals;
+    static std::uint64_t gpuRetired = 0, gpuRefused = 0, gpuSyncs = 0;
+    AgcDriver::ProfilePrint_nid_no_patch("[mirrors] GPU-written ranges: %llu mirrors retired by a GPU write, %llu mirrors refused over GPU-written memory, %llu whole syncs of retired mirrors still bound\n", take(Stats().gpuWrittenRetired, gpuRetired), take(Stats().gpuWrittenRefused, gpuRefused), take(Stats().gpuWrittenSyncs, gpuSyncs));
     static LinearSpaceCounters linearPrevious{};
     const auto linear = LinearSpaceTotals();
     AgcDriver::ProfilePrint_nid_no_patch("[mirrors] linear address space (APS5_LINEAR_ADDRESS_SPACE): %llu pages bound (%.0f MiB), %llu in use; last 10 s: %llu pages bound, %llu unbound, %llu ranges refused; %llu linear BDA tables built (%llu linear pages)\n", static_cast<unsigned long long>(linear.boundPages), static_cast<double>(linear.boundPages * LinearPageBytes) / 1048576.0, static_cast<unsigned long long>(linear.usedPages), static_cast<unsigned long long>(linear.binds - linearPrevious.binds), static_cast<unsigned long long>(linear.unbinds - linearPrevious.unbinds), static_cast<unsigned long long>(linear.refused - linearPrevious.refused), static_cast<unsigned long long>(linear.tables - linearPrevious.tables), static_cast<unsigned long long>(linear.codedPages - linearPrevious.codedPages));
@@ -331,6 +337,14 @@ std::shared_ptr<ResidentMirror> mirrorOf(const Context& context, const HostImpor
     const auto budget = BudgetBytes(context);
     if (!enabled || budget == 0 || import.bytes == 0 || import.unwatched || import.dmaBuf || !context.bufferDeviceAddress) return {};
     if (!GuestMemory::Watched(import.base, static_cast<std::size_t>(import.bytes))) return {};
+    {
+        auto& written = Mirrors();
+        std::lock_guard lock(written.mutex);
+        if (!writable && written.gpuWritten.Overlaps(import.base, import.base + import.bytes)) {
+            Stats().gpuWrittenRefused.fetch_add(1, std::memory_order_relaxed);
+            return {};
+        }
+    }
     auto& registry = Mirrors();
     const auto* recorder = Recorder::Current();
     const auto batch = recorder != nullptr ? recorder->Submissions() + 1 : 0;
@@ -484,15 +498,33 @@ VkDeviceSize MirrorBufferOffset(const ResidentMirror& mirror) {
 }
 
 void NoteMirroredWrite(std::uint64_t begin, std::uint64_t end) {
+    if (end <= begin) return;
     auto& registry = Mirrors();
-    if (!registry.any.load(std::memory_order_acquire) || end <= begin) return;
     std::lock_guard lock(registry.mutex);
-    auto it = registry.byBase.upper_bound(begin);
-    if (it != registry.byBase.begin()) --it;
-    for (; it != registry.byBase.end() && it->first < end; ++it) markBlocks(*it->second, begin, end);
-    for (const auto& mirror : registry.used) {
-        if (registry.byBase.find(mirror->base) == registry.byBase.end() || registry.byBase.find(mirror->base)->second != mirror) markBlocks(*mirror, begin, end);
+    registry.gpuWritten.Insert(begin, end);
+    if (!registry.any.load(std::memory_order_acquire)) return;
+    const auto overlaps = [&](const ResidentMirror& mirror) { return mirror.base < end && begin < mirror.base + mirror.bytes; };
+    const auto poison = [&](ResidentMirror& mirror) {
+        markBlocks(mirror, begin, end);
+        if (!mirror.gpuWritten.exchange(true, std::memory_order_acq_rel)) Stats().gpuWrittenRetired.fetch_add(1, std::memory_order_relaxed);
+    };
+    for (auto it = registry.byBase.begin(); it != registry.byBase.end() && it->first < end;) {
+        if (!overlaps(*it->second)) {
+            ++it;
+            continue;
+        }
+        poison(*it->second);
+        it->second->retired = true;
+        registry.bytes -= Footprint(*it->second);
+        it = registry.byBase.erase(it);
     }
+    for (const auto& mirror : registry.used) {
+        if (overlaps(*mirror)) poison(*mirror);
+    }
+}
+
+bool MirrorGpuWritten(const ResidentMirror& mirror) {
+    return mirror.gpuWritten.load(std::memory_order_acquire);
 }
 
 void NotePointerWrite(const Recorder& recorder, std::uint64_t begin, std::uint64_t end) {
@@ -530,7 +562,13 @@ void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirr
                 mirror->usedBatch = batch;
                 registry.used.push_back(mirror);
             }
-            if (mirror->anyUnsynced && !mirror->retired) unsynced.push_back(mirror.get());
+            if (mirror->gpuWritten.load(std::memory_order_acquire)) {
+                markBlocks(*mirror, mirror->base, mirror->base + mirror->bytes);
+                Stats().gpuWrittenSyncs.fetch_add(1, std::memory_order_relaxed);
+                unsynced.push_back(mirror.get());
+            } else if (mirror->anyUnsynced && !mirror->retired) {
+                unsynced.push_back(mirror.get());
+            }
         }
     }
     Stats().uses.fetch_add(1, std::memory_order_relaxed);
@@ -733,6 +771,8 @@ ResidentMirrorCounters MirrorTotals() {
     totals.denied = stats.denied.load(std::memory_order_relaxed);
     totals.verified = stats.verified.load(std::memory_order_relaxed);
     totals.verifyDiffering = stats.verifyDiffering.load(std::memory_order_relaxed);
+    totals.gpuWrittenRetired = stats.gpuWrittenRetired.load(std::memory_order_relaxed);
+    totals.gpuWrittenRefused = stats.gpuWrittenRefused.load(std::memory_order_relaxed);
     totals.collectMs = static_cast<double>(stats.collectNs.load(std::memory_order_relaxed)) / 1e6;
     return totals;
 }

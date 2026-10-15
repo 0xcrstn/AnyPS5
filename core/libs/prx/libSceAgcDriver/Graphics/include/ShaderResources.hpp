@@ -287,6 +287,7 @@ public:
     bool UsesAddressTable() const { return usesBda; }
     bool KnownAddressWrites() const { return usesBda && bdaReadOnly && !guestMemory.HasCopiedWrites(); }
     bool HasPlacements() const;
+    bool HoldsGpuWrittenMirror() const;
     bool DispatchEffectsKnown() const { return tableStages.empty() && !guestMemory.HasCopiedWrites() && !HasPlacements(); }
     bool WritesThroughPointers() const { return usesBda && !bdaReadOnly; }
     void UseMirrors(Recorder& recorder) const;

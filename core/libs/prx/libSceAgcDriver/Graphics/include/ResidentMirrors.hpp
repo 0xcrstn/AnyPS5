@@ -30,6 +30,7 @@ VkDeviceSize MirrorBufferOffset(const ResidentMirror& mirror);
 void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirror>> mirrors);
 void RefreshMirrorsForDirectUse(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirror>> mirrors);
 void NoteMirroredWrite(std::uint64_t begin, std::uint64_t end);
+bool MirrorGpuWritten(const ResidentMirror& mirror);
 void NotePointerWrite(const Recorder& recorder, std::uint64_t begin, std::uint64_t end);
 void SubmitMirrors(Recorder& recorder);
 void ForgetMirrors(VkDevice device, std::uint64_t begin, std::uint64_t end);
@@ -51,6 +52,8 @@ struct ResidentMirrorCounters {
     std::uint64_t denied = 0;
     std::uint64_t verified = 0;
     std::uint64_t verifyDiffering = 0;
+    std::uint64_t gpuWrittenRetired = 0;
+    std::uint64_t gpuWrittenRefused = 0;
     double collectMs = 0;
 };
 ResidentMirrorCounters MirrorTotals();

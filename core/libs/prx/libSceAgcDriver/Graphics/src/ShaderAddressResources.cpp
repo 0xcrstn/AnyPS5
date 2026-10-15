@@ -53,6 +53,12 @@ std::vector<DispatchFreeze::Reach> ShaderResources::ReachableRanges() const {
     return guestMemory.ReachableRanges(usesBda);
 }
 
+bool ShaderResources::HoldsGpuWrittenMirror() const {
+    const auto written = [](const std::shared_ptr<ResidentMirror>& mirror) { return mirror != nullptr && MirrorGpuWritten(*mirror); };
+    if (std::any_of(bufferMirrors.begin(), bufferMirrors.end(), written)) return true;
+    return bda != nullptr && std::any_of(bda->Mirrors().begin(), bda->Mirrors().end(), written);
+}
+
 bool ShaderResources::HasPlacements() const {
     return bda != nullptr && bda->HasPlacements();
 }
