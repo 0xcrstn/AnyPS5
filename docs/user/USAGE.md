@@ -213,6 +213,31 @@ Three switches take `0` (the default), `1` or `verify`; any other value stops th
 
 `APS5_COHERENCE_LAZY_RELEASE=1` makes labels and flips store only the pending results whose memory the native protection does not cover. Protected results stay on the GPU until something reads them, and the title's own CPU accesses resolve them when they happen. Every `APS5_STORE_AT_FLIP` value then behaves the same, and `APS5_STORE_AT_LABEL=1` still stores everything. `verify` stops the title when a label or flip leaves results that are neither stored nor protected. The switch needs `APS5_COHERENCE_FAULTS`, and `APS5_COHERENCE_RESIDENCY` too when `APS5_LAZY_STAGING_OUT` is on; without them the title stops at start.
 
+### GPU queue waits and scheduling
+
+A `WAIT_REG_MEM` on one queue may be satisfied by a label another queue recorded but the GPU has not stored yet. By default any label recorded after the waiting submission arrived counts (`APS5_WAIT_FLOOR=submission`). That rule is too loose: a later wait in the same submission can be satisfied by a value overwritten before it could have seen it. `APS5_WAIT_FLOOR=activation` counts only labels recorded after the waiting queue's previous wait. `APS5_VERIFY_WAIT_OBSERVATIONS=1` stops the title when a wait is satisfied by a value it could not have observed.
+
+With `APS5_COHERENCE_ORDERING=1` or `verify`, a label also waits behind the write-backs its batch still owes, so a title's own CPU loads never see a label before the results it releases. `APS5_LABEL_PUBLICATION=ordered` or `early` names the same choice; a value that contradicts `APS5_COHERENCE_ORDERING` stops the title.
+
+`APS5_TRACE_WAIT_CHAIN=1` prints a `[waitchain]` line per queue every 10 s. The line splits the time each blocked wait spent into: producer label not recorded yet, recorded but not submitted, submitted but not finished on the GPU, finished but not stored for the CPU, and stored but not seen yet. A `[labels]` line gives the same latencies over all labels. Slow-wait reports name the label that satisfied the wait.
+
+`APS5_QUEUE_SCHEDULER` chooses how the GPU queues' workers take turns:
+- `off` (the default) runs them as before.
+- `serial` runs one packet at a time across all queues; the oldest runnable submission goes next, and a queue waiting on a label gives up its turn. It is a reference for comparing results, not a fast mode.
+- `dag` runs the queues concurrently, as `off` does, and lets a packet whose shader is still compiling wait without holding any lock.
+
+`APS5_QUEUE_SCHEDULER_VERIFY=1` stops the title when a queue runs a packet out of order or while it is waiting for a compile. A `[scheduler]` line every 10 s counts turns, hand-overs and parked packets.
+
+`APS5_LABEL_TIMELINE=on` lets a wait be satisfied by another queue's recorded label only with a proof: the label was recorded after the wait became active and covers every awaited byte, or it is the newest value and nothing wrote over it since. Anything else waits for guest memory. `verify` stops the title instead of waiting. A compare function the driver does not know stops the title in both modes. The `[waitchain]` line counts waits by proof.
+
+`APS5_WAIT_BROKER=1` makes a blocked wait sleep until a label is recorded or a batch's results reach guest memory, instead of polling on a timer. It still checks again after at most `APS5_WAIT_BROKER_MAX_US` (default 2000), since stores made by the title's own CPU code wake nobody.
+
+`APS5_QUEUE_TOPOLOGY` chooses the Vulkan queues the driver runs on. The log lists every queue family when the device is created.
+- `serial` (the default) runs everything on one queue.
+- `same-family` and `dedicated` check that a second queue is available, in the graphics family or in a compute-only family respectively. They then stop the title, since running the compute queues on a second queue is not implemented yet. An unavailable topology also stops the title, naming the families that exist.
+
+`APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. `0` (the default) turns it off. The `[labels]` line counts these submits.
+
 ### Tracing system library calls
 
 Windows only. An executable converted with `--trace-imports` records the calls it makes to the libraries named in `APS5_TRACE_CALLS`, a comma-separated list such as `libkernel,libSceSaveData`, or `all`. Without the variable nothing is recorded. The crash and abort reports then end with the last 64 calls: sequence number, thread, library, import name as the executable imports it (a NID) and the caller's address. They are followed by the 32 most called imports since start-up, with their number of calls.

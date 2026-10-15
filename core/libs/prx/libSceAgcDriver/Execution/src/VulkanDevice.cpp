@@ -10,6 +10,7 @@
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/QueueTopology.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DriverHeapTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -1671,6 +1672,29 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
         enabled.sparseBinding = state->sparseBinding ? VK_TRUE : VK_FALSE;
     }
+    {
+        std::uint32_t familyCount = 0;
+        auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
+        getFamilies(selected, &familyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> properties(familyCount);
+        getFamilies(selected, &familyCount, properties.data());
+        std::vector<QueueFamilyInfo> topologyFamilies(familyCount);
+        for (std::uint32_t i = 0; i < familyCount; ++i) {
+            topologyFamilies[i].flags = properties[i].queueFlags;
+            topologyFamilies[i].count = properties[i].queueCount;
+            if (window != nullptr) {
+                VkBool32 present = VK_FALSE;
+                check(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>("vkGetPhysicalDeviceSurfaceSupportKHR")(selected, i, state->surface, &present), "vkGetPhysicalDeviceSurfaceSupportKHR");
+                topologyFamilies[i].present = present == VK_TRUE;
+            }
+        }
+        APS5_LOG_OUT("Vulkan queue families: %s; graphics family %u, sparse family %d", DescribeQueueFamilies(topologyFamilies).c_str(), family, state->sparseFamily == VK_QUEUE_FAMILY_IGNORED ? -1 : static_cast<int>(state->sparseFamily));
+        const auto topology = ParseQueueTopology(std::getenv("APS5_QUEUE_TOPOLOGY"));
+        const auto plan = PlanQueueTopology(topology, topologyFamilies, family, state->sparseFamily);
+        if (plan.topology != QueueTopology::Serial) {
+            throw std::runtime_error(std::string("APS5_QUEUE_TOPOLOGY=") + QueueTopologyName(plan.topology) + ": compute queue family " + std::to_string(plan.computeFamily) + " index " + std::to_string(plan.computeIndex) + " is available, but running guest compute queues on it needs a recorder per physical queue, which is not implemented");
+        }
+    }
     deviceInfo.pQueueCreateInfos = queueInfos;
     // Indirect draw records with a non-zero first instance, and several records per call.
     enabled.drawIndirectFirstInstance = available.drawIndirectFirstInstance;
@@ -2187,14 +2211,20 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
-    if (Coherence::LazyRelease() && !storeAtLabel) {
+    const bool lazyRelease = Coherence::LazyRelease() && !storeAtLabel;
+    if (lazyRelease) {
         static_cast<void>(Graphics::StorageTexture::FlushUnprotected("label"));
         Coherence::CheckReleaseCovered(Graphics::StorageTexture::AnyUnprotectedPending(), Graphics::AnyUnprotectedShadow(), "label");
-    } else {
-        if (storeAtLabel || Coherence::Ordering()) Graphics::StorageTexture::FlushAllPending("label");
-        if (Coherence::Ordering() && Coherence::Tracking()) Coherence::CheckDrained(Graphics::StorageTexture::AnyPending(), Graphics::AnyShadowedOverlaps(0, std::numeric_limits<std::size_t>::max()), "label");
+    } else if (storeAtLabel || Coherence::Ordering()) {
+        Graphics::StorageTexture::FlushAllPending("label");
     }
-    if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
+    const auto checkDrained = [&](bool writeBacksOrdered) {
+        if (!lazyRelease) Coherence::CheckDrained(Graphics::StorageTexture::AnyPending(), Graphics::AnyShadowedOverlaps(0, std::numeric_limits<std::size_t>::max()), "label", writeBacksOrdered);
+    };
+    if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) {
+        checkDrained(true);
+        return 4;
+    }
     auto& recorder = *state->recorder;
     // Batches that already finished are retired before the checks: their completions ran, so they
     // neither keep the recorder busy nor force this label behind a completion. Only for the
@@ -2205,15 +2235,32 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
     if (Graphics::AnyDeviceResident()) Graphics::PublishAllDeviceResident(recorder, Graphics::ResidentSite::Label);
+    const bool writeBacksOwed = !recorder.Idle() && recorder.GuestWriteBacksOwed();
+    const bool behindWriteBacks = writeBacksOwed && Graphics::Recorder::LabelPublicationOrdered();
+    checkDrained(!writeBacksOwed || behindWriteBacks);
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
-    const auto context = graphicsContext();
-    const auto* import = Graphics::HostImportFor(context, address, bytes.size());
-    if (import == nullptr) return 3;
     // A unit shadow's results in the label's unit reach the import before the store lands over
     // part of it (the store's stamp then makes the unit stale); the deferred label paths call no
     // FlushPending of their own.
-    if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    const auto publishShadow = [&] {
+        if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    };
+    const std::array<Coherence::Interval, 1> labelRange{{{address, address + bytes.size()}}};
+    if (behindWriteBacks) {
+        if (drain) return 2;
+        publishShadow();
+        auto labelToken = Coherence::Reserve(Coherence::Producer::LabelStore, labelRange, false, queue);
+        GuestMemory::MarkWritten(address, bytes.size());
+        recorder.AfterCompletions(address, bytes, stamp, queue, false);
+        labelToken.Recorded();
+        return 5;
+    }
+    const auto context = graphicsContext();
+    const auto* import = Graphics::HostImportFor(context, address, bytes.size());
+    if (import == nullptr) return 3;
+    publishShadow();
+    auto labelToken = Coherence::Reserve(Coherence::Producer::LabelStore, labelRange, false, queue);
     // The store on the GPU, into the open batch: everything recorded so far completes before it,
     // and it is visible to the host after. The barriers belong to the recorder's store run: one
     // pair for a whole group of labels recorded back to back (Recorder::RecordStore orders the
@@ -2242,12 +2289,14 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         // Commands() opened the batch the store went into, so the completion is appended to that
         // batch and runs at its reap, after the write-backs of every batch before it.
         recorder.AfterCompletions(address, bytes, stamp, queue, true);
+        labelToken.Recorded();
         return 5;
     }
     recordStore();
     // The table entry and the label's own pending-write note (Recorder::NoteLabel).
     recorder.NoteLabel(address, bytes, stamp, queue);
     GuestMemory::MarkWritten(address, bytes.size());
+    labelToken.Recorded();
     // No submit per label: the batch goes out at the queue worker's next non-label packet, at a
     // wait on its range, after APS5_LABEL_FLUSH_US, or at the submission's end (Driver.cpp).
     // Debug aid: APS5_LABEL_SUBMIT_NOW=1 submits every label at once, as before.
