@@ -41,8 +41,6 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         phaseTiming.Phase(DrawRowCapture);
         stageCapture.prepared = invocation.Handle();
         recompiled[i] = true;
-        memory = shaderMemory.Regions();
-        request.context.memory = memory;
         if (profile) {
             ++captures;
             const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBefore, phaseMs[DrawRowCapture]);
