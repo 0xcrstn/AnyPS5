@@ -238,6 +238,19 @@ With `APS5_COHERENCE_ORDERING=1` or `verify`, a label also waits behind the writ
 
 `APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. `0` (the default) turns it off. The `[labels]` line counts these submits.
 
+### Address-based shader experiments
+
+These switches change how recompiled shaders reach guest memory through addresses. Each accepts the values shown; any other value stops the title at start. `verify` runs the old and the new form side by side and stops the title with a description of the first difference.
+
+- `APS5_BDA_ABI=legacy|radix|verify`: how a guest address is found in the table of mapped ranges (a binary search, or an indexed table).
+- `APS5_BDA_RELATIVE=off|on|verify`: whether a shader reuses the last range it found for later accesses inside it. `APS5_BDA_RANGE_CACHE=1` is the same as `on`, and with `APS5_VERIFY_BDA_RANGE_CACHE=1` the same as `verify`; setting both switches to different values stops the title.
+- `APS5_BDA_INLINE_FAST_PATH=off|on`: with `APS5_BDA_RELATIVE=on`, asks the GPU driver to inline that reuse check at each access while the full lookup stays a separate function. The generated code is otherwise identical, so it has no verify mode.
+- `APS5_BDA_SPAN_HELPERS=off|on|verify`: whether wide reads use a reader specialized for the dwords they use.
+- `APS5_BDA_WRITE_NOTES=off|on|verify`: whether a shader skips recording a written page it already recorded.
+- `APS5_LAZY_LOG2_REPAIR=off|on|verify`, `APS5_LAZY_TRIG_SERIES=off|on|verify`: whether log2, sin and cos evaluate only the correction they select.
+- `APS5_BDA_PLACEMENT=host|device|verify`: whether compute shaders that store through addresses (without atomics or coherent accesses) work on device-local copies of the host memory they write, copied back after each dispatch.
+- `APS5_SHADER_MANIFEST=<folder>` writes one line per compiled shader with its address and instruction counts; `APS5_SHADER_MANIFEST_SPIRV=all` (or comma-separated hexadecimal addresses) also writes the shaders. `APS5_SPIRV_GUEST_LINES=1` tags shaders with guest program counters for GPU profilers.
+
 ### Tracing system library calls
 
 Windows only. An executable converted with `--trace-imports` records the calls it makes to the libraries named in `APS5_TRACE_CALLS`, a comma-separated list such as `libkernel,libSceSaveData`, or `all`. Without the variable nothing is recorded. The crash and abort reports then end with the last 64 calls: sequence number, thread, library, import name as the executable imports it (a NID) and the caller's address. They are followed by the 32 most called imports since start-up, with their number of calls.

@@ -255,6 +255,7 @@ public:
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
     void UseMirrors(Recorder& recorder) const;
+    void RecordPlacementCopyBack(Recorder& recorder, VkCommandBuffer commands) const;
     void PublishResidentReads(Recorder& recorder) const;
     void RefreshMirrorsForDirectUse(Recorder& recorder) const;
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
@@ -594,6 +595,7 @@ private:
     std::vector<std::shared_ptr<ResidentMirror>> bufferMirrors;
     bool usesBda = false;
     bool mirrorReads = false;
+    bool placeWrites = false;
     std::vector<std::uint64_t> multisampleSources;
     bool bdaReadOnly = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pointerTargets;

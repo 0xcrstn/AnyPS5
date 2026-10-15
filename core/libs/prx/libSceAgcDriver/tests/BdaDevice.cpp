@@ -142,6 +142,9 @@ private:
 int main(int argc, char** argv) {
     try {
         RunBdaContractTests();
+        RunBdaTableContractTests();
+        RunSpirvStatisticsTests();
+        RunBdaInlineFastPathTests();
         if (argc == 2) {
             const auto shader = MakeBdaTestShader(0x7fff12340000ULL, 32);
             std::ofstream file(argv[1], std::ios::binary);
@@ -161,12 +164,26 @@ int main(int argc, char** argv) {
         Require(buffer.DeviceAddress() != 0 && buffer.Bytes().size() == 256, "invalid real BDA buffer");
         buffer.Bytes()[255] = std::byte{0x5a};
         Require(buffer.Bytes()[255] == std::byte{0x5a}, "real BDA buffer mapping failed");
+        SetBdaTestTranslation(ShaderRecompiler::BdaTable::TranslationSetting());
+        SetBdaTestRelative(ShaderRecompiler::BdaTable::RelativeSetting());
+        SetBdaTestSpanHelpers(ShaderRecompiler::BdaSpanHelpersSetting());
+        SetBdaTestWriteNotes(ShaderRecompiler::BdaWriteNotesSetting());
+        SetBdaTestInlineFastPath(ShaderRecompiler::BdaTable::InlineFastPathSetting());
         if (device->RunsOnCpu()) {
             std::cout << "CPU Vulkan device: BDA read and multi-dword write execution not tested\n";
         } else {
             RunBdaExecutionTests(device->GetContext());
+            RunBdaTranslationTests(device->GetContext());
+            RunBdaSpanHelperTests(device->GetContext());
+            RunBdaPlacementTests(device->GetContext());
+            std::cout << "BDA translation, relative and span helper fixtures passed\n";
+            if (std::getenv("APS5_TEST_FLOAT_REPAIRS") != nullptr) {
+                RunFloatRepairTests(device->GetContext());
+                std::cout << "lazy float repairs match the eager ones for every input\n";
+            }
         }
         RunBdaStoreExecutionTests(device->GetContext());
+        RunBdaWriteNoteTests(device->GetContext());
         std::cout << "BDA store boundary tests passed\n";
         RunColorTransferTests(device->GetContext());
         std::cout << "Vulkan BDA allocation and execution tests passed\n";

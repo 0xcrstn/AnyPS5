@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include "IntermediateRepresentation/IrBlock.hpp"
 #include "IntermediateRepresentation/IrValue.hpp"
@@ -883,16 +884,42 @@ std::uint32_t Log2SeriesNearOne(SpirvEmitterState& state, std::uint32_t differen
     return Exact(state, Binary(state, spv::OpFMul, TypeF32(state), product, ConstantF32(state, 0x3fb8aa3bu)));
 }
 
-std::uint32_t EmitFPLog2(SpirvEmitterState& state, std::uint32_t arg0) {
-    const auto value = EmitExt(state, TypeF32(state), GLSLstd450Log2, {arg0});
-    const auto difference = Exact(state, Binary(state, spv::OpFSub, TypeF32(state), arg0, ConstantF32(state, 0x3f800000u)));
-    const auto series = Log2SeriesNearOne(state, difference);
+std::uint32_t Log2FarFromSeries(SpirvEmitterState& state, std::uint32_t value, std::uint32_t series) {
     const auto valueBits = Unary(state, spv::OpBitcast, TypeU32(state), value);
     const auto seriesBits = Unary(state, spv::OpBitcast, TypeU32(state), series);
     const auto distance = EmitExt(state, TypeU32(state), GLSLstd450UMin, {Binary(state, spv::OpISub, TypeU32(state), valueBits, seriesBits), Binary(state, spv::OpISub, TypeU32(state), seriesBits, valueBits)});
+    return Binary(state, spv::OpUGreaterThan, TypeBool(state), distance, ConstantU32(state, 4u));
+}
+
+std::uint32_t Log2Repaired(SpirvEmitterState& state, std::uint32_t arg0, bool lazy) {
+    const auto value = EmitExt(state, TypeF32(state), GLSLstd450Log2, {arg0});
+    const auto difference = Exact(state, Binary(state, spv::OpFSub, TypeF32(state), arg0, ConstantF32(state, 0x3f800000u)));
     const auto near = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), EmitExt(state, TypeF32(state), GLSLstd450FAbs, {difference}), ConstantF32(state, 0x3e000000u));
-    const auto far = Binary(state, spv::OpUGreaterThan, TypeBool(state), distance, ConstantU32(state, 4u));
-    return Select(state, TypeF32(state), Binary(state, spv::OpLogicalAnd, TypeBool(state), near, far), series, value);
+    if (lazy) {
+        return EmitValueIfElse(state, near, TypeF32(state), [&] {
+            const auto series = Log2SeriesNearOne(state, difference);
+            return Select(state, TypeF32(state), Log2FarFromSeries(state, value, series), series, value);
+        }, [&] { return value; });
+    }
+    const auto series = Log2SeriesNearOne(state, difference);
+    return Select(state, TypeF32(state), Binary(state, spv::OpLogicalAnd, TypeBool(state), near, Log2FarFromSeries(state, value, series)), series, value);
+}
+
+std::uint32_t VerifiedRewrite(SpirvEmitterState& state, std::uint32_t input, std::uint32_t eager, std::uint32_t lazy, std::uint32_t kind) {
+    const auto inputBits = Unary(state, spv::OpBitcast, TypeU32(state), input);
+    const auto eagerBits = Unary(state, spv::OpBitcast, TypeU32(state), eager);
+    auto lazyBits = Unary(state, spv::OpBitcast, TypeU32(state), lazy);
+    if (state.rewriteMismatchInjection != 0u) lazyBits = Binary(state, spv::OpBitwiseXor, TypeU32(state), lazyBits, ConstantU32(state, state.rewriteMismatchInjection));
+    EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), eagerBits, lazyBits), [&] {
+        RecordBdaFaultWords(state, inputBits, eagerBits, lazyBits, ConstantU32(state, kind), BdaAbi::FaultReason::RepairMismatch);
+    });
+    return eager;
+}
+
+std::uint32_t EmitFPLog2(SpirvEmitterState& state, std::uint32_t arg0) {
+    if (state.lazyLog2Repair == RewriteMode::Off) return Log2Repaired(state, arg0, false);
+    if (state.lazyLog2Repair == RewriteMode::On) return Log2Repaired(state, arg0, true);
+    return VerifiedRewrite(state, arg0, Log2Repaired(state, arg0, false), Log2Repaired(state, arg0, true), 1u);
 }
 
 std::uint32_t SinTurnSeries(SpirvEmitterState& state, std::uint32_t turns) {
@@ -927,32 +954,54 @@ std::uint32_t TrigLinearNearZero(SpirvEmitterState& state, std::uint32_t value, 
     return Select(state, TypeF32(state), near, linear, value);
 }
 
-std::uint32_t EmitFPSin(SpirvEmitterState& state, std::uint32_t arg0) {
+std::uint32_t SinSeries(SpirvEmitterState& state, std::uint32_t arg0, bool lazy) {
     const auto cycle = EmitTrigCycleF32(state, arg0, true);
     const auto absolute = EmitExt(state, TypeF32(state), GLSLstd450FAbs, {cycle});
     const auto signBits = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Unary(state, spv::OpBitcast, TypeU32(state), cycle), ConstantU32(state, 0x80000000u));
     const auto nearHalf = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), absolute, ConstantF32(state, 0x3e800000u));
     const auto distance = Select(state, TypeF32(state), nearHalf, Exact(state, Binary(state, spv::OpFSub, TypeF32(state), ConstantF32(state, 0x3f000000u), absolute)), absolute);
     const auto pastEighth = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), distance, ConstantF32(state, 0x3e000000u));
-    const auto series = Select(state, TypeF32(state), pastEighth, CosTurnSeries(state, Exact(state, Binary(state, spv::OpFSub, TypeF32(state), ConstantF32(state, 0x3e800000u), distance))), SinTurnSeries(state, distance));
+    const auto cosine = [&] { return CosTurnSeries(state, Exact(state, Binary(state, spv::OpFSub, TypeF32(state), ConstantF32(state, 0x3e800000u), distance))); };
+    const auto sine = [&] { return SinTurnSeries(state, distance); };
+    const auto series = lazy ? EmitValueIfElse(state, pastEighth, TypeF32(state), cosine, sine) : Select(state, TypeF32(state), pastEighth, cosine(), sine());
     const auto value = SeriesWhenFar(state, EmitExt(state, TypeF32(state), GLSLstd450Sin, {Binary(state, spv::OpFMul, TypeF32(state), absolute, ConstantF32(state, 0x40c90fdbu))}), series);
     const auto linearConstant = Select(state, TypeF32(state), nearHalf, ConstantF32(state, 0x40c90fdbu), ConstantF32(state, 0x40c90fd5u));
     const auto result = TrigLinearNearZero(state, value, distance, linearConstant);
     return Unary(state, spv::OpBitcast, TypeF32(state), Binary(state, spv::OpBitwiseOr, TypeU32(state), Unary(state, spv::OpBitcast, TypeU32(state), result), signBits));
 }
 
-std::uint32_t EmitFPCos(SpirvEmitterState& state, std::uint32_t arg0) {
+std::uint32_t EmitFPSin(SpirvEmitterState& state, std::uint32_t arg0) {
+    if (state.lazyTrigSeries == RewriteMode::Off) return SinSeries(state, arg0, false);
+    if (state.lazyTrigSeries == RewriteMode::On) return SinSeries(state, arg0, true);
+    return VerifiedRewrite(state, arg0, SinSeries(state, arg0, false), SinSeries(state, arg0, true), 2u);
+}
+
+std::uint32_t CosSeries(SpirvEmitterState& state, std::uint32_t arg0, bool lazy) {
     const auto cycle = EmitTrigCycleF32(state, arg0, false);
     const auto absolute = EmitExt(state, TypeF32(state), GLSLstd450FAbs, {cycle});
     const auto distance = Exact(state, Binary(state, spv::OpFSub, TypeF32(state), ConstantF32(state, 0x3e800000u), absolute));
-    const auto low = CosTurnSeries(state, absolute);
-    const auto middle = SinTurnSeries(state, distance);
-    const auto high = Unary(state, spv::OpFNegate, TypeF32(state), CosTurnSeries(state, Exact(state, Binary(state, spv::OpFSub, TypeF32(state), ConstantF32(state, 0x3f000000u), absolute))));
+    const auto low = [&] { return CosTurnSeries(state, absolute); };
+    const auto middle = [&] { return SinTurnSeries(state, distance); };
+    const auto high = [&] { return Unary(state, spv::OpFNegate, TypeF32(state), CosTurnSeries(state, Exact(state, Binary(state, spv::OpFSub, TypeF32(state), ConstantF32(state, 0x3f000000u), absolute)))); };
     const auto pastEighth = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), absolute, ConstantF32(state, 0x3e000000u));
     const auto pastThreeEighths = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), absolute, ConstantF32(state, 0x3ec00000u));
-    const auto series = Select(state, TypeF32(state), pastThreeEighths, high, Select(state, TypeF32(state), pastEighth, middle, low));
+    std::uint32_t series = 0;
+    if (lazy) {
+        series = EmitValueIfElse(state, pastThreeEighths, TypeF32(state), high, [&] { return EmitValueIfElse(state, pastEighth, TypeF32(state), middle, low); });
+    } else {
+        const auto lowValue = low();
+        const auto middleValue = middle();
+        const auto highValue = high();
+        series = Select(state, TypeF32(state), pastThreeEighths, highValue, Select(state, TypeF32(state), pastEighth, middleValue, lowValue));
+    }
     const auto value = SeriesWhenFar(state, EmitExt(state, TypeF32(state), GLSLstd450Cos, {Binary(state, spv::OpFMul, TypeF32(state), absolute, ConstantF32(state, 0x40c90fdbu))}), series);
     return TrigLinearNearZero(state, value, distance, ConstantF32(state, 0x40c90fdbu));
+}
+
+std::uint32_t EmitFPCos(SpirvEmitterState& state, std::uint32_t arg0) {
+    if (state.lazyTrigSeries == RewriteMode::Off) return CosSeries(state, arg0, false);
+    if (state.lazyTrigSeries == RewriteMode::On) return CosSeries(state, arg0, true);
+    return VerifiedRewrite(state, arg0, CosSeries(state, arg0, false), CosSeries(state, arg0, true), 3u);
 }
 
 std::uint32_t EmitIdentity(SpirvValueEmitContext&, std::uint32_t value) {

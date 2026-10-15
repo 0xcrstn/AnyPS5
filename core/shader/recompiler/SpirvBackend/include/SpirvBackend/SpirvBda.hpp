@@ -14,6 +14,7 @@ std::uint32_t BdaWord(SpirvEmitterState& state, std::uint32_t variable, std::uin
 std::uint32_t BdaLoadWord(SpirvEmitterState& state, std::uint32_t index);
 std::uint32_t BdaLoadAddress(SpirvEmitterState& state, std::uint32_t index);
 void DefineBdaFaultFunction(SpirvEmitterState& state);
+std::uint32_t DefineBdaResolveFunction(SpirvEmitterState& state, bool radix, std::uint32_t permission);
 void DefineBdaDwordReadFunctions(SpirvEmitterState& state);
 void DefineBdaSpanReadFunctions(SpirvEmitterState& state);
 void RecordBdaFault(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason);

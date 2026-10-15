@@ -894,7 +894,11 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
                 ctx.Fail(*inst, "appears after a non-Phi instruction");
             }
         } else {
+            if (!emittedNonPhi && state.guestLineFile != 0u) {
+                if (const BlockInfo* info = BlockInfoFor(state.program, block); info != nullptr) state.module.AddFunction(spv::OpLine, state.guestLineFile, info->startPc, 0u);
+            }
             emittedNonPhi = true;
+            if (state.guestLineFile != 0u && AddressOpcodeInfoOf(inst->Opcode()).access != AddressAccess::None) state.module.AddFunction(spv::OpLine, state.guestLineFile, inst->Flags<MemoryFlags>().pc, 0u);
         }
         if (state.waveLdsScope != 0) {
             const auto access = SharedAccessOf(inst->Opcode());

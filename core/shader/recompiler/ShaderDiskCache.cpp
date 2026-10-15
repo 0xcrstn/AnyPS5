@@ -807,6 +807,8 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
     writer.Value(info.hasBitwiseXor);
     writer.Value(info.usesDma);
     writer.Value(info.bdaWrites);
+    writer.Value(info.bdaAtomics);
+    writer.Value(info.bdaCoherent);
     writer.Value(info.usesFaultBuffer);
     writer.Value(info.dispatchThreadLimit);
     writer.Value(info.rasterPrimitive);
@@ -912,6 +914,8 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
     reader.Value(info.hasBitwiseXor);
     reader.Value(info.usesDma);
     reader.Value(info.bdaWrites);
+    reader.Value(info.bdaAtomics);
+    reader.Value(info.bdaCoherent);
     reader.Value(info.usesFaultBuffer);
     reader.Value(info.dispatchThreadLimit);
     reader.Value(info.rasterPrimitive);
@@ -1319,6 +1323,8 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_ITERATION_SELECTION",
     "APS5_NO_PERF_LAYOUT_PAIR",
     "APS5_NO_RESULT_MEMO",
+    "APS5_SHADER_MANIFEST",
+    "APS5_SHADER_MANIFEST_SPIRV",
 };
 
 const std::vector<std::byte>& switchKey() {

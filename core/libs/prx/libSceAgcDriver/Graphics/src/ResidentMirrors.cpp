@@ -24,6 +24,9 @@ struct ResidentMirror {
     VkBuffer source = VK_NULL_HANDLE;
     std::shared_ptr<Buffer> buffer;
     VkDeviceAddress address = 0;
+    std::shared_ptr<Buffer> pristine;
+    VkDeviceAddress pristineAddress = 0;
+    const Recorder* placedBy = nullptr;
     std::vector<std::uint64_t> generations;
     std::vector<std::uint8_t> unsynced;
     std::vector<std::uint8_t> written;
@@ -106,6 +109,84 @@ bool VerifyMirrors() {
     return verify;
 }
 
+std::uint64_t Footprint(const ResidentMirror& mirror) {
+    return mirror.pristine != nullptr ? mirror.bytes * 2u : mirror.bytes;
+}
+
+struct PlacementPipeline {
+    VkDevice device = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    PFN_vkDestroyPipeline destroyPipeline = nullptr;
+    PFN_vkDestroyPipelineLayout destroyLayout = nullptr;
+};
+
+struct PlacementPipelines {
+    std::mutex mutex;
+    std::vector<PlacementPipeline> entries;
+};
+
+PlacementPipelines& Pipelines() {
+    static PlacementPipelines pipelines;
+    return pipelines;
+}
+
+PlacementPipeline CopyBackPipeline(const Context& context) {
+    auto& pipelines = Pipelines();
+    std::lock_guard lock(pipelines.mutex);
+    for (const auto& entry : pipelines.entries) {
+        if (entry.device == context.device) return entry;
+    }
+    PlacementPipeline entry;
+    entry.device = context.device;
+    entry.destroyPipeline = context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+    entry.destroyLayout = context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+    const auto code = ShaderRecompiler::BdaPlacement::BuildCopyBackShader();
+    VkShaderModule module = VK_NULL_HANDLE;
+    try {
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ShaderRecompiler::BdaPlacement::PushConstants)};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &entry.layout), "vkCreatePipelineLayout BDA placement copy-back");
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = code.size() * sizeof(std::uint32_t);
+        moduleInfo.pCode = code.data();
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule BDA placement copy-back");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = entry.layout;
+        {
+            auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &entry.pipeline), "vkCreateComputePipelines BDA placement copy-back");
+        }
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+    } catch (...) {
+        if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        if (entry.layout != VK_NULL_HANDLE) entry.destroyLayout(context.device, entry.layout, nullptr);
+        throw;
+    }
+    pipelines.entries.push_back(entry);
+    return entry;
+}
+
+void DestroyCopyBackPipeline(VkDevice device) {
+    auto& pipelines = Pipelines();
+    std::lock_guard lock(pipelines.mutex);
+    for (auto it = pipelines.entries.begin(); it != pipelines.entries.end();) {
+        if (it->device != device) {
+            ++it;
+            continue;
+        }
+        it->destroyPipeline(device, it->pipeline, nullptr);
+        it->destroyLayout(device, it->layout, nullptr);
+        it = pipelines.entries.erase(it);
+    }
+}
+
 std::size_t BlockCount(std::uint64_t base, std::uint64_t bytes) {
     return static_cast<std::size_t>((base + bytes - 1) / BlockBytes - base / BlockBytes + 1);
 }
@@ -180,8 +261,16 @@ bool BufferMirrorsEnabled() {
     return enabled;
 }
 
-std::shared_ptr<ResidentMirror> MirrorOfImport(const Context& context, const HostImport& import) {
-    if (!(ResidentMirrorsEnabled() || BufferMirrorsEnabled()) || import.bytes == 0 || import.unwatched || import.dmaBuf || !context.bufferDeviceAddress) return {};
+ShaderRecompiler::BdaPlacement::Mode PlacementSetting() {
+    static const auto mode = ShaderRecompiler::BdaPlacement::ParseMode(std::getenv("APS5_BDA_PLACEMENT"));
+    return mode;
+}
+
+namespace {
+
+std::shared_ptr<ResidentMirror> mirrorOf(const Context& context, const HostImport& import, bool writable) {
+    const bool enabled = writable ? PlacementSetting() != ShaderRecompiler::BdaPlacement::Mode::Host : ResidentMirrorsEnabled() || BufferMirrorsEnabled();
+    if (!enabled || BudgetBytes() == 0 || import.bytes == 0 || import.unwatched || import.dmaBuf || !context.bufferDeviceAddress) return {};
     if (!GuestMemory::Watched(import.base, static_cast<std::size_t>(import.bytes))) return {};
     auto& registry = Mirrors();
     const auto* recorder = Recorder::Active();
@@ -192,7 +281,7 @@ std::shared_ptr<ResidentMirror> MirrorOfImport(const Context& context, const Hos
         Stats().deniedUses.fetch_add(1, std::memory_order_relaxed);
         if (const auto found = registry.byBase.find(import.base); found != registry.byBase.end() && found->second.use_count() == 1) {
             found->second->retired = true;
-            registry.bytes -= found->second->bytes;
+            registry.bytes -= Footprint(*found->second);
             registry.byBase.erase(found);
         }
         return {};
@@ -202,26 +291,49 @@ std::shared_ptr<ResidentMirror> MirrorOfImport(const Context& context, const Hos
         if (seen.batches < MirrorAfterBatches()) ++seen.batches;
     }
     if (const auto found = registry.byBase.find(import.base); found != registry.byBase.end()) {
-        if (found->second->device == context.device && found->second->source == import.buffer && found->second->bytes == import.bytes) return found->second;
-        registry.bytes -= found->second->bytes;
-        found->second->retired = true;
+        auto& existing = found->second;
+        if (existing->device == context.device && existing->source == import.buffer && existing->bytes == import.bytes) {
+            if (existing->placedBy != nullptr && existing->placedBy != recorder) return {};
+            if (!writable) return existing;
+            if (existing->usedBy != nullptr && existing->usedBy != recorder) return {};
+            if (existing->pristine == nullptr) {
+                if (registry.bytes + existing->bytes > BudgetBytes()) {
+                    Stats().refused.fetch_add(1, std::memory_order_relaxed);
+                    return {};
+                }
+                try {
+                    existing->pristine = std::make_shared<Buffer>(context, static_cast<std::size_t>(existing->bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                } catch (const std::exception&) {
+                    Stats().refused.fetch_add(1, std::memory_order_relaxed);
+                    return {};
+                }
+                existing->pristineAddress = existing->pristine->DeviceAddress();
+                registry.bytes += existing->bytes;
+                markBlocks(*existing, existing->base, existing->base + existing->bytes);
+            }
+            existing->placedBy = recorder;
+            return existing;
+        }
+        registry.bytes -= Footprint(*existing);
+        existing->retired = true;
         registry.byBase.erase(found);
     }
     if (batch != 0 && seen.batches < MirrorAfterBatches()) {
         Stats().deferred.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
-    if (registry.bytes + import.bytes > BudgetBytes()) {
-        for (auto it = registry.byBase.begin(); it != registry.byBase.end() && registry.bytes + import.bytes > BudgetBytes();) {
+    const auto footprint = writable ? import.bytes * 2u : import.bytes;
+    if (registry.bytes + footprint > BudgetBytes()) {
+        for (auto it = registry.byBase.begin(); it != registry.byBase.end() && registry.bytes + footprint > BudgetBytes();) {
             if (it->second.use_count() == 1) {
                 it->second->retired = true;
-                registry.bytes -= it->second->bytes;
+                registry.bytes -= Footprint(*it->second);
                 it = registry.byBase.erase(it);
             } else {
                 ++it;
             }
         }
-        if (registry.bytes + import.bytes > BudgetBytes()) {
+        if (registry.bytes + footprint > BudgetBytes()) {
             Stats().refused.fetch_add(1, std::memory_order_relaxed);
             return {};
         }
@@ -229,6 +341,7 @@ std::shared_ptr<ResidentMirror> MirrorOfImport(const Context& context, const Hos
     auto mirror = std::make_shared<ResidentMirror>();
     try {
         mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(import.bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (writable) mirror->pristine = std::make_shared<Buffer>(context, static_cast<std::size_t>(import.bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     } catch (const std::exception&) {
         Stats().refused.fetch_add(1, std::memory_order_relaxed);
         return {};
@@ -238,15 +351,48 @@ std::shared_ptr<ResidentMirror> MirrorOfImport(const Context& context, const Hos
     mirror->bytes = import.bytes;
     mirror->source = import.buffer;
     mirror->address = mirror->buffer->DeviceAddress();
+    if (writable) {
+        mirror->pristineAddress = mirror->pristine->DeviceAddress();
+        mirror->placedBy = recorder;
+    }
     const auto blocks = BlockCount(import.base, import.bytes);
     mirror->generations.assign(blocks, 0);
     mirror->unsynced.assign(blocks, 0);
     mirror->written.assign(blocks, 0);
     registry.byBase.emplace(import.base, mirror);
-    registry.bytes += import.bytes;
+    registry.bytes += footprint;
     registry.any.store(true, std::memory_order_release);
     Stats().made.fetch_add(1, std::memory_order_relaxed);
     return mirror;
+}
+
+}
+
+std::shared_ptr<ResidentMirror> MirrorOfImport(const Context& context, const HostImport& import) {
+    return mirrorOf(context, import, false);
+}
+
+std::shared_ptr<ResidentMirror> PlacementOfImport(const Context& context, const HostImport& import) {
+    return mirrorOf(context, import, true);
+}
+
+VkDeviceAddress MirrorPristineAddress(const ResidentMirror& mirror) {
+    Require(mirror.pristine != nullptr, "a BDA placement mirror has no pristine copy");
+    return mirror.pristineAddress;
+}
+
+void RecordPlacementCopyBack(const Context& context, VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress table, bool verify) {
+    const auto pipeline = CopyBackPipeline(context);
+    using ShaderRecompiler::BdaPlacement::Pass;
+    context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+    ShaderRecompiler::BdaPlacement::PushConstants push{record, table, static_cast<std::uint32_t>(Pass::CopyBack), 0};
+    context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, ShaderRecompiler::BdaPlacement::DispatchX, ShaderRecompiler::BdaPlacement::DispatchY, 1);
+    if (!verify) return;
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    push.pass = static_cast<std::uint32_t>(Pass::Verify);
+    context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, ShaderRecompiler::BdaPlacement::DispatchX, ShaderRecompiler::BdaPlacement::DispatchY, 1);
 }
 
 VkDeviceAddress MirrorDeviceAddress(const ResidentMirror& mirror) {
@@ -317,6 +463,7 @@ void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirr
         for (auto* mirror : unsynced) {
             const auto copies = blockCopies(*mirror, mirror->unsynced);
             if (!copies.empty()) recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, mirror->source, mirror->buffer->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+            if (!copies.empty() && mirror->pristine != nullptr) recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, mirror->source, mirror->pristine->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
             bytes += copiedBytes(copies);
             std::fill(mirror->unsynced.begin(), mirror->unsynced.end(), std::uint8_t{0});
             mirror->anyUnsynced = false;
@@ -370,6 +517,7 @@ void SubmitMirrors(Recorder& recorder) {
         if (!copies.empty()) {
             if (prologue == VK_NULL_HANDLE) prologue = recorder.PrologueCommands();
             recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologue, mirror->source, mirror->buffer->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+            if (mirror->pristine != nullptr) recorder.GetContext().Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(prologue, mirror->source, mirror->pristine->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
             Stats().refreshedBlocks.fetch_add(static_cast<std::uint64_t>(std::count(changed.begin(), changed.end(), GuestMemory::BlockWritten)), std::memory_order_relaxed);
             Stats().refreshedBytes.fetch_add(copiedBytes(copies), std::memory_order_relaxed);
         }
@@ -448,7 +596,7 @@ void ForgetMirrors(VkDevice device, std::uint64_t begin, std::uint64_t end) {
         const auto& mirror = *it->second;
         if (mirror.device == device && mirror.base < end && begin < mirror.base + mirror.bytes) {
             it->second->retired = true;
-            registry.bytes -= mirror.bytes;
+            registry.bytes -= Footprint(mirror);
             it = registry.byBase.erase(it);
         } else {
             ++it;
@@ -458,6 +606,7 @@ void ForgetMirrors(VkDevice device, std::uint64_t begin, std::uint64_t end) {
 
 void ClearMirrors(VkDevice device) {
     ForgetMirrors(device, 0, ~std::uint64_t{0});
+    DestroyCopyBackPipeline(device);
     auto& registry = Mirrors();
     std::lock_guard lock(registry.mutex);
     registry.used.clear();

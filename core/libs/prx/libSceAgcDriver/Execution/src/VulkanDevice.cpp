@@ -5071,6 +5071,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
     recorder.EndGpuTiming(trailingTiming);
     recorder.MarkCovered(dispatchedAccess);
+    resources.RecordPlacementCopyBack(recorder, commands);
     recordStep(PhaseRecordBind);
     resources.MarkGpuWrites(recorder);
     if (!record.movedReads.empty()) recorder.NotePendingReads(record.movedReads, Graphics::Recorder::ReadKind::DispatchElement);

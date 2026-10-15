@@ -28,6 +28,8 @@ struct SpirvTargetOptions {
     std::optional<bool> sharedFloatFunctions;
 };
 
+void PrepareRewriteVerification(IrProgram& program);
+
 class SpirvEmitter {
 public:
     [[nodiscard]] std::vector<std::uint32_t> Emit(const IrProgram& program, const CompiledBindingLayout& bindings, const SpirvTargetOptions& target) const;

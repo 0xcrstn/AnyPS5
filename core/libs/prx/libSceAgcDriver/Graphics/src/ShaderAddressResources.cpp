@@ -31,6 +31,7 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
     }
     bdaReadOnly = usesBda && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.program->bdaWrites; });
     mirrorReads = bdaReadOnly && context.recorder != nullptr && ResidentMirrorsEnabled();
+    placeWrites = usesBda && !bdaReadOnly && context.recorder != nullptr && PlacementSetting() != ShaderRecompiler::BdaPlacement::Mode::Host && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Compute && !shader.program->bdaAtomics && !shader.program->bdaCoherent; });
     if (usesBda) {
         Require(context.bufferDeviceAddress, "buffer device address is not enabled");
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -44,6 +45,13 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
 void ShaderResources::UseMirrors(Recorder& recorder) const {
     if (bda != nullptr) Graphics::UseMirrors(recorder, bda->Mirrors());
     if (!bufferMirrors.empty()) Graphics::UseMirrors(recorder, bufferMirrors);
+}
+
+void ShaderResources::RecordPlacementCopyBack(Recorder&, VkCommandBuffer commands) const {
+    if (bda == nullptr || !bda->HasPlacements()) return;
+    bda->RecordPlacementCopyBack(context, commands);
+    constexpr VkAccessFlags placedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, placedAccess);
 }
 
 void ShaderResources::PublishResidentReads(Recorder& recorder) const {

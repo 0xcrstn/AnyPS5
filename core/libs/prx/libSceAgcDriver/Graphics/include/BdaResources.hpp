@@ -15,12 +15,15 @@ bool LoopGuardTripped();
 class BdaResources {
 public:
     explicit BdaResources(const Context& context);
-    BdaResources(const Context& context, const GuestBufferMemory& memory, bool mirrorReads = false);
+    BdaResources(const Context& context, const GuestBufferMemory& memory, bool mirrorReads = false, bool placeWrites = false);
     std::span<const std::shared_ptr<ResidentMirror>> Mirrors() const { return mirrors; }
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
     void CheckFault() const;
     std::span<const Coherence::Interval> WrittenRanges() const { return written; }
+    bool HasPlacements() const { return placement != nullptr; }
+    std::span<const std::pair<std::uint64_t, std::uint64_t>> PlacedIntervals() const { return placed; }
+    void RecordPlacementCopyBack(const Context& context, VkCommandBuffer commands) const;
     struct ImageTableFaults {
         std::uint32_t stage = 0;
         std::uint64_t shader = 0;
@@ -59,6 +62,9 @@ private:
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
     std::vector<std::shared_ptr<ResidentMirror>> mirrors;
+    std::shared_ptr<Buffer> placement;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> placed;
+    void checkPlacement() const;
     std::vector<ImageTableFaults> imageTables;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
     mutable std::vector<Coherence::Interval> written;

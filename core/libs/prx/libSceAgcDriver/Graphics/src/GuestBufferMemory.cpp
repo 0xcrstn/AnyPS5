@@ -4772,6 +4772,37 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::MirroredRanges(s
     return result;
 }
 
+std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::PlacedRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::vector<std::shared_ptr<ResidentMirror>>& mirrors, std::vector<ShaderRecompiler::BdaPlacement::Entry>& entries) const {
+    std::vector<ShaderRecompiler::BdaAbi::Range> result(ranges.begin(), ranges.end());
+    if (PlacementSetting() == ShaderRecompiler::BdaPlacement::Mode::Host || context.recorder == nullptr) return result;
+    const auto overlaps = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& intervals, std::uint64_t begin, std::uint64_t end) {
+        return std::any_of(intervals.begin(), intervals.end(), [&](const auto& interval) { return interval.first < end && begin < interval.second; });
+    };
+    std::map<std::uint64_t, std::shared_ptr<ResidentMirror>> byImport;
+    for (auto& range : result) {
+        constexpr auto writable = ShaderRecompiler::BdaAbi::Read | ShaderRecompiler::BdaAbi::Write;
+        if ((range.permissions & writable) != writable || range.end <= range.begin) continue;
+        if (overlaps(writes, range.begin, range.end) || overlaps(pointerExempt, range.begin, range.end)) continue;
+        const auto* region = owner(range.begin);
+        if (region == nullptr || region->direct == nullptr || region->mirror != nullptr || range.end > region->end) continue;
+        const auto& import = *region->direct;
+        if (range.begin < import.base || range.end > import.base + import.bytes || range.deviceAddress != import.address + (range.begin - import.base)) continue;
+        const auto importEnd = import.base + import.bytes;
+        if (std::any_of(regions.begin(), regions.end(), [&](const Region& own) { return own.begin < importEnd && import.base < own.end; })) continue;
+        if (context.recorder->PendingLabelIn(import.base, static_cast<std::size_t>(import.bytes)) || context.recorder->QueuedStoreOverlaps(import.base, static_cast<std::size_t>(import.bytes))) continue;
+        auto found = byImport.find(import.base);
+        if (found == byImport.end()) found = byImport.emplace(import.base, PlacementOfImport(context, import)).first;
+        if (found->second == nullptr) continue;
+        const auto offset = range.begin - import.base;
+        entries.push_back({range.begin, range.end, MirrorDeviceAddress(*found->second) + offset, MirrorPristineAddress(*found->second) + offset, range.deviceAddress});
+        range.deviceAddress = MirrorDeviceAddress(*found->second) + offset;
+    }
+    for (auto& [base, mirror] : byImport) {
+        if (mirror != nullptr) mirrors.push_back(std::move(mirror));
+    }
+    return result;
+}
+
 Recorder::BoundPlacement GuestBufferMemory::Placement() const {
     Recorder::BoundPlacement result;
     result.addressBased = HoldsLease();

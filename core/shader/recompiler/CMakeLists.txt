@@ -35,6 +35,7 @@ function(add_shader_recompiler target runtimeTarget)
 
     add_library(${target} STATIC EXCLUDE_FROM_ALL
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Recompiler.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderManifest.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CompileTrace.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvIntern.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/StencilReplay.cpp
@@ -143,6 +144,8 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvBufferFormat.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvRuntimeBuffer.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvSpecialization.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvStatistics.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/BdaPlacementShader.cpp
 
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvMemory/SpirvBufferAccess.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvMemory/SpirvConstants.cpp
@@ -228,6 +231,12 @@ function(add_shader_recompiler target runtimeTarget)
             BuildBarycentricGeometryShader
             BuildPreparedShaderKey
             BuildRectListShaders
+            BdaPlacement::BuildCopyBackShader
+            BdaPlacement::ParseMode
+            BdaTable::Build
+            BdaTable::RangeBaseWord
+            BdaTable::TranslationSetting
+            BdaTable::Validate
             CaptureResources
             CompiledWalkCounts
             SrtCompiledWalkCounts

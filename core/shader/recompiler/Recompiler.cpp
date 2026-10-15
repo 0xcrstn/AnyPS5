@@ -1,4 +1,5 @@
 #include "Recompiler.hpp"
+#include "ShaderManifest.hpp"
 #include "StencilReplay.hpp"
 #include <algorithm>
 #include <cstring>
@@ -747,6 +748,7 @@ void VerifyEmission(const RecompileRequest& request, const IrProgram& program, c
 
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program, bool consume = false) {
     InFlightIr inFlight(estimateProgramBytes(program));
+    PrepareRewriteVerification(program);
     const auto inputInfo = RequestInputInfo(request);
     constexpr BindingAllocator bindingAllocator;
     bool registration = request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment);
@@ -1305,6 +1307,8 @@ void fillMaterializedValues(RecompileResult& result, const CompiledVariant& vari
     }
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
     result.bdaWrites = variant.info.info.bdaWrites;
+    result.bdaAtomics = variant.info.info.bdaAtomics;
+    result.bdaCoherent = variant.info.info.bdaCoherent;
     result.imageTablePoison.clear();
     result.imageTableRanges.clear();
     result.imageTableReadRanges.clear();
@@ -1380,6 +1384,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             loaded.artifact.variantId = nextVariantId();
             if (spill) loaded.artifact.spirv = loaded.artifact.spirv.Spill(diskKey, false);
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
+            NoteShaderManifest(request, *variant, "disk");
         }
     }
     if (variant == nullptr) {
@@ -1399,6 +1404,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
             throw;
         }
+        NoteShaderManifest(request, *variant, "compiled");
         if (spill) {
             auto retained = std::make_shared<CompiledVariant>(*variant);
             retained->artifact.spirv = variant->artifact.spirv.Spill(diskKey, true);

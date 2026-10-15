@@ -4,6 +4,8 @@
 #include "SpirvBackend/SpirvModule.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "BdaTable.hpp"
+#include "RewriteSwitch.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -131,9 +133,20 @@ struct SpirvEmitterState {
     std::uint32_t bdaWriteProbeFunction = 0;
     std::uint32_t bdaAtomicPointerFunction = 0;
     std::uint32_t bdaNoteWriteFunction = 0;
-    std::array<std::uint32_t, 4> bdaRangeCache {};
     std::array<std::uint32_t, 2> bdaByteWriteFunctions {};
     std::uint32_t bdaFaultFunction = 0;
+    BdaTable::Translation bdaTranslation = BdaTable::Translation::Legacy;
+    std::uint32_t guestLineFile = 0;
+    BdaTable::Relative bdaRelative = BdaTable::Relative::Off;
+    bool bdaInlineFastPath = false;
+    std::map<std::array<std::uint32_t, 3>, std::uint32_t> bdaResolveFunctions;
+    std::array<std::uint32_t, 4> bdaCapability {};
+    RewriteMode lazyLog2Repair = RewriteMode::Off;
+    RewriteMode lazyTrigSeries = RewriteMode::Off;
+    RewriteMode bdaSpanHelpers = RewriteMode::Off;
+    RewriteMode bdaWriteNotes = RewriteMode::Off;
+    std::uint32_t rewriteMismatchInjection = 0;
+    std::map<std::array<std::uint32_t, 4>, std::uint32_t> bdaSpecializedSpanFunctions;
     bool nativeF16ModesEmitted = false;
     bool f16DenormPreserveEmitted = false;
     std::uint32_t dot2F32F16Function = 0;
