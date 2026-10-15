@@ -4682,6 +4682,21 @@ std::span<const double, 5> VulkanDevice::PreparePhaseMs(const PreparedDispatch& 
     return std::span<const double, 5>(prepared.phaseMs);
 }
 
+std::span<const std::uint32_t> VulkanDevice::PreparedKey(const PreparedDispatch& prepared) {
+    return prepared.key;
+}
+
+std::vector<PreparedCpuCopy> VulkanDevice::PreparedCpuCopies(const PreparedDispatch& prepared, bool& unbounded) {
+    unbounded = false;
+    std::vector<PreparedCpuCopy> copies;
+    if (prepared.resources == nullptr) return copies;
+    unbounded = prepared.resources->PrepareCpuCopiesUnbounded();
+    const auto& made = prepared.resources->PrepareCpuCopies();
+    copies.reserve(made.size());
+    for (const auto& copy : made) copies.push_back({copy.begin, copy.end, copy.bytes});
+    return copies;
+}
+
 std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<const Recipe>& recipe, bool indirect) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& counters = Recipes().kinds[indirect ? 1 : 0];

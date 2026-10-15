@@ -23,9 +23,9 @@
 
 namespace AgcDriver::DriverDetail {
 
-enum class FrozenFallback : std::uint8_t { None, Indirect, DrawCache, Debug, NoDevice, GpuMutexHeld, Labels, MetadataPass, RectList, Mesh, Count };
+enum class FrozenFallback : std::uint8_t { None, Indirect, DrawCache, Debug, NoDevice, GpuMutexHeld, Labels, MetadataPass, RectList, Mesh, ResolvedAhead, UnregisteredShader, ArgumentRead, DepthNote, FillHle, CopyHle, UnboundedCopies, Count };
 
-inline constexpr std::array<const char*, static_cast<std::size_t>(FrozenFallback::Count)> FrozenFallbackNames{"none", "indirect", "draw cache", "debug or dump", "no device", "GPU mutex held", "labels queued", "metadata pass", "rect list", "mesh"};
+inline constexpr std::array<const char*, static_cast<std::size_t>(FrozenFallback::Count)> FrozenFallbackNames{"none", "indirect", "draw cache", "debug or dump", "no device", "GPU mutex held", "labels queued", "metadata pass", "rect list", "mesh", "resolved ahead", "unregistered shader", "CPU argument read", "depth surface note", "fill HLE", "copy HLE", "unbounded stage-A CPU copies"};
 
 struct FrozenRegisterFiles {
     std::shared_ptr<const Registers> shader;
