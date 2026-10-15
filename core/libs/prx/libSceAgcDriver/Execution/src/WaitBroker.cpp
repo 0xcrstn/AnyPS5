@@ -7,8 +7,8 @@
 namespace AgcDriver {
 
 WaitBroker& WaitBroker::Instance() {
-    static WaitBroker broker;
-    return broker;
+    static auto* const broker = new WaitBroker();
+    return *broker;
 }
 
 bool WaitBroker::Enabled() {
