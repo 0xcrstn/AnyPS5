@@ -5008,7 +5008,6 @@ std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std:
 std::vector<ShaderResources::SnapshotRequest> ShaderResources::PlanDrawSnapshots(std::span<const MovedBuffer> moved, const DrawIndexRanges* drawRanges) const {
     std::vector<SnapshotRequest> requests;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !(AddressBasedDrawSnapshots() && bdaReadOnly)) || !DrawSnapshotArena::Enabled()) return requests;
-    const auto reads = guestMemory.InPlaceReads();
     std::size_t totalSnapshotBytes = 0;
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
@@ -5021,7 +5020,7 @@ std::vector<ShaderResources::SnapshotRequest> ShaderResources::PlanDrawSnapshots
             size = override->size;
         } else {
             if (InPlaceDrawInputs() || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
-            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+            const bool direct = guestMemory.InPlaceCovers(item.address, item.size);
             if (!direct) continue;
         }
         if (override != moved.end() && InPlaceDrawInputs()) continue;
@@ -5058,7 +5057,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         statistics->*bucket += std::chrono::duration<double, std::micro>(now - lapStart).count();
         lapStart = now;
     };
-    const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
@@ -5134,7 +5132,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             size = override->size;
         } else {
             if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
-            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+            const bool direct = guestMemory.InPlaceCovers(item.address, item.size);
             if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) {
                 if (statistics != nullptr) ++statistics->skipped;
                 continue;
@@ -5533,8 +5531,7 @@ void ShaderResources::WriteBackBuffers() {
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
-    const auto reads = guestMemory.InPlaceReads();
-    return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+    return guestMemory.InPlaceOverlaps(address, bytes);
 }
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {

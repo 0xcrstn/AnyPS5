@@ -342,6 +342,8 @@ public:
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    bool InPlaceCovers(std::uint64_t address, std::size_t bytes) const;
+    bool InPlaceOverlaps(std::uint64_t address, std::size_t bytes) const;
     Recorder::BoundPlacement Placement() const;
     VkDescriptorBufferInfo MirroredDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment, std::vector<std::shared_ptr<ResidentMirror>>& mirrors) const;
     std::vector<ShaderRecompiler::BdaAbi::Range> MirroredRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::vector<std::shared_ptr<ResidentMirror>>& mirrors) const;
