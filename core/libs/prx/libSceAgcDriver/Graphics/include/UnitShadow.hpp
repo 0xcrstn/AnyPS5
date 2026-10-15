@@ -98,7 +98,7 @@ bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes);
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 void MarkShadowedReached(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::vector<std::uint8_t>& reached);
 std::size_t ForgetPublishedShadows(std::uint64_t address, std::size_t bytes);
-std::size_t PublishUnprotectedShadows(PublishReason reason);
+std::size_t PublishUnprotectedShadows(PublishReason reason, bool protectedToo = false);
 bool AnyUnprotectedShadow();
 
 // The sources of a storage upload's surface-relative runs: [begin, end) pieces of them, each read

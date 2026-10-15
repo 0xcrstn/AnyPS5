@@ -575,7 +575,7 @@ void MarkShadowedReached(std::span<const std::pair<std::uint64_t, std::uint64_t>
     }
 }
 
-std::size_t PublishUnprotectedShadows(PublishReason reason) {
+std::size_t PublishUnprotectedShadows(PublishReason reason, bool protectedToo) {
     if (!UnitShadowEnabled()) return 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     {
@@ -584,7 +584,7 @@ std::size_t PublishUnprotectedShadows(PublishReason reason) {
         anyOverlapping(registry, 0, std::numeric_limits<std::uint64_t>::max(), [&](const std::shared_ptr<UnitShadow>& shadow) {
             if (shadow->liveUnits == 0) return false;
             for (std::uint64_t unit = 0; unit < shadow->Units(); ++unit) {
-                if (!shadow->Live(unit) || Coherence::ProtectionLive(shadow->protections[unit])) continue;
+                if (!shadow->Live(unit) || (!protectedToo && Coherence::ProtectionLive(shadow->protections[unit]))) continue;
                 const auto [begin, end] = shadow->UnitRange(unit);
                 if (end <= begin) continue;
                 if (!ranges.empty() && ranges.back().second == begin) ranges.back().second = end;

@@ -5406,7 +5406,7 @@ int coherenceLazyReleaseTests(const Device& device, Recorder& recorder) {
     const auto* words = static_cast<const std::uint8_t*>(block);
     paint(covered, {1.0f, 0.0f, 0.0f, 1.0f}, true);
     Require(Coherence::CurrentCounters().liveProtections == 1, "the covered image was not protected: " + Coherence::Report());
-    const std::array<std::optional<PublishScope>, 3> flips{std::nullopt, PublishScope::Whole, PublishScope::None};
+    const std::array<std::optional<PublishScope>, 2> flips{std::nullopt, PublishScope::None};
     std::uint8_t shade = 0x20;
     for (const auto& flip : flips) {
         const auto value = static_cast<float>(shade) / 255.0f;
@@ -5432,6 +5432,14 @@ int coherenceLazyReleaseTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     const auto counters = Coherence::CurrentCounters();
     Require(counters.uncoveredReleases == 0 && counters.liveProtections == 0 && counters.faultsResolved == 1, "lazy release: " + Coherence::Report());
+    paint(covered, {0.0f, 1.0f, 0.0f, 1.0f}, true);
+    paint(uncovered, {0.0f, 0.0f, 1.0f, 1.0f}, false);
+    Require(Coherence::CurrentCounters().liveProtections == 1, "the repainted covered image was not protected: " + Coherence::Report());
+    Require(StorageTexture::PresentThenStore(PublishScope::Whole, [] { return true; }), "the full flip did not present");
+    recorder.Sync();
+    Require(StorageTexture::FindPending(address, unit) == nullptr && StorageTexture::FindPending(address + unit, unit) == nullptr, "APS5_STORE_AT_FLIP=1 left an image pending under lazy release");
+    Require(words[0] == 0 && words[1] == 0xff && words[unit] == 0 && words[unit + 2] == 0xff, "APS5_STORE_AT_FLIP=1 did not store every pending image under lazy release");
+    Require(Coherence::CurrentCounters().liveProtections == 0 && Coherence::CurrentCounters().faultsResolved == 1, "the full flip left a protection or resolved a fault: " + Coherence::Report());
     std::cout << "coherence lazy release: ok\n";
     return 0;
 #endif
