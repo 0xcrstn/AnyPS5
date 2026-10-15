@@ -9592,6 +9592,7 @@ bool residentMirrorTests(const Device& device, Recorder& recorder, bool descript
         return std::memcmp(output->Bytes().data(), expected.data(), bytes) == 0;
     };
     const auto snapshot = [&] { return std::vector<std::uint32_t>(guest, guest + words); };
+    AgcDriver::Graphics::ReportMirrorsEveryBatchForTests(true);
     const auto before = AgcDriver::Graphics::MirrorTotals();
     const auto linearBefore = AgcDriver::Graphics::LinearSpaceTotals();
     auto expected = snapshot();
@@ -9660,6 +9661,7 @@ bool residentMirrorTests(const Device& device, Recorder& recorder, bool descript
     const auto after = AgcDriver::Graphics::MirrorTotals();
     Require(after.made - before.made <= 1 && after.uses - before.uses == 9 && after.refreshes - before.refreshes >= 8 && after.midBatchSyncs - before.midBatchSyncs == 1, "resident mirror counters do not match the reads");
     if (const char* verify = std::getenv("APS5_VERIFY_RESIDENT_MIRRORS"); verify != nullptr && std::strcmp(verify, "0") != 0) Require(after.verified - before.verified >= 8 && after.verifyDiffering == before.verifyDiffering, "a resident mirror differed from its import at the start of a batch");
+    AgcDriver::Graphics::ReportMirrorsEveryBatchForTests(false);
     if (AgcDriver::Graphics::LinearSpaceEnabled(context)) Require(AgcDriver::Graphics::LinearSpaceTotals().binds > linearBefore.binds || AgcDriver::Graphics::LinearSpaceTotals().usedPages > 0, "the resident mirror was not placed in the linear address space");
     leased.WriteBack();
     std::cout << "resident mirror tests passed (" << (after.refreshedBytes - before.refreshedBytes) / 1024 << " KiB refreshed, " << (after.midBatchBytes - before.midBatchBytes) / 1024 << " KiB synced mid-batch)\n";

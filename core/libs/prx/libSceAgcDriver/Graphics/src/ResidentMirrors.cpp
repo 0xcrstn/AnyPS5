@@ -262,6 +262,8 @@ std::uint64_t copiedBytes(const std::vector<VkBufferCopy>& copies) {
     return total;
 }
 
+std::atomic<bool> reportEveryBatch{false};
+
 void reportMirrors() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -270,7 +272,7 @@ void reportMirrors() {
     static auto last = std::chrono::steady_clock::now();
     static ResidentMirrorCounters previous{};
     const auto now = std::chrono::steady_clock::now();
-    if (now - last < std::chrono::seconds(10)) return;
+    if (now - last < (reportEveryBatch.load(std::memory_order_relaxed) ? std::chrono::steady_clock::duration::zero() : std::chrono::steady_clock::duration(std::chrono::seconds(10)))) return;
     last = now;
     const auto totals = MirrorTotals();
     const auto take = [](const std::atomic<std::uint64_t>& value, std::uint64_t& last) {
@@ -703,6 +705,10 @@ void ClearMirrors(VkDevice device) {
     auto& registry = Mirrors();
     std::lock_guard lock(registry.mutex);
     registry.used.clear();
+}
+
+void ReportMirrorsEveryBatchForTests(bool everyBatch) {
+    reportEveryBatch.store(everyBatch, std::memory_order_relaxed);
 }
 
 ResidentMirrorCounters MirrorTotals() {
