@@ -60,6 +60,8 @@ alignas(16) volatile std::uint32_t Condition = 1;
 bool NopBeforeCondition = false;
 bool WideStore = false;
 bool TableWrite = false;
+int PredicateValue = -1;
+alignas(16) volatile std::uint32_t Predicate = 0;
 alignas(16) std::array<std::uint32_t, 4> RegisterPairs{};
 alignas(64) volatile std::uint32_t EndOfPipe = 0;
 std::byte* ColorMemory = nullptr;
@@ -188,7 +190,15 @@ std::vector<std::uint32_t> Frame(bool writeData) {
     } else {
         SetPixelTable(words, ValueTable.data());
     }
-    words.insert(words.end(), {0xc0012d00u, 3u, 2u});
+    if (PredicateValue >= 0) {
+        const auto predicate = reinterpret_cast<std::uintptr_t>(&Predicate);
+        words.insert(words.end(), {0xc0033700u, 0x500u, static_cast<std::uint32_t>(predicate), static_cast<std::uint32_t>(static_cast<std::uint64_t>(predicate) >> 32u), static_cast<std::uint32_t>(PredicateValue)});
+        words.insert(words.end(), {0xc0022000u, (4u << 16u) | 0x100u, static_cast<std::uint32_t>(predicate), static_cast<std::uint32_t>(static_cast<std::uint64_t>(predicate) >> 32u)});
+        words.insert(words.end(), {0xc0012d01u, 3u, 2u});
+        words.insert(words.end(), {0xc0022000u, 0u, 0u, 0u});
+    } else {
+        words.insert(words.end(), {0xc0012d00u, 3u, 2u});
+    }
     ReleaseMemory(words, &EndOfPipe, 1u, 2u);
     return words;
 }
@@ -271,6 +281,18 @@ void IndirectRegistersSeeWriteData() {
     Require(deferred == 4u, std::to_string(deferred) + " register lists were left for their packet over 4 command buffers that write them first, expected 4");
 }
 
+void PredicatedDrawsSeeWriteData() {
+    for (std::uint64_t frame = 0; frame < 4; ++frame) {
+        PredicateValue = static_cast<int>(frame % 2);
+        Predicate = PredicateValue == 0 ? 1u : 0u;
+        const auto name = std::string("a draw predicated on a value a WRITE_DATA ") + (PredicateValue != 0 ? "set" : "cleared") + " just before, frame " + std::to_string(frame);
+        const auto red = CentreRed(name);
+        if (PredicateValue != 0) Require(red + 1u >= 128u && red <= 129u, name + ": the draw wrote red " + std::to_string(red) + ", expected 128 because the predicate passes");
+        else Require(red >= 254u, name + ": the draw wrote red " + std::to_string(red) + ", expected 255 because the predicate skips the second draw");
+    }
+    PredicateValue = -1;
+}
+
 void ConditionsSeeWriteData() {
     for (std::uint64_t frame = 0; frame < 4; ++frame) {
         NopBeforeCondition = frame % 2 == 1;
@@ -312,6 +334,7 @@ int main() {
         DrawsSeeEarlierLabels(jobs);
         ConditionsSeeWriteData();
         IndirectRegistersSeeWriteData();
+        PredicatedDrawsSeeWriteData();
         DrawsSeeWideWriteData(AgcDriver::DriverDetail::ParseMemoryPacketJobs(std::getenv("APS5_MEMORY_PACKET_JOBS")));
         AgcDriverShutdown_nid_postfix();
         std::cout << "Draws on the preparation workers see the values earlier RELEASE_MEM labels stored " << (jobs ? "with labels recorded as ordered jobs" : "with labels recorded by queue 0") << " (" << AgcDriver::DriverDetail::LabelRecordJobTotals().endOfPipe << " end-of-pipe labels recorded as jobs)" << std::endl;

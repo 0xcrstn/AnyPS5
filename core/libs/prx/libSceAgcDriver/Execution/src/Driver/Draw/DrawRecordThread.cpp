@@ -213,6 +213,7 @@ struct PacketWaitCounts {
     std::atomic<std::uint64_t> syncDrains{0};
     std::atomic<std::uint64_t> labelDrains{0};
     std::atomic<std::uint64_t> waitsSatisfied{0};
+    std::atomic<std::uint64_t> predicationReads{0};
     std::atomic<std::uint64_t> labelJobs{0};
     std::atomic<std::uint64_t> labelJobLabels{0};
     std::atomic<std::uint64_t> labelPackets{0};
@@ -1214,7 +1215,31 @@ LabelRecordJobCounters LabelRecordJobTotals() {
 
 CommandProcessorReadCounters CommandProcessorReadTotals() {
     const auto& counts = packetWaitCounts();
-    return {counts.commandProcessorReads.load(std::memory_order_relaxed), counts.commandProcessorReadsAhead.load(std::memory_order_relaxed), counts.commandProcessorReadsVerified.load(std::memory_order_relaxed), counts.registerStatePackets.load(std::memory_order_relaxed), counts.syncsDeferred.load(std::memory_order_relaxed), counts.syncDrains.load(std::memory_order_relaxed), counts.labelDrains.load(std::memory_order_relaxed), counts.waitsSatisfied.load(std::memory_order_relaxed)};
+    return {counts.commandProcessorReads.load(std::memory_order_relaxed), counts.commandProcessorReadsAhead.load(std::memory_order_relaxed), counts.commandProcessorReadsVerified.load(std::memory_order_relaxed), counts.registerStatePackets.load(std::memory_order_relaxed), counts.syncsDeferred.load(std::memory_order_relaxed), counts.syncDrains.load(std::memory_order_relaxed), counts.labelDrains.load(std::memory_order_relaxed), counts.waitsSatisfied.load(std::memory_order_relaxed), counts.predicationReads.load(std::memory_order_relaxed)};
+}
+
+bool Driver::overlapPredicationRead(std::uint64_t address, std::size_t bytes) {
+    const auto mode = CommandProcessorReadsMode();
+    if (mode == CommandProcessorReads::Drain || commandProcessorSyncPending() || labelInFlightOverlaps(address, bytes)) return false;
+    auto& counts = packetWaitCounts();
+    counts.predicationReads.fetch_add(1, std::memory_order_relaxed);
+    if (mode == CommandProcessorReads::Overlap || !recordsInFlight()) return true;
+    std::vector<std::byte> early(bytes);
+    std::vector<std::byte> late(bytes);
+    {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Wait);
+        GuestMemory::Read(address, early, bytes);
+    }
+    waitDrawRecordsAt(0x102u);
+    {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Wait);
+        GuestMemory::Read(address, late, bytes);
+    }
+    counts.commandProcessorReadsVerified.fetch_add(1, std::memory_order_relaxed);
+    if (early == late) return true;
+    char what[192];
+    std::snprintf(what, sizeof(what), "APS5_CP_READS_OVERLAP=verify: the predicate at 0x%llx+0x%zx read ahead of the draw records changed once they were recorded", static_cast<unsigned long long>(address), bytes);
+    throw std::runtime_error(what);
 }
 
 bool Driver::overlapCommandProcessorRead(std::span<const std::uint32_t> packet) {
@@ -1393,7 +1418,7 @@ void Driver::reportDrawRecords() {
         }
         static CommandProcessorReadCounters lastReads{};
         const auto reads = CommandProcessorReadTotals();
-        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s; command processor reads without a drain: %llu, %llu of them ahead of pending records, %llu verified; register-state packets without a drain: %llu; sync packets deferred to the next command processor read: %llu, drained there: %llu; drained for a label job still in flight over the read: %llu; WAIT_REG_MEM already satisfied without a drain: %llu\n", text.empty() ? " none" : text.c_str(), static_cast<unsigned long long>(reads.reads - lastReads.reads), static_cast<unsigned long long>(reads.ahead - lastReads.ahead), static_cast<unsigned long long>(reads.verified - lastReads.verified), static_cast<unsigned long long>(reads.registerState - lastReads.registerState), static_cast<unsigned long long>(reads.syncsDeferred - lastReads.syncsDeferred), static_cast<unsigned long long>(reads.syncDrains - lastReads.syncDrains), static_cast<unsigned long long>(reads.labelDrains - lastReads.labelDrains), static_cast<unsigned long long>(reads.waitsSatisfied - lastReads.waitsSatisfied));
+        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s; command processor reads without a drain: %llu, %llu of them ahead of pending records, %llu verified; register-state packets without a drain: %llu; sync packets deferred to the next command processor read: %llu, drained there: %llu; drained for a label job still in flight over the read: %llu; WAIT_REG_MEM already satisfied without a drain: %llu; predicated packets without a drain: %llu\n", text.empty() ? " none" : text.c_str(), static_cast<unsigned long long>(reads.reads - lastReads.reads), static_cast<unsigned long long>(reads.ahead - lastReads.ahead), static_cast<unsigned long long>(reads.verified - lastReads.verified), static_cast<unsigned long long>(reads.registerState - lastReads.registerState), static_cast<unsigned long long>(reads.syncsDeferred - lastReads.syncsDeferred), static_cast<unsigned long long>(reads.syncDrains - lastReads.syncDrains), static_cast<unsigned long long>(reads.labelDrains - lastReads.labelDrains), static_cast<unsigned long long>(reads.waitsSatisfied - lastReads.waitsSatisfied), static_cast<unsigned long long>(reads.predicationReads - lastReads.predicationReads));
         lastReads = reads;
         static std::array<std::uint64_t, 5> lastLabels{};
         const std::array<std::uint64_t, 5> labelTotals{counts.labelPackets.load(std::memory_order_relaxed), counts.labelJobs.load(std::memory_order_relaxed), counts.labelJobLabels.load(std::memory_order_relaxed), counts.endOfPipeJobs.load(std::memory_order_relaxed), counts.memoryPacketJobs.load(std::memory_order_relaxed)};

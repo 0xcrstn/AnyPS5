@@ -119,6 +119,7 @@ struct CommandProcessorReadCounters {
     std::uint64_t syncDrains = 0;
     std::uint64_t labelDrains = 0;
     std::uint64_t waitsSatisfied = 0;
+    std::uint64_t predicationReads = 0;
 };
 
 CommandProcessorReadCounters CommandProcessorReadTotals();
@@ -135,7 +136,7 @@ LabelRecordJobCounters LabelRecordJobTotals();
 
 inline bool RegisterStatePacket(std::uint32_t header) {
     const auto opcode = (header >> 8u) & 0xffu;
-    if (opcode == 0x11 || opcode == 0x12) return true;
+    if (opcode == 0x11 || opcode == 0x12 || opcode == 0x20) return true;
     if (opcode != 0x10) return false;
     switch ((header >> 2u) & 0x3fu) {
     case 0x00: case 0x09: case 0x0b: case 0x0c: case 0x1a:
