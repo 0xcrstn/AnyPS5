@@ -342,6 +342,7 @@ void BdaResources::markWrittenPages() const {
             }
         }
         GuestMemory::MarkWritten(begin, bytes);
+        if (Coherence::Tracking()) written.push_back({begin, end});
     }), "invalid BDA written-page record");
     for (std::uint32_t claim = 0; claim < count; ++claim) {
         const auto slot = words[Abi::WrittenListWord + claim];

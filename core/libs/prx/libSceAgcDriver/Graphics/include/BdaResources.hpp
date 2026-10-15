@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BDARESOURCES_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BDARESOURCES_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "Recompiler.hpp"
 #include <string>
@@ -19,6 +20,7 @@ public:
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
     void CheckFault() const;
+    std::span<const Coherence::Interval> WrittenRanges() const { return written; }
     struct ImageTableFaults {
         std::uint32_t stage = 0;
         std::uint64_t shader = 0;
@@ -59,6 +61,7 @@ private:
     std::vector<std::shared_ptr<ResidentMirror>> mirrors;
     std::vector<ImageTableFaults> imageTables;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
+    mutable std::vector<Coherence::Interval> written;
 };
 
 }

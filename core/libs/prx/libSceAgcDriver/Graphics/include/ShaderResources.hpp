@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include <array>
 #include <chrono>
+#include <deque>
 #include <limits>
 #include <list>
 #include <map>
@@ -550,6 +551,12 @@ private:
     std::vector<std::uint64_t> multisampleSources;
     bool bdaReadOnly = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pointerTargets;
+    struct ElementWriter {
+        Coherence::ProducerToken token;
+        std::vector<Coherence::Interval> intervals;
+    };
+    mutable std::deque<ElementWriter> elementWriters;
+    void completeElementWriters() const;
     bool usesFaultBuffer = false;
     bool faultChecks = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
