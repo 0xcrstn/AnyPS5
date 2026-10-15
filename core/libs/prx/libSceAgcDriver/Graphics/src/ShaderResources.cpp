@@ -5316,7 +5316,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     }
     if (usesBda && !bdaReadOnly) {
         guestMemory.ForgetPointerShadows();
-        for (const auto& [begin, end] : guestMemory.PointerHeaps()) NoteMirroredWrite(begin, end);
+        for (const auto& [begin, end] : guestMemory.PointerHeaps()) NotePointerWrite(recorder, begin, end);
     }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {

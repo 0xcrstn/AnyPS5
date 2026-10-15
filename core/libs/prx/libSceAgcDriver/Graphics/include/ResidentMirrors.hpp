@@ -20,6 +20,7 @@ VkBuffer MirrorBuffer(const ResidentMirror& mirror);
 void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirror>> mirrors);
 void RefreshMirrorsForDirectUse(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirror>> mirrors);
 void NoteMirroredWrite(std::uint64_t begin, std::uint64_t end);
+void NotePointerWrite(const Recorder& recorder, std::uint64_t begin, std::uint64_t end);
 void SubmitMirrors(Recorder& recorder);
 void ForgetMirrors(VkDevice device, std::uint64_t begin, std::uint64_t end);
 void ClearMirrors(VkDevice device);
