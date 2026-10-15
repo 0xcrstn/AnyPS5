@@ -291,6 +291,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "texture");
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
+        owned->placement = DeviceMemoryPlacement(DeviceMemoryKind::Texture, context.HostPlaced(allocation.memoryTypeIndex), requirements.size);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
 
         {
@@ -1135,6 +1136,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         memoryBytes = requirements.size;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "storage texture");
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory storage texture");
+        placement = DeviceMemoryPlacement(DeviceMemoryKind::StorageTexture, context.HostPlaced(allocation.memoryTypeIndex), requirements.size);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
     } catch (...) {
         release();
@@ -4992,6 +4994,7 @@ void StorageTexture::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    placement.Reset();
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

@@ -151,6 +151,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         memory = allocation->memory;
         allocationBytes = allocation->allocationBytes;
         capacity = allocation->bytes;
+        placement = DeviceMemoryPlacement(DeviceMemoryKind::Buffer, false, allocationBytes);
         if (allocation->bufferBytes == size) return;
         context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
         buffer = VK_NULL_HANDLE;
@@ -176,6 +177,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, allocation.allocationSize, "device buffer");
         hostPlaced = allocation.memoryTypeIndex != context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
+        placement = DeviceMemoryPlacement(DeviceMemoryKind::Buffer, hostPlaced, allocationBytes);
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {
         release();
@@ -188,6 +190,7 @@ DeviceBuffer::~DeviceBuffer() {
 }
 
 void DeviceBuffer::release() noexcept {
+    placement.Reset();
     if (buffer && memory && cache && !hostPlaced) {
         cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, size});
         return;

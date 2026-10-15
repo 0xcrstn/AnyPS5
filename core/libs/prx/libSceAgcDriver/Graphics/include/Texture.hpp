@@ -52,6 +52,7 @@ struct OwnedImage {
     Context context;
     VkImage image;
     VkDeviceMemory memory;
+    DeviceMemoryPlacement placement;
 };
 
 class Texture {
@@ -572,6 +573,7 @@ private:
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize memoryBytes = 0;
+    DeviceMemoryPlacement placement;
     VkImageView view = VK_NULL_HANDLE;
     std::uint32_t defaultMip = 0;
     std::map<std::uint32_t, VkImageView> extraViews;
