@@ -10,6 +10,7 @@
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/QueueTopology.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DriverHeapTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -1537,6 +1538,29 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             state->sparseBinding = family < families && (queues[family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0;
         }
         enabled.sparseBinding = state->sparseBinding ? VK_TRUE : VK_FALSE;
+    }
+    {
+        std::uint32_t familyCount = 0;
+        auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
+        getFamilies(selected, &familyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> properties(familyCount);
+        getFamilies(selected, &familyCount, properties.data());
+        std::vector<QueueFamilyInfo> topologyFamilies(familyCount);
+        for (std::uint32_t i = 0; i < familyCount; ++i) {
+            topologyFamilies[i].flags = properties[i].queueFlags;
+            topologyFamilies[i].count = properties[i].queueCount;
+            if (window != nullptr) {
+                VkBool32 present = VK_FALSE;
+                check(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>("vkGetPhysicalDeviceSurfaceSupportKHR")(selected, i, state->surface, &present), "vkGetPhysicalDeviceSurfaceSupportKHR");
+                topologyFamilies[i].present = present == VK_TRUE;
+            }
+        }
+        APS5_LOG_OUT("Vulkan queue families: %s; graphics family %u, sparse family %d", DescribeQueueFamilies(topologyFamilies).c_str(), family, state->sparseFamily == VK_QUEUE_FAMILY_IGNORED ? -1 : static_cast<int>(state->sparseFamily));
+        const auto topology = ParseQueueTopology(std::getenv("APS5_QUEUE_TOPOLOGY"));
+        const auto plan = PlanQueueTopology(topology, topologyFamilies, family, state->sparseFamily);
+        if (plan.topology != QueueTopology::Serial) {
+            throw std::runtime_error(std::string("APS5_QUEUE_TOPOLOGY=") + QueueTopologyName(plan.topology) + ": compute queue family " + std::to_string(plan.computeFamily) + " index " + std::to_string(plan.computeIndex) + " is available, but running guest compute queues on it needs a recorder per physical queue, which is not implemented");
+        }
     }
     deviceInfo.pQueueCreateInfos = queueInfos;
     // Indirect draw records with a non-zero first instance, and several records per call.

@@ -220,6 +220,10 @@ With `APS5_COHERENCE_ORDERING=1` or `verify`, a label also waits behind the writ
 
 `APS5_WAIT_BROKER=1` makes a blocked wait sleep until a label is recorded or a batch's results reach guest memory, instead of polling on a timer. It still checks again after at most `APS5_WAIT_BROKER_MAX_US` (default 2000), since stores made by the title's own CPU code wake nobody.
 
+`APS5_QUEUE_TOPOLOGY` chooses the Vulkan queues the driver runs on. The log lists every queue family when the device is created.
+- `serial` (the default) runs everything on one queue.
+- `same-family` and `dedicated` check that a second queue is available, in the graphics family or in a compute-only family respectively. They then stop the title, since running the compute queues on a second queue is not implemented yet. An unavailable topology also stops the title, naming the families that exist.
+
 `APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. `0` (the default) turns it off. The `[labels]` line counts these submits.
 
 ### Tracing system library calls
