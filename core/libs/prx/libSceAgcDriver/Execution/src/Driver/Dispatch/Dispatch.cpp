@@ -81,15 +81,16 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
             Graphics::NoteHtileDepthClear(htile, static_cast<std::size_t>(threads * 16u));
         }
-        if (drawRecordState().active && !partialLastGroup && (matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || (indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))))) waitDrawRecords();
         if (indirectArguments == 0 && (packet[4] & 0x20u) == 0) {
             if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
         }
         if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
+            if (drawRecordState().active) drawRecordState().settled = true;
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
         if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
+            if (drawRecordState().active) drawRecordState().settled = true;
             pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
             return;
         }
