@@ -25,6 +25,13 @@ class StorageTexture;
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
 struct PreparedDispatch;
+
+struct PreparedCpuCopy {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::vector<std::byte> bytes;
+};
+
 struct ComputePipelineObjects;
 // The unlocked pre-checks of a recipe hit (see VulkanDevice::PrepareRecipe); opaque to callers.
 struct RecipeHit;
@@ -252,6 +259,8 @@ public:
     // APS5_PROFILE_DRAW: the parts of a PrepareDispatch in milliseconds, in the order key, find,
     // precollect, presync, stage A (the driver's 'prepare:' rows).
     static std::span<const double, 5> PreparePhaseMs(const PreparedDispatch& prepared);
+    static std::span<const std::uint32_t> PreparedKey(const PreparedDispatch& prepared);
+    static std::vector<PreparedCpuCopy> PreparedCpuCopies(const PreparedDispatch& prepared, bool& unbounded);
     // `recipe`, when given, receives the Recipe a successful call built for its dispatch-cache
     // variant (design_cpu_final M4): only when the resource cache served or took the object
     // (reusable, cacheable) and recipes are on (APS5_NO_DISPATCH_RECIPE=1 builds none); else null.

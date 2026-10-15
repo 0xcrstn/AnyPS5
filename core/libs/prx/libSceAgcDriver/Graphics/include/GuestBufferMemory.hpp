@@ -268,6 +268,15 @@ public:
     void Upload(bool addressable);
     void UploadPrepare(bool addressable);
     void UploadFinish(bool addressable);
+    struct CpuCopy {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::vector<std::byte> bytes;
+    };
+    static constexpr std::size_t MaxPrepareCpuCopies = 4096;
+    static void RecordPrepareCpuCopies(bool ranges, bool bytes);
+    const std::vector<CpuCopy>& PrepareCpuCopies() const { return prepareCopies; }
+    bool PrepareCpuCopiesUnbounded() const { return prepareCopiesUnbounded; }
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
@@ -467,6 +476,9 @@ private:
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
     std::uint64_t accountedHostCopyBytes = 0;
     void accountHostCopies() noexcept;
+    std::vector<CpuCopy> prepareCopies;
+    bool prepareCopiesUnbounded = false;
+    void notePrepareCopy(const Region& region);
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
     bool prepared = false;
     bool uploaded = false;
