@@ -1136,21 +1136,28 @@ void WaitForGuestReaders(Coherence::Interval range) {
     }
 }
 
+bool HoldsGpuMutex() {
+    return GuestMemory::GpuMutex().HeldByThisThread();
+}
+
 void InstallCoherence() {
-    if (Coherence::LazyRelease() && !Coherence::FaultOwnership()) throw std::runtime_error("APS5_COHERENCE_LAZY_RELEASE needs APS5_COHERENCE_FAULTS: a release that stores nothing must leave device-only guest memory protected");
-    if (Coherence::LazyRelease() && Graphics::LazyStagingOut() && !Coherence::Residency()) throw std::runtime_error("APS5_COHERENCE_LAZY_RELEASE with APS5_LAZY_STAGING_OUT needs APS5_COHERENCE_RESIDENCY");
+    using Coherence::Mode;
+    if (Coherence::LazyReleaseMode() != Mode::Reference && Coherence::FaultsMode() == Mode::Reference) throw std::runtime_error("APS5_COHERENCE_LAZY_RELEASE needs APS5_COHERENCE_FAULTS: a release that stores nothing must leave device-only guest memory protected");
+    if (Coherence::LazyReleaseMode() != Mode::Reference && Graphics::LazyStagingOut() && Coherence::ResidencyMode() == Mode::Reference) throw std::runtime_error("APS5_COHERENCE_LAZY_RELEASE with APS5_LAZY_STAGING_OUT needs APS5_COHERENCE_RESIDENCY");
     if (Coherence::Canonicalizing()) {
         Coherence::SetBackingTranslator(&GuestArena::GuestArenaBackingRuns_nid_postfix);
         static_cast<void>(Coherence::Translate({0x10000, 0x10001}));
     }
-    if (!Coherence::FaultOwnership() && !Coherence::InputLeases() && !Coherence::Residency()) return;
+    if (Coherence::FaultsMode() == Mode::Reference && Coherence::InputLeasesMode() == Mode::Reference && Coherence::ResidencyMode() == Mode::Reference) return;
 #ifdef _WIN32
-    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix, &GuestArena::GuestArenaOpenAccessForRead_nid_postfix});
     Coherence::SetMaterializer(&MaterializeNativeAccess);
     Coherence::SetLeaseWaiter(&WaitForGuestReaders);
+    Coherence::SetFaultPriority(&HoldsGpuMutex);
+    GuestArena::GuestArenaSetResolverBypass_nid_postfix(&HoldsGpuMutex);
     GuestArena::GuestArenaSetResolveHostWrites_nid_postfix(true);
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix, &GuestArena::GuestArenaOpenAccessForRead_nid_postfix});
 #else
-    throw std::runtime_error("APS5_COHERENCE_FAULTS, APS5_COHERENCE_INPUT_LEASES and APS5_COHERENCE_RESIDENCY: guest access protection is not implemented on this platform");
+    if (Coherence::FaultsMode() == Mode::Verify || Coherence::InputLeasesMode() == Mode::Verify || Coherence::ResidencyMode() == Mode::Verify) throw std::runtime_error("APS5_COHERENCE_FAULTS, APS5_COHERENCE_INPUT_LEASES and APS5_COHERENCE_RESIDENCY: guest access protection is not implemented on this platform");
 #endif
 }
 
@@ -2294,7 +2301,8 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         Graphics::StorageTexture::FlushAllPending("label");
     }
     const auto checkDrained = [&](bool writeBacksOrdered) {
-        if (!lazyRelease) Coherence::CheckDrained(Graphics::StorageTexture::AnyPending(), Graphics::AnyShadowedOverlaps(0, std::numeric_limits<std::size_t>::max()), "label", writeBacksOrdered);
+        if (lazyRelease) Coherence::CheckDrained(false, false, "label", writeBacksOrdered);
+        else Coherence::CheckDrained(Graphics::StorageTexture::AnyPending(), Graphics::AnyShadowedOverlaps(0, std::numeric_limits<std::size_t>::max()), "label", writeBacksOrdered);
     };
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) {
         checkDrained(true);

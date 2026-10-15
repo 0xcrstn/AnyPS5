@@ -111,8 +111,9 @@ struct Ledger {
     std::uint64_t protections = 0;
     std::uint64_t leases = 0;
     std::uint64_t leaseWaits = 0;
-    std::set<std::uint64_t> resolving;
+    std::map<std::uint64_t, std::shared_ptr<struct Resolution>> resolving;
     std::condition_variable settled;
+    FaultPriority priority = nullptr;
     std::uint64_t refused = 0;
     std::uint64_t partial = 0;
     std::uint64_t resolved = 0;
@@ -127,6 +128,16 @@ Ledger& Protections() {
 struct ResolverContext {
     std::uint64_t protection;
 };
+
+struct Resolution {
+    Interval range;
+    Materializer materializer = nullptr;
+    bool lease = false;
+    std::vector<std::uint64_t> tokens;
+    bool done = false;
+};
+
+std::atomic<bool> backendInstalled{false};
 
 [[noreturn]] void AbortInFault(const char* what, Interval range, const char* detail) {
     std::fprintf(stderr, "[coherence] %s [0x%llx, 0x%llx): %s\n", what, static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end), detail);
@@ -153,45 +164,72 @@ bool ResolveProtection(std::uint64_t token, void* context) {
             materializer = lease ? ledger.waiter : ledger.materializer;
         }
     }
+    const auto materialize = [&](const Resolution& resolution) {
+        try {
+            if (resolution.materializer == nullptr) throw std::runtime_error(resolution.lease ? "no lease waiter is installed" : "no materializer is installed");
+            resolution.materializer(resolution.range);
+        } catch (const std::exception& error) {
+            AbortInFault(resolution.lease ? "a native access to guest memory under a read lease could not wait for its readers" : "native access to device-owned guest memory could not be materialized", resolution.range, error.what());
+        }
+    };
+    const auto finish = [&](const std::shared_ptr<Resolution>& resolution) {
+        if (backend.release != nullptr) {
+            for (const auto held : resolution->tokens) backend.release(held);
+        }
+        {
+            std::lock_guard lock(ledger.mutex);
+            resolution->done = true;
+            for (const auto held : resolution->tokens) {
+                const auto found = ledger.resolving.find(held);
+                if (found != ledger.resolving.end() && found->second == resolution) ledger.resolving.erase(found);
+            }
+        }
+        ledger.settled.notify_all();
+    };
     if (live) {
-        std::vector<std::uint64_t> opened{token};
+        auto resolution = std::make_shared<Resolution>();
+        resolution->range = range;
+        resolution->materializer = materializer;
+        resolution->lease = lease;
+        resolution->tokens.push_back(token);
         {
             std::lock_guard lock(ledger.mutex);
             for (auto it = ledger.live.begin(); it != ledger.live.end();) {
                 if (it->first == id || (it->second.token != 0 && it->second.range.begin < range.end && range.begin < it->second.range.end)) {
-                    if (it->second.token != 0 && it->second.token != token) opened.push_back(it->second.token);
+                    if (it->second.token != 0 && it->second.token != token) resolution->tokens.push_back(it->second.token);
                     it = ledger.live.erase(it);
                 } else {
                     ++it;
                 }
             }
             ++(lease ? ledger.leaseWaits : ledger.resolved);
-            ledger.resolving.insert(opened.begin(), opened.end());
+            for (const auto held : resolution->tokens) ledger.resolving[held] = resolution;
         }
-        const bool readable = backend.open != nullptr;
-        for (const auto held : opened) {
-            if (readable) static_cast<void>(backend.open(held));
-            else if (backend.release != nullptr) backend.release(held);
+        if (backend.open != nullptr) {
+            for (const auto held : resolution->tokens) static_cast<void>(backend.open(held));
+        } else if (backend.release != nullptr) {
+            for (const auto held : resolution->tokens) backend.release(held);
         }
-        try {
-            if (materializer == nullptr) throw std::runtime_error(lease ? "no lease waiter is installed" : "no materializer is installed");
-            materializer(range);
-        } catch (const std::exception& error) {
-            AbortInFault(lease ? "a native access to guest memory under a read lease could not wait for its readers" : "native access to device-owned guest memory could not be materialized", range, error.what());
-        }
-        if (readable && backend.release != nullptr) {
-            for (const auto held : opened) backend.release(held);
-        }
-        {
-            std::lock_guard lock(ledger.mutex);
-            for (const auto held : opened) ledger.resolving.erase(held);
-        }
-        ledger.settled.notify_all();
+        materialize(*resolution);
+        finish(resolution);
         return true;
     }
+    std::shared_ptr<Resolution> pending;
+    FaultPriority priority = nullptr;
     {
+        std::lock_guard lock(ledger.mutex);
+        const auto found = ledger.resolving.find(token);
+        if (found != ledger.resolving.end()) pending = found->second;
+        priority = ledger.priority;
+    }
+    if (pending != nullptr && priority != nullptr && priority()) {
+        materialize(*pending);
+        finish(pending);
+        return true;
+    }
+    if (pending != nullptr) {
         std::unique_lock lock(ledger.mutex);
-        ledger.settled.wait(lock, [&] { return !ledger.resolving.contains(token); });
+        ledger.settled.wait(lock, [&] { return pending->done; });
     }
     if (backend.release != nullptr) backend.release(token);
     return true;
@@ -201,13 +239,18 @@ void ReleaseResolverContext(void* context) {
     delete static_cast<ResolverContext*>(context);
 }
 
+Mode DefaultOn(const char* variable) {
+    const char* value = std::getenv(variable);
+    return value == nullptr ? Mode::New : ParseMode(variable, value);
+}
+
 Mode EnvironmentFaults() {
-    static const Mode faults = ParseMode("APS5_COHERENCE_FAULTS", std::getenv("APS5_COHERENCE_FAULTS"));
+    static const Mode faults = DefaultOn("APS5_COHERENCE_FAULTS");
     return faults;
 }
 
 Mode EnvironmentLeases() {
-    static const Mode leases = ParseMode("APS5_COHERENCE_INPUT_LEASES", std::getenv("APS5_COHERENCE_INPUT_LEASES"));
+    static const Mode leases = DefaultOn("APS5_COHERENCE_INPUT_LEASES");
     return leases;
 }
 
@@ -219,12 +262,12 @@ std::atomic<bool> releaseOverridden{false};
 std::atomic<Mode> overrideRelease{Mode::Reference};
 
 Mode EnvironmentRelease() {
-    static const Mode release = ParseMode("APS5_COHERENCE_LAZY_RELEASE", std::getenv("APS5_COHERENCE_LAZY_RELEASE"));
+    static const Mode release = DefaultOn("APS5_COHERENCE_LAZY_RELEASE");
     return release;
 }
 
 Mode EnvironmentResidency() {
-    static const Mode residency = ParseMode("APS5_COHERENCE_RESIDENCY", std::getenv("APS5_COHERENCE_RESIDENCY"));
+    static const Mode residency = DefaultOn("APS5_COHERENCE_RESIDENCY");
     return residency;
 }
 
@@ -461,13 +504,20 @@ void SetFaultsModeForTests(Mode faults) {
 }
 
 bool FaultOwnership() {
-    return FaultsMode() != Mode::Reference;
+    return FaultsMode() != Mode::Reference && backendInstalled.load(std::memory_order_acquire);
 }
 
 void SetProtectionBackend(ProtectionBackend backend) {
     auto& ledger = Protections();
     std::lock_guard lock(ledger.mutex);
     ledger.backend = backend;
+    backendInstalled.store(backend.protect != nullptr && backend.release != nullptr, std::memory_order_release);
+}
+
+void SetFaultPriority(FaultPriority priority) {
+    auto& ledger = Protections();
+    std::lock_guard lock(ledger.mutex);
+    ledger.priority = priority;
 }
 
 void SetMaterializer(Materializer materializer) {
@@ -492,7 +542,7 @@ void SetInputLeasesModeForTests(Mode leases) {
 }
 
 bool InputLeases() {
-    return InputLeasesMode() != Mode::Reference;
+    return InputLeasesMode() != Mode::Reference && backendInstalled.load(std::memory_order_acquire);
 }
 
 void SetLeaseWaiter(Materializer waiter) {
@@ -520,7 +570,7 @@ void SetResidencyModeForTests(Mode residency) {
 }
 
 bool Residency() {
-    return ResidencyMode() != Mode::Reference;
+    return ResidencyMode() != Mode::Reference && backendInstalled.load(std::memory_order_acquire);
 }
 
 Mode LazyReleaseMode() {
@@ -533,7 +583,7 @@ void SetLazyReleaseModeForTests(Mode release) {
 }
 
 bool LazyRelease() {
-    return LazyReleaseMode() != Mode::Reference;
+    return LazyReleaseMode() != Mode::Reference && FaultOwnership();
 }
 
 std::uint64_t ProtectResident(Interval range, Version version) {

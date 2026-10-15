@@ -186,7 +186,19 @@ A title's own CPU reads of that memory are not seen, so a title that waits for a
 
 ### Guest-memory coherence checks
 
-Three switches take `0` (the default), `1` or `verify`; any other value stops the title when the GPU device is created.
+Each switch below takes `0`, `1` or `verify`. Any other value stops the title when the GPU device is created.
+- **Off by default:** `APS5_COHERENCE_AUDIT`, `APS5_COHERENCE_ORDERING`, `APS5_COHERENCE_DIRECTORY`.
+- **On by default (`1`):** `APS5_COHERENCE_FAULTS`, `APS5_COHERENCE_INPUT_LEASES`, `APS5_COHERENCE_RESIDENCY`, `APS5_COHERENCE_LAZY_RELEASE`, `APS5_DEFERRED_POINTER_STORES`. Set one to `0` to turn it off.
+
+The protection switches take effect once the GPU device installs the access guards, on Windows only. On other systems they stay inactive, except that `verify` stops the title.
+
+`APS5_DEFERRED_POINTER_STORES=1` (the default):
+- **Before any address-based shader:** only the unit shadows over its heaps are published, so the storage images pending there are no longer retiled to guest memory first.
+- **Pointer writers:** a shader that may store through pointers is tracked until it completes. A flip or address-based store of an image older than such a shader over its memory waits for a later flip. Any other store of that image first waits for the shader, so its stores are never overwritten by older results.
+- **Readers:** a shader that only reads through pointers can still see host bytes under an image whose newer results are pending.
+- **`0`:** stores every pending image over the heaps before each address-based shader, at the cost of tens of GB per 10 s in heavy scenes.
+- **`verify`:** stops the title when such an image would still be written back before the shader completed.
+- **Report:** a `[pointer-stores]` line every 10 s counts the deferred stores, the waited write-backs, and the pointer shaders that ran with pending images over their heaps.
 
 `APS5_COHERENCE_AUDIT=1` keeps a version for every GPU writer the driver records (address-based shaders that may store through pointers, and written buffer elements) and checks every store of an older GPU result into guest memory (a pending storage image, a unit shadow) against it. The first stale store prints a `[coherence] stale publication` line with the writers and stores that touched those bytes; later ones are counted on a `[coherence]` line every 10 s. An address-based shader that reads host memory under a pending image or an unpublished unit shadow prints `[coherence] stale read`. `verify` stops the title at the first stale store instead. Rendering is unchanged; the checks cost CPU time.
 
@@ -206,7 +218,8 @@ Three switches take `0` (the default), `1` or `verify`; any other value stops th
 - **Refused ranges:** ranges the protection refuses (pinned or resident pages) keep the default behaviour.
 - **`verify`:** stops the title at a refused or partly covered range, and at a driver access to such memory made while it holds the GPU lock.
 - **Limits:** unmapping or reprotecting such memory before the driver stored it stops the title. Windows only. Each pending image costs a protection change, so expect a slowdown.
-- **Deadlock risk:** a driver thread that holds the GPU lock and touches protected memory directly, while a title thread is resolving the same pages, deadlocks. The driver does not yet resolve such ranges before taking the lock, and `verify` does not catch it. The same applies to `APS5_COHERENCE_INPUT_LEASES` and `APS5_COHERENCE_RESIDENCY`.
+- **Driver accesses:** a driver thread that holds the GPU lock and touches such memory does not wait for a title thread already resolving it. It stores the results itself and releases the guard, and the title thread's resolution then finds nothing left to do.
+- **During resolution:** the range is read-only while it is resolved. Other threads' loads see the bytes from before, and their stores wait.
 
 `APS5_COHERENCE_INPUT_LEASES=1` protects the guest memory that a recorded dispatch reads in place through host imports, from recording until its batch completes. A native store into that memory waits until the recorded work has run, so the dispatch reads the bytes it was given rather than a later write. The protection covers every 4 KiB page the reads touch, so reads beside the stored bytes wait as well. Address-based heaps are not leased, because their reach is the whole heap. `verify` stops the title when a lease is refused. Windows only. Each dispatch costs a protection change, and the title's stores into memory the GPU still reads wait for the GPU.
 

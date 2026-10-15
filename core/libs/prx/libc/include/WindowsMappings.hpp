@@ -129,7 +129,11 @@ public:
             }
             if (pending.empty()) return true;
             for (const auto& [token, guard] : pending) {
-                std::lock_guard resolving(guard->resolverMutex);
+                std::unique_lock resolving(guard->resolverMutex, std::defer_lock);
+                if (!resolving.try_lock()) {
+                    const auto bypass = resolverBypass.load(std::memory_order_acquire);
+                    if (bypass == nullptr || !bypass()) resolving.lock();
+                }
                 {
                     std::lock_guard lock(mutex);
                     if (!accessGuards.contains(token)) continue;
@@ -419,6 +423,10 @@ public:
         std::lock_guard lock(mutex);
         const auto key = reinterpret_cast<std::uintptr_t>(section);
         physical.erase(physical.lower_bound(std::make_pair(key, std::uint64_t{0})), physical.lower_bound(std::make_pair(key + 1, std::uint64_t{0})));
+    }
+
+    void SetResolverBypass(bool (*bypass)()) {
+        resolverBypass.store(bypass, std::memory_order_release);
     }
 
     void SetResolveHostWrites(bool resolve) {
@@ -1184,6 +1192,7 @@ private:
     std::map<std::uint64_t, std::shared_ptr<AccessGuard>> accessGuards;
     std::atomic<std::size_t> accessGuardCount{0};
     std::atomic<bool> resolveHostWrites{false};
+    std::atomic<bool (*)()> resolverBypass{nullptr};
     std::uint64_t nextAccessToken = 0;
     std::uint64_t viewIdentity = 0;
     struct ActiveAccessResolversTag {};
