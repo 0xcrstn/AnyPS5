@@ -520,6 +520,11 @@ public:
     }
 };
 
+bool VerifyShaderCache() {
+    static const bool verify = std::getenv("APS5_VERIFY_SHADER_CACHE") != nullptr;
+    return verify;
+}
+
 struct ResourceProgram {
     explicit ResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true) : program(std::make_unique<IrProgram>(PrepareResourceProgram(request, preparation))) {
         const auto clearRegisterState = [](const auto& storage) {
@@ -621,6 +626,12 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                 IrResourcePlan loaded;
                 if (ShaderDiskCache::LoadPlan(planKey, loaded)) {
                     loaded.shaderHash = request.shader.codeAddress;
+                    if (VerifyShaderCache()) {
+                        ShaderCompileTrace::Event verifyEvent("verify.cached_plan");
+                        TraceRequest(verifyEvent, request);
+                        const ResourceProgram fresh(request, preparation, reclaim);
+                        if (!ShaderDiskCache::SamePlan(*fresh.plan, loaded)) throw std::runtime_error("APS5_VERIFY_SHADER_CACHE: the cached resource plan of shader 0x" + std::to_string(request.shader.codeAddress) + " differs from a fresh one (plan source version " + std::to_string(ShaderDiskCache::PlanSourceVersion()) + ")");
+                    }
                     source->plan = std::make_shared<const IrResourcePlan>(std::move(loaded));
                     source->planBytes = countPlan(*source->plan);
                     source->planStored = true;
