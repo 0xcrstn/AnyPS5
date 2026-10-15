@@ -118,7 +118,7 @@ bool CoreVulkanCapability(std::uint32_t capability) {
 std::atomic<std::uint64_t> computePipelinesCreated{0};
 std::atomic<std::uint64_t> computePipelinesCreatedLocked{0};
 
-void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr, Graphics::PipelineCreationTrace* trace = nullptr) {
+bool CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr, Graphics::PipelineCreationTrace* trace = nullptr) {
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.flags = flags;
     info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -135,9 +135,24 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
     const auto created = create(device, cache, 1, &info, nullptr, pipeline);
     if (trace != nullptr) trace->Created(created);
+    if (created == VK_PIPELINE_COMPILE_REQUIRED_EXT && (flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT) != 0) {
+        *pipeline = VK_NULL_HANDLE;
+        return false;
+    }
     check(created, "vkCreateComputePipelines");
     computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
     if (GuestMemory::GpuMutex().HeldByThisThread()) computePipelinesCreatedLocked.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool PipelineCacheProbes() {
+    static const bool probes = [] {
+        const char* text = std::getenv("APS5_PIPELINE_CACHE_PROBES");
+        if (text == nullptr || *text == '\0' || std::string_view(text) == "1") return true;
+        require(std::string_view(text) == "0", "APS5_PIPELINE_CACHE_PROBES accepts only 0 or 1");
+        return false;
+    }();
+    return probes;
 }
 
 // Pipelines are shared by dispatches of one compiled variant and push-constant use (0: not shared).
@@ -177,13 +192,16 @@ bool PriorityCompileScheduler() {
     return priority;
 }
 
+bool PipelineContentDedup();
+
 bool PipelinePrewarm() {
     static const bool prewarm = [] {
         const char* text = std::getenv("APS5_PIPELINE_PREWARM");
-        if (text == nullptr || *text == '\0') return PriorityCompileScheduler();
+        if (text == nullptr || *text == '\0') return PriorityCompileScheduler() && PipelineContentDedup();
         if (std::string_view(text) == "0") return false;
         require(std::string_view(text) == "1", "APS5_PIPELINE_PREWARM accepts only 0 or 1");
         require(PriorityCompileScheduler(), "APS5_PIPELINE_PREWARM=1 needs APS5_COMPILE_SCHEDULER=priority");
+        require(PipelineContentDedup(), "APS5_PIPELINE_PREWARM=1 needs APS5_PIPELINE_CONTENT_DEDUP, which shares the prewarmed pipelines");
         return true;
     }();
     return prewarm;
@@ -203,9 +221,9 @@ std::string ContentKeyName(const PipelineContentKey& key) {
 bool PipelineContentDedup() {
     static const bool dedup = [] {
         const char* text = std::getenv("APS5_PIPELINE_CONTENT_DEDUP");
-        if (text == nullptr || *text == '\0' || std::string_view(text) == "0") return false;
-        require(std::string_view(text) == "1", "APS5_PIPELINE_CONTENT_DEDUP accepts only 0 or 1");
-        return true;
+        if (text == nullptr || *text == '\0' || std::string_view(text) == "1") return true;
+        require(std::string_view(text) == "0", "APS5_PIPELINE_CONTENT_DEDUP accepts only 0 or 1");
+        return false;
     }();
     return dedup;
 }
@@ -239,7 +257,7 @@ std::size_t PositiveSetting(const char* name, std::size_t fallback, std::size_t 
 
 CompileService::Limits CompileServiceLimits() {
     CompileService::Limits limits;
-    limits.workers = PositiveSetting("APS5_COMPILE_WORKERS", 2, 16);
+    limits.workers = PositiveSetting("APS5_COMPILE_WORKERS", std::clamp<std::size_t>(std::thread::hardware_concurrency() / 4u, 2u, 8u), 16);
     limits.demandReservedWorkers = limits.workers > 1 ? 1 : 0;
     limits.budgetBytes = PositiveSetting("APS5_COMPILE_BUDGET_MIB", 2048, 65536) << 20u;
     return limits;
@@ -443,6 +461,9 @@ struct VulkanDevice::State {
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
     bool pipelineCreationFeedback = false;
+    bool pipelineCacheProbes = false;
+    std::atomic<std::uint64_t> computeProbeHits{0};
+    std::atomic<std::uint64_t> computeProbeMisses{0};
     bool maintenance8 = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool storageImageWithoutFormat = false;
@@ -578,7 +599,7 @@ struct VulkanDevice::State {
             });
         }
     }
-    std::shared_ptr<ComputePipelineObjects> BuildComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey = {});
+    std::shared_ptr<ComputePipelineObjects> BuildComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey = {}, bool probe = false);
     std::shared_ptr<ComputePipelineObjects> GetComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey = {}, bool ahead = false, bool* created = nullptr);
     std::shared_ptr<ComputePipelineObjects> FindComputePipeline(const PipelineCompileKey& key, bool demand = true);
     mutable std::mutex compileQueueMutex;
@@ -2085,6 +2106,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceExtensions.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
         deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+    }
+    VkPhysicalDevicePipelineCreationCacheControlFeaturesEXT cacheControlFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES_EXT};
+    if (PipelineCacheProbes() && hasExtension(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &cacheControlFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        if (cacheControlFeatures.pipelineCreationCacheControl == VK_TRUE) {
+            state->pipelineCacheProbes = true;
+            deviceExtensions.push_back(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME);
+            deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+            deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+            cacheControlFeatures.pNext = byteFeatures.pNext;
+            byteFeatures.pNext = &cacheControlFeatures;
+        }
     }
     VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     if (hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
@@ -4008,6 +4042,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
     context.pipelineCreationFeedback = state->pipelineCreationFeedback;
+    context.pipelineCacheProbes = state->pipelineCacheProbes;
     if (PriorityCompileScheduler()) {
         context.pipelineBuildOwner = state.get();
         context.pipelineBuildRunner = &State::RunPipelineBuild;
@@ -4105,6 +4140,15 @@ std::shared_ptr<CompileTicket> VulkanDevice::TryComputePipeline(const ShaderReco
             return existing;
         }
         service->Forget(jobKey);
+    }
+    if (context.pipelineCacheProbes && context.pipelineCache != VK_NULL_HANDLE) {
+        const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
+        const auto described = Graphics::DescribeSetLayouts(context, shaders);
+        if (auto probed = state->BuildComputePipeline(context, shader, described.layouts.main, pushStages, programAddress, described.mainKey, true)) {
+            state->computePipelines.Adopt(key, std::move(probed));
+            event.Flag("cache_hit", true);
+            return nullptr;
+        }
     }
     const auto bytes = ComputePipelineAheadRequest::EstimateBytes(shader);
     const auto request = ComputePipelineAheadRequest::Capture(shader, bytes);
@@ -4790,9 +4834,9 @@ std::uint64_t VulkanDevice::presync(std::span<const std::pair<std::uint64_t, std
 
 // The pipeline layout takes the resources' set layout: layouts built from the same bindings are
 // compatible, so the objects serve every dispatch of the variant.
-std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey) {
+std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey, bool probe) {
     std::optional<PipelineContentKey> contentKey;
-    if ((PipelineContentDedup() || PipelinePrewarm()) && !layoutKey.empty()) {
+    if (PipelineContentDedup() && !layoutKey.empty()) {
         contentKey = ComputePipelineContentKey(shader, pushStages != 0, layoutKey);
         if (auto shared = computeContents.Find(*contentKey)) {
             ShaderCompileTrace::Event event("pipeline.compute_shared");
@@ -4819,10 +4863,10 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
     layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
     layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;
     check(DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(device, &layoutInfo, nullptr, &objects->layout), "vkCreatePipelineLayout");
-    const VkPipelineCreateFlags pipelineFlags = (context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
+    const VkPipelineCreateFlags pipelineFlags = (context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT | (probe ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT : 0);
     const Graphics::PipelineSpecialization specialization(shader);
     const auto subgroupSize = computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > maxComputeSubgroupSize) ? std::min(shader.hostSubgroupSize, maxComputeSubgroupSize) : 0u;
-    if (const char* directory = std::getenv("APS5_DUMP_COMPUTE_PIPELINES"); directory != nullptr && *directory != '\0' && CaptureComputePipeline(shader.spirv.size())) {
+    if (const char* directory = std::getenv("APS5_DUMP_COMPUTE_PIPELINES"); !probe && directory != nullptr && *directory != '\0' && CaptureComputePipeline(shader.spirv.size())) {
         require(!layoutKey.empty(), "compute capture requires the described set layout");
         ComputePipelineCapture capture;
         capture.spirv = shader.spirv.Copy();
@@ -4858,7 +4902,11 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
     });
     Graphics::PipelineCreationTrace trace("pipeline.compute", context.pipelineCreationFeedback, 1u);
     if (trace.Event().Active()) trace.Event().Hex("address", programAddress).Hex("variant", shader.PipelineVariantId()).Number("spirv_words", shader.spirv.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(shader.spirv.Words())).Hex("layout_key", ShaderCompileTrace::HashOf(layoutKey)).Number("specialization_constants", shader.specialization.size()).Flag("gpu_mutex_held", GuestMemory::GpuMutex().HeldByThisThread());
-    CreateComputePipeline(device, DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization, &trace);
+    if (!CreateComputePipeline(device, DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization, &trace)) {
+        computeProbeMisses.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    if (probe) computeProbeHits.fetch_add(1, std::memory_order_relaxed);
     if (VerifyCompileJobs()) objects->recipe = ComputePipelineRecipeHash(shader, pushStages != 0, layoutKey);
     if (contentKey.has_value()) computeContents.Insert(*contentKey, objects);
     if (contentKey.has_value() && PipelinePrewarm()) StoreComputeRecipe(*contentKey, shader, pushStages != 0, programAddress);
@@ -4952,7 +5000,14 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::DemandComputePipeli
 }
 
 bool VulkanDevice::PipelineCompileAheadEnabled() {
-    return PipelineCompileThreads() != 0;
+    if (!PriorityCompileScheduler()) return PipelineCompileThreads() != 0;
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_PIPELINE_COMPILE_AHEAD");
+        if (text == nullptr || *text == '\0' || std::string_view(text) == "1") return std::getenv("APS5_DUMP_COMPUTE_PIPELINES") == nullptr;
+        require(std::string_view(text) == "0", "APS5_PIPELINE_COMPILE_AHEAD accepts only 0 or 1");
+        return false;
+    }();
+    return enabled;
 }
 
 void VulkanDevice::BuildComputePipelineAhead(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress) {
@@ -5004,6 +5059,11 @@ void VulkanDevice::BuildComputePipelineAhead(const ShaderRecompiler::RecompileRe
             return created;
         };
     });
+}
+
+VulkanDevice::PipelineCacheProbeStatistics VulkanDevice::PipelineCacheProbeCounters() const {
+    const auto graphics = Graphics::GraphicsPipelineCacheProbes();
+    return {state->computeProbeHits.load(), state->computeProbeMisses.load(), graphics.hits, graphics.misses};
 }
 
 VulkanDevice::PipelinePrewarmStatistics VulkanDevice::PipelinePrewarmCounters() const {

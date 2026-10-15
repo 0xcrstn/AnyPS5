@@ -282,6 +282,7 @@ function(add_shader_recompiler target runtimeTarget)
             ShaderDiskCache::StoreUserDataCallee
             ShaderDiskCache::EarlierShaderUses
             ShaderDiskCache::StoreShaderUse
+            ShaderDiskCache::LayeredCache
             SrgbDecodeBit
             SrgbUnormFormat
             FindUserDataTail
