@@ -19,14 +19,17 @@ Mode OrderingMode();
 Mode DirectoryMode();
 Mode FaultsMode();
 Mode InputLeasesMode();
+Mode ResidencyMode();
 void SetModesForTests(Mode audit, Mode ordering, Mode directory);
 void SetFaultsModeForTests(Mode faults);
 void SetInputLeasesModeForTests(Mode leases);
+void SetResidencyModeForTests(Mode residency);
 bool Tracking();
 bool Ordering();
 bool Canonicalizing();
 bool FaultOwnership();
 bool InputLeases();
+bool Residency();
 
 using Version = std::uint64_t;
 
@@ -119,6 +122,7 @@ void ReleaseDeviceOwned(std::uint64_t protection);
 void NoteLockedFault(Interval range);
 void SetLeaseWaiter(Materializer waiter);
 std::uint64_t AcquireReadLease(Interval range, Version version);
+std::uint64_t ProtectResident(Interval range, Version version);
 void RetireReadLease(std::uint64_t lease);
 
 struct Counters {

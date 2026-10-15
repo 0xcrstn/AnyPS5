@@ -322,6 +322,27 @@ void LeaseTests() {
     SetLeaseWaiter(nullptr);
 }
 
+void ResidencyTests() {
+    guards.clear();
+    refuseProtection = false;
+    Reset(Mode::Reference, Mode::Reference);
+    SetResidencyModeForTests(Mode::Reference);
+    SetProtectionBackend({&FakeProtect, &FakeRelease});
+    Require(ProtectResident({0x10000, 0x20000}, 1) == 0 && guards.empty(), "the reference path protected device-resident results");
+    SetResidencyModeForTests(Mode::New);
+    const auto resident = ProtectResident({0x10000, 0x20000}, 2);
+    Require(resident != 0 && guards.size() == 1 && CurrentCounters().protections == 1, "device-resident results were not protected");
+    ReleaseDeviceOwned(resident);
+    Require(guards.empty(), "released device-resident results kept their guard");
+    SetResidencyModeForTests(Mode::Verify);
+    Require(Throws([] { static_cast<void>(ProtectResident({0x10010, 0x20000}, 3)); }).find("APS5_COHERENCE_RESIDENCY=verify") != std::string::npos, "residency verify accepted device-resident results it cannot cover");
+    refuseProtection = true;
+    Require(Throws([] { static_cast<void>(ProtectResident({0x10000, 0x20000}, 4)); }).find("refused access protection") != std::string::npos, "residency verify accepted a refused protection");
+    refuseProtection = false;
+    SetResidencyModeForTests(Mode::Reference);
+    SetProtectionBackend({});
+}
+
 void LifetimeTests() {
     Reset(Mode::New, Mode::Reference);
     const auto before = NextVersion();
@@ -419,6 +440,7 @@ int main() {
         ReleaseTests();
         FaultTests();
         LeaseTests();
+        ResidencyTests();
         LifetimeTests();
         CommitSplitTests();
         EvictionTests();

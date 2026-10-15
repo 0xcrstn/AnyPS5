@@ -3461,7 +3461,10 @@ void StorageTexture::MaterializeForNativeAccess(std::uint64_t address, std::size
     if (GuestMemory::GpuMutex().HeldByThisThread()) Coherence::NoteLockedFault({address, address + bytes});
     std::lock_guard gpu(GuestMemory::GpuMutex());
     static_cast<void>(FlushPending(address, bytes, nullptr, "native access", PublishScope::Whole));
-    if (auto* recorder = Recorder::Active()) recorder->Sync();
+    if (auto* recorder = Recorder::Active()) {
+        if (AnyDeviceResident()) static_cast<void>(PublishDeviceResident(*recorder, address, bytes, ResidentSite::Native));
+        recorder->Sync();
+    }
 }
 
 void StorageTexture::Flush() {

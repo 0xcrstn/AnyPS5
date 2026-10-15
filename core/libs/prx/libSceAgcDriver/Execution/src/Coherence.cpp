@@ -179,6 +179,13 @@ Mode EnvironmentLeases() {
 
 std::atomic<bool> leasesOverridden{false};
 std::atomic<Mode> overrideLeases{Mode::Reference};
+std::atomic<bool> residencyOverridden{false};
+std::atomic<Mode> overrideResidency{Mode::Reference};
+
+Mode EnvironmentResidency() {
+    static const Mode residency = ParseMode("APS5_COHERENCE_RESIDENCY", std::getenv("APS5_COHERENCE_RESIDENCY"));
+    return residency;
+}
 
 std::uint64_t Guard(Interval range, Source source, Version version, bool outward, bool verify, const char* variable) {
     const auto begin = outward ? range.begin & ~(ProtectionGranule - 1) : (range.begin + ProtectionGranule - 1) & ~(ProtectionGranule - 1);
@@ -460,6 +467,24 @@ std::uint64_t AcquireReadLease(Interval range, Version version) {
 
 void RetireReadLease(std::uint64_t lease) {
     ReleaseDeviceOwned(lease);
+}
+
+Mode ResidencyMode() {
+    return residencyOverridden.load(std::memory_order_acquire) ? overrideResidency.load(std::memory_order_acquire) : EnvironmentResidency();
+}
+
+void SetResidencyModeForTests(Mode residency) {
+    overrideResidency.store(residency, std::memory_order_release);
+    residencyOverridden.store(true, std::memory_order_release);
+}
+
+bool Residency() {
+    return ResidencyMode() != Mode::Reference;
+}
+
+std::uint64_t ProtectResident(Interval range, Version version) {
+    if (!Residency() || range.end <= range.begin) return 0;
+    return Guard(range, Source::ResidentStaging, version, false, ResidencyMode() == Mode::Verify, "APS5_COHERENCE_RESIDENCY");
 }
 
 void ReleaseDeviceOwned(std::uint64_t protection) {

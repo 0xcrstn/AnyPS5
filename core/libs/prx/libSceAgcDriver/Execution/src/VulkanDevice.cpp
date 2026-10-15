@@ -998,14 +998,14 @@ void InstallCoherence() {
         Coherence::SetBackingTranslator(&GuestArena::GuestArenaBackingRuns_nid_postfix);
         static_cast<void>(Coherence::Translate({0x10000, 0x10001}));
     }
-    if (!Coherence::FaultOwnership() && !Coherence::InputLeases()) return;
+    if (!Coherence::FaultOwnership() && !Coherence::InputLeases() && !Coherence::Residency()) return;
 #ifdef _WIN32
     Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
     Coherence::SetMaterializer(&MaterializeNativeAccess);
     Coherence::SetLeaseWaiter(&WaitForGuestReaders);
     GuestArena::GuestArenaSetResolveHostWrites_nid_postfix(true);
 #else
-    throw std::runtime_error("APS5_COHERENCE_FAULTS and APS5_COHERENCE_INPUT_LEASES: guest access protection is not implemented on this platform");
+    throw std::runtime_error("APS5_COHERENCE_FAULTS, APS5_COHERENCE_INPUT_LEASES and APS5_COHERENCE_RESIDENCY: guest access protection is not implemented on this platform");
 #endif
 }
 

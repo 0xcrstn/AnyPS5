@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -17,7 +18,15 @@ namespace AgcDriver::Graphics {
 namespace {
 
 constexpr std::size_t SiteCount = static_cast<std::size_t>(ResidentSite::Count);
-constexpr const char* SiteNames[SiteCount] = {"hook", "scanout", "in-place", "copy-in", "address-based", "indirect", "copy", "label", "upload", "completion", "eviction", "retire"};
+constexpr const char* SiteNames[SiteCount] = {"hook", "scanout", "in-place", "copy-in", "address-based", "indirect", "copy", "label", "upload", "completion", "eviction", "retire", "native"};
+
+struct Guarded {
+    explicit Guarded(std::uint64_t protection) : protection(protection) {}
+    Guarded(const Guarded&) = delete;
+    Guarded& operator=(const Guarded&) = delete;
+    ~Guarded() { Coherence::ReleaseDeviceOwned(protection); }
+    std::uint64_t protection;
+};
 
 std::uint64_t residentBudget() {
     static const std::uint64_t bytes = [] {
@@ -35,6 +44,8 @@ struct Entry {
     std::uint64_t importBase;
     std::uint64_t generation;
     VkDevice device;
+    Coherence::Version version = 0;
+    std::shared_ptr<Guarded> guard;
 };
 
 struct Registry {
@@ -86,6 +97,8 @@ struct Piece {
     std::uint64_t importBase;
     std::uint64_t generation;
     VkDevice device;
+    Coherence::Version version = 0;
+    std::shared_ptr<Guarded> guard;
 };
 
 void cutLocked(Registry& registry, std::uint64_t begin, std::uint64_t end, std::vector<Piece>* taken) {
@@ -100,7 +113,7 @@ void cutLocked(Registry& registry, std::uint64_t begin, std::uint64_t end, std::
         }
         const auto from = std::max(begin, entryBegin);
         const auto to = std::min(end, entry.end);
-        if (taken != nullptr) taken->push_back({from, to, entry.shadow, entry.shadowBase, entry.import, entry.importBase, entry.generation, entry.device});
+        if (taken != nullptr) taken->push_back({from, to, entry.shadow, entry.shadowBase, entry.import, entry.importBase, entry.generation, entry.device, entry.version, entry.guard});
         registry.bytes -= entry.end - entryBegin;
         forgetShadow(registry, entry);
         it = registry.entries.erase(it);
@@ -125,7 +138,7 @@ template<typename TSelect>
 std::vector<Piece> selectLocked(const Registry& registry, const TSelect& select) {
     std::vector<Piece> selected;
     for (const auto& [begin, entry] : registry.entries) {
-        if (select(begin, entry)) selected.push_back({begin, entry.end, entry.shadow, entry.shadowBase, entry.import, entry.importBase, entry.generation, entry.device});
+        if (select(begin, entry)) selected.push_back({begin, entry.end, entry.shadow, entry.shadowBase, entry.import, entry.importBase, entry.generation, entry.device, entry.version, entry.guard});
     }
     return selected;
 }
@@ -189,6 +202,7 @@ std::uint64_t publishPieces(Recorder& recorder, const std::vector<Piece>& taken,
         return 0;
     }
     const bool verify = LazyStagingVerify();
+    for (const auto& piece : pieces) static_cast<void>(Coherence::CheckPublication(Coherence::Source::ResidentStaging, piece.version, {piece.begin, piece.end}, ResidentSiteName(site)));
     const auto commands = recorder.Commands();
     const auto timing = recorder.BeginGpuTiming(Recorder::CommandClass::StagingOut);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -232,6 +246,11 @@ std::uint64_t publishPieces(Recorder& recorder, const std::vector<Piece>& taken,
         recorder.NotePendingWrites(ranges);
         for (const auto& [begin, end] : ranges) static_cast<void>(GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin)));
     }
+    std::vector<std::shared_ptr<Guarded>> guards;
+    for (const auto& piece : taken) {
+        if (piece.guard != nullptr) guards.push_back(piece.guard);
+    }
+    if (!guards.empty()) recorder.OnCompleteWithoutGuestAccess([guards] { static_cast<void>(guards.size()); });
     auto& registry = Resident();
     {
         std::lock_guard lock(registry.mutex);
@@ -261,12 +280,17 @@ const char* ResidentSiteName(ResidentSite site) {
 void NoteDeviceResident(VkDevice device, std::uint64_t begin, std::uint64_t end, std::shared_ptr<Buffer> shadow, std::uint64_t shadowBase, VkBuffer import, std::uint64_t importBase, std::uint64_t generation) {
     if (end <= begin || shadow == nullptr) return;
     Require(generation != 0, "device-resident buffer results need a watched generation");
+    const auto version = Coherence::Tracking() ? Coherence::NextVersion() : Coherence::CurrentVersion();
+    std::shared_ptr<Guarded> guard;
+    if (Coherence::Residency()) {
+        if (const auto protection = Coherence::ProtectResident({begin, end}, version); protection != 0) guard = std::make_shared<Guarded>(protection);
+    }
     auto& registry = Resident();
     bool overBudget = false;
     {
         std::lock_guard lock(registry.mutex);
         cutLocked(registry, begin, end, nullptr);
-        const auto inserted = registry.entries.emplace(begin, Entry{end, std::move(shadow), shadowBase, import, importBase, generation, device}).first;
+        const auto inserted = registry.entries.emplace(begin, Entry{end, std::move(shadow), shadowBase, import, importBase, generation, device, version, std::move(guard)}).first;
         noteShadow(registry, inserted->second);
         registry.bytes += end - begin;
         registry.count.store(registry.entries.size(), std::memory_order_release);

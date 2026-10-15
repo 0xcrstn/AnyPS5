@@ -210,6 +210,8 @@ Three switches take `0` (the default), `1` or `verify`; any other value stops th
 
 `APS5_COHERENCE_INPUT_LEASES=1` protects the guest memory that a recorded dispatch reads in place through host imports, from recording until its batch completes. A native store into that memory waits until the recorded work has run, so the dispatch reads the bytes it was given rather than a later write. The protection covers every 4 KiB page the reads touch, so reads beside the stored bytes wait as well. Address-based heaps are not leased, because their reach is the whole heap. `verify` stops the title when a lease is refused. Windows only. Each dispatch costs a protection change, and the title's stores into memory the GPU still reads wait for the GPU.
 
+`APS5_COHERENCE_RESIDENCY=1` protects the guest memory under device-resident buffer results (`APS5_LAZY_STAGING_OUT`) the same way. The title's first load or store there publishes those results into guest memory and waits for them before it proceeds. A CPU store over such results then keeps the device bytes around it instead of reaching the unsupported publish after a CPU store. `verify` stops the title when the protection is refused or does not cover whole pages. Windows only.
+
 ### Tracing system library calls
 
 Windows only. An executable converted with `--trace-imports` records the calls it makes to the libraries named in `APS5_TRACE_CALLS`, a comma-separated list such as `libkernel,libSceSaveData`, or `all`. Without the variable nothing is recorded. The crash and abort reports then end with the last 64 calls: sequence number, thread, library, import name as the executable imports it (a NID) and the caller's address. They are followed by the 32 most called imports since start-up, with their number of calls.

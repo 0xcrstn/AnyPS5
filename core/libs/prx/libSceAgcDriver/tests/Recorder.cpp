@@ -4904,6 +4904,105 @@ int coherenceLeaseTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
+int coherenceResidencyTests(const Device& device, Recorder& recorder) {
+#ifndef _WIN32
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+    std::cout << "skipped, guest access protection is Windows only\n";
+    return 77;
+#else
+    using namespace AgcDriver::GuestMemory;
+    namespace Coherence = AgcDriver::Coherence;
+    const auto& base = device.GetContext();
+    constexpr std::size_t bytes = 65536;
+    std::unique_lock gpu(GpuMutex());
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared residency section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto* alias = static_cast<std::uint8_t*>(GuestArena::GuestArenaMapAlias_nid_postfix(address, bytes));
+    Require(alias != nullptr, "cannot map an alias of the residency block");
+    struct Release {
+        void* block;
+        void* alias;
+        ~Release() {
+            Coherence::SetResidencyModeForTests(Coherence::Mode::Reference);
+            Coherence::SetModesForTests(Coherence::Mode::Reference, Coherence::Mode::Reference, Coherence::Mode::Reference);
+            Coherence::ResetForTests();
+            GuestArena::GuestArenaUnmapAlias_nid_postfix(alias);
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block, alias};
+    std::memset(block, 0x11, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            ClearDeviceResident(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the residency block refused or compared: not tested\n";
+        return 77;
+    }
+    Coherence::SetModesForTests(Coherence::Mode::Verify, Coherence::Mode::Reference, Coherence::Mode::Reference);
+    Coherence::SetResidencyModeForTests(Coherence::Mode::Verify);
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetMaterializer([](Coherence::Interval range) { StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin)); });
+    Coherence::ResetForTests();
+    const auto resident = [&](std::uint8_t value) {
+        auto shadow = std::make_shared<Buffer>(base, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::memset(shadow->Bytes().data(), value, bytes);
+        const auto generation = CollectWritesUncached(address, bytes);
+        Require(generation != 0, "the residency block is not write-watched");
+        NoteDeviceResident(base.device, address, address + bytes, shadow, address, import->buffer, import->base, generation);
+        Require(AnyDeviceResidentOverlaps(address, bytes), "the device-resident results were not noted");
+        Require(Coherence::CurrentCounters().liveProtections != 0, "device-resident results over shared guest memory were not protected: " + Coherence::Report());
+    };
+
+    resident(0x5a);
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint32_t*>(address + 0x2000) = 0x11111111u;
+    gpu.lock();
+    Require(!AnyDeviceResidentOverlaps(address, bytes), "a native store left device-resident results unpublished");
+    for (std::size_t at = 0; at < bytes; ++at) {
+        const auto expected = at >= 0x2000 && at < 0x2004 ? std::uint8_t{0x11} : std::uint8_t{0x5a};
+        Require(alias[at] == expected, "a native store over device-resident results lost the device bytes or the store");
+    }
+
+    resident(0xa5);
+    gpu.unlock();
+    const auto loaded = *reinterpret_cast<volatile std::uint8_t*>(address + 0x8000);
+    gpu.lock();
+    Require(loaded == 0xa5 && !AnyDeviceResidentOverlaps(address, bytes), "a native load read host bytes under device-resident results");
+
+    recorder.Sync();
+    const auto counters = Coherence::CurrentCounters();
+    Require(counters.faultsResolved == 2 && counters.liveProtections == 0 && counters.stalePublications == 0, "device residency: " + Coherence::Report());
+    std::cout << "coherence device residency: ok\n";
+    return 0;
+#endif
+}
+
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -10207,6 +10306,16 @@ int main(int argc, char** argv) {
             }
             gpu.unlock();
             const auto result = coherenceLeaseTests(device, recorder);
+            gpu.lock();
+            return result;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--coherence-residency-only") {
+            if (device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, host imports are unavailable\n";
+                return 77;
+            }
+            gpu.unlock();
+            const auto result = coherenceResidencyTests(device, recorder);
             gpu.lock();
             return result;
         }
