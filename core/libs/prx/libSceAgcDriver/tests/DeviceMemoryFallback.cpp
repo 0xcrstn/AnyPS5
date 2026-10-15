@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <exception>
 #include <string>
+#include <utility>
 
 using namespace AgcDriver::Graphics;
 
@@ -93,6 +94,32 @@ void BufferPlacementTests() {
     choose("no physical device retains cached preference", 15, coherent, 0);
 }
 
+void LivePlacementTests() {
+    const auto live = [](DeviceMemoryKind kind, bool host) { return DeviceMemoryPlacements::Live(kind, host); };
+    const auto expectLive = [&](const char* what, DeviceMemoryKind kind, bool host, std::uint64_t bytes, std::uint64_t allocations) {
+        const auto use = live(kind, host);
+        Expect(use.bytes == bytes && use.allocations == allocations, std::string(what) + ": " + std::to_string(use.bytes) + " bytes in " + std::to_string(use.allocations) + ", expected " + std::to_string(bytes) + " in " + std::to_string(allocations));
+    };
+    Context context = mockContext(true);
+    Expect(context.HostPlaced(HostType) && !context.HostPlaced(DeviceType), "host placement follows the heap's device-local flag");
+    {
+        DeviceMemoryPlacement storage(DeviceMemoryKind::StorageTexture, true, 64 * MiB);
+        DeviceMemoryPlacement buffer(DeviceMemoryKind::Buffer, false, 16 * MiB);
+        expectLive("host-placed storage texture counted", DeviceMemoryKind::StorageTexture, true, 64 * MiB, 1);
+        expectLive("device-local buffer counted", DeviceMemoryKind::Buffer, false, 16 * MiB, 1);
+        expectLive("other kinds untouched", DeviceMemoryKind::Texture, true, 0, 0);
+        DeviceMemoryPlacement moved(std::move(storage));
+        expectLive("a move keeps one count", DeviceMemoryKind::StorageTexture, true, 64 * MiB, 1);
+        moved = DeviceMemoryPlacement(DeviceMemoryKind::StorageTexture, true, 8 * MiB);
+        expectLive("assignment releases the previous count", DeviceMemoryKind::StorageTexture, true, 8 * MiB, 1);
+        buffer.Reset();
+        buffer.Reset();
+        expectLive("reset releases once", DeviceMemoryKind::Buffer, false, 0, 0);
+    }
+    expectLive("destruction releases host placements", DeviceMemoryKind::StorageTexture, true, 0, 0);
+    expectLive("destruction leaves nothing device-local", DeviceMemoryKind::Buffer, false, 0, 0);
+}
+
 }
 
 int main() {
@@ -106,6 +133,7 @@ int main() {
         Choose("usage already over the budget", true, 2952 * MiB, 3633 * MiB, both, HostType);
         Choose("no host type allowed", true, 3000 * MiB, 3000 * MiB, 1u << DeviceType, DeviceType);
         BufferPlacementTests();
+        LivePlacementTests();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
