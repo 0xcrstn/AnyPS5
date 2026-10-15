@@ -1,13 +1,17 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "ImageTableAbi.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
 
 bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
-    return compiled.poisonedSrtReads == 0u;
+    return compiled.poisonedSrtReads == 0u && std::none_of(compiled.imageTablePoison.begin(), compiled.imageTablePoison.end(), [](const ShaderRecompiler::ImageTableEntryPoison& poison) {
+        return poison.reason == static_cast<std::uint32_t>(ShaderRecompiler::ImageTableAbi::PoisonReason::Unmapped) || poison.reason == static_cast<std::uint32_t>(ShaderRecompiler::ImageTableAbi::PoisonReason::Inactive);
+    });
 }
 
 void Driver::storeDispatchVariant(std::uint64_t key, std::shared_ptr<DispatchVariant> fresh, const std::shared_ptr<DispatchEntry>& missedEntry, std::shared_ptr<DispatchVariant>& attachVariant) {
@@ -47,9 +51,16 @@ void Driver::storeDispatchVariant(std::uint64_t key, std::shared_ptr<DispatchVar
     }
 
     static const bool lru = std::getenv("APS5_NO_DISPATCH_LRU") == nullptr;
-    if (dispatchSizing.OverLimit(dispatchCache.size(), dispatchCacheVariantBytes)) {
+    const auto overBytes = [&] { return dispatchCache.size() > 1 && dispatchCacheVariantBytes > DispatchCacheBytes(); };
+    if (dispatchSizing.OverLimit(dispatchCache.size(), dispatchCacheVariantBytes) || overBytes()) {
         if (lru) {
             evictDispatchEntries();
+            while (overBytes()) {
+                const auto evicted = dispatchOrder.back();
+                eraseDispatchEntry(dispatchCache.find(evicted));
+                dispatchSizing.Evicted(evicted);
+                ++dispatchCacheEvictions;
+            }
         } else {
             dispatchCacheEvictions += dispatchCache.size();
             dispatchCache.clear();

@@ -25,6 +25,7 @@ class StorageTexture;
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
 struct PreparedDispatch;
+struct ComputePipelineObjects;
 // The unlocked pre-checks of a recipe hit (see VulkanDevice::PrepareRecipe); opaque to callers.
 struct RecipeHit;
 // The record tail shared by an ordinary dispatch and a recipe hit (VulkanDevice::recordDispatch).
@@ -177,6 +178,10 @@ public:
         std::uint64_t aliased, created, noSource, shape, refused;
     };
     static CopyAliasing CopyAliasCounts();
+    struct ComputePipelineCreation {
+        std::uint64_t created, underGpuMutex;
+    };
+    static ComputePipelineCreation ComputePipelineCounts();
     void ResolveMemory(std::uint64_t address, std::size_t bytes, bool writable);
     void* Window() const;
     void Resize(std::uint32_t width, std::uint32_t height);
@@ -327,6 +332,7 @@ private:
     IndirectOutcome dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe);
     // The stage-A pre-sync over `surfaces` (see PrepareDispatch): the serial waited for, 0 none.
     std::uint64_t presync(std::span<const std::pair<std::uint64_t, std::uint64_t>> surfaces);
+    std::shared_ptr<ComputePipelineObjects> computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, VkShaderStageFlags pushStages, std::uint64_t programAddress);
     // A DISPATCH_INDIRECT's argument path (see DispatchIndirect): GPU-side from the host import, or
     // the counts read on the CPU (the record then continues as a direct dispatch).
     void decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText);

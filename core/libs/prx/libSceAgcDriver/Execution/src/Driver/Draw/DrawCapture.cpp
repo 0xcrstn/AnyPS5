@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
+#include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
 
@@ -32,11 +34,29 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
+    const auto named = [&](const std::exception& error) {
+        static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
+        std::string dump;
+        if (dumpShaders) {
+            try {
+                dump = dumpRequest(program.binary.codeAddress, request);
+            } catch (...) {}
+        }
+        std::ostringstream where;
+        where << "shader 0x" << std::hex << program.binary.codeAddress << " stage " << std::dec << static_cast<unsigned>(program.binary.stage);
+        if (!dump.empty()) where << " (" << dump << ")";
+        where << ": ";
+        return std::runtime_error(where.str() + error.what());
+    };
     const bool planned = bindingPlan() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
     if (planned) {
         const auto values = [&] {
             const SampledReadScope sampling(evidenceReads);
-            return shaderMemory.CaptureValues(invocation);
+            try {
+                return shaderMemory.CaptureValues(invocation);
+            } catch (const std::exception& error) {
+                throw named(error);
+            }
         }();
         phaseTiming.Phase(DrawRowCapture);
         stageCapture.prepared = invocation.Handle();
@@ -51,7 +71,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         }
         phaseTiming.Phase(DrawRowCaptureRegions);
         bool templateHit = false;
-        stageCapture.compiled = invocation.MaterializeValues(*values, &templateHit);
+        try {
+            stageCapture.compiled = invocation.MaterializeValues(*values, &templateHit);
+        } catch (const std::exception& error) {
+            throw named(error);
+        }
         phaseTiming.Phase(DrawRowRecompile);
         bool mismatch = false;
         auto part = SnapshotPart::None;
@@ -72,7 +96,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }
     const auto capture = [&] {
         const SampledReadScope sampling(evidenceReads);
-        return shaderMemory.Capture(invocation);
+        try {
+            return shaderMemory.Capture(invocation);
+        } catch (const std::exception& error) {
+            throw named(error);
+        }
     }();
     phaseTiming.Phase(DrawRowCapture);
 
@@ -86,10 +114,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     recompiled[i] = true;
     memory = shaderMemory.Regions();
 
-    if (drawHit) {
-        for (std::size_t j = 0; j < programs.size(); ++j) {
-            if (matched[j] != nullptr && !recompiled[j]) memory.insert(memory.end(), matchedRegions[j].begin(), matchedRegions[j].end());
-        }
+    for (std::size_t j = 0; j < programs.size(); ++j) {
+        if (matched[j] != nullptr && !recompiled[j] && (drawHit || j < i)) memory.insert(memory.end(), matchedRegions[j].begin(), matchedRegions[j].end());
     }
     request.context.memory = memory;
     if (traceCapSync()) traceCapture("draw-capture", program.binary.codeAddress, submission.queue, memory, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
@@ -123,13 +149,55 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     phaseTiming.Phase(DrawRowCaptureRegions);
 
     timing.Mark("capture_resources");
-    stageCapture.compiled = invocation.Materialize(*capture);
+    try {
+        stageCapture.compiled = invocation.Materialize(*capture);
+    } catch (const std::exception& error) {
+        throw named(error);
+    }
+    stageCapture.capture = capture;
     timing.Mark("materialize");
     phaseTiming.Phase(DrawRowRecompile);
     return stageCapture.compiled;
 }
 
-void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming) {
+void Driver::recordStageDataPositions(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture, const std::vector<Graphics::DecodeRead>& decodeReads) {
+    const auto& compiled = *variant.compiled;
+    if (variant.dataPositions.empty()) {
+        for (std::size_t b = 0; b < compiled.bindings.size(); ++b) {
+            if (compiled.bindings[b].role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
+            variant.flatBinding = static_cast<std::uint32_t>(b);
+            static_cast<void>(DataWordPositions(variant.runs, capture.readTrace.leaves, capture.readTrace.otherReads, variant.words, compiled.bindings[b].guestDescriptor, variant.dataPositions, variant.dataSlots));
+            break;
+        }
+        variant.bufferWordBuffers.assign(variant.dataPositions.size(), {});
+    }
+    if (variant.dataPositions.empty() || decodeReads.empty()) return;
+    std::vector<bool> decoded(variant.words.size(), false);
+    std::size_t offset = 0;
+    for (const auto& [begin, end] : variant.runs) {
+        for (const auto& read : decodeReads) {
+            const auto from = std::max(begin, read.address);
+            const auto to = std::min(end, read.address + read.bytes.size());
+            if (from >= to) continue;
+            for (auto word = (from - begin) / sizeof(std::uint32_t); word < (to - begin + sizeof(std::uint32_t) - 1) / sizeof(std::uint32_t); ++word) decoded[offset + static_cast<std::size_t>(word)] = true;
+        }
+        offset += static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+    }
+    const bool buffers = variant.bufferWordBuffers.size() == variant.dataPositions.size();
+    std::size_t kept = 0;
+    for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
+        if (decoded[variant.dataPositions[k]]) continue;
+        variant.dataPositions[kept] = variant.dataPositions[k];
+        variant.dataSlots[kept] = variant.dataSlots[k];
+        if (buffers) variant.bufferWordBuffers[kept] = std::move(variant.bufferWordBuffers[k]);
+        ++kept;
+    }
+    variant.dataPositions.resize(kept);
+    variant.dataSlots.resize(kept);
+    if (buffers) variant.bufferWordBuffers.resize(kept);
+}
+
+void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto insertStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto chargeInsert = [&] {
@@ -137,11 +205,15 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.insertUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - insertStart).count();
     };
-    if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu) && (verifyHit || admitDrawKey(drawKey))) {
+    if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu) && (verifyHit || admitDrawKey(drawKey, registerKey && drawDataHits() ? shapeKey : 0))) {
         phaseTiming.Phase(DrawRowVectors);
-        std::uint64_t unstable = 0, mismatches = 0;
+        std::uint64_t unstable = 0, mismatches = 0, differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
         for (std::size_t i = 0; i < programs.size(); ++i) {
             const auto& stageCapture = stageCaptures[i];
+            if (reused[i]) {
+                fresh[i] = matched[i];
+                continue;
+            }
             if (stageCapture.compiled == nullptr || !CacheableResult(*stageCapture.compiled)) continue;
             auto variant = std::make_shared<DispatchVariant>();
             variant->compiled = stageCapture.compiled;
@@ -157,7 +229,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             tagVariantRuns(*variant, regions, stageCapture.userDataUse, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords, stageCapture.baseSlots);
             variant->userDataReads = UserDataReads(stageCapture.userDataUse, *stageCapture.compiled, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords);
             tagBufferWords(*variant, stageCapture.bufferBaseWords);
-            const auto leafCounts = tagDataLeaves(*variant, stageCapture.dataLeaves, stageCapture.otherReads);
+            const auto leafCounts = drawStageDataHits() ? tagDataLeaves(*variant, stageCapture.dataLeaves, stageCapture.otherReads) : DataWordPositionCounts{};
             if (drawMissDiagnosisEnabled()) {
                 std::lock_guard cacheLock(drawCacheMutex);
                 auto& diagnosis = drawMissDiagnosis;
@@ -171,7 +243,6 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 diagnosis.nestedTagged += variant->nestedBases.size();
                 diagnosis.nestedRuns += static_cast<std::uint64_t>(std::count_if(variant->runNested.begin(), variant->runNested.end(), [](std::int16_t nested) { return nested >= 0; }));
             }
-            variant->inputExports = stageCapture.inputExports;
             const auto sameContent = [](const DispatchVariant& a, const DispatchVariant& b) {
                 const auto flatten = [](const DispatchVariant& source) {
                     std::vector<std::pair<std::uint64_t, std::uint32_t>> flat;
@@ -199,6 +270,18 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 }
                 return true;
             };
+            variant->inputExports = stageCapture.inputExports;
+            if (stageCapture.capture != nullptr && (!variant->dataPositions.empty() || (drawStageDataHits() && !stageCapture.capture->readTrace.leaves.empty()))) recordStageDataPositions(*variant, *stageCapture.capture, decodeReads[i]);
+            if (traceDrawCache() && entry != nullptr && matched[i] == nullptr && i < entry->stages.size()) {
+                const auto& variants = entry->stages[i];
+                const auto front = std::find_if(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& kept) { return kept->pushOffset == variant->pushOffset; });
+                if (front != variants.end() && (*front)->runs == variant->runs && (*front)->words.size() == variant->words.size()) {
+                    ++differingSameRuns;
+                    for (std::size_t w = 0; w < variant->words.size(); ++w) differingWords += (*front)->words[w] != variant->words[w] ? 1u : 0u;
+                } else if (front != variants.end()) {
+                    ++differingRunsChanged;
+                }
+            }
             if (verifyHit && matched[i] != nullptr && (!sameContent(*matched[i], *variant) || (programs[i].hiddenUserWords == 0 && !sameBindings(*matched[i]->compiled, *variant->compiled)) || !sameForwardedWords(*matched[i]->compiled, matched[i]->patchedPushConstants.empty() ? matched[i]->compiled->pushConstants : matched[i]->patchedPushConstants, *variant->compiled, programs[i].hiddenUserWords))) {
                 ++mismatches;
                 static std::atomic<std::uint64_t> reports{0};
@@ -224,11 +307,22 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 stashed = true;
             }
         }
-        if (!stashed) insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr);
-        if (unstable != 0 || mismatches != 0) {
+        if (!stashed) insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr, registerKey && drawDataHits() ? shapeKey : 0);
+        std::uint64_t dataInserts = 0, dataPositions = 0;
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            if (fresh[i] == nullptr || reused[i] || fresh[i]->dataPositions.empty()) continue;
+            ++dataInserts;
+            dataPositions += fresh[i]->dataPositions.size();
+        }
+        if (unstable != 0 || mismatches != 0 || differingSameRuns != 0 || differingRunsChanged != 0 || dataInserts != 0) {
             std::lock_guard cacheLock(drawCacheMutex);
+            drawEntryCounters.stageDataInserts += dataInserts;
+            drawEntryCounters.stageDataPositions += dataPositions;
             drawEntryCounters.unstable += unstable;
             drawEntryCounters.verifyMismatches += mismatches;
+            drawEntryCounters.differingSameRuns += differingSameRuns;
+            drawEntryCounters.differingWords += differingWords;
+            drawEntryCounters.differingRunsChanged += differingRunsChanged;
         }
         chargeInsert();
         phaseTiming.Phase(DrawRowKeyLookupValidate);

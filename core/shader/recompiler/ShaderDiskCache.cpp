@@ -1,5 +1,6 @@
 #include "ShaderDiskCache.hpp"
 #include "CacheKey.hpp"
+#include "ShaderCachePack.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "ThreadOwned.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
@@ -20,7 +21,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
-#include "ShaderCacheVersion.hpp"
+#include "ShaderCacheSourceVersion.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -83,32 +84,33 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 248, "CompiledShaderArtifact changed: update the artifact encoder");
-static_assert(sizeof(ShaderInvocation) == 112, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 416, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 592, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 280, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(ShaderInvocation) == 200, "ShaderInvocation changed: update the invocation encoder");
+static_assert(sizeof(RecompileResult) == 536, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(DescriptorBinding) == 616, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
-static_assert(sizeof(CompiledShaderInfo) == 344, "CompiledShaderInfo changed: update the info encoder");
+static_assert(sizeof(CompiledShaderInfo) == 352, "CompiledShaderInfo changed: update the info encoder");
 static_assert(sizeof(ShaderInfo) == 232, "ShaderInfo changed: update the info encoder");
 static_assert(sizeof(BufferResource) == 64, "BufferResource changed: update the info encoder");
-static_assert(sizeof(ImageResource) == 120, "ImageResource changed: update the info encoder");
-static_assert(sizeof(SamplerResource) == 20, "SamplerResource changed: update the info encoder");
+static_assert(sizeof(ImageResource) == 92, "ImageResource changed: update the info encoder");
+static_assert(sizeof(SamplerResource) == 24, "SamplerResource changed: update the info encoder");
 static_assert(sizeof(SampledResourcePair) == 12, "SampledResourcePair changed: update the info encoder");
 static_assert(sizeof(StageInput) == 56, "StageInput changed: update the info encoder");
 static_assert(sizeof(StageOutput) == 48, "StageOutput changed: update the info encoder");
-static_assert(sizeof(IrBindingLayout) == 72, "IrBindingLayout changed: update the layout encoder");
+static_assert(sizeof(IrBindingLayout) == 80, "IrBindingLayout changed: update the layout encoder");
 static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: update the layout encoder");
-static_assert(sizeof(BindingAllocationResult) == 152, "BindingAllocationResult changed: update the allocation encoder");
-static_assert(sizeof(CompiledBindingLayout) == 80, "CompiledBindingLayout changed: update the allocation encoder");
+static_assert(sizeof(BindingAllocationResult) == 208, "BindingAllocationResult changed: update the allocation encoder");
+static_assert(sizeof(CompiledBindingLayout) == 88, "CompiledBindingLayout changed: update the allocation encoder");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
-static_assert(sizeof(IrResourcePlan) == 584, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(sizeof(IrResourcePlan) == 600, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(sizeof(IrValue) == 152, "IrValue changed: update the plan value encoder");
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
-static_assert(sizeof(DescriptorSource) == 104, "DescriptorSource changed: update the plan encoder");
-static_assert(sizeof(DescriptorSource::IndirectImage) == 28, "IndirectImage changed: update the plan encoder");
+static_assert(sizeof(DescriptorSource) == 160, "DescriptorSource changed: update the plan encoder");
+static_assert(sizeof(TableColumn) == 80, "TableColumn changed: update the plan encoder");
+static_assert(sizeof(KeyDomain) == 16, "KeyDomain changed: update the plan encoder");
 static_assert(sizeof(ResourceBlock) == 80, "ResourceBlock changed: update the plan encoder");
 static_assert(sizeof(SrtRead) == 16, "SrtRead changed: update the plan encoder");
 static_assert(sizeof(UniformFill) == 28, "UniformFill changed: update the plan encoder");
@@ -139,15 +141,16 @@ constexpr std::size_t fieldCount() {
 static_assert(fieldCount<ShaderInfo>() == 23, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 13, "BufferResource changed: update the info encoder");
 static_assert(fieldCount<ImageResource>() == 38, "ImageResource changed: update the info encoder");
-static_assert(fieldCount<SamplerResource>() == 7, "SamplerResource changed: update the info encoder");
+static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
 static_assert(fieldCount<SampledResourcePair>() == 3, "SampledResourcePair changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
 static_assert(fieldCount<IrResourcePlan>() == 22, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
-static_assert(fieldCount<MemoryInfo>() == 31, "MemoryInfo changed: update the plan encoder");
+static_assert(fieldCount<MemoryInfo>() == 32, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
-static_assert(fieldCount<DescriptorSource::IndirectImage>() == 7, "IndirectImage changed: update the plan encoder");
+static_assert(fieldCount<TableColumn>() == 15, "TableColumn changed: update the plan encoder");
+static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
 static_assert(fieldCount<ResourceBlock>() == 4, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
 static_assert(fieldCount<UniformFill>() == 5, "UniformFill changed: update the plan encoder");
@@ -470,6 +473,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.imageDepthCompare);
     writer.Flags(binding.imageAtomic);
     writer.Flags(binding.imageAtomic64);
+    writer.List(binding.imageShapes, [](Writer& out, DescriptorImageShape shape) { out.Value(shape); });
     writer.Flags(binding.bufferAtomic);
     writer.Flags(binding.bufferWritten);
     writer.Flags(binding.samplerUnnormalized);
@@ -497,6 +501,7 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.imageDepthCompare);
     reader.Flags(binding.imageAtomic);
     reader.Flags(binding.imageAtomic64);
+    reader.List(binding.imageShapes, 4, [](Reader& in, DescriptorImageShape& shape) { in.Value(shape); });
     reader.Flags(binding.bufferAtomic);
     reader.Flags(binding.bufferWritten);
     reader.Flags(binding.samplerUnnormalized);
@@ -548,6 +553,9 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.barycentricEmulation.active);
     writer.Value(result.barycentricEmulation.smooth);
     writer.Value(result.barycentricEmulation.linear);
+    writer.Values(std::span<const std::uint32_t>(result.stencilReferences));
+    writer.Value(result.stencilReplaySafe);
+    writer.Value(result.stencilReferenceDword);
 }
 
 void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
@@ -590,6 +598,9 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.barycentricEmulation.active);
     reader.Value(result.barycentricEmulation.smooth);
     reader.Value(result.barycentricEmulation.linear);
+    reader.Values(result.stencilReferences);
+    reader.Value(result.stencilReplaySafe);
+    reader.Value(result.stencilReferenceDword);
     result.variantId = 0;
 }
 
@@ -609,6 +620,24 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
         out.Value(attribute.formatComponents);
     });
     writer.Value(invocation.poisonedSrtReads);
+    writer.List(invocation.imageTablePoison, [](Writer& out, const ImageTableEntryPoison& poison) {
+        for (const auto word : poison.words) out.Value(word);
+        out.Value(poison.dwordCount);
+        out.Value(poison.resource);
+        out.Value(poison.reason);
+    });
+    writer.List(invocation.imageTableRanges, [](Writer& out, const std::pair<std::uint64_t, std::uint64_t>& range) {
+        out.Value(range.first);
+        out.Value(range.second);
+    });
+    writer.List(invocation.imageTableReadRanges, [](Writer& out, const auto& ranges) {
+        out.List(ranges, [](Writer& rangeWriter, const auto& range) {
+            rangeWriter.Value(range.first);
+            rangeWriter.Value(range.second);
+        });
+    });
+    writer.Value(invocation.imageTableShader);
+    writer.Value(invocation.imageTableFaults);
 }
 
 void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
@@ -630,10 +659,29 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
         in.Value(attribute.formatComponents);
     });
     reader.Value(invocation.poisonedSrtReads);
+    reader.List(invocation.imageTablePoison, 44, [](Reader& in, ImageTableEntryPoison& poison) {
+        for (auto& word : poison.words) in.Value(word);
+        in.Value(poison.dwordCount);
+        in.Value(poison.resource);
+        in.Value(poison.reason);
+    });
+    reader.List(invocation.imageTableRanges, 16, [](Reader& in, std::pair<std::uint64_t, std::uint64_t>& range) {
+        in.Value(range.first);
+        in.Value(range.second);
+    });
+    reader.List(invocation.imageTableReadRanges, 8, [](Reader& in, auto& ranges) {
+        in.List(ranges, 16, [](Reader& rangeReader, auto& range) {
+            rangeReader.Value(range.first);
+            rangeReader.Value(range.second);
+        });
+    });
+    reader.Value(invocation.imageTableShader);
+    reader.Value(invocation.imageTableFaults);
 }
 
 void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
     writer.Value(layout.pushDataStartDword);
+    writer.Value(layout.stencilReferenceDword);
     writer.Value(layout.memoryOffsetDword);
     writer.Value(layout.memoryOffsetCount);
     writer.Value(layout.dispatchThreadLimit);
@@ -648,6 +696,7 @@ void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
 
 void decodeLayout(Reader& reader, IrBindingLayout& layout) {
     reader.Value(layout.pushDataStartDword);
+    reader.Value(layout.stencilReferenceDword);
     reader.Value(layout.memoryOffsetDword);
     reader.Value(layout.memoryOffsetCount);
     reader.Value(layout.dispatchThreadLimit);
@@ -706,17 +755,17 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(image.constantSwizzle);
         out.Value(image.constantSwizzleCompatible);
         out.Value(image.flatVolumeCompatible);
+        out.Value(image.singleMipPlaneBiasCompatible);
         out.Value(image.flatLineCompatible);
+        out.Value(image.flatVolumeLineCompatible);
         out.Value(image.foldTexelOffsetsOnly);
         out.Value(image.optionalDescriptor);
         out.Value(image.byElements);
         out.Value(image.byComponents);
         out.Value(image.packedFormat);
         out.Value(image.emulatedCompare);
-        out.Value(image.indirectRoot);
-        out.Value(image.indirectMappingOffset);
-        out.Value(image.indirectSearchIterations);
-        out.Values(std::span<const std::uint32_t>(image.indirectResources));
+        out.Value(image.table);
+        out.Value(image.tableOperation);
     });
     writer.Value(!info.runtimeImageModes.empty());
     writer.List(info.samplers, [](Writer& out, const SamplerResource& sampler) {
@@ -727,6 +776,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(sampler.depthCompare);
         out.Value(sampler.uses);
         out.Value(sampler.foldTexelOffsetsOnly);
+        out.Value(sampler.table);
     });
     writer.List(info.sampledPairs, [](Writer& out, const SampledResourcePair& pair) {
         out.Value(pair.image);
@@ -780,7 +830,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(buffer.typedAlignment);
         decodeReadRanges(in, buffer.readRanges);
     });
-    reader.List(info.images, 75, [](Reader& in, ImageResource& image) {
+    reader.List(info.images, 77, [](Reader& in, ImageResource& image) {
         in.Value(image.source);
         in.Value(image.firstUsePc);
         in.Value(image.resourceClass);
@@ -808,22 +858,22 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(image.constantSwizzle);
         in.Value(image.constantSwizzleCompatible);
         in.Value(image.flatVolumeCompatible);
+        in.Value(image.singleMipPlaneBiasCompatible);
         in.Value(image.flatLineCompatible);
+        in.Value(image.flatVolumeLineCompatible);
         in.Value(image.foldTexelOffsetsOnly);
         in.Value(image.optionalDescriptor);
         in.Value(image.byElements);
         in.Value(image.byComponents);
         in.Value(image.packedFormat);
         in.Value(image.emulatedCompare);
-        in.Value(image.indirectRoot);
-        in.Value(image.indirectMappingOffset);
-        in.Value(image.indirectSearchIterations);
-        in.Values(image.indirectResources);
+        in.Value(image.table);
+        in.Value(image.tableOperation);
     });
     bool preparedImageModes = false;
     reader.Value(preparedImageModes);
     if (preparedImageModes) ResourceMaterializer::PrepareImageModes(info);
-    reader.List(info.samplers, 17, [](Reader& in, SamplerResource& sampler) {
+    reader.List(info.samplers, 21, [](Reader& in, SamplerResource& sampler) {
         in.Value(sampler.source);
         in.Value(sampler.firstUsePc);
         in.Value(sampler.copyOf);
@@ -831,6 +881,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(sampler.depthCompare);
         in.Value(sampler.uses);
         in.Value(sampler.foldTexelOffsetsOnly);
+        in.Value(sampler.table);
     });
     reader.List(info.sampledPairs, 12, [](Reader& in, SampledResourcePair& pair) {
         in.Value(pair.image);
@@ -939,6 +990,7 @@ void encodeMemoryInfo(Writer& out, const MemoryInfo& memory) {
     out.Value(memory.gpuDescriptor);
     out.Value(memory.flushDenormals);
     out.Value(memory.descriptorWebArm);
+    out.Value(memory.flushDenormalResults);
 }
 
 void decodeMemoryInfo(Reader& in, MemoryInfo& memory) {
@@ -973,6 +1025,7 @@ void decodeMemoryInfo(Reader& in, MemoryInfo& memory) {
     in.Value(memory.gpuDescriptor);
     in.Value(memory.flushDenormals);
     in.Value(memory.descriptorWebArm);
+    in.Value(memory.flushDenormalResults);
 }
 
 bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
@@ -1029,15 +1082,28 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
     writer.List(plan.descriptorSources, [&](Writer& out, const DescriptorSource& source) {
         for (const auto* dword : source.dwords) out.Value(valueIndex(dword));
         out.Value(source.dwordCount);
-        const auto table = source.indirectImage.value_or(DescriptorSource::IndirectImage{});
-        out.Value(source.indirectImage.has_value());
-        out.Value(table.materialSource);
-        out.Value(table.heapSource);
-        out.Value(table.selectorStride);
-        out.Value(table.selectorOffset);
-        out.Value(table.keyArg);
-        out.Value(table.entryOffset);
-        out.Value(table.hasMaterial);
+        const auto column = source.tableColumn.value_or(TableColumn{});
+        out.Value(source.tableColumn.has_value());
+        out.Value(column.heapSource);
+        out.Value(column.stride);
+        out.Value(column.addend);
+        out.Value(column.offset);
+        out.Value(column.dwordCount);
+        out.Value(column.maxKey);
+        out.Value(column.sampler);
+        out.Value(column.address);
+        out.List(column.keyDomains, [](Writer& domains, const KeyDomain& domain) {
+            domains.Value(domain.source);
+            domains.Value(domain.offset);
+            domains.Value(domain.stride);
+            domains.Value(domain.value);
+        });
+        out.Value(column.unkeyed);
+        out.Value(column.indirect);
+        out.Value(column.indirectOffset);
+        out.Value(column.indirectImmediate);
+        out.Value(column.foldedAddend);
+        out.Value(column.foldedCarry);
     });
     writer.List(plan.controlFlow, [&](Writer& out, const ResourceBlock& block) {
         out.Value(valueIndex(block.condition));
@@ -1166,20 +1232,33 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         }
         value.SetDetachedOperands(std::move(arguments), std::move(phiBlocks));
     }
-    reader.List(plan.memoryInfo, 78, decodeMemoryInfo);
-    reader.List(plan.descriptorSources, 62, [&](Reader& in, DescriptorSource& source) {
+    reader.List(plan.memoryInfo, 80, decodeMemoryInfo);
+    reader.List(plan.descriptorSources, 72, [&](Reader& in, DescriptorSource& source) {
         for (auto& dword : source.dwords) dword = valueAt(in.Get<std::uint32_t>());
         in.Value(source.dwordCount);
-        const bool indirect = in.Get<bool>();
-        DescriptorSource::IndirectImage table;
-        in.Value(table.materialSource);
-        in.Value(table.heapSource);
-        in.Value(table.selectorStride);
-        in.Value(table.selectorOffset);
-        in.Value(table.keyArg);
-        in.Value(table.entryOffset);
-        in.Value(table.hasMaterial);
-        source.indirectImage = indirect ? std::optional(table) : std::nullopt;
+        const bool table = in.Get<bool>();
+        TableColumn column;
+        in.Value(column.heapSource);
+        in.Value(column.stride);
+        in.Value(column.addend);
+        in.Value(column.offset);
+        in.Value(column.dwordCount);
+        in.Value(column.maxKey);
+        in.Value(column.sampler);
+        in.Value(column.address);
+        in.List(column.keyDomains, 13, [](Reader& domains, KeyDomain& domain) {
+            domains.Value(domain.source);
+            domains.Value(domain.offset);
+            domains.Value(domain.stride);
+            domains.Value(domain.value);
+        });
+        in.Value(column.unkeyed);
+        in.Value(column.indirect);
+        in.Value(column.indirectOffset);
+        in.Value(column.indirectImmediate);
+        in.Value(column.foldedAddend);
+        in.Value(column.foldedCarry);
+        source.tableColumn = table ? std::optional(std::move(column)) : std::nullopt;
     });
     reader.List(plan.controlFlow, 28, [&](Reader& in, ResourceBlock& block) {
         block.condition = valueAt(in.Get<std::uint32_t>());
@@ -1210,7 +1289,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
     if (!valid || !reader.Done() || fill.words > plan.uniformFill.values.size()) return false;
     const auto knownSource = [&](std::uint32_t source) { return source < plan.descriptorSources.size(); };
     if (!std::ranges::all_of(plan.materializationSources, knownSource)) return false;
-    if (!std::ranges::all_of(plan.descriptorSources, [&](const DescriptorSource& source) { return source.dwordCount <= source.dwords.size() && (!source.indirectImage.has_value() || (knownSource(source.indirectImage->heapSource) && knownSource(source.indirectImage->materialSource))); })) return false;
+    if (!std::ranges::all_of(plan.descriptorSources, [&](const DescriptorSource& source) { return source.dwordCount <= source.dwords.size() && (!source.tableColumn.has_value() || (knownSource(source.tableColumn->heapSource) && std::ranges::all_of(source.tableColumn->keyDomains, [&](const KeyDomain& domain) { return knownSource(domain.source); }))); })) return false;
     if (!std::ranges::all_of(plan.info.buffers, [&](const BufferResource& buffer) { return knownSource(buffer.source); })) return false;
     if (!std::ranges::all_of(plan.info.images, [&](const ImageResource& image) { return knownSource(image.source); })) return false;
     if (!std::ranges::all_of(plan.info.samplers, [&](const SamplerResource& sampler) { return knownSource(sampler.source); })) return false;
@@ -1294,6 +1373,7 @@ public:
         if (root.empty()) return;
         this->root = root;
         directory = root / hex(SourceVersion());
+        discoverPrebuilt();
         std::thread([this] { run(); }).detach();
     }
 
@@ -1301,10 +1381,15 @@ public:
     [[nodiscard]] const std::filesystem::path& Directory() const { return directory; }
 
     bool Load(std::span<const std::byte> key, CompiledVariant& variant) {
+        if (loadPrebuilt(key, variant)) return true;
         return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void> owner) { return DecodeEntry(file, key, variant, std::move(owner)); }, hits, misses, loadFailures);
     }
 
     bool Reload(std::span<const std::byte> key, CompiledVariant& variant) {
+        if (reloadPrebuilt(key, variant)) {
+            reloads.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
         return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void> owner) { return DecodeEntry(file, key, variant, std::move(owner)); }, reloads, reloadFailures, reloadFailures);
     }
 
@@ -1376,10 +1461,52 @@ public:
         counters.planFailureWrites = planFailureWrites.load(std::memory_order_relaxed);
         counters.planReloads = planReloads.load(std::memory_order_relaxed);
         counters.planReloadFailures = planReloadFailures.load(std::memory_order_relaxed);
+        counters.prebuiltHits = prebuiltHits.load(std::memory_order_relaxed);
+        counters.prebuiltMisses = prebuiltMisses.load(std::memory_order_relaxed);
+        counters.prebuiltRejected = prebuiltRejected.load(std::memory_order_relaxed);
+        counters.lookupNanoseconds = lookupNanoseconds.load(std::memory_order_relaxed);
+        counters.readNanoseconds = readNanoseconds.load(std::memory_order_relaxed);
+        counters.decodeNanoseconds = decodeNanoseconds.load(std::memory_order_relaxed);
+        counters.loadNanoseconds = loadNanoseconds.load(std::memory_order_relaxed);
+        counters.maxLoadNanoseconds = maxLoadNanoseconds.load(std::memory_order_relaxed);
+        counters.prebuiltBytesRead = prebuiltBytesRead.load(std::memory_order_relaxed);
+        counters.prebuiltLoadNanoseconds = prebuiltLoadNanoseconds.load(std::memory_order_relaxed);
         return counters;
     }
 
 private:
+    void discoverPrebuilt() {
+        const auto start = std::chrono::steady_clock::now();
+        std::size_t entries = 0;
+        const auto addPack = [&](const std::filesystem::path& path) {
+            auto pack = std::make_unique<CachePack>(path);
+            if (!pack->Valid()) {
+                std::fprintf(stderr, "[shader-prebuilt] ignored %s: %s\n", path.string().c_str(), pack->Error().c_str());
+                return;
+            }
+            entries += pack->Count();
+            packs.push_back(std::move(pack));
+        };
+        for (const auto& path : PrebuiltCachePaths(root)) {
+            std::error_code error;
+            if (std::filesystem::is_regular_file(path, error)) { addPack(path); continue; }
+            if (!std::filesystem::is_directory(path, error)) continue;
+            bool loose = false;
+            std::vector<std::filesystem::path> packPaths;
+            for (std::filesystem::directory_iterator it(path, error), end; !error && it != end; it.increment(error)) {
+                const auto extension = it->path().extension();
+                if (extension == ".pack") packPaths.push_back(it->path());
+                if (extension == ".bin" && it->path().stem().string().size() == 32) loose = true;
+            }
+            std::sort(packPaths.begin(), packPaths.end());
+            for (const auto& item : packPaths) addPack(item);
+            if (loose) looseDirectories.push_back(path);
+            const auto versioned = path / hex(SourceVersion());
+            if (std::filesystem::is_directory(versioned, error)) looseDirectories.push_back(versioned);
+        }
+        if (!packs.empty() || !looseDirectories.empty()) std::fprintf(stderr, "[shader-prebuilt] mapped %zu packs, %zu entries, %zu loose folders in %.3f ms; exact source/ABI/request keys required\n", packs.size(), entries, looseDirectories.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    }
+
     struct Job {
         std::vector<std::byte> key;
         std::shared_ptr<const CompiledVariant> variant;
@@ -1389,6 +1516,75 @@ private:
         std::vector<std::byte> file;
         std::string failure;
     };
+
+    bool reloadPrebuilt(std::span<const std::byte> key, CompiledVariant& variant) {
+        PackLoadTimings timing;
+        for (const auto& pack : packs) {
+            if (pack->Load(key, variant, timing) == LoadStatus::Loaded) return true;
+        }
+        if (looseDirectories.empty()) return false;
+        const auto name = EntryName(key);
+        thread_local std::vector<std::byte>* fileSlot = nullptr;
+        auto& file = ThreadOwned(fileSlot);
+        bool loaded = false;
+        for (const auto& path : looseDirectories) {
+            if (ReadWholeFile(path / name, file) && DecodeEntry(file, key, variant) == LoadStatus::Loaded) {
+                loaded = true;
+                break;
+            }
+        }
+        if (file.capacity() > (4u << 20u)) std::vector<std::byte>().swap(file);
+        return loaded;
+    }
+
+    bool loadPrebuilt(std::span<const std::byte> key, CompiledVariant& variant) {
+        if (packs.empty() && looseDirectories.empty()) return false;
+        const auto started = std::chrono::steady_clock::now();
+        const auto elapsed = [](auto start) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()); };
+        bool loaded = false;
+        PackLoadTimings timing;
+        for (const auto& pack : packs) {
+            const auto status = pack->Load(key, variant, timing);
+            if (status == LoadStatus::Loaded) { loaded = true; break; }
+            if (status == LoadStatus::Rejected) prebuiltRejected.fetch_add(1, std::memory_order_relaxed);
+        }
+        lookupNanoseconds.fetch_add(timing.lookupNanoseconds, std::memory_order_relaxed);
+        decodeNanoseconds.fetch_add(timing.decodeNanoseconds, std::memory_order_relaxed);
+        prebuiltBytesRead.fetch_add(timing.bytes, std::memory_order_relaxed);
+        if (!loaded) {
+            const auto name = EntryName(key);
+            thread_local std::vector<std::byte>* fileSlot = nullptr;
+            auto& file = ThreadOwned(fileSlot);
+            for (const auto& path : looseDirectories) {
+                const auto start = std::chrono::steady_clock::now();
+                const auto read = ReadWholeFile(path / name, file);
+                readNanoseconds.fetch_add(elapsed(start), std::memory_order_relaxed);
+                if (!read) continue;
+                const auto decode = std::chrono::steady_clock::now();
+                const auto status = DecodeEntry(file, key, variant);
+                decodeNanoseconds.fetch_add(elapsed(decode), std::memory_order_relaxed);
+                prebuiltBytesRead.fetch_add(file.size(), std::memory_order_relaxed);
+                if (status == LoadStatus::Rejected) {
+                    const auto failures = prebuiltRejected.fetch_add(1, std::memory_order_relaxed);
+                    if (failures < 8) std::fprintf(stderr, "[shader-prebuilt] rejected %s (%zu bytes): truncated, corrupt or another format; recompiling\n", name.c_str(), file.size());
+                }
+                if (status == LoadStatus::Loaded) { loaded = true; break; }
+            }
+            if (file.capacity() > (4u << 20u)) std::vector<std::byte>().swap(file);
+        }
+        if (loaded) {
+            const auto previous = prebuiltHits.fetch_add(1, std::memory_order_relaxed);
+            if (previous == 0) std::fprintf(stderr, "[shader-prebuilt] first exact-key hit loaded in %.3f ms\n", elapsed(started) / 1e6);
+        } else prebuiltMisses.fetch_add(1, std::memory_order_relaxed);
+        if (loaded) {
+            const auto duration = elapsed(started);
+            prebuiltLoadNanoseconds.fetch_add(duration, std::memory_order_relaxed);
+            auto maximum = maxLoadNanoseconds.load(std::memory_order_relaxed);
+            while (maximum < duration && !maxLoadNanoseconds.compare_exchange_weak(maximum, duration, std::memory_order_relaxed)) {}
+            report(false);
+        }
+        return loaded;
+    }
 
     template<typename TDecode>
     bool load(std::span<const std::byte> key, TDecode&& decode, std::atomic<std::uint64_t>& hitCount, std::atomic<std::uint64_t>& missCount, std::atomic<std::uint64_t>& failureCount) {
@@ -1527,20 +1723,28 @@ private:
         const auto totals = Totals();
         const auto loadNs = loadNanoseconds.load(std::memory_order_relaxed);
         const auto delta = [](std::uint64_t after, std::uint64_t before) { return static_cast<unsigned long long>(after - before); };
-        if (totals.hits == reported.hits && totals.misses == reported.misses && totals.writes == reported.writes && totals.loadFailures == reported.loadFailures && totals.writeFailures == reported.writeFailures && totals.planHits == reported.planHits && totals.planMisses == reported.planMisses && totals.planWrites == reported.planWrites && totals.planLoadFailures == reported.planLoadFailures && totals.planFailureHits == reported.planFailureHits && totals.planFailureWrites == reported.planFailureWrites) return;
-        std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; refused plans: %llu replayed, %llu stored; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses)\n",
+        const auto baseChanged = totals.hits != reported.hits || totals.misses != reported.misses || totals.writes != reported.writes || totals.loadFailures != reported.loadFailures || totals.writeFailures != reported.writeFailures || totals.planHits != reported.planHits || totals.planMisses != reported.planMisses || totals.planWrites != reported.planWrites || totals.planLoadFailures != reported.planLoadFailures || totals.planFailureHits != reported.planFailureHits || totals.planFailureWrites != reported.planFailureWrites;
+        const auto prebuiltChanged = totals.prebuiltHits != reported.prebuiltHits || totals.prebuiltMisses != reported.prebuiltMisses || totals.prebuiltRejected != reported.prebuiltRejected;
+        if (!baseChanged && !prebuiltChanged) return;
+        if (baseChanged) std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; refused plans: %llu replayed, %llu stored; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses)\n",
                      delta(totals.hits, reported.hits), delta(totals.misses, reported.misses), delta(totals.writes, reported.writes), static_cast<double>(totals.bytesWritten - reported.bytesWritten) / (1024.0 * 1024.0),
                      delta(totals.loadFailures, reported.loadFailures), delta(totals.writeFailures, reported.writeFailures),
                      delta(totals.planHits, reported.planHits), delta(totals.planMisses, reported.planMisses), delta(totals.planWrites, reported.planWrites), delta(totals.planLoadFailures, reported.planLoadFailures),
                      delta(totals.planFailureHits, reported.planFailureHits), delta(totals.planFailureWrites, reported.planFailureWrites),
                      static_cast<double>(totals.bytesRead - reported.bytesRead) / (1024.0 * 1024.0), static_cast<double>(loadNs - reportedLoadNs) / 1e6,
                      static_cast<unsigned long long>(totals.hits), static_cast<unsigned long long>(totals.misses), static_cast<unsigned long long>(totals.writes), static_cast<unsigned long long>(totals.planHits), static_cast<unsigned long long>(totals.planMisses));
+        if (prebuiltChanged && (!packs.empty() || !looseDirectories.empty())) std::fprintf(stderr, "[shader-prebuilt] interval: %llu hits, %llu misses, %llu rejected; lookup %.3f ms, file read %.3f ms, decode %.3f ms; total load %.3f ms, max %.3f ms (lifetime hits %llu)\n",
+                     delta(totals.prebuiltHits, reported.prebuiltHits), delta(totals.prebuiltMisses, reported.prebuiltMisses), delta(totals.prebuiltRejected, reported.prebuiltRejected),
+                     (totals.lookupNanoseconds - reported.lookupNanoseconds) / 1e6, (totals.readNanoseconds - reported.readNanoseconds) / 1e6, (totals.decodeNanoseconds - reported.decodeNanoseconds) / 1e6,
+                     (totals.prebuiltLoadNanoseconds - reported.prebuiltLoadNanoseconds) / 1e6, totals.maxLoadNanoseconds / 1e6, static_cast<unsigned long long>(totals.prebuiltHits));
         reported = totals;
         reportedLoadNs = loadNs;
     }
 
     std::filesystem::path root;
     std::filesystem::path directory;
+    std::vector<std::unique_ptr<CachePack>> packs;
+    std::vector<std::filesystem::path> looseDirectories;
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
@@ -1550,6 +1754,7 @@ private:
     std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0}, reloads{0}, reloadFailures{0};
     std::atomic<std::uint64_t> planFailureHits{0}, planFailureMisses{0}, planFailureWrites{0};
     std::atomic<std::uint64_t> planReloads{0}, planReloadFailures{0};
+    std::atomic<std::uint64_t> prebuiltHits{0}, prebuiltMisses{0}, prebuiltRejected{0}, lookupNanoseconds{0}, readNanoseconds{0}, decodeNanoseconds{0}, maxLoadNanoseconds{0}, prebuiltBytesRead{0}, prebuiltLoadNanoseconds{0};
     std::atomic<std::int64_t> lastReport{0};
     std::mutex reportMutex;
     Counters reported;

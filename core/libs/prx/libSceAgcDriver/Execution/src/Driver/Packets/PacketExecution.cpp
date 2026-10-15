@@ -259,6 +259,7 @@ void Driver::execute(const Submission& submission) {
             }
             if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
             else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            Pm4::NoteDispatchRegisters(packet, queue);
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(opcode == 0x16);
         } else if (opcode == 0x3c || opcode == 0x93) {
