@@ -1127,7 +1127,7 @@ void InstallCoherence() {
     }
     if (!Coherence::FaultOwnership() && !Coherence::InputLeases() && !Coherence::Residency()) return;
 #ifdef _WIN32
-    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix, &GuestArena::GuestArenaOpenAccessForRead_nid_postfix});
     Coherence::SetMaterializer(&MaterializeNativeAccess);
     Coherence::SetLeaseWaiter(&WaitForGuestReaders);
     GuestArena::GuestArenaSetResolveHostWrites_nid_postfix(true);

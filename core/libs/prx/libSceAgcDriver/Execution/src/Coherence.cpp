@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -109,6 +111,8 @@ struct Ledger {
     std::uint64_t protections = 0;
     std::uint64_t leases = 0;
     std::uint64_t leaseWaits = 0;
+    std::set<std::uint64_t> resolving;
+    std::condition_variable settled;
     std::uint64_t refused = 0;
     std::uint64_t partial = 0;
     std::uint64_t resolved = 0;
@@ -150,7 +154,7 @@ bool ResolveProtection(std::uint64_t token, void* context) {
         }
     }
     if (live) {
-        std::vector<std::uint64_t> opened;
+        std::vector<std::uint64_t> opened{token};
         {
             std::lock_guard lock(ledger.mutex);
             for (auto it = ledger.live.begin(); it != ledger.live.end();) {
@@ -162,10 +166,12 @@ bool ResolveProtection(std::uint64_t token, void* context) {
                 }
             }
             ++(lease ? ledger.leaseWaits : ledger.resolved);
+            ledger.resolving.insert(opened.begin(), opened.end());
         }
-        if (backend.release != nullptr) {
-            backend.release(token);
-            for (const auto other : opened) backend.release(other);
+        const bool readable = backend.open != nullptr;
+        for (const auto held : opened) {
+            if (readable) static_cast<void>(backend.open(held));
+            else if (backend.release != nullptr) backend.release(held);
         }
         try {
             if (materializer == nullptr) throw std::runtime_error(lease ? "no lease waiter is installed" : "no materializer is installed");
@@ -173,7 +179,19 @@ bool ResolveProtection(std::uint64_t token, void* context) {
         } catch (const std::exception& error) {
             AbortInFault(lease ? "a native access to guest memory under a read lease could not wait for its readers" : "native access to device-owned guest memory could not be materialized", range, error.what());
         }
+        if (readable && backend.release != nullptr) {
+            for (const auto held : opened) backend.release(held);
+        }
+        {
+            std::lock_guard lock(ledger.mutex);
+            for (const auto held : opened) ledger.resolving.erase(held);
+        }
+        ledger.settled.notify_all();
         return true;
+    }
+    {
+        std::unique_lock lock(ledger.mutex);
+        ledger.settled.wait(lock, [&] { return !ledger.resolving.contains(token); });
     }
     if (backend.release != nullptr) backend.release(token);
     return true;

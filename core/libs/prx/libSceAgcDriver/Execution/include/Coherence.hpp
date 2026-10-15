@@ -115,6 +115,7 @@ std::vector<std::pair<std::uint32_t, Version>> QueueFrontier(std::uint32_t queue
 struct ProtectionBackend {
     std::uint64_t (*protect)(std::uintptr_t address, std::size_t bytes, bool (*resolve)(std::uint64_t token, void* context), void* context, void (*releaseContext)(void* context)) = nullptr;
     void (*release)(std::uint64_t token) = nullptr;
+    bool (*open)(std::uint64_t token) = nullptr;
 };
 
 using Materializer = void (*)(Interval range);
