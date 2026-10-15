@@ -9,6 +9,7 @@
 #include <map>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -48,6 +49,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         char name[160];
         std::snprintf(name, sizeof(name), "vk-pipelines-%04x-%04x-%08x-%s.bin", properties.vendorID, properties.deviceID, properties.driverVersion, uuid.c_str());
         path = directory / name;
+        adoptEarlierDriverFile(directory, uuid);
     }
     std::vector<std::byte> initialData;
     if (!path.empty()) {
@@ -70,6 +72,33 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
     }
     Check(result, "vkCreatePipelineCache");
     if (!path.empty()) saver = std::thread([this] { run(); });
+}
+
+void PipelineCache::adoptEarlierDriverFile(const std::filesystem::path& directory, const std::string& uuid) {
+    static const bool layered = [] {
+        const char* value = std::getenv("APS5_SHADER_CACHE_V2");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    std::error_code error;
+    if (!layered || std::filesystem::exists(path, error)) return;
+    char prefix[64];
+    std::snprintf(prefix, sizeof(prefix), "vk-pipelines-%04x-%04x-", properties.vendorID, properties.deviceID);
+    const auto suffix = "-" + uuid + ".bin";
+    std::filesystem::path newest;
+    std::filesystem::file_time_type newestTime{};
+    for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end; it.increment(error)) {
+        const auto name = it->path().filename().string();
+        if (!name.starts_with(prefix) || !name.ends_with(suffix) || !it->is_regular_file(error)) continue;
+        std::error_code timeError;
+        const auto written = std::filesystem::last_write_time(it->path(), timeError);
+        if (timeError || (!newest.empty() && written <= newestTime)) continue;
+        newest = it->path();
+        newestTime = written;
+    }
+    if (newest.empty()) return;
+    std::lock_guard pathLock(pathMutex(path));
+    if (!std::filesystem::copy_file(newest, path, std::filesystem::copy_options::skip_existing, error) || error) return;
+    std::fprintf(stderr, "[pipeline-cache] starting from %s, written by an earlier driver with the same pipeline cache UUID; the driver validates it again\n", newest.filename().string().c_str());
 }
 
 PipelineCache::~PipelineCache() {

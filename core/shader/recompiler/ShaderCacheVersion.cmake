@@ -35,6 +35,7 @@ endforeach()
 
 set(failures)
 set(manifest "${EXTRA}\n")
+set(frontendManifest "${EXTRA}\n")
 set(switches)
 foreach(source IN LISTS sources)
     if(NOT EXISTS "${source}")
@@ -43,6 +44,9 @@ foreach(source IN LISTS sources)
     file(SHA256 "${source}" digest)
     file(RELATIVE_PATH relative "${ROOT}" "${source}")
     string(APPEND manifest "${relative} ${digest}\n")
+    if(NOT relative MATCHES "^core/shader/recompiler/SpirvBackend/src/")
+        string(APPEND frontendManifest "${relative} ${digest}\n")
+    endif()
     if(NOT source MATCHES "\\.(cpp|hpp|h)$")
         continue()
     endif()
@@ -102,6 +106,7 @@ foreach(submodule IN LISTS submodules)
         set(commit "unversioned ${digest}")
     endif()
     string(APPEND manifest "submodule ${relative} ${commit}\n")
+    string(APPEND frontendManifest "submodule ${relative} ${commit}\n")
 endforeach()
 
 foreach(source IN LISTS guard)
@@ -136,6 +141,8 @@ endif()
 
 string(SHA256 version "${manifest}")
 string(SUBSTRING "${version}" 0 16 version)
+string(SHA256 frontendVersion "${frontendManifest}")
+string(SUBSTRING "${frontendVersion}" 0 16 frontendVersion)
 list(REMOVE_DUPLICATES switches)
 list(SORT switches)
 list(JOIN switches ",\n    " switchList)
@@ -153,6 +160,7 @@ constexpr std::string_view recompilerSwitches[] = {
 }
 
 constinit const std::uint64_t SourceVersion = 0x${version}ull;
+constinit const std::uint64_t FrontendSourceVersion = 0x${frontendVersion}ull;
 constinit const std::span<const std::string_view> RecompilerSwitches = recompilerSwitches;
 
 }

@@ -27,6 +27,10 @@
 #include "ImageTableAbi.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
+#include <mutex>
+#include <future>
+#include <functional>
+#include <condition_variable>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -3195,9 +3199,12 @@ struct MockVulkan {
 };
 
 MockVulkan mock;
+std::recursive_mutex mockMutex;
+std::function<void(const VkGraphicsPipelineCreateInfo&)> graphicsPipelineHook;
 
 template<typename THandle>
 THandle makeHandle() {
+    std::lock_guard lock(mockMutex);
     const auto value = mock.next++;
     if constexpr (std::is_pointer_v<THandle>) return reinterpret_cast<THandle>(static_cast<std::uintptr_t>(value));
     else return static_cast<THandle>(value);
@@ -3380,6 +3387,7 @@ VKAPI_ATTR VkDeviceAddress VKAPI_CALL mockGetBufferDeviceAddress(VkDevice, const
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockCreatePipelineLayout(VkDevice, const VkPipelineLayoutCreateInfo* info, const VkAllocationCallbacks*, VkPipelineLayout* layout) {
+    std::lock_guard lock(mockMutex);
     *layout = makeHandle<VkPipelineLayout>();
     mock.pipelineLayoutPushConstantSize[*layout] = info->pushConstantRangeCount > 0 ? info->pPushConstantRanges[0].size : 0;
     if (info->setLayoutCount != 0) mock.pipelineLayoutSets[*layout].assign(info->pSetLayouts, info->pSetLayouts + info->setLayoutCount);
@@ -3391,6 +3399,8 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreatePipelineLayout(VkDevice, const VkPipeli
 
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineCache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipelines) {
     Require(count == 1, "mock expects a single graphics pipeline");
+    if (graphicsPipelineHook) graphicsPipelineHook(infos[0]);
+    std::lock_guard lock(mockMutex);
     if ((infos[0].flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) != 0) {
         const auto* library = static_cast<const VkGraphicsPipelineLibraryCreateInfoEXT*>(infos[0].pNext);
         Require(library != nullptr && library->sType == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, "missing graphics pipeline library description");
@@ -3403,6 +3413,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineC
 }
 
 VKAPI_ATTR void VKAPI_CALL mockDestroyPipelineLayout(VkDevice, VkPipelineLayout, const VkAllocationCallbacks*) {
+    std::lock_guard lock(mockMutex);
     --mock.live;
 }
 
@@ -3417,12 +3428,14 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyRenderPass(VkDevice, VkRenderPass, const V
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateShaderModule(VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule* module) {
+    std::lock_guard lock(mockMutex);
     *module = makeHandle<VkShaderModule>();
     ++mock.live;
     return VK_SUCCESS;
 }
 
 VKAPI_ATTR void VKAPI_CALL mockDestroyShaderModule(VkDevice, VkShaderModule module, const VkAllocationCallbacks*) {
+    std::lock_guard lock(mockMutex);
     if (module != VK_NULL_HANDLE) --mock.live;
 }
 
@@ -3442,6 +3455,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateComputePipelines(VkDevice, VkPipelineCa
 }
 
 VKAPI_ATTR void VKAPI_CALL mockDestroyPipeline(VkDevice, VkPipeline, const VkAllocationCallbacks*) {
+    std::lock_guard lock(mockMutex);
     --mock.live;
 }
 
@@ -4761,6 +4775,80 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     words.insert(words.end(), declarations.begin(), declarations.end());
     words.insert(words.end(), function.begin(), function.end());
     return words;
+}
+
+void pipelineLibraryConcurrencyTests() {
+    using namespace AgcDriver::Graphics;
+    using namespace std::chrono_literals;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.device = makeHandle<VkDevice>();
+    context.graphicsPipelineLibrary = true;
+    context.pipelineLinkTimeOptimization = false;
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    const State state{};
+    ShaderRecompiler::RecompileResult vertex, first, second;
+    vertex.spirv = makeModule({});
+    first.spirv = makeModule({.fragment = true});
+    second.spirv = makeModule({.fragment = true});
+    vertex.variantId = 301;
+    first.variantId = 302;
+    second.variantId = 303;
+    const std::array<CompiledShader, 2> firstShaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &first, PipelinePushSlotBytes}}};
+    const std::array<CompiledShader, 2> secondShaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &second, PipelinePushSlotBytes}}};
+    std::array<std::uint32_t, 1> mainKey{31}, fragmentKey{32};
+    const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), makeHandle<VkDescriptorSetLayout>(), true, mainKey, fragmentKey};
+    std::mutex gateMutex;
+    std::condition_variable gateSignal;
+    bool armed = false, entered = false, released = false;
+    int fragmentLibraries = 0;
+    graphicsPipelineHook = [&](const VkGraphicsPipelineCreateInfo& info) {
+        if ((info.flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) == 0) return;
+        const auto* library = static_cast<const VkGraphicsPipelineLibraryCreateInfoEXT*>(info.pNext);
+        if (library == nullptr || library->flags != VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) return;
+        std::unique_lock lock(gateMutex);
+        ++fragmentLibraries;
+        if (!armed) return;
+        armed = false;
+        entered = true;
+        gateSignal.notify_all();
+        gateSignal.wait_for(lock, 10s, [&] { return released; });
+    };
+    struct HookReset {
+        ~HookReset() { graphicsPipelineHook = nullptr; }
+    } hookReset;
+    const auto build = [&](std::span<const CompiledShader> shaders) {
+        return std::async(std::launch::async, [&context, &state, &resources, shaders] { const Pipeline pipeline(context, state, VertexInputLayout{}, resources, shaders); });
+    };
+    build(firstShaders).get();
+    {
+        std::lock_guard lock(gateMutex);
+        armed = true;
+    }
+    const auto joinedBefore = PipelineLibraryCountersOf(context.device).joinedParts[FragmentShaderLibraryPart];
+    auto blocked = build(secondShaders);
+    {
+        std::unique_lock lock(gateMutex);
+        Require(gateSignal.wait_for(lock, 5s, [&] { return entered; }), "the first fragment library build did not start");
+    }
+    auto other = build(firstShaders);
+    const bool otherFinished = other.wait_for(5s) == std::future_status::ready;
+    auto duplicate = build(secondShaders);
+    std::this_thread::sleep_for(50ms);
+    const bool duplicateWaited = duplicate.wait_for(0s) != std::future_status::ready;
+    {
+        std::lock_guard lock(gateMutex);
+        released = true;
+    }
+    gateSignal.notify_all();
+    blocked.get();
+    if (otherFinished) other.get();
+    duplicate.get();
+    Require(otherFinished, "a pipeline whose libraries were all built waited for another pipeline's library build");
+    Require(duplicateWaited, "a pipeline needing a library under construction did not wait for that build");
+    Require(fragmentLibraries == 2, "a fragment library under construction was built a second time");
+    Require(PipelineLibraryCountersOf(context.device).joinedParts[FragmentShaderLibraryPart] == joinedBefore + 1, "the joined library build was not counted");
+    ClearCachedPipelines(context.device);
 }
 
 void pipelineLibrarySetTests() {
@@ -6916,6 +7004,7 @@ int main(int argc, char** argv) {
         stateTests();
         retainedPixelStageTests();
         pipelineLibrarySetTests();
+        pipelineLibraryConcurrencyTests();
         hdrComponentSwapTests();
         depthMaintenanceTests();
         hardwareScreenOffsetTests();

@@ -35,6 +35,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreationTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -109,7 +110,7 @@ bool CoreVulkanCapability(std::uint32_t capability) {
 std::atomic<std::uint64_t> computePipelinesCreated{0};
 std::atomic<std::uint64_t> computePipelinesCreatedLocked{0};
 
-void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr) {
+void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr, Graphics::PipelineCreationTrace* trace = nullptr) {
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.flags = flags;
     info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -122,8 +123,11 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     subgroup.requiredSubgroupSize = subgroupSize;
     if (subgroupSize != 0) info.stage.pNext = &subgroup;
     info.layout = layout;
+    if (trace != nullptr) trace->Chain(info);
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
-    check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
+    const auto created = create(device, cache, 1, &info, nullptr, pipeline);
+    if (trace != nullptr) trace->Created(created);
+    check(created, "vkCreateComputePipelines");
     computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
     if (GuestMemory::GpuMutex().HeldByThisThread()) computePipelinesCreatedLocked.fetch_add(1, std::memory_order_relaxed);
 }
@@ -151,6 +155,50 @@ std::size_t PipelineCompileThreads() {
         return count;
     }();
     return threads;
+}
+
+bool PriorityCompileScheduler() {
+    static const bool priority = [] {
+        const char* text = std::getenv("APS5_COMPILE_SCHEDULER");
+        if (text == nullptr || *text == '\0') return false;
+        require(std::string_view(text) == "priority", "APS5_COMPILE_SCHEDULER accepts only priority");
+        require(!LockedPipelines(), "APS5_COMPILE_SCHEDULER=priority cannot build pipelines under the GPU mutex (APS5_LOCKED_PIPELINES)");
+        return true;
+    }();
+    return priority;
+}
+
+bool VerifyCompileJobs() {
+    static const bool verify = std::getenv("APS5_VERIFY_COMPILE_JOBS") != nullptr;
+    return verify;
+}
+
+std::size_t PositiveSetting(const char* name, std::size_t fallback, std::size_t maximum) {
+    const char* text = std::getenv(name);
+    if (text == nullptr || *text == '\0') return fallback;
+    std::size_t value = 0;
+    const auto end = text + std::strlen(text);
+    const auto parsed = std::from_chars(text, end, value);
+    require(parsed.ec == std::errc{} && parsed.ptr == end && value != 0 && value <= maximum, std::string(name) + " must be an integer from 1 through " + std::to_string(maximum));
+    return value;
+}
+
+CompileService::Limits CompileServiceLimits() {
+    CompileService::Limits limits;
+    limits.workers = PositiveSetting("APS5_COMPILE_WORKERS", 2, 16);
+    limits.demandReservedWorkers = limits.workers > 1 ? 1 : 0;
+    limits.budgetBytes = PositiveSetting("APS5_COMPILE_BUDGET_MIB", 2048, 65536) << 20u;
+    return limits;
+}
+
+std::string ComputeJobKey(const PipelineCompileKey& key) {
+    char text[64];
+    std::snprintf(text, sizeof(text), "compute:%016llx:%x", static_cast<unsigned long long>(key.first), key.second);
+    return text;
+}
+
+std::size_t ComputeJobReservation(std::size_t requestBytes, const ShaderRecompiler::RecompileResult& shader) {
+    return requestBytes + shader.spirv.WordCount() * sizeof(std::uint32_t) * 8u;
 }
 
 bool CaptureComputePipeline(std::size_t words) {
@@ -249,6 +297,7 @@ struct ComputePipelineObjects {
     VkShaderModule module = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    std::uint64_t recipe = 0;
     std::atomic<bool> aheadUnused{false};
     ~ComputePipelineObjects() {
         if (pipeline != VK_NULL_HANDLE) destroyPipeline(device, pipeline, nullptr);
@@ -339,6 +388,7 @@ struct VulkanDevice::State {
     bool pipelineLinkTimeOptimization = true;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
+    bool pipelineCreationFeedback = false;
     bool maintenance8 = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool storageImageWithoutFormat = false;
@@ -401,12 +451,55 @@ struct VulkanDevice::State {
     PipelineCompileQueue::Statistics closedCompileQueue;
     bool compileQueueClosed = false;
     std::atomic<std::uint64_t> aheadUseful{0}, aheadJoined{0};
+    std::unique_ptr<CompileService> compileService;
+    CompileService::Statistics closedCompileService;
+    CompileService* Service() {
+        std::lock_guard lock(compileQueueMutex);
+        if (compileQueueClosed) return nullptr;
+        if (compileService == nullptr) {
+            CompileTicket::SetWaitGuard([] { return GuestMemory::GpuMutex().HeldByThisThread(); });
+            compileService = std::make_unique<CompileService>(CompileServiceLimits());
+        }
+        return compileService.get();
+    }
+    std::atomic<std::uint64_t> graphicsBuildsUnderGpuMutex{0};
+    static void RunPipelineBuild(void* owner, std::size_t reservedBytes, const std::function<void()>& build) {
+        auto& compileState = *static_cast<State*>(owner);
+        ShaderCompileTrace::Event event("demand.graphics_build");
+        event.Number("reserved_bytes", reservedBytes);
+        if (GuestMemory::GpuMutex().HeldByThisThread()) {
+            compileState.graphicsBuildsUnderGpuMutex.fetch_add(1, std::memory_order_relaxed);
+            event.Flag("gpu_mutex_held", true);
+            require(!VerifyCompileJobs(), "APS5_VERIFY_COMPILE_JOBS: graphics pipeline compile under the GPU mutex");
+            build();
+            return;
+        }
+        auto* service = compileState.Service();
+        if (service == nullptr) {
+            event.Flag("service_closed", true);
+            build();
+            return;
+        }
+        static std::atomic<std::uint64_t> sequence{0};
+        const auto key = "graphics:" + std::to_string(++sequence);
+        service->RunAndWait(key, reservedBytes, [&](const CompileTicket&) { build(); });
+        service->Forget(key);
+    }
+    std::shared_ptr<ComputePipelineObjects> DemandComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress, bool* created);
     void closeCompileQueue() {
         std::unique_ptr<PipelineCompileQueue> closing;
+        std::unique_ptr<CompileService> closingService;
         {
             std::lock_guard lock(compileQueueMutex);
             compileQueueClosed = true;
             closing = std::move(compileQueue);
+            closingService = std::move(compileService);
+        }
+        if (closingService != nullptr) {
+            closingService->Close();
+            const auto counters = closingService->Counters();
+            std::lock_guard lock(compileQueueMutex);
+            closedCompileService = counters;
         }
         if (closing == nullptr) return;
         closing->Cancel();
@@ -1754,6 +1847,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
         pipelineFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &pipelineFeatures;
+    }
+    if (ShaderCompileTrace::Enabled() && hasExtension(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME)) {
+        state->pipelineCreationFeedback = true;
+        deviceExtensions.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
     VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     if (hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
@@ -3573,6 +3672,11 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
+    context.pipelineCreationFeedback = state->pipelineCreationFeedback;
+    if (PriorityCompileScheduler()) {
+        context.pipelineBuildOwner = state.get();
+        context.pipelineBuildRunner = &State::RunPipelineBuild;
+    }
     context.srgbDecodeFormats = state->srgbDecodeFormats;
     context.sampleLocationSampleCounts = state->sampleLocationSampleCounts;
     context.sampleLocationGridSampleCounts = state->sampleLocationGridSampleCounts;
@@ -3632,7 +3736,10 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
 }
 
 void VulkanDevice::PrewarmDrawPipeline(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) {
-    Graphics::PrewarmPipeline(graphicsContext(), graphics, shaders);
+    ShaderCompileTrace::Event event("demand.graphics_pipeline");
+    event.Flag("gpu_mutex_held", GuestMemory::GpuMutex().HeldByThisThread()).Number("stages", shaders.size());
+    const auto context = graphicsContext();
+    Graphics::PrewarmPipeline(context, graphics, shaders);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const Graphics::ResolvedDraw* resolved) {
@@ -4273,7 +4380,10 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
         std::snprintf(text, sizeof(text), "compute pipeline creation for program 0x%llx (%zu SPIR-V words)", static_cast<unsigned long long>(programAddress), shader.spirv.size());
         return std::string(text);
     });
-    CreateComputePipeline(device, DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization);
+    Graphics::PipelineCreationTrace trace("pipeline.compute", context.pipelineCreationFeedback, 1u);
+    if (trace.Event().Active()) trace.Event().Hex("address", programAddress).Hex("variant", shader.PipelineVariantId()).Number("spirv_words", shader.spirv.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(shader.spirv.Words())).Hex("layout_key", ShaderCompileTrace::HashOf(layoutKey)).Number("specialization_constants", shader.specialization.size()).Flag("gpu_mutex_held", GuestMemory::GpuMutex().HeldByThisThread());
+    CreateComputePipeline(device, DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization, &trace);
+    if (VerifyCompileJobs()) objects->recipe = ComputePipelineRecipeHash(shader, pushStages != 0, layoutKey);
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
     Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
@@ -4282,6 +4392,16 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
 
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::GetComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey, bool ahead, bool* created) {
     if (key.first == 0) return BuildComputePipeline(context, shader, resourcesLayout, pushStages, programAddress, layoutKey);
+    if (!ahead && PriorityCompileScheduler()) {
+        auto objects = DemandComputePipeline(key, context, shader, programAddress, created);
+        if (VerifyCompileJobs()) RequireSameComputeRecipe(objects->recipe, ComputePipelineRecipeHash(shader, pushStages != 0, layoutKey), programAddress);
+        return objects;
+    }
+    std::optional<ShaderCompileTrace::Event> demandEvent;
+    if (!ahead) {
+        demandEvent.emplace("demand.compute_pipeline");
+        demandEvent->Hex("address", programAddress).Hex("variant", key.first).Flag("gpu_mutex_held", GuestMemory::GpuMutex().HeldByThisThread());
+    }
     if (!ahead && PipelineCompileThreads() != 0) {
         std::lock_guard lock(compileQueueMutex);
         if (compileQueue != nullptr) compileQueue->Demand(key);
@@ -4292,6 +4412,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::GetComputePipeline(
         return objects;
     });
     if (created != nullptr) *created = result.created;
+    if (demandEvent.has_value()) demandEvent->Flag("created", result.created).Flag("joined", result.joined);
     if (!ahead && PipelineCompileThreads() != 0) {
         if (result.joined) aheadJoined.fetch_add(1, std::memory_order_relaxed);
         if (result.value->aheadUnused.exchange(false, std::memory_order_relaxed)) aheadUseful.fetch_add(1, std::memory_order_relaxed);
@@ -4303,6 +4424,53 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::FindComputePipeline
     if (key.first == 0) return nullptr;
     auto objects = computePipelines.Find(key);
     if (demand && PipelineCompileThreads() != 0 && objects != nullptr && objects->aheadUnused.exchange(false, std::memory_order_relaxed)) aheadUseful.fetch_add(1, std::memory_order_relaxed);
+    return objects;
+}
+
+std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::DemandComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress, bool* created) {
+    ShaderCompileTrace::Event event("demand.compute_pipeline");
+    event.Hex("address", programAddress).Hex("variant", key.first).Text("scheduler", "priority");
+    if (auto found = computePipelines.Find(key)) {
+        event.Flag("present", true);
+        if (created != nullptr) *created = false;
+        if (found->aheadUnused.exchange(false, std::memory_order_relaxed)) aheadUseful.fetch_add(1, std::memory_order_relaxed);
+        return found;
+    }
+    CompileTicket::RequireWaitAllowed();
+    auto* service = Service();
+    if (service == nullptr) {
+        event.Flag("service_closed", true);
+        const VkShaderStageFlags stages = shader.pushConstants.empty() ? 0u : VK_SHADER_STAGE_COMPUTE_BIT;
+        const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
+        const auto described = Graphics::DescribeSetLayouts(context, shaders);
+        return GetComputePipeline(key, context, shader, described.layouts.main, stages, programAddress, described.mainKey, true, created);
+    }
+    const auto jobKey = ComputeJobKey(key);
+    auto ticket = service->Find(jobKey);
+    if (ticket != nullptr && ticket->State() == CompileState::Ready) {
+        service->Forget(jobKey);
+        ticket = nullptr;
+    }
+    const bool promoted = ticket != nullptr && ticket->State() != CompileState::Cancelled;
+    if (promoted) service->Promote(*ticket, CompilePriority::Demand);
+    else {
+        const auto bytes = ComputePipelineAheadRequest::EstimateBytes(shader);
+        const auto request = ComputePipelineAheadRequest::Capture(shader, bytes);
+        require(request != nullptr, "compute pipeline demand exceeds the request capture bound");
+        ticket = service->Submit(jobKey, CompilePriority::Demand, ComputeJobReservation(bytes, shader), [this, request, context, programAddress](const CompileTicket&) {
+            const VkShaderStageFlags stages = request->pushes ? VK_SHADER_STAGE_COMPUTE_BIT : 0u;
+            const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &request->shader, 0}}};
+            const auto described = Graphics::DescribeSetLayouts(context, shaders);
+            static_cast<void>(GetComputePipeline(ComputePipelineKey(request->shader, stages), context, request->shader, described.layouts.main, stages, programAddress, described.mainKey, true, nullptr));
+        });
+    }
+    event.Flag("promoted", promoted).Number("job_state", static_cast<std::uint64_t>(ticket->State()));
+    ticket->Wait();
+    auto objects = computePipelines.Find(key);
+    require(objects != nullptr, "compute compile job settled ready without publishing its pipeline");
+    if (created != nullptr) *created = !promoted;
+    if (promoted) aheadJoined.fetch_add(1, std::memory_order_relaxed);
+    if (objects->aheadUnused.exchange(false, std::memory_order_relaxed)) aheadUseful.fetch_add(1, std::memory_order_relaxed);
     return objects;
 }
 
@@ -4318,6 +4486,30 @@ void VulkanDevice::BuildComputePipelineAhead(const ShaderRecompiler::RecompileRe
     if (state->FindComputePipeline(key, false) != nullptr) return;
     const auto context = graphicsContext();
     if (pushStages != 0 && context.limits.maxPushConstantsSize < Graphics::ComputePushConstantBytes) return;
+    if (PriorityCompileScheduler()) {
+        auto* service = state->Service();
+        if (service == nullptr) return;
+        const auto jobKey = ComputeJobKey(key);
+        if (const auto existing = service->Find(jobKey); existing != nullptr && existing->State() != CompileState::Cancelled) {
+            if (existing->State() != CompileState::Ready) {
+                service->Promote(*existing, CompilePriority::Upcoming);
+                return;
+            }
+            service->Forget(jobKey);
+        }
+        const auto bytes = ComputePipelineAheadRequest::EstimateBytes(shader);
+        const auto request = ComputePipelineAheadRequest::Capture(shader, bytes);
+        require(request != nullptr, "pipeline compile request exceeded its capture bound");
+        service->Submit(jobKey, CompilePriority::Upcoming, ComputeJobReservation(bytes, shader), [compileState = state.get(), request, context, programAddress](const CompileTicket& ticket) {
+            if (ticket.CancellationRequested()) throw CompileCancelled();
+            const VkShaderStageFlags stages = request->pushes ? VK_SHADER_STAGE_COMPUTE_BIT : 0u;
+            const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &request->shader, 0}}};
+            const auto described = Graphics::DescribeSetLayouts(context, shaders);
+            bool created = false;
+            static_cast<void>(compileState->GetComputePipeline(ComputePipelineKey(request->shader, stages), context, request->shader, described.layouts.main, stages, programAddress, described.mainKey, true, &created));
+        });
+        return;
+    }
     std::lock_guard lock(state->compileQueueMutex);
     if (state->compileQueueClosed) return;
     if (state->compileQueue == nullptr) state->compileQueue = std::make_unique<PipelineCompileQueue>(PipelineCompileThreads());
@@ -4339,6 +4531,10 @@ void VulkanDevice::BuildComputePipelineAhead(const ShaderRecompiler::RecompileRe
 
 VulkanDevice::PipelineAheadStatistics VulkanDevice::PipelineAheadCounters() const {
     std::lock_guard lock(state->compileQueueMutex);
+    if (PriorityCompileScheduler()) {
+        const auto service = state->compileService != nullptr ? state->compileService->Counters() : state->closedCompileService;
+        return {service.submitted, service.ready, 0, service.failed, service.budgetDeferrals, service.deduplicated, service.promoted, service.cancelled, state->aheadUseful.load(std::memory_order_relaxed), state->aheadJoined.load(std::memory_order_relaxed), service.reservedBytes, service.peakReservedBytes, service.queued + service.running};
+    }
     const auto stats = state->compileQueue != nullptr ? state->compileQueue->Counters() : state->closedCompileQueue;
     return {stats.accepted, stats.built, stats.present, stats.failed, stats.refused, stats.duplicate, stats.demanded, stats.cancelled, state->aheadUseful.load(std::memory_order_relaxed), state->aheadJoined.load(std::memory_order_relaxed), stats.retainedBytes, stats.peakBytes, stats.outstanding};
 }

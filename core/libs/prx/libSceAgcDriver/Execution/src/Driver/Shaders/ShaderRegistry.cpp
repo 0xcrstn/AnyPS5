@@ -1,5 +1,6 @@
 #include "prx/libc/include/general/LogMacros.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
+#include "CompileTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SlowReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -1110,7 +1111,7 @@ public:
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
                 const auto sequence = ++submitted;
-                tasks.Push({std::move(task), sequence}, prepared, prepared != nullptr ? prepared->useRank : Queue::Unranked, prepared != nullptr && prepared->demanded.load(), behind);
+                tasks.Push({std::move(task), sequence, ShaderCompileTrace::Clock::now()}, prepared, prepared != nullptr ? prepared->useRank : Queue::Unranked, prepared != nullptr && prepared->demanded.load(), behind);
                 if (awaited) unfinished.insert(sequence);
                 lock.unlock();
                 ready.notify_one();
@@ -1176,7 +1177,11 @@ private:
                 ++pool.running;
             }
             const auto sequence = task.sequence;
-            task.function();
+            {
+                ShaderCompileTrace::Event event("queue.prepare_task");
+                event.Queued(task.enqueued).Text("pool", pool.role);
+                task.function();
+            }
             task = {};
             bool drained = false;
             {
@@ -1196,6 +1201,7 @@ private:
     struct Task {
         std::function<void()> function;
         std::uint64_t sequence = 0;
+        ShaderCompileTrace::Clock::time_point enqueued{};
     };
     using Queue = PreparationQueue<Task>;
 
