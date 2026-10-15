@@ -2,6 +2,7 @@
 #include "BdaTable.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LinearSpace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
 #include <algorithm>
 #include <atomic>
@@ -42,6 +43,7 @@ struct TableEntry {
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
     std::weak_ptr<Buffer> buffer;
     std::uint64_t spaceSerial = 0;
+    std::size_t tableBytes = 0;
 };
 
 struct TableCache {
@@ -180,7 +182,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                     ++cache.hits;
                     ++cache.classes.spaceTables;
                     table = std::move(shared);
-                    tableBytes = table->Size();
+                    tableBytes = it->tableBytes;
                     cache.entries.splice(cache.entries.begin(), cache.entries, it);
                     return;
                 }
@@ -214,7 +216,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                 // same way): the next build of this space binds it by the serial.
                 if (serial != 0) it->spaceSerial = serial;
                 table = std::move(shared);
-                tableBytes = table->Size();
+                tableBytes = it->tableBytes;
                 cache.entries.splice(cache.entries.begin(), cache.entries, it);
                 return;
             }
@@ -222,12 +224,33 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         }
     }
     for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA range ends past the addresses the written-page record can hold");
-    const auto words = ShaderRecompiler::BdaTable::Build(ranges, translation);
-    if (translation != ShaderRecompiler::BdaTable::Translation::Legacy) ShaderRecompiler::BdaTable::Validate(words, translation);
+    namespace Table = ShaderRecompiler::BdaTable;
+    LinearPageCodes codes;
+    VkDeviceAddress linearBase = 0;
+    if (Table::LinearLayout(translation)) {
+        if (const auto window = LinearSpace(context)) {
+            linearBase = window->deviceBase;
+            codes = BuildLinearPageCodes(ranges, linearBase);
+        }
+    }
+    const bool linear = !codes.words.empty();
+    constexpr std::uint64_t PendingBitmap = 4;
+    const Table::LinearSpace space{linearBase + codes.guestLow, codes.guestLow, codes.guestHigh, PendingBitmap, LinearPageShift};
+    auto words = Table::Build(ranges, translation, linear ? &space : nullptr);
     Require(words.size() <= std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t), "BDA table size overflow");
     tableBytes = words.size() * sizeof(std::uint32_t);
+    const auto bitmapBytes = codes.words.size() * sizeof(std::uint32_t);
     Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
-    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, UploadMemoryProperties(context, tableBytes));
+    table = std::make_shared<Buffer>(context, tableBytes + bitmapBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (linear ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u), UploadMemoryProperties(context, tableBytes + bitmapBytes));
+    if (linear) {
+        const auto bitmap = table->DeviceAddress() + tableBytes;
+        const auto at = static_cast<std::size_t>(words[Table::RadixReservedWord]) + Table::LinearBitmapWord;
+        words[at] = static_cast<std::uint32_t>(bitmap);
+        words[at + 1] = static_cast<std::uint32_t>(bitmap >> 32u);
+        WriteUpload(*table, tableBytes, codes.words.data(), bitmapBytes);
+        CountLinearTable(codes);
+    }
+    if (translation != Table::Translation::Legacy) Table::Validate(words, translation);
     WriteUpload(*table, 0, words.data(), tableBytes);
     if (tableCacheEnabled()) {
         std::lock_guard lock(cache.mutex);
@@ -236,7 +259,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.entries.clear();
             cache.device = context.device;
         }
-        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial});
+        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial, tableBytes});
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
 }

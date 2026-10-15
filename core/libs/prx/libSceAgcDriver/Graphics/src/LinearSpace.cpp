@@ -43,7 +43,7 @@ struct Space {
     std::vector<Chunk> chunks;
     std::unordered_map<std::uint64_t, Page> pages;
     std::uint64_t usedPages = 0;
-    std::atomic<std::uint64_t> binds{0}, unbinds{0}, refused{0};
+    std::atomic<std::uint64_t> binds{0}, unbinds{0}, refused{0}, tables{0}, codedPages{0};
 };
 
 Space& Spaces() {
@@ -265,7 +265,16 @@ void ClearLinearSpace(VkDevice device) {
 LinearSpaceCounters LinearSpaceTotals() {
     auto& space = Spaces();
     std::lock_guard lock(space.mutex);
-    return {space.pages.size(), space.usedPages, space.binds.load(std::memory_order_relaxed), space.unbinds.load(std::memory_order_relaxed), space.refused.load(std::memory_order_relaxed)};
+    return {space.pages.size(), space.usedPages, space.binds.load(std::memory_order_relaxed), space.unbinds.load(std::memory_order_relaxed), space.refused.load(std::memory_order_relaxed), space.tables.load(std::memory_order_relaxed), space.codedPages.load(std::memory_order_relaxed)};
+}
+
+void CountLinearTable(const LinearPageCodes& codes) {
+    std::uint64_t pages = 0;
+    for (const auto word : codes.words) {
+        for (std::uint32_t shift = 0; shift < 32u; shift += 2u) pages += ((word >> shift) & 3u) != 0 ? 1u : 0u;
+    }
+    Spaces().tables.fetch_add(1, std::memory_order_relaxed);
+    Spaces().codedPages.fetch_add(pages, std::memory_order_relaxed);
 }
 
 LinearPageCodes BuildLinearPageCodes(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, VkDeviceAddress deviceBase) {

@@ -283,7 +283,7 @@ void reportMirrors() {
     previous = totals;
     static LinearSpaceCounters linearPrevious{};
     const auto linear = LinearSpaceTotals();
-    AgcDriver::ProfilePrint_nid_no_patch("[mirrors] linear address space (APS5_LINEAR_ADDRESS_SPACE): %llu pages bound (%.0f MiB), %llu in use; last 10 s: %llu pages bound, %llu unbound, %llu ranges refused\n", static_cast<unsigned long long>(linear.boundPages), static_cast<double>(linear.boundPages * LinearPageBytes) / 1048576.0, static_cast<unsigned long long>(linear.usedPages), static_cast<unsigned long long>(linear.binds - linearPrevious.binds), static_cast<unsigned long long>(linear.unbinds - linearPrevious.unbinds), static_cast<unsigned long long>(linear.refused - linearPrevious.refused));
+    AgcDriver::ProfilePrint_nid_no_patch("[mirrors] linear address space (APS5_LINEAR_ADDRESS_SPACE): %llu pages bound (%.0f MiB), %llu in use; last 10 s: %llu pages bound, %llu unbound, %llu ranges refused; %llu linear BDA tables built (%llu linear pages)\n", static_cast<unsigned long long>(linear.boundPages), static_cast<double>(linear.boundPages * LinearPageBytes) / 1048576.0, static_cast<unsigned long long>(linear.usedPages), static_cast<unsigned long long>(linear.binds - linearPrevious.binds), static_cast<unsigned long long>(linear.unbinds - linearPrevious.unbinds), static_cast<unsigned long long>(linear.refused - linearPrevious.refused), static_cast<unsigned long long>(linear.tables - linearPrevious.tables), static_cast<unsigned long long>(linear.codedPages - linearPrevious.codedPages));
     linearPrevious = linear;
 }
 
