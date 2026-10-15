@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
+#include "prx/libSceAgcDriver/Execution/include/QueueScheduler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -53,6 +54,8 @@ namespace AgcDriver::DriverDetail {
 class Driver {
 public:
     static Driver& Get();
+    void ParkPacket(ParkedOp op);
+    QueueScheduler& Scheduler() { return queueScheduler; }
     static std::uint64_t GpuMapImportThreads();
     ~Driver();
     void Shutdown();
@@ -403,6 +406,7 @@ private:
     std::atomic<std::uint64_t> packetsDone{0};
 
     std::atomic<std::uint64_t> eventSerial{0};
+    QueueScheduler queueScheduler{QueueScheduler::ConfiguredMode(), QueueScheduler::ConfiguredVerify()};
     alignas(64) std::shared_ptr<ShaderRegistry> shaders = std::make_shared<ShaderRegistry>();
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>> dispatchCache;

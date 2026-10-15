@@ -114,7 +114,16 @@ void Driver::reportWaitChain(std::uint32_t queue) {
     AgcDriver::ProfilePrint_nid_no_patch("[waitchain] queue 0x%x (10 s): waits by source entry %llu, held at submit %llu, history %llu, table %llu, table-late %llu, memory %llu; %llu history matches below the activation floor refused; %llu landings ended on settled writes; blocked %llu waits %.1f ms: %s; unknown producer %llu waits %.1f ms; longest %.1f ms on stamp %llu by queue 0x%x\n",
                                          queue, static_cast<unsigned long long>(stats.bySource[1]), static_cast<unsigned long long>(stats.bySource[2]), static_cast<unsigned long long>(stats.bySource[3]), static_cast<unsigned long long>(stats.bySource[4]), static_cast<unsigned long long>(stats.bySource[5]), static_cast<unsigned long long>(stats.bySource[6]),
                                          static_cast<unsigned long long>(outcomes.belowFloor), static_cast<unsigned long long>(outcomes.landedSettled), static_cast<unsigned long long>(stats.blocked), stats.blockedMs, segments.c_str(), static_cast<unsigned long long>(stats.unknown), stats.unknownMs, stats.longestMs, static_cast<unsigned long long>(stats.longestStamp), stats.longestProducer);
-    if (queue == 0) AgcDriver::ProfilePrint_nid_no_patch("[labels] (10 s) %s\n", Graphics::LabelVersions::TakeReport().c_str());
+    if (queue == 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[labels] (10 s) %s\n", Graphics::LabelVersions::TakeReport().c_str());
+        auto& scheduler = Get().Scheduler();
+        if (scheduler.Active()) {
+            const auto taken = scheduler.Take();
+            constexpr const char* modes[] = {"off", "serial", "dag"};
+            AgcDriver::ProfilePrint_nid_no_patch("[scheduler] (10 s) mode %s%s: %llu turns, %llu handoffs, %.1f ms waiting for a turn, %llu blocked waits released the turn, %llu parks (%llu settled at arm) parked %.1f ms\n", modes[static_cast<std::size_t>(scheduler.Mode())], scheduler.Verifying() ? " verify" : "",
+                                                 static_cast<unsigned long long>(taken.turns), static_cast<unsigned long long>(taken.handoffs), taken.turnWaitMs, static_cast<unsigned long long>(taken.blocks), static_cast<unsigned long long>(taken.parks), static_cast<unsigned long long>(taken.parksSettledAtArm), taken.parkedMs);
+        }
+    }
     stats = ChainStats{};
 }
 

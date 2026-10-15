@@ -195,6 +195,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/MemoryReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ProcessMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/RecordQueue.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/QueueScheduler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DriverHeapTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
@@ -385,6 +386,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_record_queue PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_record_queue PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_queue_scheduler_tests tests/QueueScheduler.cpp Execution/src/QueueScheduler.cpp)
+    target_include_directories(agc_queue_scheduler_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_queue_scheduler_tests PRIVATE libc)
+    configure_windows_unwind(agc_queue_scheduler_tests)
+    add_test(NAME agc_queue_scheduler COMMAND agc_queue_scheduler_tests)
+    set_tests_properties(agc_queue_scheduler PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_queue_scheduler PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

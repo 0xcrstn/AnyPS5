@@ -102,6 +102,7 @@ void Driver::stop() {
     {
         std::lock_guard lock(mutex);
         stopping = true;
+        queueScheduler.Close(std::make_exception_ptr(ProcessShutdown{}));
         eopFlips.clear();
         for (auto& [queue, worker] : workers) {
             worker.pending.clear();
@@ -185,6 +186,11 @@ void Driver::CheckFailure() {
     checkStopping();
 }
 
+void Driver::ParkPacket(ParkedOp op) {
+    require(onWorkerThread(), "only a queue worker parks its packet");
+    queueScheduler.Park(std::move(op));
+}
+
 void Driver::ReportFailure(std::exception_ptr error) {
     require(error != nullptr, "null asynchronous failure");
     bool first = false;
@@ -193,6 +199,7 @@ void Driver::ReportFailure(std::exception_ptr error) {
         first = !failure;
         if (first) failure = error;
         failed.store(true, std::memory_order_release);
+        queueScheduler.Close(error);
         for (const auto& [handle, output] : outputs) output->Fail(failure);
         for (auto& [queue, worker] : workers) {
             for (const auto& item : worker.pending) {

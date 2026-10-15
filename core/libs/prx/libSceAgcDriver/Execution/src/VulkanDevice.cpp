@@ -2073,10 +2073,13 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // part of it (the store's stamp then makes the unit stale); the deferred label paths call no
     // FlushPending of their own.
     if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    const std::array<Coherence::Interval, 1> labelRange{{{address, address + bytes.size()}}};
+    auto labelToken = Coherence::Reserve(Coherence::Producer::LabelStore, labelRange, false, queue);
     if (behindWriteBacks) {
         if (drain) return 2;
         GuestMemory::MarkWritten(address, bytes.size());
         recorder.AfterCompletions(address, bytes, stamp, queue, false);
+        labelToken.Recorded();
         return 5;
     }
     const auto context = graphicsContext();
@@ -2110,12 +2113,14 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         // Commands() opened the batch the store went into, so the completion is appended to that
         // batch and runs at its reap, after the write-backs of every batch before it.
         recorder.AfterCompletions(address, bytes, stamp, queue, true);
+        labelToken.Recorded();
         return 5;
     }
     recordStore();
     // The table entry and the label's own pending-write note (Recorder::NoteLabel).
     recorder.NoteLabel(address, bytes, stamp, queue);
     GuestMemory::MarkWritten(address, bytes.size());
+    labelToken.Recorded();
     // No submit per label: the batch goes out at the queue worker's next non-label packet, at a
     // wait on its range, after APS5_LABEL_FLUSH_US, or at the submission's end (Driver.cpp).
     // Debug aid: APS5_LABEL_SUBMIT_NOW=1 submits every label at once, as before.

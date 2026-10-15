@@ -201,6 +201,21 @@ Three switches take `0` (the default), `1` or `verify`; any other value stops th
 
 `APS5_COHERENCE_DIRECTORY=1` makes those checks compare guest bytes by the memory backing them, so a write through one mapping and a store through another mapping of the same memory are compared. `verify` also stops the title when a writer completes after its range was mapped to other memory. This switch is Windows only; on other systems it stops the title at start.
 
+### GPU queue waits and scheduling
+
+A `WAIT_REG_MEM` on one queue may be satisfied by a label another queue recorded but the GPU has not stored yet. Only labels recorded after the wait became active count: after the waiting queue's previous wait, not merely after its submission arrived. `APS5_WAIT_FLOOR=submission` restores the older, looser rule for comparison. `APS5_VERIFY_WAIT_OBSERVATIONS=1` stops the title when a wait is satisfied by a value it could not have observed.
+
+With `APS5_COHERENCE_ORDERING=1` or `verify`, a label also waits behind the write-backs its batch still owes, so a title's own CPU loads never see a label before the results it releases. `APS5_LABEL_PUBLICATION=ordered` or `early` names the same choice; a value that contradicts `APS5_COHERENCE_ORDERING` stops the title.
+
+`APS5_TRACE_WAIT_CHAIN=1` (also on with `APS5_PROFILE_DRAW`) prints a `[waitchain]` line per queue every 10 s. The line splits the time each blocked wait spent into: producer label not recorded yet, recorded but not submitted, submitted but not finished on the GPU, finished but not stored for the CPU, and stored but not seen yet. A `[labels]` line gives the same latencies over all labels. Slow-wait reports name the label that satisfied the wait.
+
+`APS5_QUEUE_SCHEDULER` chooses how the GPU queues' workers take turns:
+- `off` (the default) runs them as before.
+- `serial` runs one packet at a time across all queues; the oldest runnable submission goes next, and a queue waiting on a label gives up its turn. It is a reference for comparing results, not a fast mode.
+- `dag` runs the queues concurrently, as `off` does, and lets a packet whose shader is still compiling wait without holding any lock.
+
+`APS5_QUEUE_SCHEDULER_VERIFY=1` stops the title when a queue runs a packet out of order or while it is waiting for a compile. A `[scheduler]` line every 10 s counts turns, hand-overs and parked packets.
+
 ### Tracing system library calls
 
 Windows only. An executable converted with `--trace-imports` records the calls it makes to the libraries named in `APS5_TRACE_CALLS`, a comma-separated list such as `libkernel,libSceSaveData`, or `all`. Without the variable nothing is recorded. The crash and abort reports then end with the last 64 calls: sequence number, thread, library, import name as the executable imports it (a NID) and the caller's address. They are followed by the 32 most called imports since start-up, with their number of calls.
