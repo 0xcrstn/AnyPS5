@@ -13,6 +13,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     static const bool ownLock = std::getenv("APS5_LABEL_OWN_LOCK") != nullptr;
     static std::atomic<std::uint64_t> packetFlushes{0}, deadlineFlushes{0}, capFlushes{0}, boundaryReaps{0}, overdueLocks{0}, agedSubmits{0}, agedSubmitUs{0}, agedSubmitMaxUs{0}, cappedAgedSubmits{0}, cappedAgedSubmitUs{0};
     auto& deferred = deferredLabels();
+    if (!deferred.labels.empty() && LabelRecordJobs() && (!labelPacket || std::chrono::steady_clock::now() - deferred.since >= labelFlushDeadline())) freezeLabels(queue, false);
     const bool queued = !deferred.labels.empty();
     const bool queuedTable = queued && QueuedLabelTable();
     if (queuedTable) noteQueuedLabels(queue);
