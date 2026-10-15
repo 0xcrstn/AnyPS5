@@ -905,7 +905,6 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
         PendingWriteTests(fixture);
         GpuReadTests(fixture);
         DeviceTwinTests(fixture);
-        InPlaceTests(fixture);
         DisabledTests(fixture);
         EpochDirtySetTests(fixture);
     }
@@ -927,6 +926,11 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
         Fixture fixture(context, std::size_t{1} << 20u);
         Require(fixture.Ready(), "the recycle fixture lost its host import");
         RecycleTests(fixture);
+    }
+    {
+        Fixture fixture(context, std::size_t{1} << 20u);
+        Require(fixture.Ready(), "the in-place input fixture lost its host import");
+        InPlaceTests(fixture);
     }
     std::cout << "draw snapshot arena tests passed\n";
     return true;
