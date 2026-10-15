@@ -443,6 +443,10 @@ std::size_t GuestArenaBackingRuns_nid_postfix(std::uintptr_t address, std::size_
     return WindowsMappings::Get().BackingRuns(address, bytes, begins, ends, canonicals, capacity);
 }
 
+std::size_t GuestArenaAliasRanges_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uintptr_t* begins, std::uintptr_t* ends, std::size_t capacity) {
+    return WindowsMappings::Get().AliasRanges(address, bytes, begins, ends, capacity);
+}
+
 void GuestArenaSetResolveHostWrites_nid_postfix(bool resolve) {
     WindowsMappings::Get().SetResolveHostWrites(resolve);
 }
@@ -455,6 +459,10 @@ void GuestArenaSetResolverBypass_nid_postfix(bool (*bypass)()) {
     WindowsMappings::Get().SetResolverBypass(bypass);
 }
 #else
+std::size_t GuestArenaAliasRanges_nid_postfix(std::uintptr_t, std::size_t, std::uintptr_t*, std::uintptr_t*, std::size_t) {
+    return 0;
+}
+
 std::size_t GuestArenaBackingRuns_nid_postfix(std::uintptr_t, std::size_t, std::uintptr_t*, std::uintptr_t*, std::uint64_t*, std::size_t) {
     throw std::runtime_error("canonical guest backing identities are not implemented on this platform");
 }

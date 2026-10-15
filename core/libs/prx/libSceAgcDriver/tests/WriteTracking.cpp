@@ -234,6 +234,30 @@ void CheckNewestStamp() {
 }
 
 #ifdef _WIN32
+void CheckAliasStamps() {
+    constexpr std::size_t bytes = Block;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot create the aliased backing");
+    auto* first = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+    auto* second = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
+    Require(first != nullptr && second != nullptr, "cannot allocate the aliased addresses");
+    GuestArena::GuestArenaMap_nid_postfix(first, bytes, section, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(second, bytes, section, 0, PAGE_READWRITE);
+    CloseHandle(section);
+    const auto a = reinterpret_cast<std::uint64_t>(first);
+    const auto b = reinterpret_cast<std::uint64_t>(second);
+    std::memset(first, 0x11, bytes);
+    CollectWritesUncached(a, bytes);
+    const auto synced = CollectWritesUncached(b, bytes);
+    Require(synced != 0 && UnchangedSince(b + 64, 32, synced), "the second mapping did not collect clean");
+    Require(MarkWritten(a + 64, 32) != 0, "a driver store through the first mapping was not stamped");
+    Require(WrittenSince(b + 64, 32, synced) && StoredOver(b + 64, 32, synced), "a driver store through one mapping did not stamp the other mapping of the same pages");
+    GuestArena::GuestArenaReset_nid_postfix(second, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(second, bytes);
+    GuestArena::GuestArenaReset_nid_postfix(first, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(first, bytes);
+}
+
 void CheckDeferredSharedImports() {
     constexpr std::size_t bytes = 4 * Block;
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
@@ -1115,6 +1139,9 @@ int main() {
         }
 #endif
         CheckSharedBlock();
+#ifdef _WIN32
+        CheckAliasStamps();
+#endif
         CheckOwnStore();
         CheckSharedDriverStoreLog();
         CheckCollectEpochSharing();
