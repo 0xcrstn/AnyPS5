@@ -74,6 +74,7 @@ struct PreparedShaders : PreparedShaderState {
     std::uint64_t useRank = std::numeric_limits<std::uint64_t>::max();
     bool pending = false;
     bool partialGroupsPending = false;
+    bool partialGroupsDeferred = false;
 };
 
 struct RegisteredShaderState {
@@ -116,6 +117,7 @@ std::optional<ShaderRecompiler::ShaderFloatMode> DispatchFloatMode(const ShaderS
 std::shared_ptr<const ShaderSnapshot> RegisteredHeader(const ShaderRegistry& registry, const Shader* shader);
 std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& registry, std::uint64_t address, std::initializer_list<std::uint8_t> types);
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot);
+std::uint64_t PartialGroupKey(std::span<const std::uint32_t> code);
 void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared = nullptr, bool behind = false);
 void PrioritizeRegistrationPreparation(PreparedShaders& prepared);
 void AwaitRegistrationPreparation();
