@@ -3660,6 +3660,23 @@ void EncodeDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (profile) reportParallelResolve();
 }
 
+namespace {
+
+bool PrecollectOnWorkers() {
+    static const bool enabled = [] {
+        if (std::getenv("APS5_PRECOLLECT_ON_WORKERS") == nullptr) return false;
+        if (!GuestMemory::CollectCoverageEnabled()) {
+            std::fprintf(stderr, "[parallel-resolve] APS5_PRECOLLECT_ON_WORKERS ignored: it needs APS5_COLLECT_COVERAGE
+");
+            return false;
+        }
+        return true;
+    }();
+    return enabled;
+}
+
+}
+
 std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
     const auto start = std::chrono::steady_clock::now();
     auto resolved = std::make_shared<ResolvedDraw>();
@@ -3746,6 +3763,16 @@ std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const St
             }
         }
         if (ParallelTargetsRequested()) resolveTargets(context, state, *resolved);
+        if (PrecollectOnWorkers()) {
+            for (const auto& color : state.colors) {
+                if (color.address != 0 && color.bytes != 0) static_cast<void>(GuestMemory::CollectWrites(color.address, color.bytes));
+            }
+            if (resolved->resources != nullptr) {
+                for (const auto& [begin, end] : resolved->resources->InPlaceReads()) {
+                    if (end > begin) static_cast<void>(GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin)));
+                }
+            }
+        }
     }
     counters.inputRefusals[static_cast<std::size_t>(resolved->inputsRefusal)].fetch_add(1, std::memory_order_relaxed);
     counters.resourceRefusals[static_cast<std::size_t>(resolved->resourcesRefusal)].fetch_add(1, std::memory_order_relaxed);

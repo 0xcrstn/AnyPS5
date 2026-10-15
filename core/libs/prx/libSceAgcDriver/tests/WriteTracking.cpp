@@ -153,6 +153,31 @@ void CheckSharedDriverStoreLog() {
     Require(DriverStoresSinceSequence(DriverStoreSequence(), stored) == DriverStoredSince::No, "a driver store is reported again after the sequence it was made under");
 }
 
+void CheckCollectEpochSharing() {
+    void* memory = AllocateWatched(4 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 4 * Block);
+    BumpCollectEpoch();
+    const auto epoch = CollectEpoch();
+    const auto first = CollectWrites(base, Block);
+    const auto second = CollectWrites(base + Block, Block);
+    Require(first != 0 && second != 0, "the epoch-shared ranges are not collected");
+    std::uint64_t inside = 0;
+    std::thread reader([&] {
+        const auto previous = ExchangeCollectEpoch(epoch);
+        inside = CollectWrites(base + Block / 2, Block);
+        ExchangeCollectEpoch(previous);
+    });
+    reader.join();
+    Require(inside != 0, "a range inside two ranges collected in the same epoch on another thread is not answered");
+    const auto before = TrackerGeneration();
+    static_cast<volatile std::uint8_t*>(memory)[Block + 64] = 0x22;
+    BumpCollectEpoch();
+    CollectWrites(base + Block, Block);
+    Require(!UnchangedSince(base + Block, Block, before), "a CPU store is not seen by the first collect of the next epoch");
+    Require(UnchangedSince(base + 2 * Block, Block, CollectWrites(base + 2 * Block, Block)), "an untouched range is reported written");
+}
+
 void CheckUnwatch() {
     void* memory = AllocateWatched(3 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -1092,6 +1117,7 @@ int main() {
         CheckSharedBlock();
         CheckOwnStore();
         CheckSharedDriverStoreLog();
+        CheckCollectEpochSharing();
         CheckUnwatch();
         CheckNewestStamp();
         CheckEpochDirtySet();
