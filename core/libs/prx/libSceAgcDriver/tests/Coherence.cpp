@@ -196,6 +196,9 @@ void ReleaseTests() {
     Require(CurrentCounters().undrainedReleases == 1, "a release ahead of owed write-backs was not counted");
     Reset(Mode::Reference, Mode::Verify);
     Require(Throws([] { CheckDrained(false, false, "label", false); }).find("write-backs still owed") != std::string::npos, "ordering verify accepted a release ahead of owed write-backs");
+    Reset(Mode::Verify, Mode::Reference);
+    Require(Throws([] { CheckDrained(false, false, "label", false); }).find("write-backs still owed") != std::string::npos, "audit verify accepted a release ahead of owed write-backs on the reference path");
+    Require(Throws([] { CheckDrained(true, true, "label", true); }).empty(), "audit verify failed the reference path's undrained images, which only ordering verify checks");
 }
 
 void LifetimeTests() {

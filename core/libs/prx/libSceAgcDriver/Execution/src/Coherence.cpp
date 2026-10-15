@@ -497,7 +497,7 @@ void CheckDrained(bool pendingImages, bool liveShadows, const char* where, bool 
         Note(state, EventType::Undrained, 0, 0, CurrentVersion(), 0, {0, ~std::uint64_t{0}}, where);
         char text[192];
         std::snprintf(text, sizeof(text), "[coherence] release at %s is CPU-visible ahead of guest write-backs still owed", where != nullptr ? where : "?");
-        Divergence(state, text, {}, OrderingMode() == Mode::Verify, state.releasesReported);
+        Divergence(state, text, {}, Verifying(), state.releasesReported);
     }
     if (!Tracking() || (!pendingImages && !liveShadows)) return;
     auto& state = Directory();
