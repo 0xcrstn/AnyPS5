@@ -10279,6 +10279,30 @@ int pipelineCacheFileTests(const Device& device) {
     }
     Require(contents(path) == stored, "an object that added no pipelines rewrote the cache file");
     {
+        std::filesystem::remove_all(directory);
+        {
+            PipelineCache seeded(context, properties);
+            build(seeded.Handle(), 0);
+        }
+        const auto seededFile = contents(cacheFile());
+        PipelineCache busy(context, properties);
+        build(busy.Handle(), 1);
+        {
+            const auto creating = busy.Synchronization().LockForPipelineUse();
+            const auto started = std::chrono::steady_clock::now();
+            bool saved = true;
+            std::thread saving([&] { saved = busy.TrySave(); });
+            saving.join();
+            Require(!saved, "a periodic save took its snapshot while a pipeline was being created");
+            Require(std::chrono::steady_clock::now() - started < std::chrono::seconds(2), "a periodic save waited for a pipeline creation instead of deferring");
+            const auto other = busy.Synchronization().LockForPipelineUse();
+        }
+        Require(contents(cacheFile()) == seededFile, "a deferred periodic save wrote the cache file");
+        Require(busy.TrySave(), "a periodic save deferred with no pipeline being created");
+        PipelineCache merged(context, properties);
+        Require(holds(merged.Handle(), 0) && holds(merged.Handle(), 1), "a periodic save did not merge the live cache with the file");
+    }
+    {
         std::ofstream corrupt(path, std::ios::binary | std::ios::trunc);
         corrupt << "not a pipeline cache";
     }
