@@ -286,6 +286,8 @@ public:
     bool DispatchEffectsKnown() const { return tableStages.empty() && !guestMemory.HasCopiedWrites() && !HasPlacements(); }
     bool WritesThroughPointers() const { return usesBda && !bdaReadOnly; }
     void UseMirrors(Recorder& recorder) const;
+    void UseMirrors(Recorder& recorder, std::span<const std::size_t> movedAllocations) const;
+    static void LeaseInPlaceReads(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads);
     void RecordPlacementCopyBack(Recorder& recorder, VkCommandBuffer commands) const;
     void PublishResidentReads(Recorder& recorder) const;
     void RefreshAddressUse() const;
@@ -438,6 +440,7 @@ private:
         std::int64_t dataAllocation = -1;
         std::uint32_t dataByte = 0;
         std::optional<ReadAnalysis> readAnalysis;
+        std::shared_ptr<ResidentMirror> mirror;
     };
     struct DataPatch {
         std::size_t allocation;

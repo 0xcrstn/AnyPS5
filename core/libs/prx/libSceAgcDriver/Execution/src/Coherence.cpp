@@ -76,8 +76,8 @@ struct State {
 };
 
 State& Directory() {
-    static State state;
-    return state;
+    static auto* state = new State;
+    return *state;
 }
 
 std::atomic<Version> versions{0};
@@ -111,6 +111,7 @@ struct Ledger {
     std::uint64_t protections = 0;
     std::uint64_t leases = 0;
     std::uint64_t leaseWaits = 0;
+    std::uint64_t driverReleases = 0;
     std::map<std::uint64_t, std::shared_ptr<struct Resolution>> resolving;
     std::condition_variable settled;
     FaultPriority priority = nullptr;
@@ -121,8 +122,8 @@ struct Ledger {
 };
 
 Ledger& Protections() {
-    static Ledger ledger;
-    return ledger;
+    static auto* ledger = new Ledger;
+    return *ledger;
 }
 
 struct ResolverContext {
@@ -186,7 +187,7 @@ bool ResolveProtection(std::uint64_t token, void* context) {
         }
         ledger.settled.notify_all();
     };
-    if (live) {
+    if (live && driverAccessDepth == 0) {
         auto resolution = std::make_shared<Resolution>();
         resolution->range = range;
         resolution->materializer = materializer;
@@ -212,6 +213,30 @@ bool ResolveProtection(std::uint64_t token, void* context) {
         }
         materialize(*resolution);
         finish(resolution);
+        return true;
+    }
+    if (driverAccessDepth != 0) {
+        std::vector<std::uint64_t> released{token};
+        {
+            std::lock_guard lock(ledger.mutex);
+            if (live) {
+                for (auto it = ledger.live.begin(); it != ledger.live.end();) {
+                    if (it->first == id || (it->second.token != 0 && it->second.range.begin < range.end && range.begin < it->second.range.end)) {
+                        if (it->second.token != 0 && it->second.token != token) released.push_back(it->second.token);
+                        it = ledger.live.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                ++ledger.driverReleases;
+            } else if (const auto found = ledger.resolving.find(token); found != ledger.resolving.end()) {
+                released = found->second->tokens;
+                ++ledger.driverReleases;
+            }
+        }
+        if (backend.release != nullptr) {
+            for (const auto held : released) backend.release(held);
+        }
         return true;
     }
     std::shared_ptr<Resolution> pending;
@@ -919,6 +944,7 @@ Counters CurrentCounters() {
     counters.liveProtections = ledger.live.size();
     counters.leases = ledger.leases;
     counters.leaseWaits = ledger.leaseWaits;
+    counters.driverReleases = ledger.driverReleases;
     return counters;
 }
 
@@ -927,7 +953,7 @@ std::string Report() {
     char text[768];
     std::snprintf(text, sizeof(text), "[coherence] reservations %llu, completions %llu, abandoned %llu, active %llu, publications checked %llu, stale publications %llu, stale reads %llu, undrained releases %llu, remapped completions %llu, committed %llu, evicted %llu", static_cast<unsigned long long>(c.reservations), static_cast<unsigned long long>(c.completions), static_cast<unsigned long long>(c.abandoned), static_cast<unsigned long long>(c.activeWriters), static_cast<unsigned long long>(c.publicationsChecked), static_cast<unsigned long long>(c.stalePublications), static_cast<unsigned long long>(c.staleReads), static_cast<unsigned long long>(c.undrainedReleases), static_cast<unsigned long long>(c.remappedCompletions), static_cast<unsigned long long>(c.committedIntervals), static_cast<unsigned long long>(c.evictedIntervals));
     std::string line = text;
-    std::snprintf(text, sizeof(text), "; protections %llu (refused %llu, partial %llu, live %llu), faults resolved %llu, locked faults %llu, leases %llu, lease waits %llu, uncovered releases %llu", static_cast<unsigned long long>(c.protections), static_cast<unsigned long long>(c.refusedProtections), static_cast<unsigned long long>(c.partialProtections), static_cast<unsigned long long>(c.liveProtections), static_cast<unsigned long long>(c.faultsResolved), static_cast<unsigned long long>(c.lockedFaults), static_cast<unsigned long long>(c.leases), static_cast<unsigned long long>(c.leaseWaits), static_cast<unsigned long long>(c.uncoveredReleases));
+    std::snprintf(text, sizeof(text), "; protections %llu (refused %llu, partial %llu, live %llu), faults resolved %llu, locked faults %llu, leases %llu, lease waits %llu, driver releases %llu, uncovered releases %llu", static_cast<unsigned long long>(c.protections), static_cast<unsigned long long>(c.refusedProtections), static_cast<unsigned long long>(c.partialProtections), static_cast<unsigned long long>(c.liveProtections), static_cast<unsigned long long>(c.faultsResolved), static_cast<unsigned long long>(c.lockedFaults), static_cast<unsigned long long>(c.leases), static_cast<unsigned long long>(c.leaseWaits), static_cast<unsigned long long>(c.driverReleases), static_cast<unsigned long long>(c.uncoveredReleases));
     line += text;
     return line;
 }
@@ -963,6 +989,7 @@ void ResetForTests() {
     ledger.locked = 0;
     ledger.leases = 0;
     ledger.leaseWaits = 0;
+    ledger.driverReleases = 0;
 }
 
 }

@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/LogMacros.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
 #include "CompileTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -1164,6 +1165,7 @@ private:
     }
 
     static void* Main(void* argument) {
+        const Coherence::DriverAccessScope driverAccess;
         auto& pool = *static_cast<RegistrationPreparePool*>(argument);
         NameHostThread(pool.role);
         LowerPreparationThreadPriority(pool.role);

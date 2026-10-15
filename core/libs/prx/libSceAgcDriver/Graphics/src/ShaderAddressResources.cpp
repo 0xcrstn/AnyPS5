@@ -53,6 +53,21 @@ bool ShaderResources::HasPlacements() const {
     return bda != nullptr && bda->HasPlacements();
 }
 
+void ShaderResources::UseMirrors(Recorder& recorder, std::span<const std::size_t> movedAllocations) const {
+    if (movedAllocations.empty()) {
+        UseMirrors(recorder);
+        return;
+    }
+    if (bda != nullptr) Graphics::UseMirrors(recorder, bda->Mirrors());
+    std::vector<std::shared_ptr<ResidentMirror>> used;
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& mirror = allocations[index].mirror;
+        if (mirror == nullptr || std::find(movedAllocations.begin(), movedAllocations.end(), index) != movedAllocations.end()) continue;
+        if (std::find(used.begin(), used.end(), mirror) == used.end()) used.push_back(mirror);
+    }
+    if (!used.empty()) Graphics::UseMirrors(recorder, used);
+}
+
 void ShaderResources::RecordPlacementCopyBack(Recorder&, VkCommandBuffer commands) const {
     if (bda == nullptr || !bda->HasPlacements()) return;
     bda->RecordPlacementCopyBack(context, commands);
@@ -74,7 +89,14 @@ void ShaderResources::RefreshMirrorsForDirectUse(Recorder& recorder) const {
 }
 
 VkDescriptorBufferInfo ShaderResources::descriptor(Allocation& allocation) {
-    if (allocation.guest) return allocation.written ? guestMemory.Descriptor(allocation.address, allocation.size, allocation.adjustment) : guestMemory.MirroredDescriptor(allocation.address, allocation.size, allocation.adjustment, bufferMirrors);
+    if (allocation.guest) {
+        allocation.mirror = nullptr;
+        if (allocation.written) return guestMemory.Descriptor(allocation.address, allocation.size, allocation.adjustment);
+        const auto info = guestMemory.MirroredDescriptor(allocation.address, allocation.size, allocation.adjustment, bufferMirrors);
+        const auto found = std::find_if(bufferMirrors.begin(), bufferMirrors.end(), [&](const std::shared_ptr<ResidentMirror>& mirror) { return MirrorBuffer(*mirror) == info.buffer; });
+        if (found != bufferMirrors.end()) allocation.mirror = *found;
+        return info;
+    }
     if (allocation.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
         Require(context.emptyBuffer != VK_NULL_HANDLE, "no placeholder buffer for a null V#");
         return {context.emptyBuffer, 0, allocation.size};

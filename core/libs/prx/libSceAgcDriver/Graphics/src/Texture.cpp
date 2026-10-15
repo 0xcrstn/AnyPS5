@@ -1486,7 +1486,14 @@ struct PointerWriterEntry {
     std::uint64_t id;
     std::uint64_t epoch;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> heaps;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
 };
+
+bool SortedOverlaps(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t begin, std::uint64_t end) {
+    const auto it = std::upper_bound(ranges.begin(), ranges.end(), begin, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& range) { return value < range.first; });
+    if (it != ranges.begin() && std::prev(it)->second > begin) return true;
+    return it != ranges.end() && it->first < end;
+}
 
 struct PointerWriterRegistry {
     std::mutex mutex;
@@ -1497,12 +1504,12 @@ struct PointerWriterRegistry {
 };
 
 PointerWriterRegistry& PointerWriters() {
-    static PointerWriterRegistry registry;
-    return registry;
+    static auto* registry = new PointerWriterRegistry;
+    return *registry;
 }
 
 struct PointerStoreCounters {
-    std::atomic<std::uint64_t> deferred{0}, synced{0}, exposed{0};
+    std::atomic<std::uint64_t> deferred{0}, synced{0}, exposed{0}, readWaits{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -1516,7 +1523,7 @@ void ReportPointerStores() {
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = stats.lastReport.load(std::memory_order_relaxed);
     if (now - last < 10000 || !stats.lastReport.compare_exchange_strong(last, now)) return;
-    std::fprintf(stderr, "[pointer-stores] 10 s: deferred %llu image stores behind pointer writers, synced %llu write-backs behind them, %llu pointer builds with pending images over their heaps\n", static_cast<unsigned long long>(stats.deferred.exchange(0)), static_cast<unsigned long long>(stats.synced.exchange(0)), static_cast<unsigned long long>(stats.exposed.exchange(0)));
+    std::fprintf(stderr, "[pointer-stores] 10 s: deferred %llu image stores behind pointer writers, synced %llu write-backs behind them, %llu driver reads waited for a pointer writer, %llu pointer builds with pending images over their heaps\n", static_cast<unsigned long long>(stats.deferred.exchange(0)), static_cast<unsigned long long>(stats.synced.exchange(0)), static_cast<unsigned long long>(stats.readWaits.exchange(0)), static_cast<unsigned long long>(stats.exposed.exchange(0)));
 }
 
 bool DeferrableStore(const char* reason) {
@@ -3918,14 +3925,16 @@ bool StorageTexture::DeferredPointerStores() {
     return PointerStoreMode() != PointerStores::Eager;
 }
 
-std::uint64_t StorageTexture::NotePointerWriter(std::span<const std::pair<std::uint64_t, std::uint64_t>> heaps) {
+std::uint64_t StorageTexture::NotePointerWriter(std::span<const std::pair<std::uint64_t, std::uint64_t>> heaps, std::span<const std::pair<std::uint64_t, std::uint64_t>> hostWritable) {
     auto& registry = PointerWriters();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> sorted(heaps.begin(), heaps.end());
     std::sort(sorted.begin(), sorted.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writable(hostWritable.begin(), hostWritable.end());
+    std::sort(writable.begin(), writable.end());
     std::lock_guard lock(registry.mutex);
     const auto id = ++registry.next;
     const auto epoch = registry.epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
-    registry.live.push_back({id, epoch, std::move(sorted)});
+    registry.live.push_back({id, epoch, std::move(sorted), std::move(writable)});
     registry.count.store(registry.live.size(), std::memory_order_release);
     return id;
 }
@@ -3936,6 +3945,19 @@ void StorageTexture::RetirePointerWriter(std::uint64_t writer) {
     std::lock_guard lock(registry.mutex);
     std::erase_if(registry.live, [&](const PointerWriterEntry& entry) { return entry.id == writer; });
     registry.count.store(registry.live.size(), std::memory_order_release);
+}
+
+bool StorageTexture::PointerWriterReaches(std::uint64_t address, std::size_t bytes) {
+    auto& registry = PointerWriters();
+    if (registry.count.load(std::memory_order_acquire) == 0 || bytes == 0) return false;
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    std::lock_guard lock(registry.mutex);
+    return std::any_of(registry.live.begin(), registry.live.end(), [&](const PointerWriterEntry& entry) { return SortedOverlaps(entry.writable, address, end); });
+}
+
+void StorageTexture::NotePointerReadWait() {
+    PointerStoreStats().readWaits.fetch_add(1, std::memory_order_relaxed);
+    ReportPointerStores();
 }
 
 bool StorageTexture::behindPointerWriter() const {

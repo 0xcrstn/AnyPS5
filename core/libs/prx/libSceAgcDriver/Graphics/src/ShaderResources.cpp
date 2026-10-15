@@ -5643,6 +5643,17 @@ void ShaderResources::WriteBack() {
     }
 }
 
+void ShaderResources::LeaseInPlaceReads(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads) {
+    if (!Coherence::InputLeases()) return;
+    std::vector<std::uint64_t> leases;
+    for (const auto& [begin, end] : reads) {
+        if (const auto lease = Coherence::AcquireReadLease({begin, end}, Coherence::CurrentVersion()); lease != 0) leases.push_back(lease);
+    }
+    if (!leases.empty()) recorder.OnCompleteWithoutGuestAccess([leases] {
+        for (const auto lease : leases) Coherence::RetireReadLease(lease);
+    });
+}
+
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
@@ -5654,33 +5665,30 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     } else {
         recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
     }
-    if (Coherence::InputLeases() && kind == Recorder::ReadKind::DispatchElement) {
-        std::vector<std::uint64_t> leases;
-        for (const auto& [begin, end] : guestMemory.InPlaceReads()) {
-            if (const auto lease = Coherence::AcquireReadLease({begin, end}, Coherence::CurrentVersion()); lease != 0) leases.push_back(lease);
-        }
-        if (!leases.empty()) recorder.OnCompleteWithoutGuestAccess([leases] {
-            for (const auto lease : leases) Coherence::RetireReadLease(lease);
-        });
-    }
+    if (kind == Recorder::ReadKind::DispatchElement) LeaseInPlaceReads(recorder, guestMemory.InPlaceReads());
     if (usesBda && !bdaReadOnly) {
         guestMemory.ForgetPointerShadows();
         guestMemory.PointerRecorded();
-        if (StorageTexture::DeferredPointerStores()) {
-            StorageTexture::RetirePointerWriter(std::exchange(pointerWriter, 0));
-            pointerWriter = StorageTexture::NotePointerWriter(guestMemory.PointerHeaps());
-        }
         if (Coherence::Ordering()) recorder.NotePendingWrites(guestMemory.PointerHeaps());
         const auto placed = bda != nullptr ? bda->PlacedIntervals() : std::span<const std::pair<std::uint64_t, std::uint64_t>>{};
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> hostWritable;
         for (const auto& [begin, end] : guestMemory.PointerHeaps()) {
             auto cursor = begin;
             for (const auto& [placedBegin, placedEnd] : placed) {
                 if (placedEnd <= cursor || placedBegin >= end) continue;
-                if (placedBegin > cursor) NotePointerWrite(recorder, cursor, placedBegin);
+                if (placedBegin > cursor) {
+                    NotePointerWrite(recorder, cursor, placedBegin);
+                    hostWritable.emplace_back(cursor, placedBegin);
+                }
                 cursor = std::max(cursor, placedEnd);
             }
-            if (cursor < end) NotePointerWrite(recorder, cursor, end);
+            if (cursor < end) {
+                NotePointerWrite(recorder, cursor, end);
+                hostWritable.emplace_back(cursor, end);
+            }
         }
+        StorageTexture::RetirePointerWriter(std::exchange(pointerWriter, 0));
+        pointerWriter = StorageTexture::NotePointerWriter(guestMemory.PointerHeaps(), hostWritable);
     }
     if (Coherence::Tracking() && !guestMemory.Writes().empty()) {
         std::vector<Coherence::Interval> written;
