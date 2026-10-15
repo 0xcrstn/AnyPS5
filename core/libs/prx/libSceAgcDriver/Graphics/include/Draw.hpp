@@ -39,6 +39,7 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
 struct InPlaceIndices {
     std::optional<std::uint32_t> highest;
     bool reused = false;
+    std::uint64_t generation = 0;
 };
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart);
 
