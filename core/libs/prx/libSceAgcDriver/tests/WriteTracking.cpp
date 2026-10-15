@@ -131,6 +131,28 @@ void CheckOwnStore() {
     Require(!UnchangedSince(base, 64, beforeCpu), "a CPU write after the driver store is not seen");
 }
 
+void CheckSharedDriverStoreLog() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto second = base + Block;
+    std::memset(memory, 0x11, 2 * Block);
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> first{{base, base + 4096}};
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> stored{{second + 4096, second + 8192}};
+    Require(DriverStoresSinceSequence(DriverStoreSequence(), stored) == DriverStoredSince::Unknown, "a driver store log that is off answers for a range");
+    EnableDriverStoreLog();
+    const auto before = DriverStoreSequence();
+    Require(DriverStoresSinceSequence(before, stored) == DriverStoredSince::No, "a driver store log reports a store before any was made");
+    std::thread writer([&] {
+        std::array<std::byte, 64> bytes{};
+        bytes.fill(std::byte{0x55});
+        Write(second + 4096 + 128, bytes);
+    });
+    writer.join();
+    Require(DriverStoresSinceSequence(before, stored) == DriverStoredSince::Stored, "a driver store made on another thread is not in the shared log");
+    Require(DriverStoresSinceSequence(before, first) == DriverStoredSince::No, "a driver store is reported over a range it did not reach");
+    Require(DriverStoresSinceSequence(DriverStoreSequence(), stored) == DriverStoredSince::No, "a driver store is reported again after the sequence it was made under");
+}
+
 void CheckUnwatch() {
     void* memory = AllocateWatched(3 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -1069,6 +1091,7 @@ int main() {
 #endif
         CheckSharedBlock();
         CheckOwnStore();
+        CheckSharedDriverStoreLog();
         CheckUnwatch();
         CheckNewestStamp();
         CheckEpochDirtySet();

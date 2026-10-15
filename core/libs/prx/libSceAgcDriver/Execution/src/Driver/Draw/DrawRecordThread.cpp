@@ -8,6 +8,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -46,6 +48,7 @@ struct Driver::FrozenDraw {
 
 struct Driver::PreparedFrozenDraw {
     std::uint64_t start = 0;
+    std::uint64_t storeSequence = 0;
     DrawVerdict verdict = DrawVerdict::Nothing;
     std::string rejected;
     FrozenFallback refused = FrozenFallback::None;
@@ -125,6 +128,27 @@ std::vector<PreparedRead> preparedReads(std::span<const Graphics::GuestMemorySna
 
 bool pendingWriteOverlaps(std::uint64_t address, std::size_t bytes) {
     return Graphics::Recorder::SnapshotWriteOverlaps(address, bytes);
+}
+
+std::uint64_t& aheadStoreSequence() {
+    thread_local std::uint64_t sequence = 0;
+    return sequence;
+}
+
+FrozenPrepareVerdict lateStale(std::span<const PreparedRead> reads, std::uint64_t storeSequence, bool pendingResults = true) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    ranges.reserve(reads.size());
+    for (const auto& read : reads) {
+        if (read.bytes == 0) continue;
+        if (pendingResults && (Graphics::PendingStorageOverlaps(read.address, read.bytes, nullptr) || Graphics::AnyShadowedOverlaps(read.address, read.bytes))) return FrozenPrepareVerdict::Stored;
+        ranges.emplace_back(read.address, read.address + read.bytes);
+    }
+    switch (GuestMemory::DriverStoresSinceSequence(storeSequence, ranges)) {
+    case GuestMemory::DriverStoredSince::No: return FrozenPrepareVerdict::Fresh;
+    case GuestMemory::DriverStoredSince::Stored: return FrozenPrepareVerdict::Stored;
+    case GuestMemory::DriverStoredSince::Unknown: return FrozenPrepareVerdict::Unchecked;
+    }
+    return FrozenPrepareVerdict::Unchecked;
 }
 
 const char* staleReason(DrawPrepareStale verdict) {
@@ -211,6 +235,7 @@ std::uint32_t Driver::prepareAhead() {
         }
         if (value == 1) return std::uint32_t{0};
         drawRecords().StopAfterFailure(true);
+        GuestMemory::EnableDriverStoreLog();
         std::fprintf(stderr, "[record-thread] prepare ahead: up to %lu records in flight\n", value);
         return static_cast<std::uint32_t>(value);
     }();
@@ -234,6 +259,7 @@ std::uint32_t Driver::prepareWorkers() {
         }
         const auto depth = std::max<std::uint32_t>(prepareAhead(), 1u);
         drawRecords().StopAfterFailure(true);
+        GuestMemory::EnableDriverStoreLog();
         std::fprintf(stderr, "[record-thread] prepare workers: %lu threads prepare frozen draws, up to %lu ahead of the record thread\n", value, 2ul * value + depth);
         return static_cast<std::uint32_t>(value);
     }();
@@ -430,6 +456,7 @@ std::shared_ptr<Driver::PreparedFrozenDraw> Driver::prepareFrozen(const FrozenDr
     frozenSink() = &sink;
     auto prepared = std::make_shared<PreparedFrozenDraw>();
     prepared->start = drawRecords().Finished();
+    prepared->storeSequence = GuestMemory::DriverStoreSequence();
     if (frozen.dispatch) dispatchNow(queue, frozen.packet, submission, frozen.indirectArguments);
     else prepared->verdict = drawNow(queue, frozen.packet, submission, prepared->rejected);
     prepared->refused = sink.refused;
@@ -484,7 +511,9 @@ void Driver::emitFrozen(const std::shared_ptr<FrozenDraw>& frozen, std::optional
                 redo = true;
                 ++(dispatch ? counters.dispatchOrdered : counters.orderedRedos)[static_cast<std::size_t>(use->refused)];
             } else {
-                switch (CheckFrozenPrepare(recordHistory(), use->start, ticket, use->reads, pendingWriteOverlaps)) {
+                auto verdict = CheckFrozenPrepare(recordHistory(), use->start, ticket, use->reads, pendingWriteOverlaps);
+                if (verdict == FrozenPrepareVerdict::Fresh) verdict = lateStale(use->reads, use->storeSequence);
+                switch (verdict) {
                 case FrozenPrepareVerdict::Fresh: break;
                 case FrozenPrepareVerdict::PendingWrite: redo = true; ++(dispatch ? counters.dispatchRedoStale : counters.redoPending); break;
                 case FrozenPrepareVerdict::Stored: redo = true; ++(dispatch ? counters.dispatchRedoStale : counters.redoStored); break;
@@ -655,6 +684,7 @@ void Driver::deferAhead(const std::function<void()>& prepare) {
         const auto finished = records.Finished();
         finishDrawRecords();
         drawRecordWindow.Begin(finished);
+        aheadStoreSequence() = GuestMemory::DriverStoreSequence();
         const auto posted = records.Posted();
         state = DrawRecordState{true, posted != finished ? posted : 0, false, false};
         struct Reset {
@@ -711,7 +741,14 @@ bool Driver::settleAhead(std::span<const Graphics::GuestMemorySnapshot> reads, b
         state.stale = true;
         return false;
     }
-    if (finished < state.overlapped) drawRecordWindow.Hold({std::move(prepared), drawRecordWindow.Between(finished, state.overlapped)});
+    const auto checkedSequence = GuestMemory::DriverStoreSequence();
+    if (lateStale(prepared, aheadStoreSequence(), false) != FrozenPrepareVerdict::Fresh) {
+        ++counters.staleStored;
+        ++counters.aheadStalePost;
+        state.stale = true;
+        return false;
+    }
+    if (finished < state.overlapped) drawRecordWindow.Hold({std::move(prepared), drawRecordWindow.Between(finished, state.overlapped), checkedSequence});
     return true;
 }
 
@@ -830,7 +867,8 @@ void Driver::postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, st
         } history{prepareWorkers() != 0 ? drawRecords().Finished() + 1 : 0, result};
         try {
             if (!provisional.earlier.empty()) {
-                const auto verdict = StaleAfterEach(provisional.earlier, provisional.reads, pendingWriteOverlaps);
+                auto verdict = StaleAfterEach(provisional.earlier, provisional.reads, pendingWriteOverlaps);
+                if (verdict == DrawPrepareStale::No && lateStale(provisional.reads, provisional.storeSequence) != FrozenPrepareVerdict::Fresh) verdict = DrawPrepareStale::Stored;
                 if (verdict != DrawPrepareStale::No) {
                     ++drawRecordCounters().aheadStaleRun;
                     throw std::runtime_error(std::string("preparation went stale behind ") + std::to_string(provisional.earlier.size()) + " unfinished records (" + staleReason(verdict) + " over a prepared read); queue 0 has moved past its packet, so it cannot be prepared again");

@@ -58,6 +58,7 @@ public:
     struct Provisional {
         std::vector<PreparedRead> reads;
         std::vector<std::shared_ptr<const DrawRecordEffects>> earlier;
+        std::uint64_t storeSequence = 0;
     };
 
     void Begin(std::uint64_t finished) {
