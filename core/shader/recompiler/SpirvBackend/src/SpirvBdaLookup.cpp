@@ -210,7 +210,7 @@ void EmitLegacyLookup(const BdaLookupBody& body, std::uint32_t permission, bool 
     if (radixLayout) {
         const auto rootWord = BdaLoadWord(state, constant(3));
         body.failFirst({
-            {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaTable::RadixVersion)), BdaAbi::FaultReason::InvalidTable},
+            {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaTable::LinearLayout(state.bdaTranslation) ? BdaTable::LinearVersion : BdaTable::RadixVersion)), BdaAbi::FaultReason::InvalidTable},
             {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))), BdaAbi::FaultReason::InvalidTable},
             {binary(spv::OpINotEqual, boolean, rootWord, binary(spv::OpIAdd, u32, constant(rangeBase), binary(spv::OpIMul, u32, count, constant(BdaTable::RangeWords)))), BdaAbi::FaultReason::InvalidTable},
             {binary(spv::OpULessThan, boolean, length, rootWord), BdaAbi::FaultReason::InvalidTable},
@@ -274,7 +274,7 @@ void EmitRadixLookup(const BdaLookupBody& body, std::uint32_t permission) {
     const auto rootShift = BdaLoadWord(state, constant(BdaTable::RootShiftWord));
     const auto end = body.end();
     body.failFirst({
-        {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaTable::RadixVersion)), BdaAbi::FaultReason::InvalidTable},
+        {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaTable::LinearLayout(state.bdaTranslation) ? BdaTable::LinearVersion : BdaTable::RadixVersion)), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow},
@@ -373,18 +373,19 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto u64 = TypeScalarU64(state);
     const auto translation = state.bdaTranslation;
     const auto relative = state.bdaRelative;
-    const bool direct = translation != BdaTable::Translation::Verify && relative == BdaTable::Relative::Off;
+    const bool linear = BdaTable::LinearLayout(translation);
+    const bool direct = (translation == BdaTable::Translation::Legacy || translation == BdaTable::Translation::Radix) && relative == BdaTable::Relative::Off;
     const bool capability = relative != BdaTable::Relative::Off;
     std::vector<std::uint32_t> resolves;
     if (translation == BdaTable::Translation::Verify) {
         resolves.push_back(DefineBdaResolve(state, BdaResolveKind::LegacyRadixLayout, permission, capability));
         resolves.push_back(DefineBdaResolve(state, BdaResolveKind::Radix, permission, false));
     } else if (!direct) {
-        resolves.push_back(DefineBdaResolve(state, translation == BdaTable::Translation::Radix ? BdaResolveKind::Radix : BdaResolveKind::Legacy, permission, capability));
+        resolves.push_back(DefineBdaResolve(state, translation == BdaTable::Translation::Radix || linear ? BdaResolveKind::Radix : BdaResolveKind::Legacy, permission, capability));
     }
     const auto function = state.module.AllocateId();
     state.module.AddName(function, name);
-    const bool inlined = state.bdaInlineFastPath && relative == BdaTable::Relative::On && translation != BdaTable::Translation::Verify;
+    const bool inlined = state.bdaInlineFastPath && relative == BdaTable::Relative::On && translation != BdaTable::Translation::Verify && translation != BdaTable::Translation::LinearVerify;
     state.module.AddFunction(spv::OpFunction, u64, function, inlined ? spv::FunctionControlInlineMask : spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32));
     const auto address = state.module.AllocateId();
     const auto bytes = state.module.AllocateId();
@@ -413,6 +414,49 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         state.module.AddFunction(spv::OpReturnValue, cached.result);
         EmitLabel(state, next);
     }
+    std::uint32_t linearHit = 0;
+    std::uint32_t linearResult = 0;
+    if (linear) {
+        const auto u64 = TypeScalarU64(state);
+        const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+        const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+        const auto block = BdaLoadWord(state, constant(BdaTable::RadixReservedWord));
+        const auto field = [&](std::uint32_t word) { return BdaLoadAddress(state, binary(spv::OpIAdd, u32, block, constant(word))); };
+        const auto deviceBase = field(BdaTable::LinearDeviceBaseWord);
+        const auto low = field(BdaTable::LinearGuestLowWord);
+        const auto high = field(BdaTable::LinearGuestHighWord);
+        const auto bitmap = field(BdaTable::LinearBitmapWord);
+        const auto shift = Unary(state, spv::OpUConvert, u64, BdaLoadWord(state, binary(spv::OpIAdd, u32, block, constant(BdaTable::LinearPageShiftWord))));
+        const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
+        auto inside = binary(spv::OpINotEqual, boolean, bytes, constant(0u));
+        for (const auto condition : {binary(spv::OpUGreaterThan, boolean, end, address), binary(spv::OpUGreaterThanEqual, boolean, address, low), binary(spv::OpULessThanEqual, boolean, end, high)}) inside = binary(spv::OpLogicalAnd, boolean, inside, condition);
+        const auto offset = binary(spv::OpISub, u64, address, low);
+        const auto firstPage = binary(spv::OpShiftRightLogical, u64, offset, shift);
+        const auto lastPage = binary(spv::OpShiftRightLogical, u64, binary(spv::OpISub, u64, binary(spv::OpISub, u64, end, BdaConstant(state, 1u)), low), shift);
+        const auto page = Select(state, u64, inside, firstPage, BdaConstant(state, 0u));
+        const auto codeWord = EmitValueOrZeroIfCondition(state, inside, [&] {
+            const auto wordAddress = binary(spv::OpIAdd, u64, bitmap, binary(spv::OpShiftLeftLogical, u64, binary(spv::OpShiftRightLogical, u64, page, BdaConstant(state, 4u)), BdaConstant(state, 2u)));
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, wordAddress);
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, u32, value, pointer, spv::MemoryAccessAlignedMask, 4u);
+            return value;
+        });
+        const auto position = binary(spv::OpShiftLeftLogical, u32, binary(spv::OpBitwiseAnd, u32, Unary(state, spv::OpUConvert, u32, page), constant(BdaTable::LinearPagesPerWord - 1u)), constant(1u));
+        const auto code = binary(spv::OpBitwiseAnd, u32, binary(spv::OpShiftRightLogical, u32, codeWord, position), constant(3u));
+        const auto allowed = (permission & BdaAbi::Write) != 0u ? binary(spv::OpIEqual, boolean, code, constant(BdaTable::LinearReadWrite)) : binary(spv::OpLogicalOr, boolean, binary(spv::OpIEqual, boolean, code, constant(BdaTable::LinearRead)), binary(spv::OpIEqual, boolean, code, constant(BdaTable::LinearReadWrite)));
+        linearHit = binary(spv::OpLogicalAnd, boolean, binary(spv::OpLogicalAnd, boolean, inside, binary(spv::OpIEqual, boolean, firstPage, lastPage)), allowed);
+        linearResult = binary(spv::OpIAdd, u64, deviceBase, offset);
+        if (translation == BdaTable::Translation::Linear) {
+            const auto hitLabel = state.module.AllocateId();
+            const auto next = state.module.AllocateId();
+            state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
+            state.module.AddFunction(spv::OpBranchConditional, linearHit, hitLabel, next);
+            EmitLabel(state, hitLabel);
+            state.module.AddFunction(spv::OpReturnValue, linearResult);
+            EmitLabel(state, next);
+        }
+    }
     const auto resolved = BdaResolvedType(state);
     std::vector<std::uint32_t> pairs;
     for (const auto resolve : resolves) {
@@ -431,6 +475,10 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         ReturnBdaFailureIf(state, differs, address, bytes, instruction, BdaAbi::FaultReason::TranslationMismatch);
     }
     const auto failed = Binary(state, spv::OpINotEqual, boolean, reason, BdaConstant(state, 0u));
+    if (translation == BdaTable::Translation::LinearVerify) {
+        const auto mismatch = Binary(state, spv::OpLogicalAnd, boolean, linearHit, Binary(state, spv::OpLogicalOr, boolean, failed, Binary(state, spv::OpINotEqual, boolean, result, linearResult)));
+        ReturnBdaFailureIf(state, mismatch, address, bytes, instruction, BdaAbi::FaultReason::TranslationMismatch);
+    }
     if (relative == BdaTable::Relative::Verify || provenanceVerified) {
         const auto mismatch = Binary(state, spv::OpLogicalAnd, boolean, cached.hit, Binary(state, spv::OpLogicalOr, boolean, failed, Binary(state, spv::OpINotEqual, boolean, result, cached.result)));
         ReturnBdaFailureIf(state, mismatch, address, bytes, instruction, provenanceVerified ? BdaAbi::FaultReason::ProvenanceMismatch : BdaTable::RelativeMismatchReason());
@@ -597,7 +645,7 @@ void ResolveBdaRoot(SpirvValueEmitContext& ctx, const BdaRoot& root) {
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);
-    const auto kind = state.bdaTranslation == BdaTable::Translation::Verify ? BdaResolveKind::LegacyRadixLayout : state.bdaTranslation == BdaTable::Translation::Radix ? BdaResolveKind::Radix : BdaResolveKind::Legacy;
+    const auto kind = state.bdaTranslation == BdaTable::Translation::Verify ? BdaResolveKind::LegacyRadixLayout : state.bdaTranslation == BdaTable::Translation::Radix || BdaTable::LinearLayout(state.bdaTranslation) ? BdaResolveKind::Radix : BdaResolveKind::Legacy;
     const auto resolve = DefineBdaResolve(state, kind, BdaAbi::Read, true);
     const auto low = Unary(state, spv::OpUConvert, u64, ctx.Def(root.first));
     const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, ctx.Def(root.second)), BdaConstant(state, 32u));

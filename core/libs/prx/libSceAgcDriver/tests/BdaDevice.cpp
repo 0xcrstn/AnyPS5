@@ -174,6 +174,7 @@ int main(int argc, char** argv) {
         } else {
             RunBdaExecutionTests(device->GetContext());
             RunBdaTranslationTests(device->GetContext());
+            RunBdaLinearTests(device->GetContext());
             RunBdaSpanHelperTests(device->GetContext());
             RunBdaPlacementTests(device->GetContext());
             RunFlushProofCheckTests(device->GetContext());

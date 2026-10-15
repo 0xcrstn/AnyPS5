@@ -13,6 +13,8 @@ void SetBdaTestRelative(ShaderRecompiler::BdaTable::Relative relative);
 void SetBdaTestProvenance(ShaderRecompiler::RewriteMode mode);
 ShaderRecompiler::BdaTable::Relative BdaTestRelative();
 std::vector<std::uint32_t> MakeBdaCapabilityTestShader(std::uint64_t address, std::uint64_t capabilityBase);
+std::vector<std::uint32_t> MakeBdaWordReadTestShader(std::uint64_t address);
+void RunBdaLinearTests(const AgcDriver::Graphics::Context& context);
 void SetBdaTestSpanHelpers(ShaderRecompiler::RewriteMode mode, std::uint32_t injection = 0);
 void SetBdaTestWriteNotes(ShaderRecompiler::RewriteMode mode, std::uint64_t injection = 0);
 void SetBdaTestInlineFastPath(bool enabled);

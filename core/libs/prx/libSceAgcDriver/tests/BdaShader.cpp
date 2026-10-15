@@ -291,6 +291,13 @@ ShaderRecompiler::BdaTable::Relative BdaTestRelative() {
     return testRelative;
 }
 
+std::vector<std::uint32_t> MakeBdaWordReadTestShader(std::uint64_t address) {
+    using namespace ShaderRecompiler;
+    return MakeShader(address, false, true, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
+        return std::vector<std::uint32_t>{EmitBdaRead(ctx, instruction, base, 32u)};
+    });
+}
+
 std::vector<std::uint32_t> MakeBdaCapabilityTestShader(std::uint64_t address, std::uint64_t capabilityBase) {
     using namespace ShaderRecompiler;
     return MakeShader(address, false, true, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {

@@ -547,6 +547,82 @@ void RunBdaTranslationTests(const Context& context) {
     SetBdaTestRelative(previousRelative);
 }
 
+void RunBdaLinearTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    namespace Table = ShaderRecompiler::BdaTable;
+    constexpr std::uint64_t guest = 0x7fff00000000ULL;
+    constexpr std::uint64_t page = 64u * 1024u;
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    Buffer linear(context, 2u * page, usage);
+    Buffer elsewhere(context, page, usage);
+    Buffer bitmap(context, 16, usage);
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer output(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto* linearWords = reinterpret_cast<std::uint32_t*>(linear.Bytes().data());
+    auto* elsewhereWords = reinterpret_cast<std::uint32_t*>(elsewhere.Bytes().data());
+    for (std::size_t index = 0; index < 2u * page / 4u; ++index) linearWords[index] = 0x11000000u + static_cast<std::uint32_t>(index);
+    for (std::size_t index = 0; index < page / 4u; ++index) elsewhereWords[index] = 0x22000000u + static_cast<std::uint32_t>(index);
+    const std::vector<Abi::Range> ranges{
+        {guest, guest + page, linear.DeviceAddress(), Abi::Read | Abi::Write, 0},
+        {guest + page, guest + 2u * page, elsewhere.DeviceAddress(), Abi::Read, 0},
+    };
+    const Table::LinearSpace space{linear.DeviceAddress(), guest, guest + 2u * page, bitmap.DeviceAddress(), 16};
+    const auto setCodes = [&](std::uint32_t first, std::uint32_t second) {
+        const std::uint32_t word = first | (second << Table::LinearPageBits);
+        std::memcpy(bitmap.Bytes().data(), &word, sizeof(word));
+    };
+    const auto read = [&](const std::vector<std::uint32_t>& words, std::uint64_t address) {
+        Table::Validate(words, BdaTestTranslation());
+        Buffer table(context, words.size() * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memcpy(table.Bytes().data(), words.data(), words.size() * sizeof(std::uint32_t));
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        std::memset(output.Bytes().data(), 0xcd, output.Bytes().size());
+        Pipeline pipeline(context, MakeBdaWordReadTestShader(address), {&table, &fault, &output});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        std::uint32_t value = 0;
+        std::memcpy(&value, output.Bytes().data(), sizeof(value));
+        return std::pair{report, value};
+    };
+    const auto previous = BdaTestTranslation();
+    const auto previousRelative = BdaTestRelative();
+    SetBdaTestRelative(Table::Relative::Off);
+    for (const auto translation : {Table::Translation::Linear, Table::Translation::LinearVerify}) {
+        SetBdaTestTranslation(translation);
+        const auto withSpace = Table::Build(ranges, translation, &space);
+        const auto withoutSpace = Table::Build(ranges, translation);
+        setCodes(Table::LinearReadWrite, Table::LinearFallback);
+        for (const auto& words : {withSpace, withoutSpace}) {
+            const auto [linearFault, linearValue] = read(words, guest + 16u);
+            Require(linearFault.state == Abi::FaultState::Empty && linearValue == linearWords[4], "BDA linear table: a read in a linear page did not return the linear bytes");
+            const auto [fallbackFault, fallbackValue] = read(words, guest + page + 16u);
+            Require(fallbackFault.state == Abi::FaultState::Empty && fallbackValue == elsewhereWords[4], "BDA linear table: a read in a fallback page did not take the table's range");
+            const auto [missFault, missValue] = read(words, guest + 4u * page);
+            static_cast<void>(missValue);
+            Require(missFault.state == Abi::FaultState::Ready && missFault.reason == Abi::FaultReason::Unmapped && missFault.address == guest + 4u * page, "BDA linear table: a read outside every range did not fault as unmapped");
+        }
+        setCodes(Table::LinearReadWrite, Table::LinearReadWrite);
+        const auto [injectedFault, injectedValue] = read(withSpace, guest + page + 16u);
+        if (translation == Table::Translation::Linear) Require(injectedFault.state == Abi::FaultState::Empty && injectedValue == linearWords[page / 4u + 4u], "BDA linear table: a page marked linear was not read through the linear space");
+        else Require(injectedFault.state == Abi::FaultState::Ready && injectedFault.reason == Abi::FaultReason::TranslationMismatch && injectedFault.address == guest + page + 16u, "APS5_BDA_ABI=linear_verify did not stop on a page marked linear whose range lies elsewhere");
+    }
+    SetBdaTestTranslation(previous);
+    SetBdaTestRelative(previousRelative);
+    const auto words = Table::Build(ranges, Table::Translation::Linear, &space);
+    for (const auto word : {std::size_t{0}, static_cast<std::size_t>(words[Table::RadixReservedWord]) + Table::LinearPageShiftWord, static_cast<std::size_t>(words[Table::RadixReservedWord]) + Table::LinearReservedWord}) {
+        auto corrupt = words;
+        corrupt[word] ^= 0x40u;
+        bool rejected = false;
+        try {
+            Table::Validate(corrupt, Table::Translation::Linear);
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        Require(rejected, "BDA linear table: a corrupt header or linear block was accepted");
+    }
+}
+
 void RunBdaSpanHelperTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
     Buffer wide(context, 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
