@@ -1690,8 +1690,21 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
     return true;
 }
 
+namespace {
+thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* driverStoreLog = nullptr;
+
+void logDriverStore(std::uint64_t begin, std::uint64_t end) {
+    if (driverStoreLog != nullptr && begin < end) driverStoreLog->emplace_back(begin, end);
+}
+}
+
+void LogDriverStores(std::vector<std::pair<std::uint64_t, std::uint64_t>>* log) {
+    driverStoreLog = log;
+}
+
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
+    logDriverStore(address, address + bytes);
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         noteDirty(stored.first, stored.second);
@@ -1745,6 +1758,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (bytes == 0) return 0;
+    logDriverStore(address, address + bytes);
     noteDirty(address, address + bytes);
     ++tracker.generation;
     if (!tracker.watched || !tracker.covers(address, bytes)) {
@@ -1823,6 +1837,7 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 }
 
 MarkedWrites MarkWrittenUnlessStored(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t since) {
+    for (const auto& [begin, end] : ranges) logDriverStore(begin, end);
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -2166,6 +2181,17 @@ bool GpuMutexType::HeldByOtherThread() const {
 }
 
 bool GpuMutexType::try_lock() {
+    if (!tryLockMutex()) return false;
+    runLockHook();
+    return true;
+}
+
+void GpuMutexType::lock() {
+    lockMutex();
+    runLockHook();
+}
+
+bool GpuMutexType::tryLockMutex() {
     if (!GpuLockProfiled()) {
         if (HeldByOtherThread() || !mutex.try_lock()) return false;
         acquired();
@@ -2192,10 +2218,20 @@ bool GpuMutexType::try_lock() {
 
 namespace {
 std::atomic<void (*)()> gpuUnlockHook{nullptr};
+std::atomic<void (*)()> gpuLockHook{nullptr};
 }
 
 void SetGpuUnlockHook(void (*hook)()) {
     gpuUnlockHook.store(hook, std::memory_order_release);
+}
+
+void SetGpuLockHook(void (*hook)()) {
+    gpuLockHook.store(hook, std::memory_order_release);
+}
+
+void GpuMutexType::runLockHook() {
+    if (depth != 1) return;
+    if (auto* hook = gpuLockHook.load(std::memory_order_acquire); hook != nullptr) hook();
 }
 
 std::uint64_t GpuHoldSerial() {
@@ -2233,7 +2269,7 @@ void AssertGpuLockHeld(const char* where) {
     std::abort();
 }
 
-void GpuMutexType::lock() {
+void GpuMutexType::lockMutex() {
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
