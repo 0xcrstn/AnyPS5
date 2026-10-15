@@ -95,6 +95,7 @@ public:
         skipPeerOnce = true;
     }
     static bool QueueOrderVerify();
+    static bool PeerSerialization();
     static void SuppressOrderWaitsForTest(bool suppress);
     struct QueueOrderStatistics {
         std::uint64_t requiredWaits = 0;
@@ -705,6 +706,7 @@ private:
         std::uint64_t traceId = 0;
         bool submitted = false;
         std::atomic<std::uint64_t> submitOrder{0};
+        std::atomic<std::uint64_t> afterPeer{0};
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
@@ -945,7 +947,10 @@ private:
     };
     LabelPick pickLabelLocked(std::uint64_t dword, std::uint32_t tag) const;
     static std::optional<LabelHit> evaluateLabel(std::span<const LabelEntry* const> entries, std::uint64_t afterStamp, LabelRefusal* refusal);
-    static std::optional<bool> LaterLabel(const LabelEntry& first, const LabelEntry& second);
+    static std::optional<bool> LaterLabel(const LabelEntry& first, const Recorder& firstOwner, const LabelEntry& second, const Recorder& secondOwner);
+    static bool OrderedAfter(const LabelEntry& later, const Recorder& laterOwner, const LabelEntry& earlier, const Recorder& earlierOwner);
+    std::atomic<std::uint64_t> peerFloor{0};
+    void raisePeerFloor(std::uint64_t serial);
     // Whether the in-flight batch with that serial has not signaled its fence (false when it is
     // not in flight any more): what makes a wait for it a real GPU wait (ThreadHookWaits).
     bool unsignaled(std::uint64_t serial) const;
