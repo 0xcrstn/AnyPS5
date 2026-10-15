@@ -523,7 +523,7 @@ void RunBdaTranslationTests(const Context& context) {
         if (relative == Table::Relative::On) {
             Require(report.state == Abi::FaultState::Empty && result == 0x44u, "APS5_BDA_RELATIVE=on did not translate through its capability");
         } else {
-            Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::RelativeMismatch && report.address == guest && report.instruction == 0x1234, "APS5_BDA_RELATIVE=verify did not fail on an injected capability mismatch");
+            Require(report.state == Abi::FaultState::Ready && report.reason == Table::RelativeMismatchReason() && report.address == guest && report.instruction == 0x1234, "APS5_BDA_RELATIVE=verify did not fail on an injected capability mismatch");
         }
     }
     SetBdaTestRelative(previousRelative);

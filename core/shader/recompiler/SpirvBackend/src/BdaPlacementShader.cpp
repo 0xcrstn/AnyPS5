@@ -136,10 +136,11 @@ std::vector<std::uint32_t> BuildCopyBackShader() {
             const auto host = field(32u);
             const auto low = Select(state, u64, binary(spv::OpUGreaterThan, boolean, begin, pageBegin), begin, pageBegin);
             const auto high = Select(state, u64, binary(spv::OpULessThan, boolean, end, pageEnd), end, pageEnd);
+            const auto start = binary(spv::OpIAdd, u64, low, Unary(state, spv::OpUConvert, u64, thread));
             const auto inner = BeginLoop(state);
             const auto address = state.module.AllocateId();
             const auto nextAddress = state.module.AllocateId();
-            state.module.AddFunction(spv::OpPhi, u64, address, binary(spv::OpIAdd, u64, low, Unary(state, spv::OpUConvert, u64, thread)), inner.entry, nextAddress, inner.continuation);
+            state.module.AddFunction(spv::OpPhi, u64, address, start, inner.entry, nextAddress, inner.continuation);
             LoopTest(state, inner, binary(spv::OpULessThan, boolean, address, high));
             const auto offset = binary(spv::OpISub, u64, address, begin);
             const auto current = loadByte(binary(spv::OpIAdd, u64, work, offset));
