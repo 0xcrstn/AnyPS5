@@ -526,6 +526,78 @@ struct DrawProfile {
 };
 constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown"};
 
+bool DirtyRecord() {
+    static const bool enabled = std::getenv("APS5_DIRTY_RECORD") != nullptr;
+    return enabled;
+}
+
+struct BoundDrawState {
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    std::uint64_t pass = 0;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    bool sets = false;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSet fragmentSet = VK_NULL_HANDLE;
+    bool pushed = false;
+    VkShaderStageFlags pushStages = 0;
+    std::array<std::byte, PipelinePushConstantBytes> push{};
+    bool vertices = false;
+    std::vector<VkBuffer> vertexHandles;
+    std::vector<VkDeviceSize> vertexOffsets;
+    bool indices = false;
+    VkBuffer indexHandle = VK_NULL_HANDLE;
+    VkDeviceSize indexOffset = 0;
+    VkIndexType indexType = VK_INDEX_TYPE_UINT16;
+};
+
+struct DirtyRecordCounts {
+    std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> known{0};
+    std::atomic<std::uint64_t> sets{0};
+    std::atomic<std::uint64_t> setsSkipped{0};
+    std::atomic<std::uint64_t> pushes{0};
+    std::atomic<std::uint64_t> pushesSkipped{0};
+    std::atomic<std::uint64_t> vertexBinds{0};
+    std::atomic<std::uint64_t> vertexSkipped{0};
+    std::atomic<std::uint64_t> indexBinds{0};
+    std::atomic<std::uint64_t> indexSkipped{0};
+};
+
+DirtyRecordCounts& dirtyRecordCounts() {
+    static DirtyRecordCounts counts;
+    return counts;
+}
+
+BoundDrawState* boundForDraw(VkCommandBuffer commands, bool continued, std::uint64_t pass, VkPipelineLayout layout) {
+    if (!DirtyRecord()) return nullptr;
+    static BoundDrawState bound;
+    auto& counts = dirtyRecordCounts();
+    ++counts.draws;
+    if (continued && pass != 0 && bound.commands == commands && bound.pass == pass && bound.layout == layout) {
+        ++counts.known;
+        return &bound;
+    }
+    bound.commands = commands;
+    bound.pass = 0;
+    bound.layout = layout;
+    bound.sets = false;
+    bound.pushed = false;
+    bound.vertices = false;
+    bound.indices = false;
+    return &bound;
+}
+
+void reportDirtyRecord() {
+    if (!DirtyRecord()) return;
+    static std::array<std::uint64_t, 10> last{};
+    auto& counts = dirtyRecordCounts();
+    const std::array<std::uint64_t, 10> values{counts.draws.load(), counts.known.load(), counts.sets.load(), counts.setsSkipped.load(), counts.pushes.load(), counts.pushesSkipped.load(), counts.vertexBinds.load(), counts.vertexSkipped.load(), counts.indexBinds.load(), counts.indexSkipped.load()};
+    std::array<unsigned long long, 10> delta{};
+    for (std::size_t i = 0; i < values.size(); ++i) delta[i] = static_cast<unsigned long long>(values[i] - last[i]);
+    last = values;
+    std::fprintf(stderr, "[draw-record] dirty record: %llu draws, %llu with known binds; descriptor sets %llu bound, %llu skipped; push constants %llu pushed, %llu skipped; vertex buffers %llu bound, %llu skipped; index buffers %llu bound, %llu skipped\n", delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7], delta[8], delta[9]);
+}
+
 DrawProfile& Profile() {
     static DrawProfile profile;
     return profile;
@@ -554,6 +626,7 @@ void reportRecordParts(const DrawProfile& profile, double elapsedSeconds) {
         reportedTwins = twins;
     }
     std::fprintf(stderr, "%s\n", line);
+    reportDirtyRecord();
     char reasons[1024];
     int r = std::snprintf(reasons, sizeof(reasons), "[draw-record] whole snapshot copies by reason (count, MiB):");
     bool any = false;
@@ -1617,7 +1690,7 @@ void bindInputTwins(Recorder& recorder, DrawInputs& inputs) {
     inputs.reusedCopies.clear();
 }
 
-void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset) {
+void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset, BoundDrawState* bound = nullptr) {
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
     const auto* args = indirect != nullptr ? indirect->args : nullptr;
     if (state.stages.mesh && args != nullptr) {
@@ -1629,8 +1702,37 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
         context.Function<PFN_vkCmdDrawMeshTasksEXT>("vkCmdDrawMeshTasksEXT")(commands, inputs.meshGroups, draw.instanceCount, 1);
         return;
     }
-    if (!inputs.vertexHandles.empty()) context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
-    if (draw.indexed) context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+    const auto indexType = draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+    if (bound == nullptr) {
+        if (!inputs.vertexHandles.empty()) context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
+        if (draw.indexed) context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, indexType);
+    } else {
+        auto& counts = dirtyRecordCounts();
+        if (!inputs.vertexHandles.empty()) {
+            const bool same = bound->vertices && bound->vertexHandles == inputs.vertexHandles && bound->vertexOffsets == inputs.vertexOffsets;
+            if (same) {
+                ++counts.vertexSkipped;
+            } else {
+                context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
+                ++counts.vertexBinds;
+                bound->vertexHandles.assign(inputs.vertexHandles.begin(), inputs.vertexHandles.end());
+                bound->vertexOffsets.assign(inputs.vertexOffsets.begin(), inputs.vertexOffsets.end());
+                bound->vertices = true;
+            }
+        }
+        if (draw.indexed) {
+            if (bound->indices && bound->indexHandle == inputs.indexHandle && bound->indexOffset == inputs.indexOffset && bound->indexType == indexType) {
+                ++counts.indexSkipped;
+            } else {
+                context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, indexType);
+                ++counts.indexBinds;
+                bound->indices = true;
+                bound->indexHandle = inputs.indexHandle;
+                bound->indexOffset = inputs.indexOffset;
+                bound->indexType = indexType;
+            }
+        }
+    }
     if (args == nullptr) {
         if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, draw.indexCount, draw.instanceCount, 0, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
         else context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, draw.indexCount, draw.instanceCount, draw.firstVertex, draw.firstInstance);
@@ -1857,7 +1959,24 @@ struct RecordedDraw {
     VkShaderStageFlags pushStages = 0;
 };
 
-void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false) {
+void pushBlock(const Pipeline& pipeline, VkCommandBuffer commands, VkShaderStageFlags stages, const std::array<std::byte, PipelinePushConstantBytes>& block, BoundDrawState* bound) {
+    if (bound == nullptr) {
+        pipeline.PushConstants(commands, stages, block);
+        return;
+    }
+    auto& counts = dirtyRecordCounts();
+    if (bound->pushed && bound->pushStages == stages && bound->push == block) {
+        ++counts.pushesSkipped;
+        return;
+    }
+    pipeline.PushConstants(commands, stages, block);
+    ++counts.pushes;
+    bound->pushed = true;
+    bound->pushStages = stages;
+    bound->push = block;
+}
+
+void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false, BoundDrawState* bound = nullptr) {
     auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
     if (bytes == nullptr) {
         resources.PatchPushConstants(block);
@@ -1870,7 +1989,7 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
         std::memcpy(block.data() + ShaderRecompiler::TessellationLevelPushOffsetBytes, levels.data(), sizeof(levels));
     }
     if (!state.stages.mesh) {
-        pipeline.PushConstants(commands, stages, block);
+        pushBlock(pipeline, commands, stages, block, bound);
         return;
     }
     const auto firstVertex = draw.indirect ? draw.indirect->vertexConstant : draw.firstVertex;
@@ -1878,7 +1997,7 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
     const std::array<std::uint32_t, ShaderRecompiler::MeshDrawPushBytes / 4> words{draw.indexCount, firstVertex, firstInstance, draw.indexed ? draw.indexSize | (restartTable ? ShaderRecompiler::MeshIndexRestartTable : 0u) : 0u, static_cast<std::uint32_t>(meshArguments), static_cast<std::uint32_t>(meshArguments >> 32u)};
     static_assert(ShaderRecompiler::MeshDrawPushOffsetBytes + ShaderRecompiler::MeshDrawPushBytes == PipelinePushSlotBytes);
     std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
-    pipeline.PushConstants(commands, stages | VK_SHADER_STAGE_MESH_BIT_EXT, block);
+    pushBlock(pipeline, commands, stages | VK_SHADER_STAGE_MESH_BIT_EXT, block, bound);
 }
 
 // The record of a draw whose targets are all resident (`lean`: recorded into the device's open
@@ -2100,21 +2219,37 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     parts.lap(RecordBegin);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
+    auto* bound = capture ? nullptr : boundForDraw(commands, continued, recorder->OpenPassSerial(), record.pipeline->Layout());
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
         const auto fragmentSet = drawBindings->fragmentAllocation.set;
-        if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
-        if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
+        if (bound != nullptr && bound->sets && bound->set == set && bound->fragmentSet == fragmentSet) {
+            ++dirtyRecordCounts().setsSkipped;
+        } else {
+            if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
+            if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
+            if (bound != nullptr) {
+                ++dirtyRecordCounts().sets;
+                bound->sets = true;
+                bound->set = set;
+                bound->fragmentSet = fragmentSet;
+            }
+        }
     } else {
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
+        if (bound != nullptr) bound->sets = false;
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), bound);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     bindInputTwins(*recorder, inputs);
     const auto programTiming = Recorder::GpuTimingEnabled() ? recorder->BeginDrawProgramTiming(drawProgramTimingKey(shaders)) : Recorder::NoTiming;
     if (programTiming != Recorder::NoTiming) Recorder::NoteProgramPlacement(drawProgramTimingKey(shaders), drawPlacement(resources, drawBindings.get(), inputs));
-    recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
+    recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, bound);
+    if (bound != nullptr && (record.pipeline->SplitsFaces() || record.pipeline->SplitsSecondChannel())) {
+        bound->commands = VK_NULL_HANDLE;
+        bound = nullptr;
+    }
     if (record.pipeline->SplitsFaces()) {
         record.pipeline->ContinueBackFaces(commands, state);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
@@ -2139,6 +2274,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    if (bound != nullptr) bound->pass = recorder->OpenPassSerial();
     parts.lap(RecordLeave);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
