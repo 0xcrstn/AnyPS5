@@ -76,7 +76,8 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     if (specializeEvent.Active()) {
         std::vector<std::uint32_t> vector;
         for (const auto& constant : constants) vector.insert(vector.end(), {constant.id, constant.value});
-        specializeEvent.Hex("variant", artifact.variantId).Number("spirv_words_in", artifact.spirv.size()).Hex("spirv_in_hash", ShaderCompileTrace::HashOf(artifact.spirv.Words())).Number("constants", constants.size()).Hex("specialization_hash", ShaderCompileTrace::HashOf(std::span<const std::uint32_t>(vector))).Hex("vertex_classes_hash", ShaderCompileTrace::HashOf(classes));
+        const auto input = artifact.spirv.Resolved();
+        specializeEvent.Hex("variant", artifact.variantId).Number("spirv_words_in", input.size()).Hex("spirv_in_hash", ShaderCompileTrace::HashOf(input.Words())).Number("constants", constants.size()).Hex("specialization_hash", ShaderCompileTrace::HashOf(std::span<const std::uint32_t>(vector))).Hex("vertex_classes_hash", ShaderCompileTrace::HashOf(classes));
     }
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
