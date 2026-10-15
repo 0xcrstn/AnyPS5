@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <algorithm>
 
 namespace AgcDriver::DriverDetail {
 
@@ -132,6 +133,8 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
     if (product->pixel.ancillary) product->pixel.rasterPrimitive = Graphics::RasterPrimitiveOf(product->state);
     if (product->pixel.ancillary) product->pixel.layerExported = product->state.layerExports != 0;
     product->pixel.ditheredAlphaToCoverage = product->state.ditheredAlphaToCoverage;
+    const auto fragment = std::ranges::find(product->roles, ShaderRecompiler::ProgramRole::Fragment);
+    if (fragment != product->roles.end() && !product->programs[static_cast<std::size_t>(fragment - product->roles.begin())].nullPixel) product->pixel.extraLdsDwords = Graphics::DecodePixelExtraLdsDwords(queue.shader);
     return product;
 }
 

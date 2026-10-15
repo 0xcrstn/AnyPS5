@@ -195,6 +195,7 @@ private:
         append(key, value.ditheredAlphaToCoverage);
         append(key, value.quadPixelMask);
         append(key, value.quadSampleMask);
+        append(key, value.extraLdsDwords);
         append(key, value.targetOutputMode);
     }
 

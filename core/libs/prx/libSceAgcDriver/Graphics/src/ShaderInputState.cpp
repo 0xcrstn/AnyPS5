@@ -19,6 +19,7 @@ constexpr std::uint32_t computeNumThreadX = 0x207;
 constexpr std::uint32_t computeNumThreadY = 0x208;
 constexpr std::uint32_t computeNumThreadZ = 0x209;
 constexpr std::uint32_t computePgmRsrc2 = 0x213;
+constexpr std::uint32_t pixelPgmRsrc2 = 0x00B;
 
 constexpr std::uint32_t spiPsInputCntl0 = 0x191;
 constexpr std::uint32_t spiPsInputEna = 0x1B3;
@@ -173,6 +174,10 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
         .targetExportMapping = nullProgram ? std::array<std::uint8_t, 8>{} : exportMappings,
         .stencilRefExportEnable = stencilRefExportEnable
     };
+}
+
+std::uint32_t DecodePixelExtraLdsDwords(const Registers& shader) {
+    return ((read(shader, pixelPgmRsrc2, RegisterBank::Shader) >> 8u) & 0xFFu) * 128u;
 }
 
 bool PixelEarlyZ(std::uint32_t shaderControl) {

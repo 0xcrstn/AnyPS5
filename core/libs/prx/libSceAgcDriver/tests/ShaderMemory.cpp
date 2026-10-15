@@ -3513,6 +3513,12 @@ void verifyMeshConfiguration() {
         std::vector<std::uint64_t> partial;
         RecompileCacheKey::Build(fragment, partial);
         require(partial != full, "the quad sample masks are not part of the recompile cache key");
+        fragment.context.pixel->extraLdsDwords = 256u;
+        const auto allocated = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(fragment));
+        require(allocated.request.context.pixel.has_value() && allocated.request.context.pixel->extraLdsDwords == 256u, "the pixel shader LDS allocation was lost in serialization");
+        std::vector<std::uint64_t> extra;
+        RecompileCacheKey::Build(fragment, extra);
+        require(extra != partial, "the pixel shader LDS allocation is not part of the recompile cache key");
     }
     std::vector<std::uint64_t> key;
     RecompileCacheKey::Build(request, key);
@@ -5346,7 +5352,7 @@ void verifyBdaReadFallbackFunctions() {
 
 void verifyFunctionLdsBound() {
     using namespace ShaderRecompiler;
-    const auto build = [](const auto& body) {
+    const auto build = [](const auto& body, std::uint32_t allocation = FunctionLdsDwordLimit) {
         IrProgram program;
         program.Resources().stage = IrShaderStage::Pixel;
         for (const std::uint32_t offset : {0u, 256u, 512u, 0xfffffff0u}) {
@@ -5377,7 +5383,7 @@ void verifyFunctionLdsBound() {
         auto& active = program.CreateValue(IrOpcode::Void, IrType::U1);
         active.SetImmediateBool(true);
         body(program, block, emit, constant, active);
-        return std::pair{FunctionLdsDwords(program), AnalyzeProgramRequirements(program)};
+        return std::pair{FunctionLdsDwords(program), AnalyzeProgramRequirements(program, allocation)};
     };
 
     const auto [laneSlots, laneRequirements] = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
@@ -5453,6 +5459,28 @@ void verifyFunctionLdsBound() {
         emit(IrOpcode::WriteSharedU32, IrType::Void, {&user, &user, &active}, 0u);
     });
     require(unbounded == FunctionLdsDwordLimit && unboundedRequirements.functionLdsDwords == FunctionLdsDwordLimit, "function LDS: an address without a bound must keep the full array");
+
+    const auto unboundedWrite = [](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
+        auto& user = emit(IrOpcode::GetUserData, IrType::U32, {&constant(0u)});
+        emit(IrOpcode::WriteSharedU32, IrType::Void, {&user, &user, &active}, 0u);
+    };
+    require(build(unboundedWrite, 256u).second.functionLdsDwords == 256u, "function LDS: an address without a bound must take the pixel shader's LDS allocation, not the full array");
+    const auto laneSlotsWrite = [](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
+        auto& lane = emit(IrOpcode::LaneId, IrType::U32, {});
+        auto& address = emit(IrOpcode::ShiftLeftLogical32, IrType::U32, {&lane, &constant(2u)});
+        for (const std::uint32_t memory : {0u, 1u, 2u}) emit(IrOpcode::WriteSharedU32, IrType::Void, {&address, &lane, &active}, memory);
+    };
+    const auto allocated = build(laneSlotsWrite, 256u).second;
+    require(allocated.functionLdsDwords == 192u && allocated.functionLdsAddresses.size() == 3u, "function LDS: lane slots inside the allocation must keep their bounded size and constant slots");
+    const auto truncated = build(laneSlotsWrite, 128u).second;
+    require(truncated.functionLdsDwords == 128u && truncated.functionLdsAddresses.empty(), "function LDS: lane slots past the allocation must take the allocation and keep the lane term");
+    bool rejected = false;
+    try {
+        static_cast<void>(build(unboundedWrite, 0u));
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    require(rejected, "function LDS: an empty allocation must be rejected");
 
     const auto [counter, counterRequirements] = build([](IrProgram&, IrBlock&, auto& emit, auto& constant, IrValue& active) {
         auto& m0 = emit(IrOpcode::GetUserData, IrType::U32, {&constant(0u)});
