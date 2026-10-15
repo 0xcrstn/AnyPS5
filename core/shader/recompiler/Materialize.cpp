@@ -454,6 +454,7 @@ RecompileResult materializeSkeleton(const CompiledVariant& variant, const Recomp
         result.spirv = artifact.spirv.Resolved();
     }
     parts.bindings = bindingPlan;
+    if (std::none_of(bindingPlan->bindings.begin(), bindingPlan->bindings.end(), [](const PreparedDescriptorBinding& binding) { return binding.descriptor.role == DescriptorRole::FaultBuffer; })) result.bdaAbiVersion = 0u;
     return result;
 }
 
