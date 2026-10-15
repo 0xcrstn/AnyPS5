@@ -142,6 +142,7 @@ private:
 int main(int argc, char** argv) {
     try {
         RunBdaContractTests();
+        RunBdaTableContractTests();
         if (argc == 2) {
             const auto shader = MakeBdaTestShader(0x7fff12340000ULL, 32);
             std::ofstream file(argv[1], std::ios::binary);
@@ -161,12 +162,23 @@ int main(int argc, char** argv) {
         Require(buffer.DeviceAddress() != 0 && buffer.Bytes().size() == 256, "invalid real BDA buffer");
         buffer.Bytes()[255] = std::byte{0x5a};
         Require(buffer.Bytes()[255] == std::byte{0x5a}, "real BDA buffer mapping failed");
+        using ShaderRecompiler::BdaTable::Translation;
         if (device->RunsOnCpu()) {
             std::cout << "CPU Vulkan device: BDA read and multi-dword write execution not tested\n";
         } else {
-            RunBdaExecutionTests(device->GetContext());
+            for (const auto translation : {Translation::Legacy, Translation::Radix, Translation::Verify}) {
+                SetBdaTestTranslation(translation);
+                RunBdaExecutionTests(device->GetContext());
+            }
+            SetBdaTestTranslation(Translation::Legacy);
+            RunBdaTranslationTests(device->GetContext());
+            std::cout << "BDA translation fixtures passed\n";
         }
-        RunBdaStoreExecutionTests(device->GetContext());
+        for (const auto translation : {Translation::Legacy, Translation::Radix, Translation::Verify}) {
+            SetBdaTestTranslation(translation);
+            RunBdaStoreExecutionTests(device->GetContext());
+        }
+        SetBdaTestTranslation(Translation::Legacy);
         std::cout << "BDA store boundary tests passed\n";
         RunColorTransferTests(device->GetContext());
         std::cout << "Vulkan BDA allocation and execution tests passed\n";

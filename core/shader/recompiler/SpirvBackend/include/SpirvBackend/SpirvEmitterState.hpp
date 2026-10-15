@@ -4,6 +4,7 @@
 #include "SpirvBackend/SpirvModule.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "BdaTable.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -133,6 +134,8 @@ struct SpirvEmitterState {
     std::uint32_t bdaNoteWriteFunction = 0;
     std::array<std::uint32_t, 2> bdaByteWriteFunctions {};
     std::uint32_t bdaFaultFunction = 0;
+    BdaTable::Translation bdaTranslation = BdaTable::Translation::Legacy;
+    std::array<std::array<std::uint32_t, 4>, 2> bdaResolveFunctions {};
     bool nativeF16ModesEmitted = false;
     bool f16DenormPreserveEmitted = false;
     std::uint32_t dot2F32F16Function = 0;

@@ -1,4 +1,5 @@
 #include "BdaShader.hpp"
+#include "BdaTranslationFixtures.hpp"
 #include "BdaAbi.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -7,7 +8,11 @@
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <memory>
 #include <set>
+#include <sstream>
+#include <stdexcept>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -92,6 +97,17 @@ private:
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
+std::unique_ptr<Buffer> MakeTable(const Context& context, std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::size_t count) {
+    namespace Table = ShaderRecompiler::BdaTable;
+    const auto translation = BdaTestTranslation();
+    auto words = Table::Build(ranges.first(std::min(count, ranges.size())), translation);
+    if (translation == Table::Translation::Legacy) words[1] = static_cast<std::uint32_t>(count);
+    else Table::Validate(words, translation);
+    auto table = std::make_unique<Buffer>(context, words.size() * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::memcpy(table->Bytes().data(), words.data(), words.size() * sizeof(std::uint32_t));
+    return table;
+}
+
 }
 
 static void RunWrittenRangeDecodeTests() {
@@ -145,7 +161,7 @@ static void RunBdaDwordWriteTests(const Context& context) {
         {guest + firstBytes, guest + firstBytes + 16, second.DeviceAddress(), Abi::Read | Abi::Write, 0},
         {guest + firstBytes + 16, guest + firstBytes + 32, readOnly.DeviceAddress(), Abi::Read, 0},
     }};
-    Buffer table(context, sizeof(Abi::Header) + sizeof(ranges), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::unique_ptr<Buffer> table;
     Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const std::array<std::uint32_t, 4> values{0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u};
@@ -167,12 +183,10 @@ static void RunBdaDwordWriteTests(const Context& context) {
         return std::pair{covered, total};
     };
     const auto write = [&](std::uint64_t address, std::uint32_t dwords, std::uint32_t storedBytes, Abi::FaultReason reason, std::uint32_t groups = 1) {
-        const Abi::Header header{Abi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(Abi::Range), 0};
-        std::memcpy(table.Bytes().data(), &header, sizeof(header));
-        std::memcpy(table.Bytes().data() + sizeof(header), ranges.data(), sizeof(ranges));
+        table = MakeTable(context, ranges, ranges.size());
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         for (auto* buffer : {&first, &second, &readOnly}) std::memset(buffer->Bytes().data(), 0xa5, buffer->Bytes().size());
-        Pipeline pipeline(context, MakeBdaDwordWriteTestShader(address, dwords, values.data()), {&table, &fault, &output});
+        Pipeline pipeline(context, MakeBdaDwordWriteTestShader(address, dwords, values.data()), {table.get(), &fault, &output});
         pipeline.Run(groups);
         Abi::Fault report{};
         std::memcpy(&report, fault.Bytes().data(), sizeof(report));
@@ -224,17 +238,15 @@ void RunBdaExecutionTests(const Context& context) {
     second.Bytes()[1] = std::byte{0x55};
     constexpr std::uint64_t guest = 0x7fff12340001ULL;
     std::array<Abi::Range, 2> ranges{{{guest, guest + 3, first.DeviceAddress(), Abi::Read, 0}, {guest + 3, guest + 5, second.DeviceAddress(), Abi::Read, 0}}};
-    Buffer table(context, sizeof(Abi::Header) + sizeof(ranges), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::unique_ptr<Buffer> table;
     Buffer fault(context, sizeof(Abi::Fault), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const auto run = [&](std::uint64_t address, std::uint32_t bits, std::uint32_t expected, Abi::FaultReason reason, std::uint32_t count = 2, std::uint32_t groups = 1, std::int64_t offset = 0) {
-        const Abi::Header header{Abi::Version, count, sizeof(Abi::Range), 0};
-        std::memcpy(table.Bytes().data(), &header, sizeof(header));
-        std::memcpy(table.Bytes().data() + sizeof(header), ranges.data(), sizeof(ranges));
+        table = MakeTable(context, ranges, count);
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         const std::uint32_t sentinel = 0xdeadbeef;
         std::memcpy(output.Bytes().data(), &sentinel, sizeof(sentinel));
-        Pipeline pipeline(context, MakeBdaTestShader(address, bits, offset), {&table, &fault, &output});
+        Pipeline pipeline(context, MakeBdaTestShader(address, bits, offset), {table.get(), &fault, &output});
         pipeline.Run(groups);
         Abi::Fault report{};
         std::uint32_t result = 0;
@@ -253,18 +265,16 @@ void RunBdaExecutionTests(const Context& context) {
     run(guest + 5, 8, 0, Abi::FaultReason::Unmapped, 2, 64);
     run(guest - 1, 8, 0, Abi::FaultReason::Unmapped);
     run(std::numeric_limits<std::uint64_t>::max() - 1, 32, 0, Abi::FaultReason::Overflow);
-    run(guest, 8, 0, Abi::FaultReason::InvalidTable, 3);
+    if (BdaTestTranslation() == ShaderRecompiler::BdaTable::Translation::Legacy) run(guest, 8, 0, Abi::FaultReason::InvalidTable, 3);
     run(std::numeric_limits<std::uint64_t>::max() - 2, 8, 0, Abi::FaultReason::Overflow, 2, 1, 4);
     run(1, 8, 0, Abi::FaultReason::Overflow, 2, 1, -4);
     Buffer words(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const auto read = [&](std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops, std::uint32_t value, bool faults) {
-        const Abi::Header header{Abi::Version, 2, sizeof(Abi::Range), 0};
-        std::memcpy(table.Bytes().data(), &header, sizeof(header));
-        std::memcpy(table.Bytes().data() + sizeof(header), ranges.data(), sizeof(ranges));
+        table = MakeTable(context, ranges, 2);
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         const std::array<std::uint32_t, 4> sentinel{0xdeadbeef, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef};
         std::memcpy(words.Bytes().data(), sentinel.data(), sizeof(sentinel));
-        Pipeline pipeline(context, MakeBdaDwordReadTestShader(address, dwords, coherent, stops), {&table, &fault, &words});
+        Pipeline pipeline(context, MakeBdaDwordReadTestShader(address, dwords, coherent, stops), {table.get(), &fault, &words});
         pipeline.Run(1);
         Abi::Fault report{};
         std::array<std::uint32_t, 4> result{};
@@ -296,15 +306,13 @@ void RunBdaExecutionTests(const Context& context) {
     }
     constexpr std::uint64_t spanGuest = 0x7fff56780000ULL;
     const std::array<Abi::Range, 3> spanRanges{{ranges[0], ranges[1], {spanGuest, spanGuest + 32, wide.DeviceAddress(), Abi::Read, 0}}};
-    Buffer spanTable(context, sizeof(Abi::Header) + sizeof(spanRanges), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::unique_ptr<Buffer> spanTable;
     const auto span = [&](std::uint64_t address, std::int32_t offset, std::uint32_t extracted, bool coherent, bool stops, std::array<std::uint32_t, 4> values, Abi::FaultReason reason = {}, std::uint64_t faultAddress = 0, std::uint32_t faultBytes = 0) {
-        const Abi::Header header{Abi::Version, 3, sizeof(Abi::Range), 0};
-        std::memcpy(spanTable.Bytes().data(), &header, sizeof(header));
-        std::memcpy(spanTable.Bytes().data() + sizeof(header), spanRanges.data(), sizeof(spanRanges));
+        spanTable = MakeTable(context, spanRanges, 3);
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         const std::array<std::uint32_t, 4> sentinel{0xdeadbeef, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef};
         std::memcpy(words.Bytes().data(), sentinel.data(), sizeof(sentinel));
-        Pipeline pipeline(context, MakeBdaSpanReadTestShader(address, static_cast<std::uint32_t>(offset), extracted, coherent, stops), {&spanTable, &fault, &words});
+        Pipeline pipeline(context, MakeBdaSpanReadTestShader(address, static_cast<std::uint32_t>(offset), extracted, coherent, stops), {spanTable.get(), &fault, &words});
         pipeline.Run(1);
         Abi::Fault report{};
         std::array<std::uint32_t, 4> result{};
@@ -339,23 +347,21 @@ void RunBdaStoreExecutionTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
     Buffer first(context, 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     Buffer second(context, 3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-    Buffer table(context, sizeof(Abi::Header) + 2 * sizeof(Abi::Range), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::unique_ptr<Buffer> table;
     Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     constexpr std::uint64_t guest = 0x7fff1235fffdULL;
     constexpr std::uint32_t writable = Abi::Read | Abi::Write;
-    const Abi::Header header{Abi::Version, 2, sizeof(Abi::Range), 0};
     std::array<Abi::Range, 2> ranges{};
     bool runtime = false;
     const auto run = [&](const char* name, std::uint64_t address, std::uint32_t bits, bool coherent, const std::array<std::uint8_t, 5>& expected, std::initializer_list<std::uint64_t> writtenAddresses, Abi::FaultReason reason = {}, std::uint64_t faultAddress = 0, std::uint32_t faultBytes = 0) {
         const std::string label = std::string(runtime ? "BDA runtime write " : "BDA store ") + name + (coherent ? " coherent: " : ": ");
         std::memset(first.Bytes().data(), 0xcd, first.Bytes().size());
         std::memset(second.Bytes().data(), 0xcd, second.Bytes().size());
-        std::memcpy(table.Bytes().data(), &header, sizeof(header));
-        std::memcpy(table.Bytes().data() + sizeof(header), ranges.data(), sizeof(ranges));
+        table = MakeTable(context, ranges, ranges.size());
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         std::memset(output.Bytes().data(), 0, output.Bytes().size());
-        Pipeline pipeline(context, runtime ? MakeBdaWriteTestShader(address, 0xa1b2c3d4u, bits, coherent) : MakeBdaStoreTestShader(address, 0xa1b2c3d4u, bits, coherent), {&table, &fault, &output});
+        Pipeline pipeline(context, runtime ? MakeBdaWriteTestShader(address, 0xa1b2c3d4u, bits, coherent) : MakeBdaStoreTestShader(address, 0xa1b2c3d4u, bits, coherent), {table.get(), &fault, &output});
         pipeline.Run(1);
         std::array<std::uint8_t, 5> actual{};
         std::memcpy(actual.data(), first.Bytes().data(), 2);
@@ -405,4 +411,78 @@ void RunBdaStoreExecutionTests(const Context& context) {
         ranges = {{{guest + 3, guest + 5, first.DeviceAddress(), writable, 0}, {guest + 5, guest + 8, second.DeviceAddress(), writable, 0}}};
         run("split aligned dword", guest + 3, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Unmapped, guest + 3, 4);
     }
+}
+
+void RunBdaTranslationTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    namespace Table = ShaderRecompiler::BdaTable;
+    constexpr std::uint32_t stride = 12;
+    Buffer unused(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::array<std::vector<std::uint32_t>, 4> shaders{};
+    for (std::uint32_t permission = 1; permission < shaders.size(); ++permission) shaders[permission] = MakeBdaResolveTestShader(permission);
+    const auto tables = BdaTableFixtures();
+    for (std::size_t fixture = 0; fixture < tables.size(); ++fixture) {
+        const auto& ranges = tables[fixture];
+        const auto words = Table::Build(ranges, Table::Translation::Verify);
+        Table::Validate(words, Table::Translation::Verify);
+        Buffer table(context, words.size() * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memcpy(table.Bytes().data(), words.data(), words.size() * sizeof(std::uint32_t));
+        const auto queries = BdaFixtureQueries(ranges, fixture == 3);
+        const auto groups = static_cast<std::uint32_t>((queries.size() + 63u) / 64u);
+        Buffer io(context, static_cast<std::size_t>(groups) * 64u * stride * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        for (std::uint32_t permission = 1; permission < shaders.size(); ++permission) {
+            auto* data = reinterpret_cast<std::uint32_t*>(io.Bytes().data());
+            for (std::size_t index = 0; index < static_cast<std::size_t>(groups) * 64u; ++index) {
+                const auto& query = queries[std::min(index, queries.size() - 1u)];
+                auto* slot = data + index * stride;
+                std::fill(slot, slot + stride, 0xffffffffu);
+                slot[0] = static_cast<std::uint32_t>(query.address);
+                slot[1] = static_cast<std::uint32_t>(query.address >> 32u);
+                slot[2] = query.bytes;
+            }
+            Pipeline pipeline(context, shaders[permission], {&table, &io, &unused});
+            pipeline.Run(groups);
+            for (std::size_t index = 0; index < queries.size(); ++index) {
+                const auto& query = queries[index];
+                const auto* slot = data + index * stride;
+                const auto expected = ReferenceBdaResolve(ranges, query.address, query.bytes, permission);
+                const BdaResolved legacy{slot[4] | (static_cast<std::uint64_t>(slot[5]) << 32u), slot[6]};
+                const BdaResolved radix{slot[8] | (static_cast<std::uint64_t>(slot[9]) << 32u), slot[10]};
+                if (legacy == expected && radix == expected) continue;
+                std::ostringstream message;
+                message << std::hex << "BDA translation fixture " << fixture << " permission " << permission << " address 0x" << query.address << std::dec << " bytes " << query.bytes << std::hex << ": expected 0x" << expected.result << "/" << expected.reason << ", legacy 0x" << legacy.result << "/" << legacy.reason << ", radix 0x" << radix.result << "/" << radix.reason;
+                Require(false, message.str());
+            }
+        }
+    }
+    const auto previous = BdaTestTranslation();
+    SetBdaTestTranslation(Table::Translation::Verify);
+    Buffer first(context, 3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    Buffer second(context, 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    constexpr std::uint64_t guest = 0x7fff12340001ULL;
+    const std::array<Abi::Range, 2> ranges{{{guest, guest + 3, first.DeviceAddress(), Abi::Read, 0}, {guest + 3, guest + 5, second.DeviceAddress(), Abi::Read, 0}}};
+    auto words = Table::Build(ranges, Table::Translation::Verify);
+    const auto entry = words[3];
+    Require(words[entry] == 1u && words[entry + 1] == 0u, "the injected-mismatch fixture no longer has a one-range root entry");
+    words[entry] = 2u;
+    bool rejected = false;
+    try {
+        Table::Validate(words, Table::Translation::Verify);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    Require(rejected, "host validation accepted a radix entry that selects the wrong range");
+    Buffer table(context, words.size() * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::memcpy(table.Bytes().data(), words.data(), words.size() * sizeof(std::uint32_t));
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    for (const std::uint32_t bits : {8u, 32u}) {
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        Pipeline pipeline(context, MakeBdaTestShader(guest, bits), {&table, &fault, &output});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::TranslationMismatch && report.address == guest && report.instruction == 0x1234, "APS5_BDA_ABI=verify did not fail on an injected radix mismatch");
+    }
+    SetBdaTestTranslation(previous);
 }

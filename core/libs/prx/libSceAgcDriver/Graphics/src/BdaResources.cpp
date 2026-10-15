@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "BdaTable.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
@@ -145,8 +146,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     const auto serial = cached.has_value() ? cached->serial : 0;
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
-    tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range);
-    Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
+    const auto translation = ShaderRecompiler::BdaTable::TranslationSetting();
     auto& cache = Tables();
     std::uint64_t hash = 0;
     if (tableCacheEnabled()) {
@@ -163,6 +163,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                     ++cache.hits;
                     ++cache.classes.spaceTables;
                     table = std::move(shared);
+                    tableBytes = table->Size();
                     cache.entries.splice(cache.entries.begin(), cache.entries, it);
                     return;
                 }
@@ -196,6 +197,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                 // same way): the next build of this space binds it by the serial.
                 if (serial != 0) it->spaceSerial = serial;
                 table = std::move(shared);
+                tableBytes = table->Size();
                 cache.entries.splice(cache.entries.begin(), cache.entries, it);
                 return;
             }
@@ -203,10 +205,13 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         }
     }
     for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA range ends past the addresses the written-page record can hold");
+    const auto words = ShaderRecompiler::BdaTable::Build(ranges, translation);
+    if (translation != ShaderRecompiler::BdaTable::Translation::Legacy) ShaderRecompiler::BdaTable::Validate(words, translation);
+    Require(words.size() <= std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t), "BDA table size overflow");
+    tableBytes = words.size() * sizeof(std::uint32_t);
+    Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
     table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), 0};
-    std::memcpy(table->Bytes().data(), &header, sizeof(header));
-    if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
+    std::memcpy(table->Bytes().data(), words.data(), tableBytes);
     if (tableCacheEnabled()) {
         std::lock_guard lock(cache.mutex);
         ++cache.misses;
@@ -288,13 +293,15 @@ void BdaResources::CheckFault() const {
         throw std::runtime_error(message.str());
     }
     message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::TranslationMismatch) message << "; the legacy and radix BDA translations differ for this access (APS5_BDA_ABI=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Permission && table != nullptr) {
         const auto bytes = table->Bytes();
         ShaderRecompiler::BdaAbi::Header header{};
         std::memcpy(&header, bytes.data(), sizeof(header));
+        const auto rangeBytes = ShaderRecompiler::BdaTable::RangeBaseWord(ShaderRecompiler::BdaTable::TranslationSetting()) * sizeof(std::uint32_t);
         for (std::uint32_t index = 0; index < header.count; ++index) {
             ShaderRecompiler::BdaAbi::Range range{};
-            std::memcpy(&range, bytes.data() + sizeof(header) + index * sizeof(range), sizeof(range));
+            std::memcpy(&range, bytes.data() + rangeBytes + index * sizeof(range), sizeof(range));
             if (report.address < range.begin || report.address >= range.end) continue;
             message << std::hex << "; the store hit 0x" << range.begin << "+0x" << range.end - range.begin << ", read-only in the BDA table: stores through GPU-selected descriptors and FLAT/GLOBAL addresses reach only writable ranges imported in place, not ones served by a mirror or a copy (past APS5_HOST_IMPORT_MIB, or refused by the driver)";
             break;

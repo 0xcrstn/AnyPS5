@@ -225,6 +225,10 @@ function(add_shader_recompiler target runtimeTarget)
             BuildBarycentricGeometryShader
             BuildPreparedShaderKey
             BuildRectListShaders
+            BdaTable::Build
+            BdaTable::RangeBaseWord
+            BdaTable::TranslationSetting
+            BdaTable::Validate
             CaptureResources
             CompiledWalkCounts
             SrtCompiledWalkCounts
