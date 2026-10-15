@@ -43,6 +43,19 @@ struct OptimizedPipeline {
     void Release() noexcept;
 };
 
+struct PipelineLibraryPartsMissing {};
+
+class ReadyPipelineLibraryParts {
+public:
+    ReadyPipelineLibraryParts();
+    ~ReadyPipelineLibraryParts();
+    ReadyPipelineLibraryParts(const ReadyPipelineLibraryParts&) = delete;
+    ReadyPipelineLibraryParts& operator=(const ReadyPipelineLibraryParts&) = delete;
+
+private:
+    bool previous;
+};
+
 VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys, std::shared_ptr<OptimizedPipeline>* optimized = nullptr, bool partsOnly = false, std::span<VkShaderModule> modules = {});
 
 std::array<std::uint64_t, 4>& ThreadBuiltLibraryParts();

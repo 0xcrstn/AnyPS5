@@ -593,8 +593,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         pipelineInfo.renderPass = renderPass;
         if (dynamicRendering) pipelineInfo.pNext = &rendering;
         timing.Mark("modules_and_state");
-        if (probingPipelineCache && (libraries || prebuilding)) throw PipelineCompileRequired{};
-        if (probingPipelineCache) pipelineInfo.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
+        if (probingPipelineCache && prebuilding) throw PipelineCompileRequired{};
+        if (probingPipelineCache && !libraries) pipelineInfo.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
         if (prebuilding && !libraries) {
             for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
             _modules.clear();
@@ -635,7 +635,16 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         if (libraries) {
             ShaderCompileTrace::Event linkEvent("pipeline.graphics_from_libraries");
             traceStages(linkEvent);
-            pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+            if (probingPipelineCache) {
+                try {
+                    const ReadyPipelineLibraryParts ready;
+                    pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+                } catch (const PipelineLibraryPartsMissing&) {
+                    throw PipelineCompileRequired{};
+                }
+            } else {
+                pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+            }
             if (VerifyPipelineModes()) {
                 VkPipeline monolithic = VK_NULL_HANDLE;
                 VkResult created;

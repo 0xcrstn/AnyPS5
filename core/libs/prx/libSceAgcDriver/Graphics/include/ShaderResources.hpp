@@ -225,6 +225,7 @@ public:
         double allocateUs = 0;
         double updateUs = 0;
     };
+    void VerifyDataWords(std::span<const CompiledShader> shaders, std::span<const MovedBuffer> moved) const;
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsStatistics* statistics = nullptr, const DrawIndexRanges* drawRanges = nullptr, std::span<const DrawSnapshotArena::Prefill> prefills = {}) const;
     struct SnapshotRequest {
         std::uint64_t begin;
