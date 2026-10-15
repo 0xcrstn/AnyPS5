@@ -50,7 +50,7 @@ inline constexpr std::uint32_t SearchLimit = 4;
 inline constexpr std::uint32_t NodeBit = 0x80000000u;
 
 inline Translation ParseTranslation(const char* value) {
-    if (value == nullptr) return Translation::Radix;
+    if (value == nullptr) return Translation::Linear;
     const std::string_view text(value);
     if (text == "legacy") return Translation::Legacy;
     if (text == "radix") return Translation::Radix;
