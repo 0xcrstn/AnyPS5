@@ -4879,7 +4879,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
 }
 
 void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText) {
-    auto& recorder = *state->recorder;
+    auto& recorder = RecorderFor(GuestMemory::GpuLockThreadTag());
     auto& timer = *record.timer;
     const auto& context = *record.context;
     const auto arguments = record.arguments;
@@ -4941,7 +4941,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
 
 void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     auto& d = Dispatches();
-    auto& recorder = *state->recorder;
+    auto& recorder = RecorderFor(GuestMemory::GpuLockThreadTag());
     auto& timer = *record.timer;
     const auto& context = *record.context;
     auto& resources = *record.resources;
@@ -5115,7 +5115,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut) {
-    state->recorder->BoundKeptBytes();
+    RecorderFor(GuestMemory::GpuLockThreadTag()).BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     PerformanceTimer timing("Vulkan.Dispatch");
     if (recipeOut != nullptr) *recipeOut = nullptr;
@@ -5184,7 +5184,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         static const bool deferEviction = std::getenv("APS5_NO_DEFERRED_EVICTION") == nullptr;
         std::vector<std::shared_ptr<Graphics::ShaderResources>> evicted;
         state->resourceCache.Insert(contentKey, resources, deferEviction ? &evicted : nullptr);
-        for (auto& object : evicted) state->recorder->Keep(std::move(object));
+        for (auto& object : evicted) RecorderFor(GuestMemory::GpuLockThreadTag()).Keep(std::move(object));
         if (profile) {
             timer.add(PhaseResourcesInsert, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - insertStart).count());
             if (auto* rows = timer.holdRows()) rows->phaseCounts[PhaseResourcesInsert] += evicted.size();
@@ -5234,19 +5234,19 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         if (cached != nullptr) {
             if (cached->Revalidate(shaders[0])) {
                 std::optional<std::vector<Graphics::ShaderResources::MovedDispatchBuffer>> moved;
-                if (MovedTemplatesSwitch()) moved = cached->MovedDispatchBuffers(shaders[0], *state->recorder);
+                if (MovedTemplatesSwitch()) moved = cached->MovedDispatchBuffers(shaders[0], RecorderFor(GuestMemory::GpuLockThreadTag()));
                 if (MovedTemplatesSwitch() && !moved.has_value()) {
                     MovedTemplates().refused.fetch_add(1, std::memory_order_relaxed);
                     cached = nullptr;
                 } else {
                     if (moved.has_value() && !moved->empty()) {
-                        movedSet = cached->BindMovedDispatchBuffers(*state->recorder, *moved);
+                        movedSet = cached->BindMovedDispatchBuffers(RecorderFor(GuestMemory::GpuLockThreadTag()), *moved);
                         for (const auto& entry : *moved) movedReads.emplace_back(entry.begin, entry.begin + entry.view.range);
                         if (VerifyMovedTemplates()) {
                             auto fresh = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0);
                             const auto expected = fresh->GuestBufferViews();
                             const auto served = cached->GuestBufferViews(*moved);
-                            state->recorder->Keep(std::move(fresh));
+                            RecorderFor(GuestMemory::GpuLockThreadTag()).Keep(std::move(fresh));
                             if (expected != served) {
                                 std::size_t index = 0;
                                 while (index < expected.size() && index < served.size() && expected[index] == served[index]) ++index;
@@ -5268,7 +5268,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                 state->resourceCache.Remove(contentKey, cached.get());
                 ++d.cacheInvalidated;
                 // Off the mutex with its batch, as an evicted entry (insert()).
-                state->recorder->Keep(std::move(cached));
+                RecorderFor(GuestMemory::GpuLockThreadTag()).Keep(std::move(cached));
             }
             if (profile) {
                 revalidateMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - subPhaseStart).count();
@@ -5320,7 +5320,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     // Recorded into the device's open batch: the CPU moves on to the next command while the GPU
     // works; the batch is waited for where the guest expects results (labels, flips, CPU reads).
-    auto& recorder = *state->recorder;
+    auto& recorder = RecorderFor(GuestMemory::GpuLockThreadTag());
     IndirectOutcome outcome{0, 0};
     RecordedDispatch record{&context, &shaders[0], resources, objects, pushStages, &pushBytes, x, y, z, arguments, nullptr, programAddress, fromCache && TemplateDataRefresh() ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::None, 0, revalidateMs, &timer};
     record.resourceKeyMatched = fromCache;
@@ -5401,7 +5401,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
 }
 
 RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify, bool refreshByWords) {
-    state->recorder->BoundKeptBytes();
+    RecorderFor(GuestMemory::GpuLockThreadTag()).BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     PerformanceTimer timing("Vulkan.DispatchRecipe");
     outcome = {0, 0};
@@ -5444,7 +5444,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         // ordinary path runs with the prepared find (C10: the template goes to the batch).
         if (verify->cached.get() != hit->resources.get()) {
             counters.verifyReplaced.fetch_add(1, std::memory_order_relaxed);
-            state->recorder->Keep(std::move(hit->resources));
+            RecorderFor(GuestMemory::GpuLockThreadTag()).Keep(std::move(hit->resources));
             return RecipeOutcome::Rebuild;
         }
         std::shared_ptr<ComputePipelineObjects> mapped;
@@ -5477,7 +5477,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         state->resourceCache.Remove(recipe.key, hit->resources.get());
         ++d.cacheInvalidated;
         // Off the mutex with its batch, as an evicted entry.
-        state->recorder->Keep(std::move(hit->resources));
+        RecorderFor(GuestMemory::GpuLockThreadTag()).Keep(std::move(hit->resources));
         counters.rebuilds[static_cast<std::size_t>(report.failure)].fetch_add(1, std::memory_order_relaxed);
         return RecipeOutcome::Rebuild;
     }
@@ -5503,7 +5503,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     APS5_LOG_OUT_DEBUG("Dispatch recorded from recipe groups=%s", groupsText);
     if (SyncEachDispatch()) {
         Graphics::Recorder::CountSync(3);
-        state->recorder->Sync();
+        RecorderFor(GuestMemory::GpuLockThreadTag()).Sync();
         timer.phase(PhaseSync);
     }
     if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, hit->resources->Describe().c_str());

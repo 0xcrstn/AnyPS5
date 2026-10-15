@@ -237,7 +237,9 @@ void Driver::traceCopyPending(const char* what, std::uint64_t address, std::size
     if (shown.fetch_add(1) >= 160) return;
     char pending[160];
     std::snprintf(pending, sizeof(pending), " no recorded write");
-    if (auto* recorder = Graphics::Recorder::Active()) {
+    for (std::uint32_t physical = 0; physical < Graphics::Recorder::PhysicalQueues; ++physical) {
+        auto* recorder = Graphics::Recorder::ForPhysicalQueue(physical);
+        if (recorder == nullptr) continue;
         if (const auto info = recorder->DescribePendingWrite(address, bytes)) {
             std::snprintf(pending, sizeof(pending), " batch %llu%s%s range 0x%llx+0x%llx (%zu batches to finish)", static_cast<unsigned long long>(info->serial), info->open ? " open" : "", info->signaled ? " signaled" : " unsignaled", static_cast<unsigned long long>(info->rangeBegin), static_cast<unsigned long long>(info->rangeEnd - info->rangeBegin), info->batchesToFinish);
         }
