@@ -256,7 +256,9 @@ Queue 0's draws and dispatches are prepared on worker threads and recorded on a 
 - `APS5_EPOCH_DIRTY_SET` (with `APS5_EPOCH_DIRTY_SET_WIDEN_KIB`, 256), `APS5_COLLECT_COVERAGE`, `APS5_PRECOLLECT_ON_WORKERS`: write-tracking collects are widened, shared between the threads of a collect epoch and made early on the preparation workers.
 - `APS5_DIRTY_RECORD`: a draw that continues a render pass skips the binds that did not change.
 
-Off by default: `APS5_CHUNKED_RECORDING=1` records a render pass's draws into secondary command buffers on a recording thread (it costs more than it saves at a few draws per pass), and `APS5_IN_PLACE_DRAW_INPUTS=1` binds read-only draw inputs in place instead of snapshotting them (a title's CPU store before the GPU reads them is seen by the draw).
+`APS5_IN_PLACE_DRAW_INPUTS` binds read-only draw inputs through their host imports instead of snapshotting them. It is on by default whenever `APS5_COHERENCE_INPUT_LEASES` is: each input then holds a read lease until its batch completes, so a CPU store into it waits for the draw instead of reaching it, and an input whose lease is refused is snapshotted. Setting it to `1` without the leases binds the inputs unprotected (a CPU store before the GPU reads them is seen by the draw); `0` turns it off.
+
+Off by default: `APS5_CHUNKED_RECORDING=1` records a render pass's draws into secondary command buffers on a recording thread (it costs more than it saves at a few draws per pass).
 
 ### Address-based shader experiments
 

@@ -4898,13 +4898,17 @@ int coherenceLeaseTests(const Device& device, Recorder& recorder) {
     });
     Coherence::ResetForTests();
     const auto copyBuffer = base.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
-    const auto read = [&](Buffer& output) {
+    const auto read = [&](Buffer& output, bool drawInput = false) {
         const auto commands = recorder.Commands();
         RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         const VkBufferCopy piece{address - import->base, 0, 16};
         copyBuffer(commands, import->buffer, output.Handle(), 1, &piece);
         RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
         recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (drawInput) {
+            Require(recorder.NoteInPlaceDrawInput(address, 16), "a draw input bound in place was refused its read lease");
+            return;
+        }
         const auto lease = Coherence::AcquireReadLease({address, address + 16}, Coherence::CurrentVersion());
         Require(lease != 0, "a read lease over shared guest memory was refused");
         recorder.OnCompleteWithoutGuestAccess([lease] { Coherence::RetireReadLease(lease); });
@@ -4929,6 +4933,17 @@ int coherenceLeaseTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     counters = Coherence::CurrentCounters();
     Require(counters.leases == 1002 && counters.leaseWaits == 1 && counters.liveProtections == 0, "unwritten leased reads waited or kept their leases: " + Coherence::Report());
+    Coherence::ResetForTests();
+    read(first, true);
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint32_t*>(address) = 0x43434343u;
+    gpu.lock();
+    read(second, true);
+    recorder.Sync();
+    Require(early[0] == 0x42 && early[3] == 0x42 && early[4] == 0x41, "a draw input bound in place saw a native write made after it was recorded");
+    Require(late[0] == 0x43 && late[3] == 0x43 && late[4] == 0x41, "a draw input bound in place after a native write missed it");
+    counters = Coherence::CurrentCounters();
+    Require(counters.leases == 2 && counters.leaseWaits == 1 && counters.liveProtections == 0, "in-place draw input leases: " + Coherence::Report());
     std::cout << "coherence input leases: ok\n";
     return 0;
 #endif
