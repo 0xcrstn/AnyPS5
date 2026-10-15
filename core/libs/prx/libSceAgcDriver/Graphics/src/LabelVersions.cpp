@@ -98,7 +98,7 @@ bool Enabled() {
             const char* value = std::getenv(name);
             return value != nullptr && std::strcmp(value, "0") != 0;
         };
-        state = set("APS5_TRACE_WAIT_CHAIN") || set("APS5_PROFILE_DRAW") ? 1 : 0;
+        state = set("APS5_TRACE_WAIT_CHAIN") ? 1 : 0;
         EnabledState().store(state, std::memory_order_relaxed);
     }
     return state == 1;

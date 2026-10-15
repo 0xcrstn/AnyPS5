@@ -2096,11 +2096,14 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // A unit shadow's results in the label's unit reach the import before the store lands over
     // part of it (the store's stamp then makes the unit stale); the deferred label paths call no
     // FlushPending of their own.
-    if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    const auto publishShadow = [&] {
+        if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    };
     const std::array<Coherence::Interval, 1> labelRange{{{address, address + bytes.size()}}};
-    auto labelToken = Coherence::Reserve(Coherence::Producer::LabelStore, labelRange, false, queue);
     if (behindWriteBacks) {
         if (drain) return 2;
+        publishShadow();
+        auto labelToken = Coherence::Reserve(Coherence::Producer::LabelStore, labelRange, false, queue);
         GuestMemory::MarkWritten(address, bytes.size());
         recorder.AfterCompletions(address, bytes, stamp, queue, false);
         labelToken.Recorded();
@@ -2109,6 +2112,8 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     const auto context = graphicsContext();
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());
     if (import == nullptr) return 3;
+    publishShadow();
+    auto labelToken = Coherence::Reserve(Coherence::Producer::LabelStore, labelRange, false, queue);
     // The store on the GPU, into the open batch: everything recorded so far completes before it,
     // and it is visible to the host after. The barriers belong to the recorder's store run: one
     // pair for a whole group of labels recorded back to back (Recorder::RecordStore orders the
