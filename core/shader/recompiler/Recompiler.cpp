@@ -8,6 +8,7 @@
 #include <cstdio>
 #include "CacheKey.hpp"
 #include "CompileTrace.hpp"
+#include "SpirvIntern.hpp"
 #include "CompiledVariant.hpp"
 #include "VertexInputSpecialization.hpp"
 #include "FragmentOutputSpecialization.hpp"
@@ -844,7 +845,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program,
     {
         ShaderCompileTrace::Event optimizeEvent("emit.validate_optimize");
         const auto wordsIn = result.spirv.size();
-        result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded);
+        result.spirv = InternSpirv(ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded));
         if (optimizeEvent.Active()) optimizeEvent.Hex("address", request.shader.codeAddress).Flag("optimized", !embedded).Number("spirv_words_in", wordsIn).Number("spirv_words", result.spirv.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(result.spirv.Words()));
     }
     if (embedded) {
@@ -980,9 +981,12 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         }
         cursor += count;
     }
-    module->spirv = std::move(materialized);
+    module->spirv = InternSpirv(std::move(materialized));
     module->specializationId = constants.empty() ? 0u : nextVariantId();
-    if (specializeEvent.Active()) specializeEvent.Number("spirv_words", module->spirv.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(module->spirv.Words()));
+    if (specializeEvent.Active()) {
+        const auto interned = SpirvInternTotals();
+        specializeEvent.Number("spirv_words", module->spirv.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(module->spirv.Words())).Number("intern_lookups", interned.lookups).Number("intern_shared", interned.shared).Number("intern_shared_bytes", interned.sharedBytes);
+    }
     retainedCounters().specializedModules.fetch_add(1, std::memory_order_relaxed);
     retainedCounters().specializedSpirvBytes.fetch_add(module->spirv.Words().size() * sizeof(std::uint32_t), std::memory_order_relaxed);
     return module;
