@@ -8,9 +8,9 @@
 
 namespace AgcDriver::DriverDetail {
 
-enum DrawDriverPhase { DrawRowPrologue, DrawRowPrecheck, DrawRowDecode, DrawRowProgramPrepare, DrawRowCaptureInvocation, DrawRowCapture, DrawRowCaptureHookWaits, DrawRowCaptureRegions, DrawRowRecompile, DrawRowStageVerify, DrawRowRectList, DrawRowVectors, DrawRowPipelinePrepare, DrawRowKeyLookupValidate, DrawRowValidateWait, DrawRowLockWait, DrawRowLabels, DrawRowGraphics, DrawRowSkipped, DrawRowEpilogue, DrawDriverPhaseCount };
+enum DrawDriverPhase { DrawRowPrologue, DrawRowFreezeCheck, DrawRowPrecheck, DrawRowDecode, DrawRowProgramPrepare, DrawRowCaptureInvocation, DrawRowCapture, DrawRowCaptureHookWaits, DrawRowCaptureRegions, DrawRowRecompile, DrawRowStageVerify, DrawRowRectList, DrawRowVectors, DrawRowPipelinePrepare, DrawRowKeyLookupValidate, DrawRowValidateWait, DrawRowLockWait, DrawRowLabels, DrawRowGraphics, DrawRowSkipped, DrawRowEpilogue, DrawDriverPhaseCount };
 
-inline constexpr const char* DrawDriverPhaseNames[DrawDriverPhaseCount] = {"prologue", "precheck", "decode", "program prepare", "capture invocation", "capture", "capture hook waits", "capture regions", "recompile", "stage verify", "rect-list", "vectors", "pipeline prepare", "key/lookup/validate", "validate GPU wait", "lock wait", "labels", "Graphics::Draw", "skipped", "epilogue"};
+inline constexpr const char* DrawDriverPhaseNames[DrawDriverPhaseCount] = {"prologue", "freeze check", "precheck", "decode", "program prepare", "capture invocation", "capture", "capture hook waits", "capture regions", "recompile", "stage verify", "rect-list", "vectors", "pipeline prepare", "key/lookup/validate", "validate GPU wait", "lock wait", "labels", "Graphics::Draw", "skipped", "epilogue"};
 
 struct DrawPhaseTotals {
     std::array<double, DrawDriverPhaseCount> ms{};

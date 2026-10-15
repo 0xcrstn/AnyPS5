@@ -5381,6 +5381,34 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     lap(&DrawBindingsStatistics::checkUs);
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    const bool persistent = RecordBindingsMode() == RecordBindings::Persistent;
+    std::vector<std::array<std::uint64_t, 4>> persistentKey;
+    if (persistent) {
+        persistentKey.reserve(selected.size() + 1);
+        persistentKey.push_back({recorder.SnapshotArena().Identity(), selected.size(), 0, 0});
+        for (std::size_t index = 0; index < selected.size(); ++index) {
+            const auto& snapshot = result->snapshots[index];
+            persistentKey.push_back({selected[index], reinterpret_cast<std::uint64_t>(snapshot.handle), snapshot.offset, snapshot.bytes.size()});
+        }
+        std::shared_ptr<const DrawBindings> reused;
+        {
+            std::lock_guard lock(persistentDrawSetMutex);
+            const auto found = std::find_if(persistentDrawSets.begin(), persistentDrawSets.end(), [&](const PersistentDrawSet& entry) { return entry.key == persistentKey; });
+            if (found != persistentDrawSets.end()) reused = found->bindings;
+        }
+        if (reused != nullptr) {
+            result->allocation = reused->allocation;
+            result->fragmentAllocation = reused->fragmentAllocation;
+            result->persistent = std::move(reused);
+            recorder.Keep(result);
+            for (const auto& snapshot : result->snapshots) {
+                if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+            }
+            if (statistics != nullptr) ++statistics->persistentSets;
+            lap(&DrawBindingsStatistics::allocateUs);
+            return result;
+        }
+    }
     std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
     std::array<std::map<VkDescriptorType, std::uint32_t>, 2> counts;
     for (const auto& binding : bindings) {
@@ -5433,8 +5461,41 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     }
     if (statistics != nullptr) statistics->descriptorWrites += writes.size();
+    if (persistent) {
+        std::lock_guard lock(persistentDrawSetMutex);
+        PersistentDrawSet entry{std::move(persistentKey), result};
+        if (persistentDrawSets.size() < PersistentDrawSetSlots) persistentDrawSets.push_back(std::move(entry));
+        else persistentDrawSets[persistentDrawSetNext++ % PersistentDrawSetSlots] = std::move(entry);
+    }
     lap(&DrawBindingsStatistics::updateUs);
     return result;
+}
+
+ShaderResources::RecordBindings ShaderResources::ParseRecordBindings(const char* text) {
+    if (text == nullptr) return RecordBindings::Persistent;
+    const std::string_view value(text);
+    if (value == "persistent" || value == "1" || value == "on") return RecordBindings::Persistent;
+    if (value == "legacy" || value == "0" || value == "off") return RecordBindings::Legacy;
+    throw std::invalid_argument("APS5_RECORD_BINDINGS must be persistent, legacy, 1, 0, on or off, not \"" + std::string(value) + "\"");
+}
+
+namespace {
+
+std::atomic<int>& recordBindingsOverride() {
+    static std::atomic<int> mode{-1};
+    return mode;
+}
+
+}
+
+ShaderResources::RecordBindings ShaderResources::RecordBindingsMode() {
+    static const auto parsed = ParseRecordBindings(std::getenv("APS5_RECORD_BINDINGS"));
+    const auto forced = recordBindingsOverride().load(std::memory_order_relaxed);
+    return forced >= 0 ? static_cast<RecordBindings>(forced) : parsed;
+}
+
+void ShaderResources::SetRecordBindingsMode(RecordBindings mode) {
+    recordBindingsOverride().store(static_cast<int>(mode), std::memory_order_relaxed);
 }
 
 void ShaderResources::Bind(const CommandSink& commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {

@@ -173,8 +173,14 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        std::shared_ptr<const DrawBindings> persistent;
         ~DrawBindings();
     };
+    enum class RecordBindings : std::uint8_t { Legacy, Persistent };
+    static RecordBindings ParseRecordBindings(const char* text);
+    static RecordBindings RecordBindingsMode();
+    static void SetRecordBindingsMode(RecordBindings mode);
+    static constexpr std::size_t PersistentDrawSetSlots = 4;
     enum class WholeCopy : std::uint8_t { NotAnalysed, IndexVertex, IndexInstance, IndexMemory, IndexUserData, IndexOther, NoDrawRange, IndexAtDraw, IndexAtDrawUserWord, IndexAtDrawUnderflow, IndexAtDrawOverflow, Offset, Soffset, ScalarOffset, Wrap, Opcode, Alias, Swizzled, AddTid, BeyondFourGiB, OverHalf, Disabled, Count };
     static const char* WholeCopyName(WholeCopy reason);
     using ByteRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
@@ -209,6 +215,7 @@ public:
         std::uint64_t inPlace = 0;
         std::uint64_t inPlaceBytes = 0;
         std::uint64_t overHalfReadBytes = 0;
+        std::uint64_t persistentSets = 0;
         double checkUs = 0;
         double collectUs = 0;
         double lookupUs = 0;
@@ -650,6 +657,13 @@ private:
         DrawSnapshotArena::Placed placed{};
     };
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
+    struct PersistentDrawSet {
+        std::vector<std::array<std::uint64_t, 4>> key;
+        std::shared_ptr<const DrawBindings> bindings;
+    };
+    mutable std::mutex persistentDrawSetMutex;
+    mutable std::vector<PersistentDrawSet> persistentDrawSets;
+    mutable std::size_t persistentDrawSetNext = 0;
     mutable std::size_t movedWordBufferNext = 0;
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
