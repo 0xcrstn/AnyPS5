@@ -3299,6 +3299,10 @@ void drawSnapshotEpochTests(const Device& device) {
         std::cout << "host import of the block refused: draw snapshot reuse within a collect epoch not tested\n";
         return;
     }
+    if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host imports are compared, not watched: draw snapshot reuse within a collect epoch not tested\n";
+        return;
+    }
     constexpr std::size_t elementOffset = 4096;
     constexpr std::size_t elementBytes = 2 * 65536;
     const auto element = address + elementOffset;
