@@ -90,6 +90,7 @@ public:
         skipPeerOnce = true;
     }
     static bool QueueOrderVerify();
+    static void SuppressOrderWaitsForTest(bool suppress);
     struct QueueOrderStatistics {
         std::uint64_t requiredWaits = 0;
         std::uint64_t peerWaits = 0;
