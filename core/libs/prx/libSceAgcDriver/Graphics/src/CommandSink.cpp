@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommandSink.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PassSignatures.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -91,234 +92,215 @@ std::uintptr_t CommandSink::Identity() const {
     return list != nullptr ? identity : reinterpret_cast<std::uintptr_t>(commands);
 }
 
-void CommandSink::BindPipeline(const Context& context, VkPipelineBindPoint bindPoint, VkPipeline pipeline) const {
+bool CommandSink::emit(ChunkCommand command, std::initializer_list<std::uint64_t> arguments, std::span<const std::uint64_t> tail) const {
     if (list != nullptr) {
-        list->Append(ChunkCommand::BindPipeline, {Value(bindPoint), Handle(pipeline)});
-        return;
+        list->Append(command, arguments, tail);
+        return true;
+    }
+    PassSignatures::Note(static_cast<std::uint32_t>(command), arguments, tail);
+    return false;
+}
+
+void CommandSink::BindPipeline(const Context& context, VkPipelineBindPoint bindPoint, VkPipeline pipeline) const {
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::BindPipeline, {Value(bindPoint), Handle(pipeline)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, bindPoint, pipeline);
 }
 
 void CommandSink::SetViewport(const Context& context, const VkViewport& viewport) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetViewport, {Pair(Low(Bits(viewport.x)), Low(Bits(viewport.y))), Pair(Low(Bits(viewport.width)), Low(Bits(viewport.height))), Pair(Low(Bits(viewport.minDepth)), Low(Bits(viewport.maxDepth)))});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetViewport, {Pair(Low(Bits(viewport.x)), Low(Bits(viewport.y))), Pair(Low(Bits(viewport.width)), Low(Bits(viewport.height))), Pair(Low(Bits(viewport.minDepth)), Low(Bits(viewport.maxDepth)))})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &viewport);
 }
 
 void CommandSink::SetScissor(const Context& context, const VkRect2D& scissor) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetScissor, {Pair(static_cast<std::uint32_t>(scissor.offset.x), static_cast<std::uint32_t>(scissor.offset.y)), Pair(scissor.extent.width, scissor.extent.height)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetScissor, {Pair(static_cast<std::uint32_t>(scissor.offset.x), static_cast<std::uint32_t>(scissor.offset.y)), Pair(scissor.extent.width, scissor.extent.height)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &scissor);
 }
 
 void CommandSink::SetStencilReference(const Context& context, VkStencilFaceFlags faces, std::uint32_t reference) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetStencilReference, {Value(faces), Value(reference)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetStencilReference, {Value(faces), Value(reference)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, faces, reference);
 }
 
 void CommandSink::SetStencilCompareMask(const Context& context, VkStencilFaceFlags faces, std::uint32_t mask) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetStencilCompareMask, {Value(faces), Value(mask)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetStencilCompareMask, {Value(faces), Value(mask)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetStencilCompareMask, "vkCmdSetStencilCompareMask")(commands, faces, mask);
 }
 
 void CommandSink::SetStencilWriteMask(const Context& context, VkStencilFaceFlags faces, std::uint32_t mask) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetStencilWriteMask, {Value(faces), Value(mask)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetStencilWriteMask, {Value(faces), Value(mask)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetStencilWriteMask, "vkCmdSetStencilWriteMask")(commands, faces, mask);
 }
 
 void CommandSink::SetStencilOp(const Context& context, VkStencilFaceFlags faces, VkStencilOp failOp, VkStencilOp passOp, VkStencilOp depthFailOp, VkCompareOp compareOp) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetStencilOp, {Value(faces), Value(failOp), Value(passOp), Value(depthFailOp), Value(compareOp)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetStencilOp, {Value(faces), Value(failOp), Value(passOp), Value(depthFailOp), Value(compareOp)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetStencilOp, "vkCmdSetStencilOpEXT")(commands, faces, failOp, passOp, depthFailOp, compareOp);
 }
 
 void CommandSink::SetCullMode(const Context& context, VkCullModeFlags mode) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetCullMode, {Value(mode)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetCullMode, {Value(mode)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT")(commands, mode);
 }
 
 void CommandSink::SetFrontFace(const Context& context, VkFrontFace face) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetFrontFace, {Value(face)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetFrontFace, {Value(face)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT")(commands, face);
 }
 
 void CommandSink::SetDepthBias(const Context& context, float constant, float clamp, float slope) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetDepthBias, {Bits(constant), Bits(clamp), Bits(slope)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetDepthBias, {Bits(constant), Bits(clamp), Bits(slope)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, constant, clamp, slope);
 }
 
 void CommandSink::SetDepthBounds(const Context& context, float minimum, float maximum) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetDepthBounds, {Bits(minimum), Bits(maximum)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetDepthBounds, {Bits(minimum), Bits(maximum)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, minimum, maximum);
 }
 
 void CommandSink::SetDepthTestEnable(const Context& context, VkBool32 enable) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetDepthTestEnable, {Value(enable)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetDepthTestEnable, {Value(enable)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT")(commands, enable);
 }
 
 void CommandSink::SetDepthWriteEnable(const Context& context, VkBool32 enable) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetDepthWriteEnable, {Value(enable)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetDepthWriteEnable, {Value(enable)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT")(commands, enable);
 }
 
 void CommandSink::SetDepthCompareOp(const Context& context, VkCompareOp compare) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetDepthCompareOp, {Value(compare)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetDepthCompareOp, {Value(compare)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT")(commands, compare);
 }
 
 void CommandSink::SetDepthBoundsTestEnable(const Context& context, VkBool32 enable) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetDepthBoundsTestEnable, {Value(enable)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetDepthBoundsTestEnable, {Value(enable)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT")(commands, enable);
 }
 
 void CommandSink::SetStencilTestEnable(const Context& context, VkBool32 enable) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::SetStencilTestEnable, {Value(enable)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::SetStencilTestEnable, {Value(enable)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, enable);
 }
 
 void CommandSink::BindDescriptorSet(const Context& context, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t index, VkDescriptorSet set, std::span<const std::uint32_t> dynamicOffsets) const {
-    if (list != nullptr) {
+    if (list != nullptr || PassSignatures::Active()) {
         std::vector<std::uint64_t> offsets(dynamicOffsets.begin(), dynamicOffsets.end());
-        list->Append(ChunkCommand::BindDescriptorSet, {Value(bindPoint), Handle(layout), Value(index), Handle(set), Value(static_cast<std::uint32_t>(offsets.size()))}, offsets);
-        return;
+        if (emit(ChunkCommand::BindDescriptorSet, {Value(bindPoint), Handle(layout), Value(index), Handle(set), Value(static_cast<std::uint32_t>(offsets.size()))}, offsets)) return;
     }
     context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, index, 1, &set, static_cast<std::uint32_t>(dynamicOffsets.size()), dynamicOffsets.empty() ? nullptr : dynamicOffsets.data());
 }
 
 void CommandSink::PushConstants(const Context& context, VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::uint32_t size, const void* values) const {
-    if (list != nullptr) {
+    if (list != nullptr || PassSignatures::Active()) {
         std::vector<std::uint64_t> data((static_cast<std::size_t>(size) + 7u) / 8u, 0);
         if (size != 0) std::memcpy(data.data(), values, size);
-        list->Append(ChunkCommand::PushConstants, {Handle(layout), Value(stages), Value(offset), Value(size)}, data);
-        return;
+        if (emit(ChunkCommand::PushConstants, {Handle(layout), Value(stages), Value(offset), Value(size)}, data)) return;
     }
     context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, stages, offset, size, values);
 }
 
 void CommandSink::BindVertexBuffers(const Context& context, std::uint32_t first, std::span<const VkBuffer> buffers, std::span<const VkDeviceSize> offsets) const {
     Require(offsets.size() >= buffers.size(), "a vertex buffer bind lacks offsets");
-    if (list != nullptr) {
+    if (list != nullptr || PassSignatures::Active()) {
         std::vector<std::uint64_t> tail;
         tail.reserve(buffers.size() * 2u);
         for (const auto buffer : buffers) tail.push_back(Handle(buffer));
         for (std::size_t index = 0; index < buffers.size(); ++index) tail.push_back(Value(offsets[index]));
-        list->Append(ChunkCommand::BindVertexBuffers, {Value(first), Value(static_cast<std::uint32_t>(buffers.size()))}, tail);
-        return;
+        if (emit(ChunkCommand::BindVertexBuffers, {Value(first), Value(static_cast<std::uint32_t>(buffers.size()))}, tail)) return;
     }
     context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, first, static_cast<std::uint32_t>(buffers.size()), buffers.data(), offsets.data());
 }
 
 void CommandSink::BindIndexBuffer(const Context& context, VkBuffer buffer, VkDeviceSize offset, VkIndexType type) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::BindIndexBuffer, {Handle(buffer), Value(offset), Value(type)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::BindIndexBuffer, {Handle(buffer), Value(offset), Value(type)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, buffer, offset, type);
 }
 
 void CommandSink::Draw(const Context& context, std::uint32_t vertexCount, std::uint32_t instanceCount, std::uint32_t firstVertex, std::uint32_t firstInstance) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::Draw, {Value(vertexCount), Value(instanceCount), Value(firstVertex), Value(firstInstance)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::Draw, {Value(vertexCount), Value(instanceCount), Value(firstVertex), Value(firstInstance)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, vertexCount, instanceCount, firstVertex, firstInstance);
 }
 
 void CommandSink::DrawIndexed(const Context& context, std::uint32_t indexCount, std::uint32_t instanceCount, std::uint32_t firstIndex, std::int32_t vertexOffset, std::uint32_t firstInstance) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::DrawIndexed, {Value(indexCount), Value(instanceCount), Value(firstIndex), Value(static_cast<std::uint32_t>(vertexOffset)), Value(firstInstance)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::DrawIndexed, {Value(indexCount), Value(instanceCount), Value(firstIndex), Value(static_cast<std::uint32_t>(vertexOffset)), Value(firstInstance)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
 }
 
 void CommandSink::DrawIndirect(const Context& context, VkBuffer buffer, VkDeviceSize offset, std::uint32_t count, std::uint32_t stride) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::DrawIndirect, {Handle(buffer), Value(offset), Value(count), Value(stride)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::DrawIndirect, {Handle(buffer), Value(offset), Value(count), Value(stride)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdDrawIndirect, "vkCmdDrawIndirect")(commands, buffer, offset, count, stride);
 }
 
 void CommandSink::DrawIndexedIndirect(const Context& context, VkBuffer buffer, VkDeviceSize offset, std::uint32_t count, std::uint32_t stride) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::DrawIndexedIndirect, {Handle(buffer), Value(offset), Value(count), Value(stride)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::DrawIndexedIndirect, {Handle(buffer), Value(offset), Value(count), Value(stride)})) return;
     }
     context.Resolved(&DeviceFunctions::cmdDrawIndexedIndirect, "vkCmdDrawIndexedIndirect")(commands, buffer, offset, count, stride);
 }
 
 void CommandSink::DrawIndirectCount(const Context& context, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countOffset, std::uint32_t maxCount, std::uint32_t stride) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::DrawIndirectCount, {Handle(buffer), Value(offset), Handle(countBuffer), Value(countOffset), Value(maxCount), Value(stride)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::DrawIndirectCount, {Handle(buffer), Value(offset), Handle(countBuffer), Value(countOffset), Value(maxCount), Value(stride)})) return;
     }
     context.Function<PFN_vkCmdDrawIndirectCountKHR>("vkCmdDrawIndirectCountKHR")(commands, buffer, offset, countBuffer, countOffset, maxCount, stride);
 }
 
 void CommandSink::DrawIndexedIndirectCount(const Context& context, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countOffset, std::uint32_t maxCount, std::uint32_t stride) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::DrawIndexedIndirectCount, {Handle(buffer), Value(offset), Handle(countBuffer), Value(countOffset), Value(maxCount), Value(stride)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::DrawIndexedIndirectCount, {Handle(buffer), Value(offset), Handle(countBuffer), Value(countOffset), Value(maxCount), Value(stride)})) return;
     }
     context.Function<PFN_vkCmdDrawIndexedIndirectCountKHR>("vkCmdDrawIndexedIndirectCountKHR")(commands, buffer, offset, countBuffer, countOffset, maxCount, stride);
 }
 
 void CommandSink::DrawMeshTasks(const Context& context, std::uint32_t x, std::uint32_t y, std::uint32_t z) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::DrawMeshTasks, {Value(x), Value(y), Value(z)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::DrawMeshTasks, {Value(x), Value(y), Value(z)})) return;
     }
     context.Function<PFN_vkCmdDrawMeshTasksEXT>("vkCmdDrawMeshTasksEXT")(commands, x, y, z);
 }
 
 void CommandSink::DrawMeshTasksIndirect(const Context& context, VkBuffer buffer, VkDeviceSize offset, std::uint32_t count, std::uint32_t stride) const {
-    if (list != nullptr) {
-        list->Append(ChunkCommand::DrawMeshTasksIndirect, {Handle(buffer), Value(offset), Value(count), Value(stride)});
-        return;
+    if (list != nullptr || PassSignatures::Active()) {
+        if (emit(ChunkCommand::DrawMeshTasksIndirect, {Handle(buffer), Value(offset), Value(count), Value(stride)})) return;
     }
     context.Function<PFN_vkCmdDrawMeshTasksIndirectEXT>("vkCmdDrawMeshTasksIndirectEXT")(commands, buffer, offset, count, stride);
 }

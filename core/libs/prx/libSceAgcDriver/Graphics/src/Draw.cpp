@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PassSignatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DefaultSwitch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/IndexBounds.hpp"
@@ -653,6 +654,7 @@ void reportRecordParts(const DrawProfile& profile, double elapsedSeconds) {
     }
     if (bindings.wholeCopies[static_cast<std::size_t>(ShaderResources::WholeCopy::OverHalf)] != 0 && r > 0 && static_cast<std::size_t>(r) < sizeof(reasons)) r += std::snprintf(reasons + r, sizeof(reasons) - static_cast<std::size_t>(r), " over half read %.1f MiB of them;", static_cast<double>(bindings.overHalfReadBytes) / 1048576.0);
     if (any) std::fprintf(stderr, "%s\n", reasons);
+    PassSignatures::Report();
 }
 
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
@@ -2415,6 +2417,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
+    PassSignatures::BeginDraw(recorder->OpenPassSerial(), reinterpret_cast<std::uint64_t>(record.framebuffer.get()) ^ (static_cast<std::uint64_t>(state.renderExtent.width) << 32u) ^ state.renderExtent.height);
     if (continued) {
         commands = recorder->PassSink(context, Recorder::ChunkedRecordingEnabled() ? chunkDrawOf(shaders, draw, record) : ChunkDraw{});
         record.pipeline->Continue(commands, state);
@@ -2491,6 +2494,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
     recorder->EndGpuTiming(programTiming);
+    PassSignatures::EndDraw();
     parts.lap(RecordCommands);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);

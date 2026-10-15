@@ -114,6 +114,7 @@ public:
     void DrawMeshTasksIndirect(const Context& context, VkBuffer buffer, VkDeviceSize offset, std::uint32_t count, std::uint32_t stride) const;
 
 private:
+    bool emit(ChunkCommand command, std::initializer_list<std::uint64_t> arguments, std::span<const std::uint64_t> tail = {}) const;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     CommandList* list = nullptr;
     std::uintptr_t identity = 0;

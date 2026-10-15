@@ -224,6 +224,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LabelVersions.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/CommandSink.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassSignatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ChunkedRecording.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DrawSnapshotArena.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/IndexBounds.cpp
