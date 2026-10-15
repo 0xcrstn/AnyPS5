@@ -173,6 +173,31 @@ void DirectoryTests() {
     Require(Translate({AliasA, AliasA + 16}).front().canonical == AliasA, "the reference directory is not the identity");
 }
 
+void ReleaseTests() {
+    Reset(Mode::New, Mode::Reference);
+    auto first = Reserve(Producer::PointerWriter, std::vector<Interval>{{0x1000, 0x2000}}, true, 3);
+    auto second = Reserve(Producer::ElementWriter, std::vector<Interval>{{0x3000, 0x3100}}, false, 5);
+    first.Recorded();
+    auto unrecorded = Reserve(Producer::ElementWriter, std::vector<Interval>{{0x4000, 0x4100}}, false, 3);
+    const auto release = SnapshotRelease(3, {0x8000, 0x8008}, 7, 42);
+    Require(release.queue == 3 && release.value == 7 && release.labelStamp == 42 && release.version > first.Id(), "the release does not describe its label");
+    Require(release.frontier.size() == 1 && release.frontier[0].first == 3 && release.frontier[0].second == first.Id(), "the release frontier is not the newest recorded writer per queue");
+    second.Recorded();
+    Require(QueueFrontier(9).empty(), "a queue imported a frontier it never waited for");
+    ImportFrontier(9, release);
+    auto frontier = QueueFrontier(9);
+    Require(frontier.size() == 1 && frontier[0].second == first.Id(), "the consumer did not import the release frontier");
+    const auto later = SnapshotRelease(5, {0x8000, 0x8008}, 8, 43);
+    ImportFrontier(9, later);
+    ImportFrontier(9, release);
+    frontier = QueueFrontier(9);
+    Require(frontier.size() == 2 && frontier[0].second == first.Id() && frontier[1].second == second.Id(), "an older release moved an imported frontier back");
+    Require(Throws([] { CheckDrained(false, false, "label", false); }).empty(), "audit 1 failed a release ahead of owed write-backs");
+    Require(CurrentCounters().undrainedReleases == 1, "a release ahead of owed write-backs was not counted");
+    Reset(Mode::Reference, Mode::Verify);
+    Require(Throws([] { CheckDrained(false, false, "label", false); }).find("write-backs still owed") != std::string::npos, "ordering verify accepted a release ahead of owed write-backs");
+}
+
 void LifetimeTests() {
     Reset(Mode::New, Mode::Reference);
     const auto before = NextVersion();
@@ -267,6 +292,7 @@ int main() {
         StalePublicationTests();
         RecordOrderTests();
         DirectoryTests();
+        ReleaseTests();
         LifetimeTests();
         CommitSplitTests();
         EvictionTests();

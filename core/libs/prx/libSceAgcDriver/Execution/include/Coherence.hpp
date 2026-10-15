@@ -6,6 +6,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Coherence {
@@ -83,7 +84,20 @@ struct Writer {
 std::optional<Writer> NewerWriter(Interval destination, Version source);
 bool CheckPublication(Source source, Version sourceVersion, Interval destination, const char* reason);
 bool CheckRead(Source newer, Version newerVersion, Interval range, const char* reader);
-void CheckDrained(bool pendingImages, bool liveShadows, const char* where);
+void CheckDrained(bool pendingImages, bool liveShadows, const char* where, bool writeBacksOrdered = true);
+
+struct Release {
+    std::uint32_t queue = 0;
+    Interval label;
+    std::uint64_t value = 0;
+    std::uint64_t labelStamp = 0;
+    Version version = 0;
+    std::vector<std::pair<std::uint32_t, Version>> frontier;
+};
+
+Release SnapshotRelease(std::uint32_t queue, Interval label, std::uint64_t value, std::uint64_t labelStamp);
+void ImportFrontier(std::uint32_t consumerQueue, const Release& release);
+std::vector<std::pair<std::uint32_t, Version>> QueueFrontier(std::uint32_t queue);
 
 struct Counters {
     std::uint64_t reservations = 0;

@@ -65,6 +65,8 @@ struct State {
     std::size_t readsReported = 0;
     std::size_t releasesReported = 0;
     std::size_t remapsReported = 0;
+    std::map<std::uint32_t, Version> recordedByQueue;
+    std::map<std::uint32_t, std::map<std::uint32_t, Version>> imported;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -357,6 +359,8 @@ void ProducerToken::Recorded() {
     active.recorded = true;
     const auto reserved = id;
     id = NextVersion();
+    auto& newest = state.recordedByQueue[active.queue];
+    newest = std::max(newest, id);
     for (const auto& interval : active.intervals) Note(state, EventType::Recorded, static_cast<std::uint8_t>(active.kind), active.queue, id, reserved, interval, nullptr);
     state.active.emplace(id, std::move(active));
 }
@@ -485,7 +489,16 @@ bool CheckRead(Source newer, Version newerVersion, Interval range, const char* r
     return false;
 }
 
-void CheckDrained(bool pendingImages, bool liveShadows, const char* where) {
+void CheckDrained(bool pendingImages, bool liveShadows, const char* where, bool writeBacksOrdered) {
+    if (!writeBacksOrdered && Tracking()) {
+        auto& state = Directory();
+        std::lock_guard lock(state.mutex);
+        ++state.counters.undrainedReleases;
+        Note(state, EventType::Undrained, 0, 0, CurrentVersion(), 0, {0, ~std::uint64_t{0}}, where);
+        char text[192];
+        std::snprintf(text, sizeof(text), "[coherence] release at %s is CPU-visible ahead of guest write-backs still owed", where != nullptr ? where : "?");
+        Divergence(state, text, {}, OrderingMode() == Mode::Verify, state.releasesReported);
+    }
     if (!Tracking() || (!pendingImages && !liveShadows)) return;
     auto& state = Directory();
     std::lock_guard lock(state.mutex);
@@ -494,6 +507,32 @@ void CheckDrained(bool pendingImages, bool liveShadows, const char* where) {
     char text[256];
     std::snprintf(text, sizeof(text), "[coherence] release at %s is CPU-visible while %s%s%s are unpublished", where != nullptr ? where : "?", pendingImages ? "pending images" : "", pendingImages && liveShadows ? " and " : "", liveShadows ? "shadow units" : "");
     Divergence(state, text, {}, OrderingMode() == Mode::Verify, state.releasesReported);
+}
+
+Release SnapshotRelease(std::uint32_t queue, Interval label, std::uint64_t value, std::uint64_t labelStamp) {
+    Release release{queue, label, value, labelStamp, NextVersion(), {}};
+    auto& state = Directory();
+    std::lock_guard lock(state.mutex);
+    release.frontier.assign(state.recordedByQueue.begin(), state.recordedByQueue.end());
+    return release;
+}
+
+void ImportFrontier(std::uint32_t consumerQueue, const Release& release) {
+    auto& state = Directory();
+    std::lock_guard lock(state.mutex);
+    auto& frontier = state.imported[consumerQueue];
+    for (const auto& [queue, version] : release.frontier) {
+        auto& known = frontier[queue];
+        known = std::max(known, version);
+    }
+}
+
+std::vector<std::pair<std::uint32_t, Version>> QueueFrontier(std::uint32_t queue) {
+    auto& state = Directory();
+    std::lock_guard lock(state.mutex);
+    const auto found = state.imported.find(queue);
+    if (found == state.imported.end()) return {};
+    return {found->second.begin(), found->second.end()};
 }
 
 Counters CurrentCounters() {
@@ -530,6 +569,8 @@ void ResetForTests() {
     state.readsReported = 0;
     state.releasesReported = 0;
     state.remapsReported = 0;
+    state.recordedByQueue.clear();
+    state.imported.clear();
 }
 
 }
