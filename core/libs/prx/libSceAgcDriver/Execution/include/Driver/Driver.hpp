@@ -160,6 +160,10 @@ private:
     static bool verifyIncrementalBindings();
     static ShaderMemory::IncrementalState& incrementalBinding(const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::span<const std::uint32_t> userData);
     void noteIncrementalStage(const ShaderRecompiler::SrtTapeInstance& instance, bool verified, bool stale);
+    static bool incrementalPlans();
+    static bool verifyIncrementalPlans();
+    static ShaderMemory::PlanInstance& resourcePlanInstance(const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle, std::uint32_t pushOffset, std::span<const std::uint32_t> userData);
+    void notePlanInstance(const ShaderMemory::PlanCapture& capture, bool verified, bool stale);
     static std::uint64_t drawDecodeKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
     void reportBindingPlan();
     static bool verifyDrawEntries();
