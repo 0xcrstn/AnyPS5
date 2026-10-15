@@ -71,6 +71,11 @@ constexpr std::uint32_t RecordWorkerTag = 0x100;
 constexpr std::uint32_t PrepareWorkerTag = 0x200;
 constexpr std::size_t RecordHistoryEntries = 4096;
 
+std::chrono::steady_clock::time_point& drawEnteredAt() {
+    thread_local std::chrono::steady_clock::time_point entered{};
+    return entered;
+}
+
 RecordQueue& drawRecords() {
     static auto* queue = new RecordQueue;
     return *queue;
@@ -405,7 +410,10 @@ DrawVerdict Driver::freezeDraw(QueueState& queue, std::span<const std::uint32_t>
         pending.phases = true;
         pending.captures = 0;
         pending.ms = {};
-        if (packetStartedAt() != std::chrono::steady_clock::time_point{}) pending.ms[DrawRowPrologue] = std::chrono::duration<double, std::milli>(begin - packetStartedAt()).count();
+        const auto entered = std::exchange(drawEnteredAt(), std::chrono::steady_clock::time_point{});
+        const auto split = entered != std::chrono::steady_clock::time_point{} && entered <= begin ? entered : begin;
+        if (packetStartedAt() != std::chrono::steady_clock::time_point{}) pending.ms[DrawRowPrologue] = std::chrono::duration<double, std::milli>(split - packetStartedAt()).count();
+        pending.ms[DrawRowFreezeCheck] = std::chrono::duration<double, std::milli>(begin - split).count();
         pending.ms[DrawRowVectors] = std::chrono::duration<double, std::milli>(frozenAt - begin).count();
         pending.ms[DrawRowLockWait] = std::chrono::duration<double, std::milli>(now - frozenAt).count();
         pending.tailAt = now;
@@ -753,6 +761,8 @@ std::string Driver::recordIdentity(const Submission& submission, const char* wha
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     if (drawRecordState().active || frozenSink() != nullptr || !deferDrawRecords(submission.queue)) return drawNow(queue, packet, submission, rejected);
     if (prepareWorkers() != 0) {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile) drawEnteredAt() = std::chrono::steady_clock::now();
         freezeLabels(submission.queue, true);
         const auto reason = frozenFallback(packet);
         if (reason == FrozenFallback::None) return freezeDraw(queue, packet, submission);
