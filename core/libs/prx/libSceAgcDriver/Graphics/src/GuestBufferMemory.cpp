@@ -161,6 +161,21 @@ StagingShadowCache& StagingShadows() {
     return cache;
 }
 
+}
+
+ShadowReads BdaShadowReads() {
+    static const ShadowReads mode = [] {
+        const char* value = std::getenv("APS5_BDA_SHADOW_READS");
+        if (value == nullptr || std::strcmp(value, "1") == 0) return ShadowReads::On;
+        if (std::strcmp(value, "0") == 0) return ShadowReads::Off;
+        if (std::strcmp(value, "verify") == 0) return ShadowReads::Verify;
+        throw std::runtime_error(std::string("APS5_BDA_SHADOW_READS=") + value + ": expected 0, 1 or verify");
+    }();
+    return mode;
+}
+
+namespace {
+
 enum class ReuseReads { Off, On, Verify };
 
 ReuseReads StagingReuseReads() {
@@ -3855,15 +3870,35 @@ void GuestBufferMemory::CompletePointerWrites(std::span<const Coherence::Interva
     if (pointerToken.Held()) pointerToken.Complete(written);
 }
 
-void GuestBufferMemory::storePointerHeaps() const {
+void GuestBufferMemory::storePointerHeaps(bool refresh) const {
     std::vector<std::uint8_t> reached(pointerHeaps.size(), PointerStoreEveryHeap() ? 1 : 0);
     if (!PointerStoreEveryHeap() && !pointerHeaps.empty()) {
         StorageTexture::MarkPendingReached(pointerHeaps, reached);
         MarkShadowedReached(pointerHeaps, reached);
     }
+    const bool shadowReads = !pointerWrites && BdaShadowReads() != ShadowReads::Off && UnitShadowEnabled() && context.bufferDeviceAddress && StorageTexture::DeferredPointerStores();
     for (std::size_t index = 0; index < pointerHeaps.size(); ++index) {
         const auto [begin, end] = pointerHeaps[index];
         const auto bytes = static_cast<std::size_t>(end - begin);
+        if (shadowReads) {
+            if (reached[index] == 0) continue;
+            static_cast<void>(StorageTexture::ShadowForPointerReads(begin, bytes, pointerExempt));
+            for (const auto& region : regions) {
+                if (region.direct == nullptr || region.end <= begin || region.begin >= end) continue;
+                const auto from = std::max(region.begin, begin);
+                const auto to = std::min(region.end, end);
+                static_cast<void>(PublishShadow(from, static_cast<std::size_t>(to - from), PublishScope::Whole, PublishReason::Pointer));
+            }
+            if (!refresh) continue;
+            auto cursor = begin;
+            for (const auto& read : slabReads) {
+                if (read.end <= cursor || read.begin >= end) continue;
+                if (read.begin > cursor) static_cast<void>(PublishShadow(cursor, static_cast<std::size_t>(read.begin - cursor), PublishScope::Whole, PublishReason::Pointer));
+                cursor = std::max(cursor, read.end);
+            }
+            if (cursor < end) static_cast<void>(PublishShadow(cursor, static_cast<std::size_t>(end - cursor), PublishScope::Whole, PublishReason::Pointer));
+            continue;
+        }
         if (reached[index] != 0) static_cast<void>(StorageTexture::StoreForPointerAccess(begin, bytes, pointerExempt));
         else if (VerifyPointerStorePretest()) Require(!StorageTexture::StoreForPointerAccess(begin, bytes, pointerExempt), "APS5_VERIFY_POINTER_STORE_PRETEST: a pointer heap no pending image or unit shadow reaches stored or published storage results");
     }
@@ -3895,7 +3930,7 @@ bool GuestBufferMemory::AddressSpaceCurrent() const {
 void GuestBufferMemory::RefreshAddressUse() const {
     Require(space != nullptr && uploaded && !committed, "an address template's use needs its uploaded address space");
     completeSpaceWrites();
-    storePointerHeaps();
+    storePointerHeaps(true);
     if (AnyDeviceResident()) {
         if (auto* active = Recorder::Current()) {
             for (const auto& [begin, end] : DeviceReads()) PublishDeviceResident(*active, begin, static_cast<std::size_t>(end - begin), ResidentSite::AddressBased);
@@ -4924,6 +4959,58 @@ VkDescriptorBufferInfo GuestBufferMemory::MirroredDescriptor(std::uint64_t addre
     info.offset += MirrorBufferOffset(*mirror);
     if (std::find(mirrors.begin(), mirrors.end(), mirror) == mirrors.end()) mirrors.push_back(std::move(mirror));
     return info;
+}
+
+std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::ShadowedRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges) const {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    slabReads.clear();
+    std::vector<Abi::Range> result(ranges.begin(), ranges.end());
+    if (pointerWrites || BdaShadowReads() == ShadowReads::Off || !UnitShadowEnabled() || !context.bufferDeviceAddress || !StorageTexture::DeferredPointerStores()) return result;
+    result.clear();
+    for (const auto& range : ranges) {
+        const auto bytes = range.end - range.begin;
+        if ((range.permissions & Abi::Read) == 0 || bytes == 0 || !AnyShadowedOverlaps(range.begin, static_cast<std::size_t>(bytes))) {
+            result.push_back(range);
+            continue;
+        }
+        const auto* import = HostImportFor(context, range.begin, static_cast<std::size_t>(bytes));
+        if (import == nullptr || range.begin < import->base || range.end > import->base + import->bytes) {
+            static_cast<void>(PublishShadow(range.begin, static_cast<std::size_t>(bytes), PublishScope::Whole, PublishReason::Pointer));
+            result.push_back(range);
+            continue;
+        }
+        const std::pair<std::uint64_t, std::uint64_t> run{0, bytes};
+        const auto sources = ShadowSources(context, *import, range.begin, std::span(&run, 1), {}, false);
+        for (const auto& source : sources) {
+            auto piece = range;
+            piece.begin = range.begin + source.begin;
+            piece.end = range.begin + source.end;
+            if (source.shadow && source.slab != nullptr && source.slab->deviceAddress != 0) {
+                piece.deviceAddress = source.slab->deviceAddress + source.offset;
+                piece.permissions = Abi::Read;
+                slabReads.push_back({piece.begin, piece.end, source.offset, source.slab});
+            } else {
+                if (source.shadow) static_cast<void>(PublishShadow(piece.begin, static_cast<std::size_t>(piece.end - piece.begin), PublishScope::Whole, PublishReason::Pointer));
+                piece.deviceAddress = range.deviceAddress + source.begin;
+            }
+            result.push_back(piece);
+        }
+    }
+    return result;
+}
+
+bool GuestBufferMemory::SlabReadsCurrent() const {
+    if (slabReads.empty()) return true;
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    for (const auto& read : slabReads) {
+        const auto bytes = read.end - read.begin;
+        const auto* import = HostImportFor(context, read.begin, static_cast<std::size_t>(bytes));
+        if (import == nullptr) return false;
+        const std::pair<std::uint64_t, std::uint64_t> run{0, bytes};
+        const auto sources = ShadowSources(context, *import, read.begin, std::span(&run, 1), {}, false);
+        if (sources.size() != 1 || !sources[0].shadow || sources[0].slab != read.slab || sources[0].offset != read.offset) return false;
+    }
+    return true;
 }
 
 std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::MirroredRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::vector<std::shared_ptr<ResidentMirror>>& mirrors) const {

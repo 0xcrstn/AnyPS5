@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LinearSpace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -126,6 +128,47 @@ std::uint64_t hashRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& ran
 
 }
 
+namespace {
+
+std::atomic<std::uint64_t> slabReadBuilds{0}, slabReadsVerified{0};
+
+void verifySlabReads(const Context& context, std::span<const GuestBufferMemory::SlabRead> reads) {
+    auto* recorder = Recorder::Current();
+    Require(recorder != nullptr, "APS5_BDA_SHADOW_READS=verify needs an active recorder");
+    for (const auto& read : reads) {
+        const auto bytes = read.end - read.begin;
+        const auto* import = HostImportFor(context, read.begin, static_cast<std::size_t>(bytes));
+        Require(import != nullptr, "APS5_BDA_SHADOW_READS=verify: a slab-backed range lost its host import");
+        auto scratch = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes * 2), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto commands = recorder->Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, read.slab->buffer, read.offset, scratch->Handle(), 0, bytes);
+        static_cast<void>(PublishShadow(read.begin, static_cast<std::size_t>(bytes), PublishScope::Whole, PublishReason::Pointer));
+        commands = recorder->Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, import->buffer, read.begin - import->base, scratch->Handle(), bytes, bytes);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+        recorder->MarkCovered(0);
+        recorder->Keep(scratch);
+        recorder->Keep(read.slab);
+        recorder->OnCompleteWithoutGuestAccess([scratch, bytes, address = read.begin] {
+            const auto held = scratch->Bytes();
+            if (std::memcmp(held.data(), held.data() + bytes, static_cast<std::size_t>(bytes)) != 0) {
+                char message[192];
+                std::snprintf(message, sizeof(message), "APS5_BDA_SHADOW_READS=verify: the unit shadow an address-based read of 0x%llx+0x%llx reads differs from the bytes its publish stores", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+                throw std::runtime_error(message);
+            }
+            slabReadsVerified.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+}
+
+}
+
+BdaResources::SlabReadStats BdaResources::SlabReadCounters() {
+    return {slabReadBuilds.load(std::memory_order_relaxed), slabReadsVerified.load(std::memory_order_relaxed)};
+}
+
 BdaResources::BdaResources(const Context& context) {
     static_assert(std::endian::native == std::endian::little);
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
@@ -142,6 +185,16 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         if (!mirrors.empty()) {
             built = std::move(mirrored);
             cached.reset();
+        }
+    }
+    if (!memory.PointerWrites() && BdaShadowReads() != ShadowReads::Off) {
+        auto shadowed = memory.ShadowedRanges(cached.has_value() ? std::span<const ShaderRecompiler::BdaAbi::Range>(*cached->ranges) : std::span<const ShaderRecompiler::BdaAbi::Range>(built));
+        if (!memory.SlabReads().empty()) {
+            built = std::move(shadowed);
+            cached.reset();
+            for (const auto& read : memory.SlabReads()) slabs.push_back(read.slab);
+            slabReadBuilds.fetch_add(1, std::memory_order_relaxed);
+            if (BdaShadowReads() == ShadowReads::Verify) verifySlabReads(context, memory.SlabReads());
         }
     }
     if (placeWrites) {

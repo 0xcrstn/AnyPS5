@@ -3994,6 +3994,15 @@ bool StorageTexture::StoreForPointerAccess(std::uint64_t address, std::size_t by
     return stored || published;
 }
 
+bool StorageTexture::ShadowForPointerReads(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt) {
+    const auto previous = std::exchange(pointerExempt, exempt);
+    struct Restore {
+        std::span<const std::pair<std::uint64_t, std::uint64_t>> previous;
+        ~Restore() { pointerExempt = previous; }
+    } restore{previous};
+    return FlushPending(address, bytes, nullptr, "address-based heap", PublishScope::None);
+}
+
 void StorageTexture::AuditPointerReads(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt) {
     if (!Coherence::Tracking()) return;
     std::vector<std::pair<Coherence::Interval, Coherence::Version>> stale;

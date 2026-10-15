@@ -64,6 +64,7 @@ struct ShadowSlab {
     VkDeviceMemory memory;
     std::uint64_t firstUnit;
     std::uint32_t units;
+    VkDeviceAddress deviceAddress = 0;
     std::uint64_t lastUse = 0;
     // Destinations handed out for a write-back in progress: such a slab is never evicted.
     std::atomic<std::uint32_t> pins{0};

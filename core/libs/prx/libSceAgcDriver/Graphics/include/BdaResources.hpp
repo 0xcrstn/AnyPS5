@@ -52,6 +52,11 @@ public:
         std::uint64_t firstEmpty = 0;
     };
     static TableCacheStats TableCacheCounters();
+    struct SlabReadStats {
+        std::uint64_t builds = 0;
+        std::uint64_t verified = 0;
+    };
+    static SlabReadStats SlabReadCounters();
 
 private:
     // The page table is read-only to the shader, so consecutive builds mapping the same ranges to the
@@ -62,6 +67,7 @@ private:
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
     std::vector<std::shared_ptr<ResidentMirror>> mirrors;
+    std::vector<std::shared_ptr<ShadowSlab>> slabs;
     std::shared_ptr<Buffer> placement;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> placed;
     void checkPlacement() const;

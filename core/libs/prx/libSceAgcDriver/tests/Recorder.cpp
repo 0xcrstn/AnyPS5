@@ -5610,6 +5610,149 @@ int deferredPointerStoreTests(const Device& device, Recorder& recorder) {
     return 0;
 }
 
+int bdaShadowReadTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& base = device.GetContext();
+    if (!base.bufferDeviceAddress) {
+        std::cout << "skipped, buffer device addresses are unavailable\n";
+        return 77;
+    }
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 4 * unit;
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared slab-read section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    struct Release {
+        void* block;
+        ~Release() {
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+#else
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "unit shadows are on without write watching");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+#endif
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the slab-read block refused or compared: not tested\n";
+        return 77;
+    }
+    CollectWritesUncached(address, bytes);
+    auto* words = static_cast<std::uint8_t*>(block);
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address + unit;
+    resource.width = 128;
+    resource.height = 128;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == unit, "the slab-read image does not fill its 64 KiB block");
+    auto image = StorageTexture::Create(context, detiler, resource, 0);
+    const auto paint = [&](std::array<float, 4> color) {
+        image->Refresh();
+        const VkClearColorValue value{{color[0], color[1], color[2], color[3]}};
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+    };
+    auto output = std::make_shared<Buffer>(base, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    struct Use {
+        std::shared_ptr<GuestBufferMemory> memory;
+        std::shared_ptr<BdaResources> bda;
+        std::shared_ptr<AddressProgram> program;
+        std::uint32_t loaded = 0;
+    };
+    const auto reader = [&](std::uint64_t at) {
+        Use use;
+        use.memory = std::make_shared<GuestBufferMemory>(base);
+        use.memory->AcquireRegistered();
+        use.memory->SetPointerAccess(false, {});
+        use.memory->Upload(true);
+        use.bda = std::make_shared<BdaResources>(base, *use.memory);
+        std::memset(output->Bytes().data(), 0, output->Bytes().size());
+        const auto code = MakeBdaDwordReadTestShader(at, 1, false, true);
+        use.program = std::make_shared<AddressProgram>(base, code, std::array<VkDescriptorBufferInfo, 3>{use.bda->Table(), use.bda->Fault(), VkDescriptorBufferInfo{output->Handle(), 0, 16}});
+        use.program->Record(recorder);
+        recorder.Keep(use.memory);
+        recorder.Keep(use.bda);
+        recorder.Keep(use.program);
+        recorder.Sync();
+        use.bda->CheckFault();
+        std::memcpy(&use.loaded, output->Bytes().data(), sizeof(use.loaded));
+        return use;
+    };
+    std::unique_lock gpu(GpuMutex());
+    const auto mode = BdaShadowReads();
+    const auto before = BdaResources::SlabReadCounters();
+    paint({1.0f, 0.0f, 0.0f, 1.0f});
+    const auto red = reader(address + unit + 16);
+    if (mode == ShadowReads::Off) {
+        Require(red.loaded == 0x11111111u, "APS5_BDA_SHADOW_READS=0: a read-only address-based build stored or published the pending image");
+        std::cout << "address-based reads of unit shadows (off): ok\n";
+        return 0;
+    }
+    Require(red.loaded == 0xff0000ffu, "a read-only address-based build read stale bytes under a pending image: " + std::to_string(red.loaded) + ", " + std::to_string(red.memory->SlabReads().size()) + " slab reads, pending " + std::to_string(StorageTexture::FindPending(address + unit, unit) != nullptr) + ShadowReport());
+    Require(StorageTexture::FindPending(address + unit, unit) == nullptr, "a read-only address-based build left the image it reads pending");
+    Require(mode == ShadowReads::Verify || (words[unit + 16] == 0x11 && words[unit + 19] == 0x11), "a read-only address-based build stored the image into guest memory instead of reading its unit shadow: " + std::to_string(red.memory->SlabReads().size()) + " slab reads, " + ShadowReport());
+    Require(!red.memory->SlabReads().empty() && BdaResources::SlabReadCounters().builds == before.builds + 1, "a read-only address-based build did not read the unit shadow's slab");
+    Require(red.memory->SlabReadsCurrent(), "a slab-backed read was not current right after its build");
+    const auto again = reader(address + unit + 64);
+    Require(again.loaded == 0xff0000ffu && (mode == ShadowReads::Verify || words[unit + 64] == 0x11), "a second read-only build did not read the same unit shadow");
+    gpu.unlock();
+    *reinterpret_cast<volatile std::uint32_t*>(words + unit + 128) = 0x22222222u;
+    gpu.lock();
+    CollectWritesUncached(address + unit, unit);
+    Require(!red.memory->SlabReadsCurrent(), "a CPU store into a slab-backed unit left its reads current");
+    const auto stale = reader(address + unit + 128);
+    Require(stale.loaded == 0x22222222u, "a read-only address-based build read a unit shadow older than a CPU store");
+    if (mode == ShadowReads::Verify) Require(BdaResources::SlabReadCounters().verified >= before.verified + 1, "APS5_BDA_SHADOW_READS=verify did not compare the slab-backed reads");
+    std::cout << "address-based reads of unit shadows: ok\n";
+    return 0;
+}
+
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -11995,6 +12138,13 @@ int main(int argc, char** argv) {
             }
             unitShadowTests(device, recorder);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--bda-shadow-reads-only") {
+            if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, unit shadows or host imports are unavailable\n";
+                return 77;
+            }
+            return bdaShadowReadTests(device, recorder);
         }
         if (argc == 2 && std::string_view(argv[1]) == "--deferred-pointer-stores-only") {
             if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
