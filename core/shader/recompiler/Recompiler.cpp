@@ -328,7 +328,6 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     }
     constexpr InterpolationFactsAnnotator interpolationFactsAnnotator;
     static_cast<void>(interpolationFactsAnnotator.Annotate(program));
-    PrepareRewriteVerification(program);
 
     if (inputInfo.vertex != nullptr) {
         constexpr TessellationLowering tessellationLowering;
@@ -692,6 +691,7 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
 
     constexpr ShaderInfoCollector shaderInfoCollector;
     shaderInfoCollector.Collect(program, inputInfo);
+    PrepareRewriteVerification(program);
 }
 
 bool VerifyShaderEmission() {
