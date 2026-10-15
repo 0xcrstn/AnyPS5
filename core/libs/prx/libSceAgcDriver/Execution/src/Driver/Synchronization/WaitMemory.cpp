@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitBroker.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -74,6 +75,11 @@ WaitFloorMode Driver::waitFloorMode() {
         if (std::strcmp(value, "submission") == 0) return WaitFloorMode::Submission;
         throw std::runtime_error(std::string("APS5_WAIT_FLOOR: unknown mode ") + value + " (activation or submission)");
     }();
+    return mode;
+}
+
+LabelTimelineMode Driver::labelTimelineMode() {
+    static const LabelTimelineMode mode = ParseLabelTimeline(std::getenv("APS5_LABEL_TIMELINE"));
     return mode;
 }
 
@@ -166,11 +172,24 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     observation.activation = requireMemory ? received : WaitActivationStamp(waitFloorMode(), received, waitFloor());
     observation.activatedAt = std::chrono::steady_clock::now();
     const std::uint64_t activation = observation.activation;
+    const auto timeline = requireMemory ? LabelTimelineMode::Off : labelTimelineMode();
+    const auto proven = [&](WaitSource source) {
+        if (timeline == LabelTimelineMode::Off) return true;
+        ProofInput input{source, observation.function, observation.reference, observation.mask, observation.bytes, observation.value, observation.bytes, queue, observation.producerQueue, observation.producerStamp, std::max(received, waitFloor())};
+        const auto proof = Prove(input);
+        ++outcomes.lifts[static_cast<std::size_t>(proof.lift)];
+        if (proof.lift != Lift::Exact) return true;
+        observation.source = source;
+        if (timeline == LabelTimelineMode::Verify) throw std::runtime_error(std::string("APS5_LABEL_TIMELINE=verify: an unproven wait discharge (") + proof.reason + "): " + DescribeObservation(observation));
+        ++outcomes.unprovenRefused;
+        return false;
+    };
     const auto discharge = [&](WaitSource source) {
         observation.source = source;
         if (source == WaitSource::Entry || source == WaitSource::Memory || source == WaitSource::HeldAtSubmit) {
             const bool readable = GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(awaited)), awaitedBytes);
             observation.value = !readable ? 0 : wideWait ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+            if (timeline != LabelTimelineMode::Off) ++outcomes.lifts[static_cast<std::size_t>(Lift::Latched)];
         }
         if (!requireMemory) dischargeWait(observation, packet);
     };
@@ -178,10 +197,11 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (requireMemory) return false;
         const auto match = storedSince(packet, awaited, awaitedBytes, activation);
         if (!match.has_value()) return false;
-        ++(match->queue == queue ? outcomes.storedSinceSameQueue : outcomes.storedSinceOtherQueue);
         observation.value = match->value;
         observation.producerQueue = match->queue;
         observation.producerStamp = match->stamp;
+        if (!proven(WaitSource::History)) return false;
+        ++(match->queue == queue ? outcomes.storedSinceSameQueue : outcomes.storedSinceOtherQueue);
         discharge(WaitSource::History);
         return true;
     };
@@ -242,6 +262,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (trace) traceLate(hit.has_value() ? "value mismatch" : "refused by the table", hit, refusal);
             return false;
         }
+        observation.value = hit->value;
+        observation.producerQueue = hit->queue;
+        observation.producerStamp = hit->stamp;
+        if (!proven(hit->late ? WaitSource::TableLate : WaitSource::Table)) return false;
         if (hit->late) {
             if (hit->generation == refusedGeneration) return false;
             if (!GuestMemory::UnchangedSinceCollected(awaited, awaitedBytes, hit->generation)) {
@@ -416,6 +440,11 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     const auto spinStart = std::chrono::steady_clock::now();
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
+    auto& broker = WaitBroker::Instance();
+    const bool brokered = WaitBroker::Enabled() && !requireMemory;
+    std::uint64_t brokerSeen = broker.Sequence();
+    constexpr std::chrono::microseconds shortestBrokerSleep{100};
+    auto brokerSleep = shortestBrokerSleep;
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
         if (historyHit()) {
             if (observation.producerQueue == queue) epochPoint.bump = false;
@@ -426,6 +455,15 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             _mm_pause();
             if ((polls & 63u) != 0) continue;
             if (std::chrono::steady_clock::now() - spinStart > spinLimit) spinning = false;
+        } else if (brokered) {
+            if (broker.WaitFor(brokerSeen, brokerSleep)) {
+                ++outcomes.brokerWakes;
+                brokerSleep = shortestBrokerSleep;
+            } else {
+                ++outcomes.brokerTimeouts;
+                brokerSleep = std::min(brokerSleep * 2, WaitBroker::LongestSleep());
+            }
+            brokerSeen = broker.Sequence();
         } else if (pauseSpin || polls >= 4000) {
             PollSleep();
         } else {

@@ -40,6 +40,7 @@
 #include <span>
 #include <stop_token>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -324,6 +325,9 @@ private:
     static std::uint64_t& waitFloor();
     static WaitFloorMode waitFloorMode();
     static bool verifyWaitObservations();
+    static LabelTimelineMode labelTimelineMode();
+    static std::chrono::microseconds batchAgeBound();
+    void runBatchAge(std::chrono::microseconds bound) noexcept;
     void dischargeWait(WaitObservation& observation, std::span<const std::uint32_t> packet);
     void noteWaitChain(const WaitObservation& observation, std::span<const std::uint32_t> packet);
     void noteRelease(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
@@ -407,6 +411,11 @@ private:
 
     std::atomic<std::uint64_t> eventSerial{0};
     QueueScheduler queueScheduler{QueueScheduler::ConfiguredMode(), QueueScheduler::ConfiguredVerify()};
+    std::thread batchAgeThread;
+    std::mutex batchAgeMutex;
+    std::condition_variable batchAgeChanged;
+    std::atomic<std::uint64_t> batchAgeSubmits{0};
+    std::atomic<std::uint64_t> batchAgeChecks{0};
     alignas(64) std::shared_ptr<ShaderRegistry> shaders = std::make_shared<ShaderRegistry>();
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>> dispatchCache;

@@ -378,11 +378,11 @@ void testWaitObservesValueStoredAfterActivation() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
-void testWaitFloorVerifyFails() {
+void testWaitFloorVerifyFails(const char* expected) {
     alignas(64) static volatile std::uint32_t first = 0, second = 0, done = 0;
     submitOverwrittenBeforeActivation(&first, &second, &done);
     const auto failure = expectFailure([] { AgcDriverWaitIdle_nid_postfix(); });
-    check(failure.find("APS5_VERIFY_WAIT_OBSERVATIONS") != std::string::npos, "a wait observation below the activation floor did not fail the verify mode");
+    check(failure.find(expected) != std::string::npos, "a wait observation below the activation floor did not fail the verify mode");
     check(done == 0, "the consumer ran past an unproven wait observation");
 }
 
@@ -900,8 +900,8 @@ void testWorkerFailure() {
 
 int main(int argc, char** argv) {
     try {
-        if (argc == 2 && std::string_view(argv[1]) == "--wait-floor-verify") {
-            testWaitFloorVerifyFails();
+        if (argc == 2 && (std::string_view(argv[1]) == "--wait-floor-verify" || std::string_view(argv[1]) == "--label-timeline-verify")) {
+            testWaitFloorVerifyFails(std::string_view(argv[1]) == "--wait-floor-verify" ? "APS5_VERIFY_WAIT_OBSERVATIONS" : "APS5_LABEL_TIMELINE=verify");
             check(!expectFailure([] { LibcRunShutdown_nid_postfix(); }).empty(), "shutdown lost the verify failure");
             std::puts("Wait floor verify failed as required");
             return 0;

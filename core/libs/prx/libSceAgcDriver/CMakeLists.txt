@@ -196,6 +196,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ProcessMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/RecordQueue.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/QueueScheduler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WaitBroker.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DriverHeapTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
@@ -397,6 +398,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_queue_scheduler PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_queue_scheduler PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_wait_proof_tests tests/WaitProof.cpp Execution/src/WaitBroker.cpp)
+    target_include_directories(agc_wait_proof_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_wait_proof_tests PRIVATE libc)
+    configure_windows_unwind(agc_wait_proof_tests)
+    add_test(NAME agc_wait_proof COMMAND agc_wait_proof_tests)
+    set_tests_properties(agc_wait_proof PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_wait_proof PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
@@ -1691,6 +1703,12 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_wait_floor_verify PROPERTIES TIMEOUT 20 ENVIRONMENT "APS5_WAIT_FLOOR=submission;APS5_VERIFY_WAIT_OBSERVATIONS=1")
     if(WIN32)
         set_tests_properties(agc_driver_wait_floor_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_label_timeline_verify COMMAND agc_driver_tests --label-timeline-verify)
+    set_tests_properties(agc_driver_label_timeline_verify PROPERTIES TIMEOUT 20 ENVIRONMENT "APS5_WAIT_FLOOR=submission;APS5_LABEL_TIMELINE=verify")
+    if(WIN32)
+        set_tests_properties(agc_driver_label_timeline_verify PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_readonly_resummarize COMMAND agc_driver_tests --readonly-resummarize)
