@@ -5035,6 +5035,16 @@ int coherenceResidencyTests(const Device& device, Recorder& recorder) {
     gpu.lock();
     Require(loaded == 0xa5 && !AnyDeviceResidentOverlaps(address, bytes), "a native load read host bytes under device-resident results");
 
+    {
+        auto shadow = std::make_shared<Buffer>(base, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::memset(shadow->Bytes().data(), 0x3c, bytes);
+        const auto generation = CollectWritesUncached(address, bytes);
+        NoteDeviceResident(base.device, address + 16, address + 0x1010, shadow, address, import->buffer, import->base, generation);
+        Require(!AnyDeviceResidentOverlaps(address, bytes), "device-resident results the guards cannot cover whole were kept on the device");
+        recorder.Sync();
+        Require(alias[16] == 0x3c && alias[0x100f] == 0x3c && alias[15] != 0x3c && alias[0x1010] != 0x3c, "device-resident results the guards cannot cover were not published in place of a copy-back");
+    }
+
     recorder.Sync();
     const auto counters = Coherence::CurrentCounters();
     Require(counters.faultsResolved == 2 && counters.liveProtections == 0 && counters.stalePublications == 0, "device residency: " + Coherence::Report());
