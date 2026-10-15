@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchRelocation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CacheSizing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
@@ -219,13 +220,16 @@ private:
     };
     static DrawRecordState& drawRecordState();
     static bool recordThread();
+    static std::uint32_t prepareAhead();
     static void runDrawRecords();
     bool deferDrawRecords(std::uint32_t queue) const;
     static bool recordDispatches();
     bool deferDispatchRecords(std::uint32_t queue) const;
     void deferRecord(const std::function<void()>& prepare);
+    void deferAhead(const std::function<void()>& prepare);
     static std::string recordIdentity(const Submission& submission, const char* what, std::uint64_t program);
-    bool settleDrawRecords(std::span<const Graphics::GuestMemorySnapshot> reads);
+    bool settleDrawRecords(std::span<const Graphics::GuestMemorySnapshot> reads, bool drain = false);
+    bool settleAhead(std::span<const Graphics::GuestMemorySnapshot> reads, bool drain);
     void finishDrawRecords();
     void waitDrawRecords();
     void postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::string identity, std::function<void(DrawRecordResult&)> record);
@@ -435,6 +439,7 @@ private:
     std::vector<std::uint64_t> drawStageDonorKeys;
     std::mutex drawCacheMutex;
     std::shared_ptr<DrawRecordResult> drawRecordResult;
+    PrepareAheadWindow<DrawRecordResult> drawRecordWindow;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     std::optional<DrawKeySightings> drawKeySightings;
     std::optional<DrawKeySightings> drawShapeSightings;

@@ -1,9 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/RecordQueue.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -230,6 +232,160 @@ void testOverlappingPackets() {
     Expect(!OverlapsDrawRecords(0x49, false, true) && !OverlapsDrawRecords(0x3c, false, true), "labels and waits wait with dispatches deferred too");
 }
 
+struct AheadJob {
+    std::uint64_t ticket = 0;
+    DrawRecordEffects effects;
+};
+
+bool noPendingWrite(std::uint64_t, std::size_t) {
+    return false;
+}
+
+void testAheadWaitTicket() {
+    Expect(AheadWaitTicket(0, 0, 3) == 0, "an idle queue never waits");
+    Expect(AheadWaitTicket(2, 0, 3) == 0, "fewer than k records in flight leave room for one more");
+    Expect(AheadWaitTicket(3, 0, 3) == 1, "k records in flight wait for the oldest");
+    Expect(AheadWaitTicket(7, 1, 3) == 5, "more than k records in flight wait until k - 1 remain");
+    Expect(AheadWaitTicket(4, 2, 1) == 4, "depth 1 waits for every earlier record");
+}
+
+void testAheadOrderingWithKInFlight() {
+    constexpr std::uint32_t Depth = 3;
+    constexpr int Jobs = 60;
+    RecordQueue queue;
+    std::mutex gate;
+    queue.Start([&] {
+        std::lock_guard lock(gate);
+        queue.RunPending();
+    });
+    std::vector<int> order;
+    std::uint64_t deepest = 0;
+    bool bounded = true;
+    std::unique_lock held(gate);
+    for (int i = 0; i < Jobs; ++i) {
+        if (const auto ticket = AheadWaitTicket(queue.Posted(), queue.Finished(), Depth); ticket != 0) {
+            if (held.owns_lock()) held.unlock();
+            queue.WaitFinished(ticket);
+        }
+        queue.Post([&order, i] {
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            order.push_back(i);
+        });
+        const auto depth = queue.Posted() - queue.Finished();
+        deepest = std::max(deepest, depth);
+        bounded = bounded && depth <= Depth;
+    }
+    if (held.owns_lock()) held.unlock();
+    queue.WaitIdle();
+    queue.Stop();
+    bool ordered = order.size() == Jobs;
+    for (int i = 0; ordered && i < Jobs; ++i) ordered = order[static_cast<std::size_t>(i)] == i;
+    Expect(ordered, "records posted k deep run once each, in posting order");
+    Expect(bounded, "the producer never has more than k records in flight");
+    Expect(deepest == Depth, "the producer posts k records before it waits for the first");
+}
+
+void testAheadStaleAgainstEarlierJob() {
+    const std::vector<PreparedRead> reads{{0x1000, 0x100}};
+    PrepareAheadWindow<AheadJob> window;
+    window.Begin(0);
+    auto first = std::make_shared<AheadJob>(AheadJob{1, DrawRecordEffects{5, 5, {{0x1080, 0x1090}}}});
+    auto second = std::make_shared<AheadJob>(AheadJob{2, DrawRecordEffects{5, 5, {}}});
+    auto third = std::make_shared<AheadJob>(AheadJob{3, DrawRecordEffects{5, 6, {{0x9000, 0x9100}}}});
+    window.Add(first);
+    window.Add(second);
+    window.Add(third);
+    Expect(window.CheckFinished(reads, 3, noPendingWrite) == DrawPrepareStale::Stored, "a store by the oldest of three finished records makes the preparation stale");
+    Expect(window.CheckFinished(reads, 0, noPendingWrite) == DrawPrepareStale::No, "records that have not finished are not judged at post");
+    window.Begin(1);
+    Expect(window.Size() == 2, "records finished before the preparation began leave the window");
+    Expect(window.CheckFinished(reads, 3, noPendingWrite) == DrawPrepareStale::No, "a store finished before the preparation began leaves it valid");
+    Expect(!window.Touched(2), "a quiet record leaves an unsettled preparation valid");
+    Expect(window.Touched(3), "a record that noted writes makes an unsettled preparation stale");
+    const auto earlier = window.Between(1, 3);
+    Expect(earlier.size() == 2, "the provisional job carries every record still unfinished at post");
+    Expect(StaleAfterEach(earlier, reads, noPendingWrite) == DrawPrepareStale::No, "the unfinished records are clean when the job is posted");
+    third->effects.stores.push_back({0x10f8, 0x1100});
+    Expect(StaleAfterEach(earlier, reads, noPendingWrite) == DrawPrepareStale::Stored, "a store an unfinished record makes after the post is seen when the provisional job starts");
+}
+
+void testAheadStaleAtRunFailsClosed() {
+    RecordQueue queue;
+    queue.StopAfterFailure(true);
+    Exclusion exclusion(queue);
+    const std::vector<PreparedRead> reads{{0x2000, 0x40}};
+    auto earlier = std::make_shared<AheadJob>(AheadJob{1, DrawRecordEffects{}});
+    const std::vector<std::shared_ptr<const DrawRecordEffects>> behind{std::shared_ptr<const DrawRecordEffects>(earlier, &earlier->effects)};
+    bool provisionalRan = false;
+    bool laterRan = false;
+    queue.Post([earlier] { earlier->effects.stores.push_back({0x2020, 0x2030}); });
+    queue.Post([&reads, &provisionalRan, behind] {
+        try {
+            if (StaleAfterEach(behind, reads, noPendingWrite) != DrawPrepareStale::No) throw std::runtime_error("went stale");
+            provisionalRan = true;
+        } catch (const std::exception& error) {
+            throw std::runtime_error(std::string("draw at dword 7: ") + error.what());
+        }
+    });
+    queue.Post([&laterRan] { laterRan = true; });
+    {
+        std::lock_guard lock(exclusion);
+    }
+    Expect(!provisionalRan, "a provisional job whose preparation went stale is not recorded");
+    Expect(!laterRan, "no job after a failed one runs before the producer takes the failure");
+    Expect(queue.Finished() == 3 && !queue.Pending(), "dropped jobs still finish their tickets");
+    std::string message;
+    try {
+        if (auto failure = queue.TakeFailure()) std::rethrow_exception(failure);
+    } catch (const std::exception& error) {
+        message = error.what();
+    }
+    Expect(message == "draw at dword 7: went stale", "the failure names the job that went stale");
+    Expect(queue.Counts().failed == 1 && queue.Counts().dropped == 1, "the stale job counts as failed and the later one as dropped");
+
+    queue.Post([] { throw std::runtime_error("record failed"); });
+    {
+        std::lock_guard lock(exclusion);
+    }
+    bool postedBeforeTake = false;
+    queue.Post([&postedBeforeTake] { postedBeforeTake = true; });
+    Expect(queue.TakeFailure() != nullptr, "the second failure is reported");
+    {
+        std::lock_guard lock(exclusion);
+    }
+    Expect(!postedBeforeTake, "a job posted before the producer took the failure is dropped as well");
+    bool postedAfterTake = false;
+    queue.Post([&postedAfterTake] { postedAfterTake = true; });
+    {
+        std::lock_guard lock(exclusion);
+    }
+    Expect(postedAfterTake, "jobs posted after the failure was taken run again");
+    Expect(queue.TakeFailure() == nullptr, "dropping a job is not a new failure");
+}
+
+void testAheadDrainAtNonDrawPacket() {
+    constexpr int Depth = 4;
+    RecordQueue queue;
+    std::mutex gate;
+    queue.Start([&] {
+        std::lock_guard lock(gate);
+        queue.RunPending();
+    });
+    std::atomic<int> ran{0};
+    const auto packet = [&](std::uint32_t opcode) {
+        if (!OverlapsDrawRecords(opcode, false)) queue.WaitIdle();
+    };
+    std::unique_lock held(gate);
+    for (int i = 0; i < Depth; ++i) queue.Post([&ran] { ++ran; });
+    packet(0x69);
+    packet(0x27);
+    Expect(queue.Posted() - queue.Finished() == Depth && ran.load() == 0, "register writes and draws leave k records in flight");
+    held.unlock();
+    packet(0x3c);
+    Expect(!queue.Pending() && ran.load() == Depth, "a memory wait drains every record in flight, not only the newest");
+    queue.Stop();
+}
+
 }
 
 int main() {
@@ -241,6 +397,11 @@ int main() {
     testHoldersWaitForTheWorker();
     testStalePreparation();
     testOverlappingPackets();
+    testAheadWaitTicket();
+    testAheadOrderingWithKInFlight();
+    testAheadStaleAgainstEarlierJob();
+    testAheadStaleAtRunFailsClosed();
+    testAheadDrainAtNonDrawPacket();
     if (failures != 0) {
         std::fprintf(stderr, "%d record queue checks failed\n", failures);
         return 1;
