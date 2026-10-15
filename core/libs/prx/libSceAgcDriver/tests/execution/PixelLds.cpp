@@ -94,6 +94,7 @@ void Draw(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, bool bounded)
     pixel.posY = true;
     pixel.targetOutputMode[0] = 9;
     pixel.targetExportMapping.fill(0xe4u);
+    pixel.extraLdsDwords = 256u;
     std::vector<std::uint32_t> pixelUserData(8, 0u);
     const auto results = BufferDescriptor(Results.data(), 16u, Width * Height);
     std::copy(results.begin(), results.end(), pixelUserData.begin() + 4);

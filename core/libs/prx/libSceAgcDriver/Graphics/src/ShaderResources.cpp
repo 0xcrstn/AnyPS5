@@ -2507,7 +2507,8 @@ const char* ShaderResources::EpochProofVerdictName(EpochProofVerdict verdict) {
 ShaderResources::EpochProofResult ShaderResources::ResolveEpochProof() const {
     EpochProofResult result;
     if (!reusable || !ParallelRevalidateRequested() || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return result;
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    struct RangesTag {};
+    auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, RangesTag>();
     std::uint64_t serial = 0;
     {
         std::unique_lock lock(proofMutex, std::try_to_lock);

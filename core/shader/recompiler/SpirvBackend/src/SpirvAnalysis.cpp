@@ -333,7 +333,7 @@ std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const
     return addresses;
 }
 
-SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
+SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program, std::uint32_t functionLdsAllocationDwords) {
     SpirvRequirements requirements {};
     for (const IrBlock* block : program.BlockOrder()) {
         for (const IrValue* inst : block->Instructions()) {
@@ -467,7 +467,10 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
         }
     }
     if (requirements.functionLds) {
-        requirements.functionLdsDwords = FunctionLdsDwords(program);
+        if (functionLdsAllocationDwords == 0u || functionLdsAllocationDwords > FunctionLdsDwordLimit) {
+            throw std::runtime_error("function LDS allocation must be between 1 and " + std::to_string(FunctionLdsDwordLimit) + " dwords");
+        }
+        requirements.functionLdsDwords = std::min(FunctionLdsDwords(program), functionLdsAllocationDwords);
         requirements.functionLdsAddresses = FunctionLdsLaneAddresses(program);
         if (!requirements.functionLdsAddresses.empty()) {
             std::uint64_t needed = 0;
@@ -475,7 +478,11 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                 const auto offset = program.Resources().memoryInfo[inst->Flags<MemoryFlags>().index].offset;
                 needed = std::max<std::uint64_t>(needed, ((std::uint64_t{address} + offset) >> 2u) + SharedAccessDwords(inst->Opcode()));
             }
-            requirements.functionLdsDwords = static_cast<std::uint32_t>(std::max<std::uint64_t>((needed + 63u) & ~63ull, 64u));
+            if (needed > functionLdsAllocationDwords) {
+                requirements.functionLdsAddresses.clear();
+            } else {
+                requirements.functionLdsDwords = static_cast<std::uint32_t>(std::min<std::uint64_t>(std::max<std::uint64_t>((needed + 63u) & ~63ull, 64u), functionLdsAllocationDwords));
+            }
         }
     }
     requirements.coherentBufferAlias = requirements.coherentBuffers && !program.Metadata().invalidatesCaches;

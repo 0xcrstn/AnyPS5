@@ -181,6 +181,7 @@ inline std::unique_ptr<CacheEntryRequest> ReadCacheEntry(std::span<const std::by
         info.ditheredAlphaToCoverage = key.NextBool();
         info.quadPixelMask = static_cast<std::uint8_t>(key.Next());
         for (auto& mask : info.quadSampleMask) mask = static_cast<std::uint16_t>(key.Next());
+        info.extraLdsDwords = key.Next32();
         for (auto& mode : info.targetOutputMode) mode = static_cast<std::uint8_t>(key.Next());
         for (std::uint8_t target = 0; target < info.targetExportMapping.size(); ++target) info.targetExportMapping[target] = target;
         request.context.pixel = info;

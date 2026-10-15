@@ -23,7 +23,10 @@ extern "C" int APS5_VABI __cxa_atexit_nid_postfix(void (APS5_VABI *func)(void*),
 namespace {
 
 std::mutex shutdownMutex;
-std::condition_variable shutdownChanged;
+std::condition_variable& ShutdownChanged() {
+    static auto* const changed = new std::condition_variable();
+    return *changed;
+}
 std::vector<void (*)()> shutdownCallbacks;
 std::thread::id shutdownThread;
 bool shutdownStarted = false;
@@ -74,7 +77,7 @@ extern "C" void LibcRunShutdown_nid_postfix() {
     std::unique_lock lock(shutdownMutex);
     if (shutdownStarted) {
         if (!shutdownFinished && shutdownThread == std::this_thread::get_id()) throw std::runtime_error("libc: recursive shutdown");
-        shutdownChanged.wait(lock, [] { return shutdownFinished; });
+        ShutdownChanged().wait(lock, [] { return shutdownFinished; });
         if (shutdownFailure) std::rethrow_exception(shutdownFailure);
         return;
     }
@@ -92,7 +95,7 @@ extern "C" void LibcRunShutdown_nid_postfix() {
     shutdownFailure = error;
     shutdownFinished = true;
     lock.unlock();
-    shutdownChanged.notify_all();
+    ShutdownChanged().notify_all();
     if (error) std::rethrow_exception(error);
 }
 

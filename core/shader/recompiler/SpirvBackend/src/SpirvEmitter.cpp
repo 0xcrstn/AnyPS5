@@ -75,9 +75,14 @@ std::uint32_t WaveLdsScope(const IrProgram& program, const ShaderWorkgroupInputI
     return threads <= program.WaveSize() ? spv::ScopeWorkgroup : 0u;
 }
 
+std::uint32_t FunctionLdsAllocationDwords(const IrProgram& program, const ShaderStageInputInfo& inputInfo) {
+    if (program.Resources().stage != IrShaderStage::Pixel || inputInfo.pixel == nullptr || inputInfo.pixel->psExtraLdsDwords == 0u) return FunctionLdsDwordLimit;
+    return std::min(inputInfo.pixel->psExtraLdsDwords, FunctionLdsDwordLimit);
 }
 
-SpirvEmitterState::SpirvEmitterState(const IrProgram& program, const ShaderStageInputInfo& inputInfo) : module(program.Resources().stage == IrShaderStage::Mesh ? 0x00010400u : 0x00010300u), program(program), inputInfo(inputInfo), requirements(AnalyzeProgramRequirements(program)) {
+}
+
+SpirvEmitterState::SpirvEmitterState(const IrProgram& program, const ShaderStageInputInfo& inputInfo) : module(program.Resources().stage == IrShaderStage::Mesh ? 0x00010400u : 0x00010300u), program(program), inputInfo(inputInfo), requirements(AnalyzeProgramRequirements(program, FunctionLdsAllocationDwords(program, inputInfo))) {
 }
 
 SpirvValueEmitContext::SpirvValueEmitContext(SpirvEmitterState& state) : state(state) {
