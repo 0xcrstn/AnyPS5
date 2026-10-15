@@ -1571,6 +1571,35 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     start = recorder.StartDrawPass(0x5eed, false, false, PassAccess{});
     Require(!start.continued && start.barrier, "a render pass begun after uncovered work skipped its barrier");
     recorder.Sync();
+    {
+        const std::pair<std::uint64_t, std::uint64_t> first{0x1000, 0x2000};
+        const std::pair<std::uint64_t, std::uint64_t> second{0x3000, 0x4000};
+        const PassAccess writesFirst{{}, std::span(&first, 1), {}, {}, false, false, false};
+        const PassAccess writesSecond{{}, std::span(&second, 1), {}, {}, false, false, false};
+        const PassAccess readsFirst{std::span(&first, 1), {}, {}, {}, false, false, false};
+        const int owners[3]{};
+        const auto setting = Recorder::DispatchBarriersSetting();
+        const bool on = setting == Recorder::DispatchBarriers::On;
+        recorder.DispatchCommands(writesFirst, &owners[0], true, &covered);
+        Require(recorder.DeferDispatchBarrier(writesFirst, &owners[0], true) == on, "a dispatch's trailing barrier was deferred with the switch off (or recorded with it on)");
+        Require(recorder.DispatchBarrierPending() == (setting != Recorder::DispatchBarriers::Off), "a deferrable dispatch left nothing pending");
+        recorder.DispatchCommands(writesSecond, &owners[1], true, &covered);
+        Require(!on || (covered == Recorder::DispatchedAccess && recorder.DispatchBarrierPending()), "an independent dispatch flushed the deferred barrier or was not covered by it");
+        recorder.DeferDispatchBarrier(writesSecond, &owners[1], true);
+        recorder.DispatchCommands(readsFirst, &owners[2], true, &covered);
+        Require(!recorder.DispatchBarrierPending() && (!on || covered == Recorder::DispatchedAccess), "a dispatch reading a deferred dispatch's writes did not get its barrier");
+        recorder.DeferDispatchBarrier(readsFirst, &owners[2], true);
+        recorder.DispatchCommands(writesSecond, &owners[2], true, &covered);
+        Require(!recorder.DispatchBarrierPending(), "a second dispatch of the same resources skipped the barrier");
+        recorder.DeferDispatchBarrier(writesSecond, &owners[2], true);
+        recorder.DispatchCommands(writesFirst, &owners[0], false, &covered);
+        Require(!recorder.DispatchBarrierPending(), "a dispatch with unknown effects skipped the barrier");
+        recorder.DeferDispatchBarrier(writesFirst, &owners[0], true);
+        recorder.Commands(&covered);
+        Require(!recorder.DispatchBarrierPending() && (!on || covered == Recorder::DispatchedAccess), "other work did not get the deferred barrier");
+        recorder.Sync();
+        Require(Recorder::ParseDispatchBarriers(nullptr) == Recorder::DispatchBarriers::On && Recorder::ParseDispatchBarriers("0") == Recorder::DispatchBarriers::Off && Recorder::ParseDispatchBarriers("verify") == Recorder::DispatchBarriers::Verify, "APS5_DISPATCH_BARRIERS values");
+    }
     // The hazard tracker (counting mode only): accesses are noted without effect on the batch.
     const std::pair<std::uint64_t, std::uint64_t> range{address, address + 64};
     recorder.NoteAccess(Recorder::CommandClass::Fill, Recorder::Access{{}, std::span(&range, 1), {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -11639,6 +11668,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--resident-buffer-mirrors-only") {
             if (!residentMirrorTests(device, recorder, true)) return 77;
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--store-runs-only") {
+            storeRunTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--resident-mirrors-only") {

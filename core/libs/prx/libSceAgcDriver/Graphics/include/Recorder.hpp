@@ -114,6 +114,13 @@ public:
     void MarkCovered(VkAccessFlags access);
     static constexpr VkAccessFlags DrawPassAccess = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
+    static constexpr VkAccessFlags DispatchedAccess = DrawPassAccess | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    enum class DispatchBarriers : std::uint8_t { Off, On, Verify };
+    static DispatchBarriers ParseDispatchBarriers(const char* text);
+    static DispatchBarriers DispatchBarriersSetting();
+    VkCommandBuffer DispatchCommands(const PassAccess& access, const void* owner, bool independent, VkAccessFlags* coveredAccess);
+    bool DeferDispatchBarrier(const PassAccess& access, const void* owner, bool deferrable);
+    bool DispatchBarrierPending() const;
     struct DrawPassStart {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         bool continued = false;
@@ -769,6 +776,10 @@ private:
             ChunkInheritance inheritance;
         } renderPass;
         PassHazards passHazards;
+        PassHazards dispatchHazards;
+        std::vector<const void*> dispatchOwners;
+        bool dispatchBarrierPending = false;
+        bool dispatchBarrierDeferred = false;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
         // Queued DCC key stores (see QueueKeyStore).
@@ -865,6 +876,7 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
+    void flushDispatchBarrier();
     void dropStaleHoldKept();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();

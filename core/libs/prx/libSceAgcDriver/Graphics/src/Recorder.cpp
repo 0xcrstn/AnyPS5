@@ -1605,6 +1605,7 @@ constexpr std::size_t PassBreaks = static_cast<std::size_t>(PassBreak::Count);
 constexpr const char* PassBreakNames[PassBreaks] = {"closed", "forced", "sample-slot", "target", "target-fenced", "raw", "waw", "war", "image", "unknown-read", "unknown-write"};
 std::atomic<std::uint64_t> passBreaks[PassBreaks]{};
 std::atomic<std::uint64_t> readOnlyAddressDraws{0}, avoidableAddressBreaks{0};
+std::atomic<std::uint64_t> dispatchBarriersSkipped{0}, dispatchBarrierConflicts{0}, dispatchBarrierFlushes{0};
 
 PassBreak PassBreakFor(PassHazard hazard) {
     switch (hazard) {
@@ -1788,6 +1789,7 @@ void Recorder::FlushKeyStores() {
 }
 
 void Recorder::recordKeyStores(bool forWriter) {
+    flushDispatchBarrier();
     auto stores = std::move(open->keyStores);
     open->keyStores.clear();
     if (stores.empty()) return;
@@ -1859,6 +1861,72 @@ void Recorder::ensureOpen() {
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
         if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);
     }
+    flushDispatchBarrier();
+}
+
+void Recorder::flushDispatchBarrier() {
+    if (open == nullptr || !open->dispatchBarrierPending) return;
+    const bool deferred = open->dispatchBarrierDeferred;
+    open->dispatchBarrierPending = false;
+    open->dispatchBarrierDeferred = false;
+    open->dispatchHazards.Clear();
+    open->dispatchOwners.clear();
+    if (!deferred) return;
+    if (DrawOrGpuProfiled()) dispatchBarrierFlushes.fetch_add(1, std::memory_order_relaxed);
+    const auto timing = beginTiming(ClassKey(CommandClass::DispatchTrailing));
+    recordBarrier(open->commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, DispatchedAccess);
+    CountBarriers(CommandClass::DispatchTrailing);
+    EndGpuTiming(timing);
+    open->coveredAccess = DispatchedAccess;
+}
+
+Recorder::DispatchBarriers Recorder::ParseDispatchBarriers(const char* text) {
+    if (text == nullptr || std::strcmp(text, "1") == 0) return DispatchBarriers::On;
+    if (std::strcmp(text, "0") == 0) return DispatchBarriers::Off;
+    if (std::strcmp(text, "verify") == 0) return DispatchBarriers::Verify;
+    throw std::runtime_error(std::string("APS5_DISPATCH_BARRIERS must be 0, 1 or verify, not ") + text);
+}
+
+Recorder::DispatchBarriers Recorder::DispatchBarriersSetting() {
+    static const auto setting = ParseDispatchBarriers(std::getenv("APS5_DISPATCH_BARRIERS"));
+    return setting;
+}
+
+VkCommandBuffer Recorder::DispatchCommands(const PassAccess& access, const void* owner, bool independent, VkAccessFlags* coveredAccess) {
+    if (open == nullptr || !open->dispatchBarrierPending) return Commands(coveredAccess);
+    GuestMemory::AssertGpuLockHeld("Recorder::DispatchCommands");
+    const bool ownerPending = std::find(open->dispatchOwners.begin(), open->dispatchOwners.end(), owner) != open->dispatchOwners.end();
+    const bool skip = independent && !ownerPending && !open->renderPass.open && !open->run.open && open->dispatchHazards.Check(access, false) == PassHazard::None;
+    if (!skip) {
+        if (DrawOrGpuProfiled()) dispatchBarrierConflicts.fetch_add(1, std::memory_order_relaxed);
+        return Commands(coveredAccess);
+    }
+    if (DrawOrGpuProfiled()) dispatchBarriersSkipped.fetch_add(1, std::memory_order_relaxed);
+    if (coveredAccess != nullptr) *coveredAccess = open->dispatchBarrierDeferred ? DispatchedAccess : open->coveredAccess;
+    open->coveredAccess = 0;
+    return open->commands;
+}
+
+bool Recorder::DispatchBarrierPending() const {
+    return open != nullptr && open->dispatchBarrierPending;
+}
+
+bool Recorder::DeferDispatchBarrier(const PassAccess& access, const void* owner, bool deferrable) {
+    const auto setting = DispatchBarriersSetting();
+    if (setting == DispatchBarriers::Off || open == nullptr) return false;
+    if (!deferrable) {
+        open->dispatchBarrierPending = false;
+        open->dispatchBarrierDeferred = false;
+        open->dispatchHazards.Clear();
+        open->dispatchOwners.clear();
+        return false;
+    }
+    open->dispatchHazards.Add(access);
+    open->dispatchOwners.push_back(owner);
+    open->dispatchBarrierPending = true;
+    if (setting == DispatchBarriers::Verify) return false;
+    open->dispatchBarrierDeferred = true;
+    return true;
 }
 
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
@@ -2126,8 +2194,9 @@ void reportBarriers() {
         std::snprintf(text, sizeof(text), " %s %llu", PassBreakNames[i], static_cast<unsigned long long>(passBreaks[i].exchange(0, std::memory_order_relaxed)));
         breaks += text;
     }
-    static constexpr const char* ReadOnlyAddressModes[] = {"0", "1", "verify"};
-    AgcDriver::ProfilePrint_nid_no_patch("; render passes begun by reason:%s; read-only address-based draws (APS5_READONLY_ADDRESS_PASSES=%s): %llu, unknown-write breaks only they caused %llu", breaks.c_str(), ReadOnlyAddressModes[static_cast<std::size_t>(ReadOnlyAddressPassesSetting())], static_cast<unsigned long long>(readOnlyAddressDraws.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(avoidableAddressBreaks.exchange(0, std::memory_order_relaxed)));
+    static constexpr const char* SwitchModes[] = {"0", "1", "verify"};
+    AgcDriver::ProfilePrint_nid_no_patch("; render passes begun by reason:%s; read-only address-based draws (APS5_READONLY_ADDRESS_PASSES=%s): %llu, unknown-write breaks only they caused %llu", breaks.c_str(), SwitchModes[static_cast<std::size_t>(ReadOnlyAddressPassesSetting())], static_cast<unsigned long long>(readOnlyAddressDraws.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(avoidableAddressBreaks.exchange(0, std::memory_order_relaxed)));
+    AgcDriver::ProfilePrint_nid_no_patch("; dispatch trailing barriers (APS5_DISPATCH_BARRIERS=%s): %llu %s past independent dispatches, %llu flushed by a conflicting dispatch, %llu deferred ones flushed by other work", SwitchModes[static_cast<std::size_t>(Recorder::DispatchBarriersSetting())], static_cast<unsigned long long>(dispatchBarriersSkipped.exchange(0, std::memory_order_relaxed)), Recorder::DispatchBarriersSetting() == Recorder::DispatchBarriers::On ? "deferred" : "deferrable", static_cast<unsigned long long>(dispatchBarrierConflicts.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(dispatchBarrierFlushes.exchange(0, std::memory_order_relaxed)));
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
@@ -2580,6 +2649,7 @@ void Recorder::foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::
 }
 
 void Recorder::foldSegments() {
+    flushDispatchBarrier();
     const auto commands = open->commands;
     const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(pendingSamples.size(), SegmentFoldCapacity));
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -2599,6 +2669,7 @@ void Recorder::endSamples(Batch& batch) {
 }
 
 void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
+    if (&batch == open.get()) flushDispatchBarrier();
     const auto commands = batch.commands;
     const auto copy = function(cmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
     const auto bind = function(cmdBindPipeline, "vkCmdBindPipeline");
@@ -4017,6 +4088,7 @@ void Recorder::Submit() {
         });
         open->inPlaceLeases.clear();
     }
+    flushDispatchBarrier();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     if (chunks != nullptr && chunks->IsOpen()) chunks->Discard();
