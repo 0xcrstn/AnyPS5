@@ -47,6 +47,8 @@ class ChunkPool;
 // up to serial S" WITHOUT the mutex (WaitSerial), because the monotonic value cannot be reset or
 // recycled the way the pooled batch fences are, and afterwards run the completions under the mutex
 // (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
+class Recorder;
+
 struct RecorderDomain {
     std::atomic<std::int64_t> pendingLabelSince{std::numeric_limits<std::int64_t>::min()};
     std::atomic<std::uint64_t> writeGeneration{0};
@@ -57,7 +59,7 @@ struct RecorderDomain {
     std::atomic<std::uint64_t> writeBackCompletions{0};
     std::atomic<std::uint64_t> workSinceSubmit{0};
     std::mutex labelTableMutex;
-    class Recorder* labelTableOwner = nullptr;
+    Recorder* labelTableOwner = nullptr;
 };
 
 class Recorder {

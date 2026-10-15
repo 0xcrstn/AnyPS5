@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WaitBroker.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LabelVersions.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -93,7 +94,7 @@ bool Driver::verifyWaitObservations() {
 
 void Driver::dischargeWait(WaitObservation& observation, std::span<const std::uint32_t> packet) {
     observation.discharged = eventSerial.load(std::memory_order_acquire);
-    observation.dischargedAt = std::chrono::steady_clock::now();
+    if (Graphics::LabelVersions::Enabled()) observation.dischargedAt = std::chrono::steady_clock::now();
     auto& floor = waitFloor();
     if (verifyWaitObservations() && !ObservationProven(observation, floor)) throw std::runtime_error("APS5_VERIFY_WAIT_OBSERVATIONS: unproven wait observation: " + DescribeObservation(observation) + ", queue floor " + std::to_string(floor));
     floor = std::max(floor, observation.discharged);
@@ -170,7 +171,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     observation.queue = queue;
     observation.received = received;
     observation.activation = requireMemory ? received : WaitActivationStamp(waitFloorMode(), received, waitFloor());
-    observation.activatedAt = std::chrono::steady_clock::now();
+    const bool observing = !requireMemory && (Graphics::LabelVersions::Enabled() || verifyWaitObservations() || labelTimelineMode() != LabelTimelineMode::Off);
+    if (Graphics::LabelVersions::Enabled()) observation.activatedAt = std::chrono::steady_clock::now();
     const std::uint64_t activation = observation.activation;
     const auto timeline = requireMemory ? LabelTimelineMode::Off : labelTimelineMode();
     const auto proven = [&](WaitSource source) {
@@ -186,7 +188,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     };
     const auto discharge = [&](WaitSource source) {
         observation.source = source;
-        if (source == WaitSource::Entry || source == WaitSource::Memory || source == WaitSource::HeldAtSubmit) {
+        if (observing && (source == WaitSource::Entry || source == WaitSource::Memory || source == WaitSource::HeldAtSubmit)) {
             const bool readable = GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(awaited)), awaitedBytes);
             observation.value = !readable ? 0 : wideWait ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
             if (timeline != LabelTimelineMode::Off) ++outcomes.lifts[static_cast<std::size_t>(Lift::Latched)];
