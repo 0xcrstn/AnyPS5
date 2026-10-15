@@ -37,8 +37,9 @@ inline DrawPrepareStale StaleDrawPrepare(const DrawRecordEffects& effects, std::
     return DrawPrepareStale::No;
 }
 
-inline bool OverlapsDrawRecords(std::uint32_t opcode, bool predicated) {
+inline bool OverlapsDrawRecords(std::uint32_t opcode, bool predicated, bool dispatches = false) {
     if (predicated) return false;
+    if (dispatches && (opcode == 0x15 || opcode == 0x16)) return true;
     switch (opcode) {
     case 0x13: case 0x26: case 0x28: case 0x2a: case 0x2f:
     case 0x69: case 0x76: case 0x79: case 0x7a:

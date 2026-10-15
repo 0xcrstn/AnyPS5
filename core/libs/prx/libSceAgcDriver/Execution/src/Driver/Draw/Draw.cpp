@@ -650,7 +650,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             std::uint64_t drawKey = 0;
         };
         auto inputs = std::make_shared<Inputs>(Inputs{relocatedDecode, decode, entry, shaderMemoryOwner, drawParameters, std::move(programs), std::move(decodeReads), std::move(memory), std::move(matchedRegions), std::move(matched), std::move(fresh), std::move(stageCaptures), std::move(results), std::move(stages), std::move(snapshots), recipe, std::move(recipeStages), drawKey});
-        postDrawRecord(localDevice, submission.queue, [inputs, localDevice](DrawRecordResult& result) {
+        postDrawRecord(localDevice, submission.queue, recordIdentity(submission, "draw", stages.empty() ? 0 : stages.back().programAddress), [inputs, localDevice](DrawRecordResult& result) {
             const auto& state = inputs->state->state;
             if (inputs->recipe != nullptr) {
                 if (localDevice->DrawFromRecipe(state, inputs->draw, inputs->stages, inputs->snapshots, inputs->recipe) == RecipeOutcome::Recorded) return;
