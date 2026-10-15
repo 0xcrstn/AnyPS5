@@ -135,6 +135,7 @@ struct SpirvEmitterState {
     std::array<std::uint32_t, 2> bdaByteWriteFunctions {};
     std::uint32_t bdaFaultFunction = 0;
     BdaTable::Translation bdaTranslation = BdaTable::Translation::Legacy;
+    std::uint32_t guestLineFile = 0;
     std::array<std::array<std::uint32_t, 4>, 2> bdaResolveFunctions {};
     bool nativeF16ModesEmitted = false;
     bool f16DenormPreserveEmitted = false;

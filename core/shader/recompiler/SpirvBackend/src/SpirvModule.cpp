@@ -89,7 +89,7 @@ std::vector<std::uint32_t> SpirvModule::Finalize() const {
     }
     if (inHelperFunction) throw std::runtime_error("SpirvModule::Finalize called inside a helper function");
     std::vector<std::uint32_t> module;
-    module.reserve(5u + capabilities.size() + extensions.size() + extInstImports.size() + memoryModel.size() + entryPoints.size() + executionModes.size() + debug.size() + annotations.size() + typeDeclarations.size() + declarations.size() + globalVariables.size() + functionInstructions.size() + helperFunctionInstructions.size());
+    module.reserve(5u + capabilities.size() + extensions.size() + extInstImports.size() + memoryModel.size() + entryPoints.size() + executionModes.size() + debugStrings.size() + debug.size() + annotations.size() + typeDeclarations.size() + declarations.size() + globalVariables.size() + functionInstructions.size() + helperFunctionInstructions.size());
     module.push_back(spv::MagicNumber);
     module.push_back(version);
     module.push_back(0u);
@@ -101,6 +101,7 @@ std::vector<std::uint32_t> SpirvModule::Finalize() const {
     module.insert(module.end(), memoryModel.begin(), memoryModel.end());
     module.insert(module.end(), entryPoints.begin(), entryPoints.end());
     module.insert(module.end(), executionModes.begin(), executionModes.end());
+    module.insert(module.end(), debugStrings.begin(), debugStrings.end());
     module.insert(module.end(), debug.begin(), debug.end());
     module.insert(module.end(), annotations.begin(), annotations.end());
     module.insert(module.end(), typeDeclarations.begin(), typeDeclarations.end());
@@ -215,6 +216,14 @@ void SpirvModule::AddName(std::uint32_t target, const std::string& name) {
     std::vector<std::uint32_t> operands = {target};
     appendString(operands, name);
     appendInstruction(debug, spv::OpName, operands);
+}
+
+std::uint32_t SpirvModule::AddString(const std::string& text) {
+    const auto id = AllocateId();
+    std::vector<std::uint32_t> operands = {id};
+    appendString(operands, text);
+    appendInstruction(debugStrings, spv::OpString, operands);
+    return id;
 }
 
 void SpirvModule::AddFunction(std::span<const std::uint32_t> words) {

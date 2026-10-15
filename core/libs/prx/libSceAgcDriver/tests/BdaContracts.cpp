@@ -2,6 +2,7 @@
 #include "BdaTranslationFixtures.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
+#include "SpirvBackend/SpirvStatistics.hpp"
 #include <array>
 #include <string>
 #include <vector>
@@ -93,4 +94,16 @@ void RunBdaTableContractTests() {
     }
     std::vector<Abi::Range> unsorted{{0x2000, 0x3000, 0x1000, Abi::Read, 0}, {0x1000, 0x2000, 0x2000, Abi::Read, 0}};
     reject([&] { static_cast<void>(Table::Build(unsorted, Table::Translation::Radix)); }, "sorted by begin");
+}
+
+void RunSpirvStatisticsTests() {
+    using AgcDriver::Graphics::Require;
+    const auto statistics = ShaderRecompiler::AnalyzeSpirv(MakeBdaSpanReadTestShader(0x7fff12340000ULL, 0u, 0b0101u, false, true));
+    const auto calls = [&](const char* name) {
+        const auto found = statistics.callsByCallee.find(name);
+        return found != statistics.callsByCallee.end() ? found->second : 0u;
+    };
+    Require(calls("read_bda_span_stop") == 1u && calls("probe_bda_pointer") == 1u && calls("load_bda_span") >= 1u && calls("get_bda_pointer") >= 1u, "SPIR-V statistics miscounted the BDA helper calls");
+    Require(statistics.functions >= 5u && statistics.physicalLoads >= 2u && statistics.loops >= 2u && statistics.float64Arithmetic == 0u && statistics.lines == 0u, "SPIR-V statistics miscounted the BDA test shader");
+    Require(statistics.instructionsByFunction.contains("get_bda_pointer") && ShaderRecompiler::SpirvStatisticsJson(statistics).find("\"probe_bda_pointer\":1") != std::string::npos, "SPIR-V statistics JSON lost the helper counts");
 }

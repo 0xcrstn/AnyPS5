@@ -55,6 +55,7 @@ public:
     [[nodiscard]] std::uint32_t DefineInitializedGlobalVariable(std::uint32_t pointerType, std::uint32_t storageClass, std::uint32_t initializer);
     void AddMemoryModel(std::uint32_t addressingModel, std::uint32_t memoryModel);
     void AddName(std::uint32_t target, const std::string& name);
+    std::uint32_t AddString(const std::string& text);
     void AddFunction(std::span<const std::uint32_t> words);
     void BeginHelperFunction();
     void EndHelperFunction();
@@ -242,6 +243,7 @@ private:
     std::vector<std::uint32_t> extInstImports;
     std::vector<std::uint32_t> memoryModel;
     std::vector<std::uint32_t> executionModes;
+    std::vector<std::uint32_t> debugStrings;
     std::vector<std::uint32_t> debug;
     std::vector<std::uint32_t> annotations;
     std::vector<std::uint32_t> declarations;

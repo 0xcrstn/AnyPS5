@@ -1313,6 +1313,8 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_ITERATION_SELECTION",
     "APS5_NO_PERF_LAYOUT_PAIR",
     "APS5_NO_RESULT_MEMO",
+    "APS5_SHADER_MANIFEST",
+    "APS5_SHADER_MANIFEST_SPIRV",
 };
 
 const std::vector<std::byte>& switchKey() {

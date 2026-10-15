@@ -1,4 +1,5 @@
 #include "Recompiler.hpp"
+#include "ShaderManifest.hpp"
 #include "StencilReplay.hpp"
 #include <algorithm>
 #include <cstring>
@@ -1270,6 +1271,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             loaded.artifact.variantId = nextVariantId();
             if (spill) loaded.artifact.spirv = loaded.artifact.spirv.Spill(diskKey, false);
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
+            NoteShaderManifest(request, *variant, "disk");
         }
     }
     if (variant == nullptr) {
@@ -1289,6 +1291,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
             throw;
         }
+        NoteShaderManifest(request, *variant, "compiled");
         if (spill) {
             auto retained = std::make_shared<CompiledVariant>(*variant);
             retained->artifact.spirv = variant->artifact.spirv.Spill(diskKey, true);

@@ -143,6 +143,7 @@ int main(int argc, char** argv) {
     try {
         RunBdaContractTests();
         RunBdaTableContractTests();
+        RunSpirvStatisticsTests();
         if (argc == 2) {
             const auto shader = MakeBdaTestShader(0x7fff12340000ULL, 32);
             std::ofstream file(argv[1], std::ios::binary);

@@ -19,6 +19,7 @@ void RunBdaStoreExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaContractTests();
 void RunBdaTableContractTests();
+void RunSpirvStatisticsTests();
 void RunBdaTranslationTests(const AgcDriver::Graphics::Context& context);
 
 #endif
