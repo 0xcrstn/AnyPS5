@@ -27,6 +27,8 @@ struct StagingStats {
     std::uint64_t copiedInBytes = 0;
     std::uint64_t skipped = 0;
     std::uint64_t skippedBytes = 0;
+    std::uint64_t reusedComplete = 0;
+    std::uint64_t reuseVerified = 0;
 };
 StagingStats StagingCounters();
 
@@ -416,6 +418,8 @@ private:
         bool unstaged = false;
         std::shared_ptr<StagingShadow> shadow {};
         mutable bool shadowBegun = false;
+        mutable std::uint64_t copiedIn = 0;
+        mutable bool reusedComplete = false;
         mutable bool lazyResident = false;
     };
 
@@ -470,7 +474,7 @@ private:
     bool writesCover(std::uint64_t begin, std::uint64_t end) const;
     bool shadowReusable(const Region& region) const;
     bool takeShadow(Region& region, bool addressable);
-    static void settleShadow(const Region& region, std::uint64_t generation);
+    static void settleShadow(const Region& region, std::uint64_t generation, bool complete = false);
     void takeHeapReferences();
     Context context;
     bool stagingAllowed = false;

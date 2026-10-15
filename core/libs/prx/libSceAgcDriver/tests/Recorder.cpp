@@ -2860,8 +2860,28 @@ void stagingReuseTests(const Device& device, Recorder& recorder) {
     Require(guestAll(element, element + 64, 0xa1), "a use without copy-back stored its results");
     const auto partial = address + 4 * 65536;
     const auto partialFirst = run(partial, 2 * elementBytes, 0, 0, 0, true);
-    const auto partialSecond = run(partial, 2 * elementBytes, 0, 0, 0, true);
-    Require(partialFirst.copied == 1 && partialSecond.copied == 1 && partialSecond.skipped == 0, "a staged region the shader writes only in part skipped its copy-in");
+    const auto partialSecond = run(partial, 2 * elementBytes, 0, 64, 0xe5e5e5e5u, true);
+    const char* reuseReads = std::getenv("APS5_STAGING_REUSE_READS");
+    if (reuseReads != nullptr && std::string_view(reuseReads) == "0") {
+        Require(partialFirst.copied == 1 && partialSecond.copied == 1 && partialSecond.skipped == 0, "APS5_STAGING_REUSE_READS=0: a staged region the shader writes only in part skipped its copy-in");
+    } else {
+        const auto reusedBefore = StagingCounters().reusedComplete;
+        Require(partialFirst.copied == 1 && partialSecond.copied == 0 && partialSecond.skipped == 1, "an unchanged staged region the shader writes only in part was copied in again");
+        Require(all(partialSecond.seen, 0x11), "a reused partly written shadow does not hold the guest bytes");
+        const auto partialThird = run(partial, 2 * elementBytes, 0, 0, 0, true);
+        Require(partialThird.skipped == 1 && partialThird.seen[0] == 0xe5 && partialThird.seen[63] == 0xe5 && partialThird.seen[64] == 0x11, "a reused partly written shadow lost the previous use's results");
+        guest[partial - address + elementBytes + 100] = 0xf6;
+        const auto partialFourth = run(partial, 2 * elementBytes, 0, 0, 0, true);
+        Require(partialFourth.copied == 1 && partialFourth.skipped == 0, "a CPU store into the unwritten part of a staged region did not copy it in again");
+        Require(AgcDriver::GuestMemory::MarkWritten(partial + elementBytes + 512, 16) != 0, "a GPU write into the unwritten part was not stamped");
+        const auto partialFifth = run(partial, 2 * elementBytes, 0, 0, 0, true);
+        Require(partialFifth.copied == 1 && partialFifth.skipped == 0, "a driver store into the unwritten part of a staged region did not copy it in again");
+        const auto partialSixth = run(partial, 2 * elementBytes, 0, 0, 0, true);
+        recorder.Sync();
+        const auto counters = StagingCounters();
+        Require(partialSixth.skipped == 1 && counters.reusedComplete >= reusedBefore + 2, "partly written shadows were not counted as reused");
+        if (reuseReads != nullptr && std::string_view(reuseReads) == "verify") Require(counters.reuseVerified >= 2, "APS5_STAGING_REUSE_READS=verify did not compare the reused shadows");
+    }
     std::cout << "Staging reuse tests passed\n";
 }
 

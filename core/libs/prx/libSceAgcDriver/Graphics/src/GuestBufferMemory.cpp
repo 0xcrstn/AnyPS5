@@ -133,6 +133,7 @@ struct StagingShadow {
     std::uint64_t generation = 0;
     std::uint32_t inFlight = 0;
     std::uint64_t lastUse = 0;
+    bool complete = false;
     bool retired = false;
 };
 
@@ -159,6 +160,21 @@ StagingShadowCache& StagingShadows() {
     static StagingShadowCache cache;
     return cache;
 }
+
+enum class ReuseReads { Off, On, Verify };
+
+ReuseReads StagingReuseReads() {
+    static const ReuseReads mode = [] {
+        const char* value = std::getenv("APS5_STAGING_REUSE_READS");
+        if (value == nullptr || std::strcmp(value, "1") == 0) return ReuseReads::On;
+        if (std::strcmp(value, "0") == 0) return ReuseReads::Off;
+        if (std::strcmp(value, "verify") == 0) return ReuseReads::Verify;
+        throw std::runtime_error(std::string("APS5_STAGING_REUSE_READS=") + value + ": expected 0, 1 or verify");
+    }();
+    return mode;
+}
+
+std::atomic<std::uint64_t> reusedCompleteShadows{0}, reuseVerified{0};
 
 std::uint64_t stagingReuseBudget() {
     static const std::uint64_t bytes = [] {
@@ -3407,6 +3423,28 @@ std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes,
 
 // APS5_TRACE_STAGING=1: every distinct staged range once, with its size and whether an atomic
 // element lies in it, to see which elements the staging window admits at a stage.
+void verifyReusedShadow(Recorder& recorder, const std::shared_ptr<Buffer>& shadow, VkBuffer source, std::uint64_t sourceOffset, std::uint64_t address, std::uint64_t bytes) {
+    const auto& context = recorder.GetContext();
+    auto scratch = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes * 2), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, shadow->Handle(), 0, scratch->Handle(), 0, bytes);
+    CopyBuffer(context, commands, source, sourceOffset, scratch->Handle(), bytes, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+    recorder.MarkCovered(0);
+    recorder.Keep(scratch);
+    recorder.Keep(shadow);
+    recorder.OnCompleteWithoutGuestAccess([scratch, bytes, address] {
+        const auto held = scratch->Bytes();
+        if (std::memcmp(held.data(), held.data() + bytes, static_cast<std::size_t>(bytes)) != 0) {
+            char message[192];
+            std::snprintf(message, sizeof(message), "APS5_STAGING_REUSE_READS=verify: the staging shadow of 0x%llx+0x%llx reused without a copy-in differs from guest memory", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+            throw std::runtime_error(message);
+        }
+        reuseVerified.fetch_add(1, std::memory_order_relaxed);
+    });
+}
+
 void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
     static const bool trace = std::getenv("APS5_TRACE_STAGING") != nullptr;
     if (!trace) return;
@@ -3429,7 +3467,7 @@ void reportStaging() {
     const auto out = stats.stagedOutBytes.load();
     const auto skipped = stats.stagedSkipped.load();
     const auto skippedBytes = stats.stagedSkippedBytes.load();
-    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused, %llu copy-ins skipped (%.0f KiB) on current shadows; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back, %llu copy-ins skipped (%.0f KiB)\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(skipped), skippedBytes / 1024.0, static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0, static_cast<unsigned long long>(skipped - lastSkipped), (skippedBytes - lastSkippedBytes) / 1024.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused, %llu copy-ins skipped (%.0f KiB) on current shadows (%llu holding bytes the use did not write, %llu verified); last 10 s: %llu regions, %.0f KiB in, %.0f KiB back, %llu copy-ins skipped (%.0f KiB)\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(skipped), skippedBytes / 1024.0, static_cast<unsigned long long>(reusedCompleteShadows.load(std::memory_order_relaxed)), static_cast<unsigned long long>(reuseVerified.load(std::memory_order_relaxed)), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0, static_cast<unsigned long long>(skipped - lastSkipped), (skippedBytes - lastSkippedBytes) / 1024.0);
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
@@ -3441,7 +3479,7 @@ void reportStaging() {
 
 StagingStats StagingCounters() {
     const auto& stats = Copies();
-    return {stats.staged.load(), stats.stagedInBytes.load(), stats.stagedSkipped.load(), stats.stagedSkippedBytes.load()};
+    return {stats.staged.load(), stats.stagedInBytes.load(), stats.stagedSkipped.load(), stats.stagedSkippedBytes.load(), reusedCompleteShadows.load(std::memory_order_relaxed), reuseVerified.load(std::memory_order_relaxed)};
 }
 
 void ShutdownGuestBufferWorkers() {
@@ -3503,7 +3541,7 @@ bool GuestBufferMemory::writesCover(std::uint64_t begin, std::uint64_t end) cons
 
 bool GuestBufferMemory::shadowReusable(const Region& region) const {
     const auto bytes = region.end - region.begin;
-    return stagingReuseBudget() != 0 && bytes <= stagingReuseBudget() && writesCover(region.begin, region.end);
+    return stagingReuseBudget() != 0 && bytes <= stagingReuseBudget() && (StagingReuseReads() != ReuseReads::Off || writesCover(region.begin, region.end));
 }
 
 bool GuestBufferMemory::takeShadow(Region& region, bool addressable) {
@@ -3532,24 +3570,37 @@ bool GuestBufferMemory::takeShadow(Region& region, bool addressable) {
     region.shadow = entry;
     region.buffer = entry->buffer;
     bool fresh = false;
+    bool complete = false;
     std::uint64_t since = 0;
     {
         std::lock_guard lock(cache.mutex);
         fresh = !entry->retired && entry->inFlight == 0 && entry->generation != 0 && entry->source == region.copySource && entry->sourceBase == region.copySourceBase;
         since = entry->generation;
+        complete = entry->complete;
         entry->generation = 0;
+        entry->complete = false;
         ++entry->inFlight;
         entry->source = region.copySource;
         entry->sourceBase = region.copySourceBase;
         entry->lastUse = ++cache.clock;
     }
     region.shadowBegun = true;
+    region.copiedIn = 0;
+    region.reusedComplete = false;
     if (!fresh) return false;
+    const bool covered = writesCover(region.begin, region.end);
+    if (!covered) {
+        if (!complete || StagingReuseReads() == ReuseReads::Off) return false;
+        if (PendingStorageOverlaps(region.begin, static_cast<std::size_t>(bytes), nullptr) || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(bytes)) || AnyDeviceResidentOverlaps(region.begin, static_cast<std::size_t>(bytes))) return false;
+    }
     static_cast<void>(GuestMemory::CollectWrites(region.begin, static_cast<std::size_t>(bytes)));
-    return !GuestMemory::StoredOver(region.begin, static_cast<std::size_t>(bytes), since);
+    if (GuestMemory::StoredOver(region.begin, static_cast<std::size_t>(bytes), since)) return false;
+    if (complete) region.copiedIn = since;
+    region.reusedComplete = !covered;
+    return true;
 }
 
-void GuestBufferMemory::settleShadow(const Region& region, std::uint64_t generation) {
+void GuestBufferMemory::settleShadow(const Region& region, std::uint64_t generation, bool complete) {
     if (region.shadow == nullptr || !region.shadowBegun) return;
     region.shadowBegun = false;
     auto& cache = StagingShadows();
@@ -3557,6 +3608,7 @@ void GuestBufferMemory::settleShadow(const Region& region, std::uint64_t generat
     auto& entry = *region.shadow;
     if (entry.inFlight > 0) --entry.inFlight;
     entry.generation = entry.inFlight == 0 && !entry.retired ? generation : 0;
+    entry.complete = complete && entry.generation != 0;
 }
 
 void GuestBufferMemory::UploadPrepare(bool addressable) {
@@ -4216,6 +4268,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> requested, bool
         region->snapshot.clear();
         traceStaged(region->begin, region->end, region->atomic);
         skippedAny = true;
+        if (region->reusedComplete) {
+            reusedCompleteShadows.fetch_add(1, std::memory_order_relaxed);
+            if (StagingReuseReads() == ReuseReads::Verify) verifyReusedShadow(*recorder, region->buffer, region->copySource, region->begin - region->copySourceBase, region->begin, region->end - region->begin);
+        }
         Copies().staged.fetch_add(1, std::memory_order_relaxed);
         Copies().stagedSkipped.fetch_add(1, std::memory_order_relaxed);
         Copies().stagedSkippedBytes.fetch_add(region->end - region->begin, std::memory_order_relaxed);
@@ -4262,6 +4318,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> requested, bool
         }
         std::vector<std::byte> expected;
         const auto address = region->begin;
+        if (region->deviceLocal && region->shadowBegun) region->copiedIn = GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes));
         const auto batch = static_cast<unsigned long long>(recorder->Submissions() + 1);
         const bool pendingWriter = recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes));
         const bool writable = WritesOverlap(address, static_cast<std::size_t>(bytes));
@@ -4577,6 +4634,12 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {
+    if (StagingReuseReads() != ReuseReads::Off) {
+        for (const auto& region : regions) {
+            if (!region.gpuCopy || !region.deviceLocal || !region.shadowBegun || region.copiedIn == 0 || WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) continue;
+            settleShadow(region, region.copiedIn, true);
+        }
+    }
     std::vector<const Region*> shadowed;
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin);
@@ -4593,8 +4656,13 @@ void GuestBufferMemory::MarkDirectWrites() const {
         for (const auto& [begin, end] : writes) {
             if (begin < region->end && region->begin < end) ranges.emplace_back(begin, end);
         }
+        bool clean = false;
+        if (StagingReuseReads() != ReuseReads::Off && region->copiedIn != 0) {
+            static_cast<void>(GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(region->end - region->begin)));
+            clean = !GuestMemory::StoredOver(region->begin, static_cast<std::size_t>(region->end - region->begin), region->copiedIn);
+        }
         const auto marked = GuestMemory::MarkWrittenUnlessStored(ranges, 0);
-        settleShadow(*region, marked.generation);
+        settleShadow(*region, marked.generation, clean);
         if (region->lazyResident && region->buffer != nullptr) {
             for (const auto& [begin, end] : ranges) NoteDeviceResident(context.device, std::max(begin, region->begin), std::min(end, region->end), region->buffer, region->begin, region->copySource, region->copySourceBase, marked.generation);
         }
