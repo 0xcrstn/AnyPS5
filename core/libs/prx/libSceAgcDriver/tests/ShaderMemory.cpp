@@ -5298,6 +5298,8 @@ void verifyBdaReadFallbackFunctions() {
             std::size_t lookupFaults = 0;
             std::size_t lookupVariables = 0;
             std::size_t readerLookups = 0;
+            std::set<std::string> calledSpans;
+            std::map<std::string, std::array<std::size_t, 4>> specializedShape;
             for (std::size_t cursor = 5; cursor < five.size();) {
                 const auto length = five[cursor] >> 16u;
                 require(length != 0 && length <= five.size() - cursor, "BDA read functions: truncated SPIR-V instruction");
@@ -5319,7 +5321,17 @@ void verifyBdaReadFallbackFunctions() {
                 if (op == spv::OpFunctionCall && function == "main") {
                     const auto& callee = names[five[cursor + 3]];
                     if (callee == "probe_bda_pointer" || callee.starts_with("read_bda_dword_bytes")) ++mainProbes;
-                    if (spanReader(callee)) ++spanCalls;
+                    if (spanReader(callee)) {
+                        ++spanCalls;
+                        calledSpans.insert(callee);
+                    }
+                }
+                if (function != span && spanReader(function)) {
+                    auto& shape = specializedShape[function];
+                    if (op == spv::OpFunctionCall && names[five[cursor + 3]] == "probe_bda_pointer") ++shape[0];
+                    if (op == spv::OpFunctionCall && names[five[cursor + 3]] == reader) ++shape[1];
+                    if (op == spv::OpLoad) ++shape[2];
+                    if (op == spv::OpAtomicLoad) ++shape[3];
                 }
                 if ((op == spv::OpLoad || op == spv::OpAtomicLoad) && function == span) ++spanLoads;
                 if (op == spv::OpFunctionCall && function == span && names[five[cursor + 3]] == loader) ++spanLoaderCalls;
@@ -5339,15 +5351,27 @@ void verifyBdaReadFallbackFunctions() {
                 if (op == spv::OpFunctionCall && function == reader && names[five[cursor + 3]] == "get_bda_pointer") ++readerLookups;
                 cursor += length;
             }
-            require(definitions["record_bda_fault"] == 1u && definitions[reader] == 1u && definitions[span] == 1u, "BDA read functions: the fault, byte read and span read functions are not defined");
-            require(definitions[loader] == 1u && loaderLoads == 4u && loaderCalls == 0u, "BDA read functions: the span load function does not hold the four in-place loads and nothing else");
-            require(spanLoads == 0u && spanLoaderCalls == 1u, "BDA read functions: a span read function loads in place itself");
+            require(definitions["record_bda_fault"] == 1u && definitions[reader] == 1u, "BDA read functions: the fault and byte read functions are not defined");
+            require(!calledSpans.empty(), "BDA read functions: no read site calls a span read function");
+            for (const auto& called : calledSpans) require(definitions[called] == 1u, "BDA read functions: a called span read function is not defined");
+            const bool generic = calledSpans.contains(span);
+            if (generic) {
+                require(definitions[loader] == 1u && loaderLoads == 4u && loaderCalls == 0u, "BDA read functions: the span load function does not hold the four in-place loads and nothing else");
+                require(spanLoads == 0u && spanLoaderCalls == 1u, "BDA read functions: a span read function loads in place itself");
+            }
+            for (const auto& called : calledSpans) {
+                if (called == span) continue;
+                const auto& shape = specializedShape[called];
+                require(shape[0] == 1u, "BDA read functions: a specialized span read does not probe its span once");
+                require(shape[1] >= 1u && shape[1] <= 4u, "BDA read functions: a specialized span read does not fall back to the byte read for each used dword");
+                require(coherent ? shape[2] == 0u && shape[3] >= 1u && shape[3] <= 4u : shape[3] == 0u && shape[2] >= 1u && shape[2] <= 4u, "BDA read functions: a specialized span read does not load its used dwords in place with the access's coherence");
+            }
             for (const auto& [name, count] : definitions) require(count == 1u, "BDA read functions: a function is defined twice");
             require(compareExchanges == 1u, "BDA read functions: a fault is recorded outside record_bda_fault");
             require(mainLookups == 0u, "BDA read functions: a read site looks up its bytes inline");
             require(readerLoads[coherent] == 1u && readerLoads[!coherent] == 0u, "BDA read functions: the looped byte load does not keep the access's coherence");
             require(readerAtomics == (coherent ? 1u : 0u), "BDA read functions: aligned coherent reads do not retain their atomic path");
-            require(spanReaderCalls == 1u, "BDA read functions: the span read does not call the byte read from one looped site");
+            require(!generic || spanReaderCalls == 1u, "BDA read functions: the span read does not call the byte read from one looped site");
             require(lookupFaults <= 4u, "BDA read functions: the page-table lookup records its faults from more than 4 call sites");
             require(lookupVariables == 0u, "BDA read functions: the page-table lookup keeps its search bounds in function variables");
             require(readerLookups == 1u, "BDA read functions: the byte read does not look up its bytes once, in a loop");
