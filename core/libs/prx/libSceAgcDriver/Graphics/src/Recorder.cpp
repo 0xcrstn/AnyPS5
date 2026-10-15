@@ -1124,6 +1124,10 @@ RecorderDomain& Recorder::DomainOf(std::uint32_t guestQueue) {
     return Domain(PhysicalQueueOf(guestQueue));
 }
 
+Recorder* Recorder::Current() {
+    return ForPhysicalQueue(PhysicalQueueOf(GuestMemory::GpuLockThreadTag()));
+}
+
 Recorder* Recorder::ForPhysicalQueue(std::uint32_t physicalQueue) {
     Require(physicalQueue < PhysicalQueues, "recorder for an unknown physical queue");
     return Domain(physicalQueue).active;

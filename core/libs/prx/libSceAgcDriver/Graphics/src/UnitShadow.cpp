@@ -241,7 +241,7 @@ struct SlabCopies {
 void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes) {
     const auto& context = shadow.context;
     using CommandClass = Recorder::CommandClass;
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     std::unique_ptr<CommandBatch> batch;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkAccessFlags covered = 0;
@@ -283,10 +283,10 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
 // APS5_SHADOW_VERIFY=1: the published bytes read back from the slabs equal the guest bytes.
 void verifyPublished(const UnitShadow& shadow, const std::vector<SlabCopies>& copies) {
     const auto& context = shadow.context;
-    if (auto* recorder = Recorder::Active()) {
+    Recorder::ForEachActive([](Recorder& recorder) {
         Recorder::CountSync(4);
-        recorder->Sync();
-    }
+        recorder.Sync();
+    });
     for (const auto& entry : copies) {
         for (const auto& region : entry.regions) {
             Buffer host(context, static_cast<std::size_t>(region.size), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -315,7 +315,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         std::vector<std::uint64_t>& deferred;
         ~Settle() {
             if (deferred.empty()) return;
-            if (auto* recorder = Recorder::Active()) {
+            if (auto* recorder = Recorder::Current()) {
                 recorder->OnCompleteWithoutGuestAccess([released = std::move(deferred)] {
                     for (const auto protection : released) Coherence::ReleaseDeviceOwned(protection);
                 });

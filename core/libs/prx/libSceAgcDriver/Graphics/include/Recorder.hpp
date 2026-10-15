@@ -72,6 +72,13 @@ public:
     static void MapGuestQueue(std::uint32_t guestQueue, std::uint32_t physicalQueue);
     static std::uint32_t PhysicalQueueOf(std::uint32_t guestQueue);
     static RecorderDomain& DomainOf(std::uint32_t guestQueue);
+    static Recorder* Current();
+    template<typename TAction>
+    static void ForEachActive(TAction&& action) {
+        for (std::uint32_t queue = 0; queue < PhysicalQueues; ++queue) {
+            if (auto* recorder = ForPhysicalQueue(queue)) action(*recorder);
+        }
+    }
     std::uint32_t PhysicalQueue() const { return physicalQueue; }
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
     explicit Recorder(const Context& context, bool timelineSemaphores = false);

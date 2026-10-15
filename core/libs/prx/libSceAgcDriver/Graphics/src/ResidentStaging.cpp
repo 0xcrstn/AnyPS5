@@ -302,9 +302,9 @@ void NoteDeviceResident(VkDevice device, std::uint64_t begin, std::uint64_t end,
     }
     Stats().noted.fetch_add(1, std::memory_order_relaxed);
     Stats().notedBytes.fetch_add(end - begin, std::memory_order_relaxed);
-    if (auto* active = Recorder::Active(); active != nullptr && active->GetContext().device == device) active->RefreshPendingWrites();
+    if (auto* active = Recorder::Current(); active != nullptr && active->GetContext().device == device) active->RefreshPendingWrites();
     if (overBudget) {
-        auto* recorder = Recorder::Active();
+        auto* recorder = Recorder::Current();
         Require(recorder != nullptr && recorder->GetContext().device == device, "evicting device-resident buffer results needs their active recorder");
         PublishAllDeviceResident(*recorder, ResidentSite::Eviction);
     }
@@ -405,7 +405,7 @@ void ClearDeviceResident(VkDevice device) {
         }
         registry.count.store(registry.entries.size(), std::memory_order_release);
     }
-    if (auto* active = Recorder::Active(); active != nullptr && active->GetContext().device == device) active->RefreshPendingWrites();
+    if (auto* active = Recorder::Current(); active != nullptr && active->GetContext().device == device) active->RefreshPendingWrites();
 }
 
 ResidentCounters DeviceResidentTotals() {
