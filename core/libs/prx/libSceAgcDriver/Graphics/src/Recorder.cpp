@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LabelVersions.hpp"
@@ -3416,28 +3417,13 @@ bool Recorder::GuestWriteBacksOwed() const {
 }
 
 bool Recorder::LabelPublicationOrdered() {
-    static const bool ordered = [] {
-        const char* value = std::getenv("APS5_LABEL_PUBLICATION");
-        if (value == nullptr || std::strcmp(value, "early") == 0) return false;
-        if (std::strcmp(value, "ordered") == 0) return true;
-        throw std::runtime_error(std::string("APS5_LABEL_PUBLICATION: unknown mode ") + value + " (early or ordered)");
-    }();
+    const bool ordered = Coherence::Ordering();
+    static const char* alias = std::getenv("APS5_LABEL_PUBLICATION");
+    if (alias == nullptr) return ordered;
+    const bool requested = std::strcmp(alias, "ordered") == 0;
+    if (!requested && std::strcmp(alias, "early") != 0) throw std::runtime_error(std::string("APS5_LABEL_PUBLICATION: unknown mode ") + alias + " (early or ordered)");
+    if (requested != ordered) throw std::runtime_error(std::string("APS5_LABEL_PUBLICATION=") + alias + " contradicts APS5_COHERENCE_ORDERING, which owns the label publication policy");
     return ordered;
-}
-
-bool Recorder::LabelPublicationVerify() {
-    static const bool verify = [] {
-        const char* value = std::getenv("APS5_LABEL_PUBLICATION_VERIFY");
-        return value != nullptr && std::strcmp(value, "0") != 0;
-    }();
-    return verify;
-}
-
-void Recorder::requireLabelAfterWriteBacks(std::uint64_t address, std::size_t bytes) const {
-    if (!LabelPublicationVerify() || !GuestWriteBacksOwed()) return;
-    char text[192];
-    std::snprintf(text, sizeof(text), "APS5_LABEL_PUBLICATION_VERIFY: label 0x%llx+%zu stored on the GPU while guest write-backs are still owed: native readers see it before its payload", static_cast<unsigned long long>(address), bytes);
-    throw std::runtime_error(text);
 }
 
 void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion) {
@@ -3467,7 +3453,6 @@ void Recorder::markBehindCompletion(const Batch& batch, std::uint64_t begin, std
 }
 
 void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
-    requireLabelAfterWriteBacks(address, bytes.size());
     ensureOpen();
     NoteMirroredWrite(address, address + bytes.size());
     // The table entry before the write note: the note bumps the write generation a poller
@@ -3581,7 +3566,6 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
 }
 
 void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu) {
-    if (storedOnGpu) requireLabelAfterWriteBacks(address, bytes.size());
     if (AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Completion);
     Require(open != nullptr || !inFlight.empty(), "no batch to append a completion label to");
     Batch& batch = open != nullptr ? *open : *inFlight.back();

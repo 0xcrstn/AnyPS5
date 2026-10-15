@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -322,6 +323,8 @@ private:
     static bool verifyWaitObservations();
     void dischargeWait(WaitObservation& observation, std::span<const std::uint32_t> packet);
     void noteWaitChain(const WaitObservation& observation, std::span<const std::uint32_t> packet);
+    void noteRelease(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
+    void importRelease(const WaitObservation& observation);
     static WaitObservation& lastObservation();
     static void reportWaitChain(std::uint32_t queue);
     void landPendingWaits(std::uint32_t queue);
@@ -473,6 +476,8 @@ private:
 
     std::mutex labelStoresMutex;
     std::unordered_map<std::uint64_t, std::array<LabelStore, LabelStoreHistory>> labelStores;
+    std::mutex releasesMutex;
+    std::array<Coherence::Release, 4096> releases;
 
     std::vector<std::shared_ptr<VulkanDevice>> replacedDevices;
     std::stop_token shutdownToken = LibcShutdownToken_nid_postfix();

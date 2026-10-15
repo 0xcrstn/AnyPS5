@@ -95,7 +95,6 @@ public:
     bool HasGuestCompletions() const;
     bool GuestWriteBacksOwed() const;
     static bool LabelPublicationOrdered();
-    static bool LabelPublicationVerify();
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
@@ -836,7 +835,6 @@ private:
     std::uint64_t writtenBackSequence = 0;
     // PendingLabel without the table mutex (the caller holds it, or the GPU mutex).
     std::optional<LabelHit> lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const;
-    void requireLabelAfterWriteBacks(std::uint64_t address, std::size_t bytes) const;
     // Whether the in-flight batch with that serial has not signaled its fence (false when it is
     // not in flight any more): what makes a wait for it a real GPU wait (ThreadHookWaits).
     bool unsignaled(std::uint64_t serial) const;

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
@@ -86,6 +87,8 @@ int RecordReleaseAfterWriteBack(AgcDriver::VulkanDevice& device, GuestBlock& blo
 }
 
 int RunOrder(AgcDriver::VulkanDevice& device) {
+    AgcDriver::Coherence::SetModesForTests(AgcDriver::Coherence::Mode::Reference, AgcDriver::Coherence::Mode::Verify, AgcDriver::Coherence::Mode::Reference);
+    Require(AgcDriver::Graphics::Recorder::LabelPublicationOrdered(), "label publication order: ordering verify did not select the ordered label path");
     GuestBlock block;
     block.SetWord(PayloadOffset, OldPayload);
     std::uint64_t epoch = 0;
@@ -112,7 +115,8 @@ int RunOrder(AgcDriver::VulkanDevice& device) {
 }
 
 int RunVerify(AgcDriver::VulkanDevice& device) {
-    Require(AgcDriver::Graphics::Recorder::LabelPublicationVerify() && !AgcDriver::Graphics::Recorder::LabelPublicationOrdered(), "label publication verify: run with APS5_LABEL_PUBLICATION_VERIFY=1 and early publication");
+    AgcDriver::Coherence::SetModesForTests(AgcDriver::Coherence::Mode::Verify, AgcDriver::Coherence::Mode::Reference, AgcDriver::Coherence::Mode::Reference);
+    Require(!AgcDriver::Graphics::Recorder::LabelPublicationOrdered(), "label publication verify: the reference ordering selected the ordered label path");
     GuestBlock block;
     std::uint64_t epoch = 0;
     std::string failure;
@@ -124,7 +128,7 @@ int RunVerify(AgcDriver::VulkanDevice& device) {
     std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
     device.WaitIdle();
     device.ReapRecorded();
-    Require(failure.find("APS5_LABEL_PUBLICATION_VERIFY") != std::string::npos, "label publication verify: a label stored on the GPU ahead of an owed write-back did not fail the verify mode (" + failure + ")");
+    Require(failure.find("ahead of guest write-backs still owed") != std::string::npos, "label publication verify: a label stored on the GPU ahead of an owed write-back did not fail the verify mode (" + failure + ")");
     std::puts("label publication verify: the injected inversion failed as required");
     return 0;
 }

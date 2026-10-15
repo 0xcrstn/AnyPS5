@@ -92,6 +92,7 @@ void Driver::dischargeWait(WaitObservation& observation, std::span<const std::ui
     if (verifyWaitObservations() && !ObservationProven(observation, floor)) throw std::runtime_error("APS5_VERIFY_WAIT_OBSERVATIONS: unproven wait observation: " + DescribeObservation(observation) + ", queue floor " + std::to_string(floor));
     floor = std::max(floor, observation.discharged);
     if (observation.FromRecordedStore() && observation.CrossQueue()) notePendingWait(packet, observation);
+    importRelease(observation);
     noteWaitChain(observation, packet);
 }
 

@@ -2049,8 +2049,11 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
     if (storeAtLabel || Coherence::Ordering()) Graphics::StorageTexture::FlushAllPending("label");
-    if (Coherence::Ordering() && Coherence::Tracking()) Coherence::CheckDrained(Graphics::StorageTexture::AnyPending(), Graphics::AnyShadowedOverlaps(0, std::numeric_limits<std::size_t>::max()), "label");
-    if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
+    const auto checkDrained = [&](bool writeBacksOrdered) { Coherence::CheckDrained(Graphics::StorageTexture::AnyPending(), Graphics::AnyShadowedOverlaps(0, std::numeric_limits<std::size_t>::max()), "label", writeBacksOrdered); };
+    if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) {
+        checkDrained(true);
+        return 4;
+    }
     auto& recorder = *state->recorder;
     // Batches that already finished are retired before the checks: their completions ran, so they
     // neither keep the recorder busy nor force this label behind a completion. Only for the
@@ -2061,15 +2064,24 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
     if (Graphics::AnyDeviceResident()) Graphics::PublishAllDeviceResident(recorder, Graphics::ResidentSite::Label);
+    const bool writeBacksOwed = !recorder.Idle() && recorder.GuestWriteBacksOwed();
+    const bool behindWriteBacks = writeBacksOwed && Graphics::Recorder::LabelPublicationOrdered();
+    checkDrained(!writeBacksOwed || behindWriteBacks);
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
-    const auto context = graphicsContext();
-    const auto* import = Graphics::HostImportFor(context, address, bytes.size());
-    if (import == nullptr) return 3;
     // A unit shadow's results in the label's unit reach the import before the store lands over
     // part of it (the store's stamp then makes the unit stale); the deferred label paths call no
     // FlushPending of their own.
     if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    if (behindWriteBacks) {
+        if (drain) return 2;
+        GuestMemory::MarkWritten(address, bytes.size());
+        recorder.AfterCompletions(address, bytes, stamp, queue, false);
+        return 5;
+    }
+    const auto context = graphicsContext();
+    const auto* import = Graphics::HostImportFor(context, address, bytes.size());
+    if (import == nullptr) return 3;
     // The store on the GPU, into the open batch: everything recorded so far completes before it,
     // and it is visible to the host after. The barriers belong to the recorder's store run: one
     // pair for a whole group of labels recorded back to back (Recorder::RecordStore orders the
@@ -2081,12 +2093,6 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // stores elsewhere. Debug aid: APS5_LABEL_GATE_ALL=1 gates on any completion, as before (a
     // completion label there registered its own completion, so every later label followed).
     static const bool gateAll = std::getenv("APS5_LABEL_GATE_ALL") != nullptr;
-    if (Graphics::Recorder::LabelPublicationOrdered() && recorder.GuestWriteBacksOwed()) {
-        if (drain) return 2;
-        GuestMemory::MarkWritten(address, bytes.size());
-        recorder.AfterCompletions(address, bytes, stamp, queue, false);
-        return 5;
-    }
     if (gateAll ? recorder.HasCompletions() : state->CopiedWriterOverlaps(address, bytes.size())) {
         // A copied buffer's write-back is still to run: the store must land after it. It is stored
         // by a completion action of the batch (a CPU memcpy when the batch is reaped) instead of
