@@ -480,6 +480,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
+            if (auto* sink = frozenSink(); indirectCpu && sink != nullptr && sink->Refuse(FrozenFallback::Indirect)) return DrawVerdict::Nothing;
         } else if (i == 0) {
             fold(result, drawParameters);
         }
@@ -688,6 +689,9 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         if (!sink->inOrder && recipe == nullptr && parallelResolve()) {
             auto& prepared = *sink->inputs;
             prepared.resolved = localDevice->ResolveDraw(prepared.state->state, prepared.draw, prepared.stages);
+            if (prepared.resolved != nullptr) {
+                for (const auto& [address, bytes] : Graphics::ResolvedSnapshotReads(*prepared.resolved)) sink->reads.push_back({address, bytes});
+            }
         }
         phaseTiming.Phase(DrawRowGraphics);
         timing.Mark("draw_and_resource_release");

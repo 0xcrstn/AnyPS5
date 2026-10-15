@@ -56,6 +56,8 @@ alignas(16) std::array<std::uint32_t, 4> FullTable{};
 alignas(16) std::array<std::uint32_t, 4> ValueTable{};
 alignas(16) std::array<float, 4> Full{1.0f, 0.0f, 0.0f, 0.0f};
 alignas(16) std::array<float, 4> Values{};
+alignas(16) volatile std::uint32_t Condition = 1;
+bool NopBeforeCondition = false;
 alignas(64) volatile std::uint32_t EndOfPipe = 0;
 std::byte* ColorMemory = nullptr;
 
@@ -132,7 +134,7 @@ const std::vector<std::pair<std::uint32_t, std::uint32_t>> ContextBaseline{
     {0xb4, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)}, {0x114, 0}, {0x113, std::bit_cast<std::uint32_t>(1.0f)},
 };
 
-std::vector<std::uint32_t> Frame() {
+std::vector<std::uint32_t> Frame(bool writeData) {
     const auto colorAddress = reinterpret_cast<std::uintptr_t>(ColorMemory);
     const auto vertexAddress = reinterpret_cast<std::uintptr_t>(VertexCode.data());
     const auto pixelAddress = reinterpret_cast<std::uintptr_t>(BufferPixelCode.data());
@@ -163,17 +165,24 @@ std::vector<std::uint32_t> Frame() {
     SetRegister(words, SetShReg, 0x08d, static_cast<std::uint32_t>(vertexTable >> 32u));
     words.insert(words.end(), {0xc0012d00u, 3u, 2u});
     ReleaseMemory(words, Values.data(), std::bit_cast<std::uint32_t>(0.5f), 0u);
+    if (writeData) {
+        const auto condition = reinterpret_cast<std::uintptr_t>(&Condition);
+        words.insert(words.end(), {0xc0033700u, 0x500u, static_cast<std::uint32_t>(condition), static_cast<std::uint32_t>(static_cast<std::uint64_t>(condition) >> 32u), 0u});
+        if (NopBeforeCondition) words.insert(words.end(), {0xc0001000u, 0u});
+        words.insert(words.end(), {0xc0032200u, static_cast<std::uint32_t>(condition), static_cast<std::uint32_t>(static_cast<std::uint64_t>(condition) >> 32u), 0u, 9u});
+    }
     SetPixelTable(words, ValueTable.data());
     words.insert(words.end(), {0xc0012d00u, 3u, 2u});
     ReleaseMemory(words, &EndOfPipe, 1u, 2u);
     return words;
 }
 
-std::uint32_t CentreRed(const std::string& what) {
+std::uint32_t CentreRed(const std::string& what, bool writeData = false) {
     std::fill_n(ColorMemory, ColorBytes, std::byte{0});
     EndOfPipe = 0;
     Values = {1.0f, 0.0f, 0.0f, 0.0f};
-    auto words = Frame();
+    Condition = 1;
+    auto words = Frame(writeData);
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, what + ": the submission failed");
     AgcDriverWaitIdle_nid_postfix();
@@ -216,6 +225,16 @@ void DrawsSeeEarlierLabels(bool jobs) {
     Require(after.endOfPipe - before.endOfPipe <= Frames, std::to_string(after.endOfPipe - before.endOfPipe) + " end-of-pipe labels were recorded as jobs over " + std::to_string(Frames) + " frames, expected at most one per frame");
 }
 
+void ConditionsSeeWriteData() {
+    for (std::uint64_t frame = 0; frame < 4; ++frame) {
+        NopBeforeCondition = frame % 2 == 1;
+        const auto name = std::string(NopBeforeCondition ? "a COND_EXEC after a NOP over a condition a WRITE_DATA cleared" : "a COND_EXEC over a condition a WRITE_DATA cleared just before") + ", frame " + std::to_string(frame);
+        const auto red = CentreRed(name, true);
+        Require(red >= 254u, name + ": the draw wrote red " + std::to_string(red) + ", expected 255 because the COND_EXEC skips the second draw");
+        Require(Condition == 0u, name + ": the WRITE_DATA did not clear the condition");
+    }
+}
+
 void SetEnvironment(const char* name, const char* value) {
 #ifdef _WIN32
     Require(_putenv_s(name, value) == 0, std::string("cannot set ") + name);
@@ -245,6 +264,7 @@ int main() {
         Register(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Register(BufferPixelHeader, BufferPixelCode.data(), sizeof(BufferPixelCode), 1);
         DrawsSeeEarlierLabels(jobs);
+        ConditionsSeeWriteData();
         AgcDriverShutdown_nid_postfix();
         std::cout << "Draws on the preparation workers see the values earlier RELEASE_MEM labels stored " << (jobs ? "with labels recorded as ordered jobs" : "with labels recorded by queue 0") << " (" << AgcDriver::DriverDetail::LabelRecordJobTotals().endOfPipe << " end-of-pipe labels recorded as jobs)" << std::endl;
         return 0;

@@ -104,6 +104,9 @@ private:
 
 enum class CommandProcessorReads : std::uint8_t { Drain, Overlap, Verify };
 
+bool ParseFrozenIndirectDraws(const char* text);
+bool FrozenIndirectDraws();
+std::uint64_t FrozenIndirectRedos();
 CommandProcessorReads ParseCommandProcessorReads(const char* text);
 CommandProcessorReads CommandProcessorReadsMode();
 void SetCommandProcessorReadsMode(CommandProcessorReads mode);
@@ -113,6 +116,10 @@ struct CommandProcessorReadCounters {
     std::uint64_t ahead = 0;
     std::uint64_t verified = 0;
     std::uint64_t registerState = 0;
+    std::uint64_t syncsDeferred = 0;
+    std::uint64_t syncDrains = 0;
+    std::uint64_t labelDrains = 0;
+    std::uint64_t waitsSatisfied = 0;
 };
 
 CommandProcessorReadCounters CommandProcessorReadTotals();
@@ -136,6 +143,11 @@ inline bool RegisterStatePacket(std::uint32_t header) {
     default:
         return false;
     }
+}
+
+inline bool CommandProcessorSyncPacket(std::uint32_t header) {
+    const auto opcode = (header >> 8u) & 0xffu;
+    return opcode == 0x42 || opcode == 0x46 || opcode == 0x58;
 }
 
 inline bool OverlapsDrawRecords(std::uint32_t opcode, bool predicated, bool dispatches = false) {

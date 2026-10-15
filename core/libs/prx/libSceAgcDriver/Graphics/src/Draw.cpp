@@ -3811,6 +3811,13 @@ std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const St
     return resolved;
 }
 
+std::vector<std::pair<std::uint64_t, std::size_t>> ResolvedSnapshotReads(const ResolvedDraw& resolved) {
+    std::vector<std::pair<std::uint64_t, std::size_t>> reads;
+    reads.reserve(resolved.prefills.size());
+    for (const auto& prefill : resolved.prefills) reads.emplace_back(prefill.address, prefill.bytes);
+    return reads;
+}
+
 ParallelResolveCounts ParallelResolveStatistics() {
     const auto& counters = resolveCounters();
     ParallelResolveCounts counts;

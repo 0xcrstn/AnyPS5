@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -236,12 +237,16 @@ void PlannedIndirectDrawsKeepOwnedResults() {
     SetVertexRecords(3);
     SetPixelBuffer(First.data());
     const auto before = Counters();
+    const auto redosBefore = AgcDriver::DriverDetail::FrozenIndirectRedos();
     Draw(BufferPixelCode.data(), PixelTable.data(), 255, "the first CPU-expanded indirect planned draw", true);
     SetPixelBuffer(Moved.data());
     Draw(BufferPixelCode.data(), PixelTable.data(), 128, "a CPU-expanded indirect planned draw with moved pixel values", true);
     const auto after = Counters();
-    Require(after.stages == before.stages + 8u, "indirect planned draws did not materialize both initial stages and both patched vertex records");
-    Require(after.verifiedStages == before.verifiedStages + 8u && after.stageMismatches == before.stageMismatches, "CPU-expanded planned stages differ from full materialization");
+    const auto redos = AgcDriver::DriverDetail::FrozenIndirectRedos() - redosBefore;
+    const char* workers = std::getenv("APS5_PREPARE_WORKERS");
+    if (workers != nullptr && AgcDriver::DriverDetail::FrozenIndirectDraws()) Require(redos == 2u, std::to_string(redos) + " CPU-expanded indirect draws were prepared again in order on the record thread after a worker refused them, expected 2");
+    Require(after.stages == before.stages + 8u + redos, "indirect planned draws did not materialize both initial stages and both patched vertex records (" + std::to_string(after.stages - before.stages) + " stages, " + std::to_string(redos) + " worker attempts refused)");
+    Require(after.verifiedStages == before.verifiedStages + 8u + redos && after.stageMismatches == before.stageMismatches, "CPU-expanded planned stages differ from full materialization");
 }
 
 void IncrementalDrawsFollowWatchedTables() {

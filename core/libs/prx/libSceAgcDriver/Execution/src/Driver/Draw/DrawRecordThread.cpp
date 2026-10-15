@@ -50,6 +50,7 @@ struct Driver::FrozenDraw {
     std::uint64_t indirectArguments = 0;
     std::vector<DeferredLabel> labels;
     bool endOfPipe = false;
+    std::uint64_t labelSequence = 0;
 };
 
 struct Driver::PreparedFrozenDraw {
@@ -201,11 +202,55 @@ struct PacketWaitCounts {
     std::atomic<std::uint64_t> commandProcessorReadsAhead{0};
     std::atomic<std::uint64_t> commandProcessorReadsVerified{0};
     std::atomic<std::uint64_t> registerStatePackets{0};
+    std::atomic<std::uint64_t> syncsDeferred{0};
+    std::atomic<std::uint64_t> syncDrains{0};
+    std::atomic<std::uint64_t> labelDrains{0};
+    std::atomic<std::uint64_t> waitsSatisfied{0};
     std::atomic<std::uint64_t> labelJobs{0};
     std::atomic<std::uint64_t> labelJobLabels{0};
     std::atomic<std::uint64_t> labelPackets{0};
     std::atomic<std::uint64_t> endOfPipeJobs{0};
 };
+
+struct LabelRangeInFlight {
+    std::uint64_t sequence;
+    std::uint64_t begin;
+    std::uint64_t end;
+};
+
+struct LabelRangesInFlightTag {};
+
+std::vector<LabelRangeInFlight>& labelRangesInFlight() {
+    return HostThreadLocal<std::vector<LabelRangeInFlight>, LabelRangesInFlightTag>();
+}
+
+std::uint64_t& labelItemsFrozen() {
+    thread_local std::uint64_t frozen = 0;
+    return frozen;
+}
+
+std::atomic<std::uint64_t>& labelItemsRecorded() {
+    static std::atomic<std::uint64_t> recorded{0};
+    return recorded;
+}
+
+void noteLabelRangeInFlight(std::uint64_t sequence, std::uint64_t address, std::size_t bytes) {
+    if (bytes != 0) labelRangesInFlight().push_back({sequence, address, address + bytes});
+}
+
+bool labelInFlightOverlaps(std::uint64_t address, std::size_t bytes) {
+    const auto& deferred = deferredLabels().labels;
+    if (std::any_of(deferred.begin(), deferred.end(), [&](const DeferredLabel& label) { return address < label.address + label.size && label.address < address + bytes; })) return true;
+    auto& ranges = labelRangesInFlight();
+    const auto recorded = labelItemsRecorded().load(std::memory_order_acquire);
+    std::erase_if(ranges, [&](const LabelRangeInFlight& range) { return range.sequence <= recorded; });
+    return std::any_of(ranges.begin(), ranges.end(), [&](const LabelRangeInFlight& range) { return address < range.end && range.begin < address + bytes; });
+}
+
+bool& commandProcessorSyncPending() {
+    thread_local bool pending = false;
+    return pending;
+}
 
 std::atomic<int>& commandProcessorReadsOverride() {
     static std::atomic<int> mode{-1};
@@ -339,6 +384,10 @@ std::uint32_t Driver::frozenBound() {
     return 2u * prepareWorkers() + std::max<std::uint32_t>(prepareAhead(), 1u);
 }
 
+bool Driver::recordsInFlight() {
+    return drawRecords().Pending() || (prepareWorkers() != 0 && !frozenDraws().Idle());
+}
+
 Driver::FrozenPipeline& Driver::frozenDraws() {
     static auto* pipeline = new FrozenPipeline(prepareWorkers(), frozenBound(), [](std::shared_ptr<FrozenDraw>& frozen) {
         return Get().prepareFrozen(*frozen, false);
@@ -370,7 +419,7 @@ FrozenFallback Driver::frozenFallback(std::span<const std::uint32_t> packet) {
         const char* slot = std::getenv("APS5_DUMP_DRAW_SLOT1");
         return (shaders != nullptr && std::strtoull(shaders, nullptr, 16) != 0) || (slot != nullptr && std::strtoull(slot, nullptr, 16) != 0);
     }();
-    if (Pm4::IndirectDrawOpcode((packet[0] >> 8u) & 0xffu)) return FrozenFallback::Indirect;
+    if (Pm4::IndirectDrawOpcode((packet[0] >> 8u) & 0xffu) && !FrozenIndirectDraws()) return FrozenFallback::Indirect;
     if (!bindingPlan()) return FrozenFallback::DrawCache;
     if (dumps || ShaderRecompiler::DebugProbeActive()) return FrozenFallback::Debug;
     if (device.Load() == nullptr) return FrozenFallback::NoDevice;
@@ -633,6 +682,7 @@ void Driver::emitFrozenLabels(const std::shared_ptr<FrozenDraw>& frozen) {
             }
             if (!outcome.interruptDeferred) AgcDriverDeliverEopInterrupt(frozen->queue);
         }
+        labelItemsRecorded().store(frozen->labelSequence, std::memory_order_release);
         GuestMemory::LogDriverStores(nullptr);
         result->effects.writeGenerationAfter = Graphics::Recorder::WriteGeneration();
     });
@@ -644,7 +694,7 @@ bool Driver::freezeLabels(std::uint32_t queue, bool force) {
     if (!LabelRecordJobs() || prepareWorkers() == 0 || !deferDrawRecords(queue) || frozenSink() != nullptr || GuestMemory::GpuMutex().HeldByThisThread()) return false;
     auto& deferred = deferredLabels();
     if (deferred.labels.empty()) return false;
-    if (!force && !drawRecords().Pending() && frozenDraws().Idle()) return false;
+    if (!force && !recordsInFlight()) return false;
     frozenProducer() = true;
     surfaceRecordFailure();
     startDrawRecords();
@@ -663,13 +713,15 @@ bool Driver::freezeLabels(std::uint32_t queue, bool force) {
     auto& counts = packetWaitCounts();
     counts.labelJobs.fetch_add(1, std::memory_order_relaxed);
     counts.labelJobLabels.fetch_add(frozen->labels.size(), std::memory_order_relaxed);
+    frozen->labelSequence = ++labelItemsFrozen();
+    for (const auto& label : frozen->labels) noteLabelRangeInFlight(frozen->labelSequence, label.address, label.size);
     frozenDraws().Submit(std::move(frozen));
     return true;
 }
 
 bool Driver::freezeEndOfPipe(std::uint32_t queue, std::span<const std::uint32_t> packet) {
     if (!LabelRecordJobs() || prepareWorkers() == 0 || !deferDrawRecords(queue) || frozenSink() != nullptr || GuestMemory::GpuMutex().HeldByThisThread() || device.Load() == nullptr) return false;
-    if (!drawRecords().Pending() && frozenDraws().Idle()) return false;
+    if (!recordsInFlight()) return false;
     frozenProducer() = true;
     surfaceRecordFailure();
     startDrawRecords();
@@ -690,6 +742,9 @@ bool Driver::freezeEndOfPipe(std::uint32_t queue, std::span<const std::uint32_t>
     auto& counts = packetWaitCounts();
     counts.endOfPipeJobs.fetch_add(1, std::memory_order_relaxed);
     counts.labelJobLabels.fetch_add(frozen->labels.size(), std::memory_order_relaxed);
+    frozen->labelSequence = ++labelItemsFrozen();
+    for (const auto& label : frozen->labels) noteLabelRangeInFlight(frozen->labelSequence, label.address, label.size);
+    if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelRangeInFlight(frozen->labelSequence, label->address, label->Bytes().size());
     frozenDraws().Submit(std::move(frozen));
     return true;
 }
@@ -991,6 +1046,23 @@ void Driver::waitDrawRecordsAt(std::uint32_t opcode) {
     waitDrawRecords();
 }
 
+bool ParseFrozenIndirectDraws(const char* text) {
+    if (text == nullptr) return true;
+    const std::string_view value(text);
+    if (value == "1" || value == "on") return true;
+    if (value == "0" || value == "off") return false;
+    throw std::invalid_argument("APS5_FROZEN_INDIRECT_DRAWS must be 0, 1, off or on, not \"" + std::string(value) + "\"");
+}
+
+bool FrozenIndirectDraws() {
+    static const bool enabled = ParseFrozenIndirectDraws(std::getenv("APS5_FROZEN_INDIRECT_DRAWS"));
+    return enabled;
+}
+
+std::uint64_t FrozenIndirectRedos() {
+    return drawRecordCounters().orderedRedos[static_cast<std::size_t>(FrozenFallback::Indirect)].load(std::memory_order_relaxed);
+}
+
 CommandProcessorReads ParseCommandProcessorReads(const char* text) {
     if (text == nullptr) return CommandProcessorReads::Overlap;
     const std::string_view value(text);
@@ -1017,7 +1089,7 @@ LabelRecordJobCounters LabelRecordJobTotals() {
 
 CommandProcessorReadCounters CommandProcessorReadTotals() {
     const auto& counts = packetWaitCounts();
-    return {counts.commandProcessorReads.load(std::memory_order_relaxed), counts.commandProcessorReadsAhead.load(std::memory_order_relaxed), counts.commandProcessorReadsVerified.load(std::memory_order_relaxed), counts.registerStatePackets.load(std::memory_order_relaxed)};
+    return {counts.commandProcessorReads.load(std::memory_order_relaxed), counts.commandProcessorReadsAhead.load(std::memory_order_relaxed), counts.commandProcessorReadsVerified.load(std::memory_order_relaxed), counts.registerStatePackets.load(std::memory_order_relaxed), counts.syncsDeferred.load(std::memory_order_relaxed), counts.syncDrains.load(std::memory_order_relaxed), counts.labelDrains.load(std::memory_order_relaxed), counts.waitsSatisfied.load(std::memory_order_relaxed)};
 }
 
 bool Driver::overlapCommandProcessorRead(std::span<const std::uint32_t> packet) {
@@ -1027,11 +1099,33 @@ bool Driver::overlapCommandProcessorRead(std::span<const std::uint32_t> packet) 
         packetWaitCounts().registerStatePackets.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
+    if (CommandProcessorSyncPacket(packet[0])) {
+        if (!recordsInFlight()) return false;
+        commandProcessorSyncPending() = true;
+        packetWaitCounts().syncsDeferred.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    const auto waitOpcode = (packet[0] >> 8u) & 0xffu;
+    if ((waitOpcode == 0x3c || waitOpcode == 0x93) && packet.size() >= 4) {
+        if (commandProcessorSyncPending()) return false;
+        if (labelInFlightOverlaps(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), waitOpcode == 0x93 ? 8u : 4u)) return false;
+        if (!Pm4::WaitSatisfied(packet)) return false;
+        packetWaitCounts().waitsSatisfied.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
     const auto read = Pm4::CommandProcessorReadOf(packet);
     if (!read) return false;
+    if (commandProcessorSyncPending()) {
+        packetWaitCounts().syncDrains.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (labelInFlightOverlaps(read->address, read->bytes)) {
+        packetWaitCounts().labelDrains.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     auto& counts = packetWaitCounts();
     counts.commandProcessorReads.fetch_add(1, std::memory_order_relaxed);
-    const bool ahead = drawRecords().Pending() || !frozenDraws().Idle();
+    const bool ahead = recordsInFlight();
     if (ahead) counts.commandProcessorReadsAhead.fetch_add(1, std::memory_order_relaxed);
     if (mode == CommandProcessorReads::Overlap || !ahead) return true;
     const auto opcode = (packet[0] >> 8u) & 0xffu;
@@ -1059,7 +1153,7 @@ void Driver::waitDrawRecords() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto opcode = packetWaitOpcode();
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto frozenPending = profile && !frozenDraws().Idle();
+    const auto frozenPending = profile && prepareWorkers() != 0 && !frozenDraws().Idle();
     drainFrozen(false);
     mergeFrozenRecords();
     auto& records = drawRecords();
@@ -1077,6 +1171,8 @@ void Driver::waitDrawRecords() {
     if (auto& state = drawRecordState(); state.active && !state.settled) state.settled = true;
     Graphics::Recorder::DrainChunks();
     finishDrawRecords();
+    commandProcessorSyncPending() = false;
+    labelRangesInFlight().clear();
 }
 
 void Driver::startDrawRecords() {
@@ -1172,7 +1268,7 @@ void Driver::reportDrawRecords() {
         }
         static CommandProcessorReadCounters lastReads{};
         const auto reads = CommandProcessorReadTotals();
-        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s; command processor reads without a drain: %llu, %llu of them ahead of pending records, %llu verified; register-state packets without a drain: %llu\n", text.empty() ? " none" : text.c_str(), static_cast<unsigned long long>(reads.reads - lastReads.reads), static_cast<unsigned long long>(reads.ahead - lastReads.ahead), static_cast<unsigned long long>(reads.verified - lastReads.verified), static_cast<unsigned long long>(reads.registerState - lastReads.registerState));
+        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s; command processor reads without a drain: %llu, %llu of them ahead of pending records, %llu verified; register-state packets without a drain: %llu; sync packets deferred to the next command processor read: %llu, drained there: %llu; drained for a label job still in flight over the read: %llu; WAIT_REG_MEM already satisfied without a drain: %llu\n", text.empty() ? " none" : text.c_str(), static_cast<unsigned long long>(reads.reads - lastReads.reads), static_cast<unsigned long long>(reads.ahead - lastReads.ahead), static_cast<unsigned long long>(reads.verified - lastReads.verified), static_cast<unsigned long long>(reads.registerState - lastReads.registerState), static_cast<unsigned long long>(reads.syncsDeferred - lastReads.syncsDeferred), static_cast<unsigned long long>(reads.syncDrains - lastReads.syncDrains), static_cast<unsigned long long>(reads.labelDrains - lastReads.labelDrains), static_cast<unsigned long long>(reads.waitsSatisfied - lastReads.waitsSatisfied));
         lastReads = reads;
         static std::array<std::uint64_t, 4> lastLabels{};
         const std::array<std::uint64_t, 4> labelTotals{counts.labelPackets.load(std::memory_order_relaxed), counts.labelJobs.load(std::memory_order_relaxed), counts.labelJobLabels.load(std::memory_order_relaxed), counts.endOfPipeJobs.load(std::memory_order_relaxed)};
