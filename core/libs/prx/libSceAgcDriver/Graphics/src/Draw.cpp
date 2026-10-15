@@ -1802,7 +1802,15 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         countCache(&DrawProfile::uncacheable);
     }
     timer.phase(PhaseLookup);
-    if (resolved.resources == nullptr && staged != nullptr) resolved.resources = completeStagedBuild(context, state, draw, shaders, snapshots, indexBytes, staged);
+    if (resolved.resources == nullptr && staged != nullptr) {
+        resolved.resources = completeStagedBuild(context, state, draw, shaders, snapshots, indexBytes, staged);
+        if (resolved.resources != nullptr) {
+            resolved.built = &resolved.resources->Timing();
+            outcome.addressBased = resolved.resources->HoldsLease();
+            outcome.kind = !outcome.addressBased ? KindBuild : resolved.resources->WritesThroughPointers() ? KindBdaWriter : KindBda;
+            if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
+        }
+    }
     if (resolved.resources == nullptr) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.built = &resolved.resources->Timing();
