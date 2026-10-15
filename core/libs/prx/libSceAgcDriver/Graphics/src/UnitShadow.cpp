@@ -563,6 +563,16 @@ bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>
     return false;
 }
 
+void MarkShadowedReached(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::vector<std::uint8_t>& reached) {
+    if (!UnitShadowEnabled() || ranges.empty()) return;
+    auto& registry = Registry();
+    std::lock_guard lock(registry.mutex);
+    for (std::size_t index = 0; index < ranges.size() && index < reached.size(); ++index) {
+        const auto [begin, end] = ranges[index];
+        if (reached[index] == 0 && end > begin && anyLiveOverlapping(registry, begin, static_cast<std::size_t>(end - begin))) reached[index] = 1;
+    }
+}
+
 std::size_t PublishUnprotectedShadows(PublishReason reason) {
     if (!UnitShadowEnabled()) return 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;

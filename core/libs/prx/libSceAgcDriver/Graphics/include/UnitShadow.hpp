@@ -96,6 +96,7 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
 // hook-free readers and a build's stage A.
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes);
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+void MarkShadowedReached(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::vector<std::uint8_t>& reached);
 std::size_t ForgetPublishedShadows(std::uint64_t address, std::size_t bytes);
 std::size_t PublishUnprotectedShadows(PublishReason reason);
 bool AnyUnprotectedShadow();

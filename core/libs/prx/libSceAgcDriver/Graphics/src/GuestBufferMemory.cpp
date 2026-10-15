@@ -138,8 +138,8 @@ struct StagingShadow {
 
 namespace {
 
-bool PointerStorePretest() {
-    static const bool enabled = std::getenv("APS5_POINTER_STORE_PRETEST") != nullptr;
+bool PointerStoreEveryHeap() {
+    static const bool enabled = std::getenv("APS5_NO_POINTER_STORE_PRETEST") != nullptr;
     return enabled;
 }
 
@@ -3961,15 +3961,16 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         }
         for (const auto& region : regions) heap(region);
     }
-    const auto storeForPointers = [&] {
-        bool stored = false;
-        for (const auto& [begin, end] : pointerHeaps) stored = StorageTexture::StoreForPointerAccess(begin, static_cast<std::size_t>(end - begin), pointerExempt) || stored;
-        return stored;
-    };
-    if (!PointerStorePretest() || StorageTexture::AnyPendingOverlaps(pointerHeaps) || AnyShadowedOverlaps(pointerHeaps)) {
-        static_cast<void>(storeForPointers());
-    } else if (VerifyPointerStorePretest()) {
-        Require(!storeForPointers(), "APS5_VERIFY_POINTER_STORE_PRETEST: an address-based build skipped by the pointer-heap pretest stored or published storage results");
+    std::vector<std::uint8_t> reached(pointerHeaps.size(), PointerStoreEveryHeap() ? 1 : 0);
+    if (!PointerStoreEveryHeap() && !pointerHeaps.empty()) {
+        StorageTexture::MarkPendingReached(pointerHeaps, reached);
+        MarkShadowedReached(pointerHeaps, reached);
+    }
+    for (std::size_t index = 0; index < pointerHeaps.size(); ++index) {
+        const auto [begin, end] = pointerHeaps[index];
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (reached[index] != 0) static_cast<void>(StorageTexture::StoreForPointerAccess(begin, bytes, pointerExempt));
+        else if (VerifyPointerStorePretest()) Require(!StorageTexture::StoreForPointerAccess(begin, bytes, pointerExempt), "APS5_VERIFY_POINTER_STORE_PRETEST: a pointer heap no pending image or unit shadow reaches stored or published storage results");
     }
     if (Coherence::Tracking() && !pointerHeaps.empty()) {
         for (const auto& [begin, end] : pointerHeaps) StorageTexture::AuditPointerReads(begin, static_cast<std::size_t>(end - begin), pointerExempt);
