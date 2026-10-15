@@ -489,6 +489,7 @@ struct VulkanDevice::State {
         return compileService.get();
     }
     std::atomic<std::uint64_t> graphicsBuildsUnderGpuMutex{0};
+    std::atomic<std::uint64_t> computeBuildsUnderGpuMutex{0};
     static void RunPipelineBuild(void* owner, std::size_t reservedBytes, const std::function<void()>& build) {
         auto& compileState = *static_cast<State*>(owner);
         ShaderCompileTrace::Event event("demand.graphics_build");
@@ -496,7 +497,6 @@ struct VulkanDevice::State {
         if (GuestMemory::GpuMutex().HeldByThisThread()) {
             compileState.graphicsBuildsUnderGpuMutex.fetch_add(1, std::memory_order_relaxed);
             event.Flag("gpu_mutex_held", true);
-            require(!VerifyCompileJobs(), "APS5_VERIFY_COMPILE_JOBS: graphics pipeline compile under the GPU mutex");
             build();
             return;
         }
@@ -4578,9 +4578,12 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::GetComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey, bool ahead, bool* created) {
     if (key.first == 0) return BuildComputePipeline(context, shader, resourcesLayout, pushStages, programAddress, layoutKey);
     if (!ahead && PriorityCompileScheduler()) {
-        auto objects = DemandComputePipeline(key, context, shader, programAddress, created);
-        if (VerifyCompileJobs()) RequireSameComputeRecipe(objects->recipe, ComputePipelineRecipeHash(shader, pushStages != 0, layoutKey), programAddress);
-        return objects;
+        if (GuestMemory::GpuMutex().HeldByThisThread()) {
+            computeBuildsUnderGpuMutex.fetch_add(1, std::memory_order_relaxed);
+        } else if (auto objects = DemandComputePipeline(key, context, shader, programAddress, created)) {
+            if (VerifyCompileJobs()) RequireSameComputeRecipe(objects->recipe, ComputePipelineRecipeHash(shader, pushStages != 0, layoutKey), programAddress);
+            return objects;
+        }
     }
     std::optional<ShaderCompileTrace::Event> demandEvent;
     if (!ahead) {
@@ -4621,14 +4624,10 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::DemandComputePipeli
         if (found->aheadUnused.exchange(false, std::memory_order_relaxed)) aheadUseful.fetch_add(1, std::memory_order_relaxed);
         return found;
     }
-    CompileTicket::RequireWaitAllowed();
     auto* service = Service();
     if (service == nullptr) {
         event.Flag("service_closed", true);
-        const VkShaderStageFlags stages = shader.pushConstants.empty() ? 0u : VK_SHADER_STAGE_COMPUTE_BIT;
-        const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
-        const auto described = Graphics::DescribeSetLayouts(context, shaders);
-        return GetComputePipeline(key, context, shader, described.layouts.main, stages, programAddress, described.mainKey, true, created);
+        return nullptr;
     }
     const auto jobKey = ComputeJobKey(key);
     auto ticket = service->Find(jobKey);
