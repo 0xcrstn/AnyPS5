@@ -3603,6 +3603,29 @@ void StorageTexture::settleProtection() {
     else Coherence::ReleaseDeviceOwned(protection);
 }
 
+namespace {
+
+void noteFlipStores(std::uint64_t images, std::uint64_t imageBytes, std::uint64_t units, std::uint64_t unitBytes) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::mutex mutex;
+    static auto last = std::chrono::steady_clock::now();
+    static std::uint64_t flips = 0, storedImages = 0, storedImageBytes = 0, publishedUnits = 0, publishedUnitBytes = 0;
+    std::lock_guard lock(mutex);
+    ++flips;
+    storedImages += images;
+    storedImageBytes += imageBytes;
+    publishedUnits += units;
+    publishedUnitBytes += unitBytes;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    AgcDriver::ProfilePrint_nid_no_patch("[flip-stores] last 10 s: %llu flips stored %llu unprotected images (%.1f MiB) and published %llu unprotected shadow units (%.1f MiB); per flip %.1f MiB\n", static_cast<unsigned long long>(flips), static_cast<unsigned long long>(storedImages), static_cast<double>(storedImageBytes) / 1048576.0, static_cast<unsigned long long>(publishedUnits), static_cast<double>(publishedUnitBytes) / 1048576.0, static_cast<double>(storedImageBytes + publishedUnitBytes) / 1048576.0 / static_cast<double>(flips));
+    flips = storedImages = storedImageBytes = publishedUnits = publishedUnitBytes = 0;
+}
+
+}
+
 std::size_t StorageTexture::FlushUnprotected(const char* reason) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     {
@@ -3613,8 +3636,16 @@ std::size_t StorageTexture::FlushUnprotected(const char* reason) {
         }
     }
     std::size_t stored = 0;
-    for (const auto& [begin, end] : ranges) stored += FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, reason, PublishScope::Whole) ? 1 : 0;
-    return stored + PublishUnprotectedShadows(PublishReasonFor(reason));
+    std::uint64_t storedBytes = 0;
+    for (const auto& [begin, end] : ranges) {
+        if (!FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, reason, PublishScope::Whole)) continue;
+        ++stored;
+        storedBytes += end - begin;
+    }
+    const auto shadowBytesBefore = UnprotectedShadowBytes().load(std::memory_order_relaxed);
+    const auto units = PublishUnprotectedShadows(PublishReasonFor(reason));
+    if (std::strcmp(reason, "flip") == 0) noteFlipStores(stored, storedBytes, units, UnprotectedShadowBytes().load(std::memory_order_relaxed) - shadowBytesBefore);
+    return stored + units;
 }
 
 bool StorageTexture::AnyUnprotectedPending() {
