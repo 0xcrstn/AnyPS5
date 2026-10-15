@@ -517,7 +517,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         phaseTiming.Phase(DrawRowLabels);
     };
     if (drawParameters.indirect && indirectCpu) {
-        if (drawRecordState().active && !settleDrawRecords(snapshots)) return DrawVerdict::Nothing;
+        if (drawRecordState().active && !settleDrawRecords(snapshots, true)) return DrawVerdict::Nothing;
 
         const auto indirect = *drawParameters.indirect;
         results.reserve(programs.size() + 2u);

@@ -33,6 +33,7 @@ public:
     void WaitFinished(std::uint64_t ticket);
     void WaitIdle() { WaitFinished(Posted()); }
     std::exception_ptr TakeFailure();
+    void StopAfterFailure(bool stop);
 
     struct Statistics {
         std::uint64_t posted = 0;
@@ -40,6 +41,7 @@ public:
         std::uint64_t byWorker = 0;
         std::uint64_t byOthers = 0;
         std::uint64_t failed = 0;
+        std::uint64_t dropped = 0;
         std::uint64_t waits = 0;
         std::uint64_t blockedWaits = 0;
         std::uint64_t waitedNs = 0;
@@ -59,11 +61,15 @@ private:
     std::atomic<std::uint64_t> byWorker{0};
     std::atomic<std::uint64_t> byOthers{0};
     std::atomic<std::uint64_t> failed{0};
+    std::atomic<std::uint64_t> dropped{0};
     std::atomic<std::uint64_t> waits{0};
     std::atomic<std::uint64_t> blockedWaits{0};
     std::atomic<std::uint64_t> waitedNs{0};
     std::atomic<std::uint64_t> jobNs{0};
     bool stopping = false;
+    bool stopAfterFailure = false;
+    std::uint64_t popped = 0;
+    std::uint64_t dropThrough = 0;
     std::thread worker;
 };
 
