@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -401,8 +402,10 @@ void RunAtomics(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::uint32_
     std::memcpy(guest.Data(), initial.data(), BlockBytes);
     FillInput();
     Output.fill(Sentinel);
+    const auto placedBefore = AgcDriver::Graphics::PlacedBuilds();
     Dispatch(device, waveSize, guest.Data());
     const auto wave = "global atomics: wave" + std::to_string(waveSize) + " ";
+    if (AgcDriver::Graphics::PlacementSetting() != ShaderRecompiler::BdaPlacement::Mode::Host) Require(AgcDriver::Graphics::PlacedBuilds() > placedBefore, wave + "dispatch with address atomics was not placed in device memory");
     for (std::uint32_t op = 0; op < OpCount; ++op) {
         for (std::uint32_t tid = 0; tid < Threads; ++tid) {
             const auto& row = RowOf(op, tid);

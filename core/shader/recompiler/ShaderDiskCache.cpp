@@ -139,7 +139,7 @@ constexpr std::size_t fieldCount() {
     }
 }
 
-static_assert(fieldCount<ShaderInfo>() == 25, "ShaderInfo changed: update the info encoder");
+static_assert(fieldCount<ShaderInfo>() == 26, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 13, "BufferResource changed: update the info encoder");
 static_assert(fieldCount<ImageResource>() == 38, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
@@ -809,6 +809,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
     writer.Value(info.bdaWrites);
     writer.Value(info.bdaAtomics);
     writer.Value(info.bdaCoherent);
+    writer.Value(info.bdaSpinWait);
     writer.Value(info.usesFaultBuffer);
     writer.Value(info.dispatchThreadLimit);
     writer.Value(info.rasterPrimitive);
@@ -916,6 +917,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
     reader.Value(info.bdaWrites);
     reader.Value(info.bdaAtomics);
     reader.Value(info.bdaCoherent);
+    reader.Value(info.bdaSpinWait);
     reader.Value(info.usesFaultBuffer);
     reader.Value(info.dispatchThreadLimit);
     reader.Value(info.rasterPrimitive);

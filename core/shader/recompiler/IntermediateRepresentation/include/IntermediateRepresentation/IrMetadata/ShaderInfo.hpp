@@ -35,6 +35,7 @@ struct ShaderInfo {
     bool bdaWrites = false;
     bool bdaAtomics = false;
     bool bdaCoherent = false;
+    bool bdaSpinWait = false;
     bool usesFaultBuffer = false;
     bool dispatchThreadLimit = false;
     bool rasterPrimitive = false;

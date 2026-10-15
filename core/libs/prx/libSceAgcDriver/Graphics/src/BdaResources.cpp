@@ -156,6 +156,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             std::memcpy(placement->Bytes().data() + sizeof(header), entries.data(), entries.size() * sizeof(Placement::Entry));
             for (const auto& entry : entries) placed.emplace_back(entry.begin, entry.end);
             std::sort(placed.begin(), placed.end());
+            CountPlacedBuild();
         }
     }
     const auto& ranges = cached.has_value() ? *cached->ranges : built;

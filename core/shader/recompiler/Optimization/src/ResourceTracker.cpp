@@ -1,4 +1,5 @@
 #include "Optimization/ResourceTracker.hpp"
+#include "Optimization/SpinWaitAnalysis.hpp"
 #include "Optimization/BufferReadAnalysis.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
@@ -1858,6 +1859,7 @@ private:
 
 void ResourceTracker::Track(IrProgram& program) const {
     Tracker(program).Run();
+    program.Info().bdaSpinWait = HasMemorySpinWait(program);
 }
 
 }

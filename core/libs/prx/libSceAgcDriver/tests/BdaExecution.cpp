@@ -663,8 +663,13 @@ void RunBdaPlacementTests(const Context& context) {
     }
     work.Bytes()[10] = std::byte{0x5a};
     host.Bytes()[20] = std::byte{0xa5};
+    work.Bytes()[32] = std::byte{0x3c};
+    host.Bytes()[33] = std::byte{0xc3};
+    pristine.Bytes()[33] = std::byte{0xc3};
+    work.Bytes()[33] = std::byte{0xc3};
     writePages(0b001u);
     const auto checked = run(0, bytes, true);
+    Require(std::to_integer<std::uint8_t>(host.Bytes()[32]) == 0x3c && std::to_integer<std::uint8_t>(host.Bytes()[33]) == 0xc3 && std::to_integer<std::uint8_t>(host.Bytes()[34]) == original(34), "BDA placement copy-back did not merge a changed byte into a unit whose neighbouring byte the host holds");
     Require(std::to_integer<std::uint8_t>(host.Bytes()[10]) == 0x5a, "BDA placement copy-back missed a byte the shader changed");
     Require(std::to_integer<std::uint8_t>(host.Bytes()[20]) == 0xa5, "BDA placement copy-back overwrote a byte written after the copy-in");
     Require(checked.mismatches == 1 && checked.firstMismatch == guest + 20, "APS5_BDA_PLACEMENT=verify did not report the injected difference between the placement and the import");

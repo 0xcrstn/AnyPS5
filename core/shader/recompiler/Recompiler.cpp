@@ -1312,6 +1312,7 @@ void fillMaterializedValues(RecompileResult& result, const CompiledVariant& vari
     result.bdaWrites = variant.info.info.bdaWrites;
     result.bdaAtomics = variant.info.info.bdaAtomics;
     result.bdaCoherent = variant.info.info.bdaCoherent;
+    result.bdaSpinWait = variant.info.info.bdaSpinWait;
     result.imageTablePoison.clear();
     result.imageTableRanges.clear();
     result.imageTableReadRanges.clear();
