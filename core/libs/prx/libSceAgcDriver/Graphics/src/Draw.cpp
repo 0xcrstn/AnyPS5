@@ -2501,6 +2501,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    if (resources.HasPlacements()) resources.RecordPlacementCopyBack(*recorder, recorder->Commands());
     if (bound != nullptr) bound->pass = recorder->OpenPassSerial();
     parts.lap(RecordLeave);
     timer.phase(PhaseRecord);

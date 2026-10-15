@@ -655,6 +655,14 @@ void RunBdaPlacementTests(const Context& context) {
     pristine.Bytes()[20] = std::byte{0xa5};
     Require(run(0, bytes, true).mismatches == 0, "APS5_BDA_PLACEMENT=verify reported a difference after a consistent copy-back");
     ClearMirrors(context.device);
+    Require(ParseDrawPlacement(nullptr) && ParseDrawPlacement("1") && !ParseDrawPlacement("0"), "APS5_DRAW_BDA_PLACEMENT values");
+    bool threw = false;
+    try {
+        static_cast<void>(ParseDrawPlacement("on"));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Require(threw, "an unknown APS5_DRAW_BDA_PLACEMENT value did not throw");
 }
 
 void RunBdaWriteNoteTests(const Context& context) {
