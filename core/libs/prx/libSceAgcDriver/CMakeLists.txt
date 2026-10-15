@@ -1413,13 +1413,15 @@ if(BUILD_TESTING)
     add_test(NAME agc_resident_present COMMAND agc_driver_recorder_tests --resident-present-only)
     set_tests_properties(agc_resident_present PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME agc_queued_write_groups COMMAND agc_driver_recorder_tests --queued-write-groups-only)
+    add_test(NAME agc_tiled_resolve COMMAND agc_driver_recorder_tests --tiled-resolve-only)
+    set_tests_properties(agc_tiled_resolve PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME agc_slice_dirty COMMAND agc_driver_recorder_tests --slice-dirty-only)
     add_test(NAME agc_present_then_store COMMAND agc_driver_recorder_tests --present-then-store-only)
     set_tests_properties(agc_slice_dirty agc_present_then_store PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME agc_metadata_pass COMMAND agc_driver_recorder_tests --metadata-pass-only)
     set_tests_properties(agc_metadata_pass PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_recorder_read_list agc_sparse_run_import agc_sparse_run_import_copied agc_metadata_pass agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_unit_shadow agc_pointer_access_shadow agc_snapshot_twins agc_draw_input_twins agc_draw_input_twins_sync agc_resident_mirrors agc_resident_buffer_mirrors agc_lazy_staging_out agc_lazy_staging_out_verify agc_lazy_staging_out_bounded agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_retire agc_draw_snapshot_epoch agc_multisample_guest_access agc_draw_inputs_in_place agc_resident_present agc_slice_dirty agc_queued_write_groups agc_present_then_store agc_staging_reuse PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_recorder_read_list agc_sparse_run_import agc_sparse_run_import_copied agc_metadata_pass agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_unit_shadow agc_pointer_access_shadow agc_snapshot_twins agc_draw_input_twins agc_draw_input_twins_sync agc_resident_mirrors agc_resident_buffer_mirrors agc_lazy_staging_out agc_lazy_staging_out_verify agc_lazy_staging_out_bounded agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_retire agc_draw_snapshot_epoch agc_multisample_guest_access agc_draw_inputs_in_place agc_resident_present agc_slice_dirty agc_queued_write_groups agc_present_then_store agc_staging_reuse agc_tiled_resolve PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         add_test(NAME agc_host_import_second_mapping COMMAND agc_driver_recorder_tests --host-import-second-mapping-only)
         set_tests_properties(agc_host_import_second_mapping PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT_MODIFICATION
