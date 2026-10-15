@@ -985,6 +985,7 @@ private:
     bool skipPeerOnce = false;
     bool submittingNow = false;
     std::map<Recorder*, std::uint64_t> foreignProducers;
+    std::uint32_t submitDepth = 0;
     void noteForeignRecord();
     std::map<VkSemaphore, std::uint64_t> orderWaits;
     std::map<VkSemaphore, std::uint64_t> requiredOrder;
