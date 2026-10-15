@@ -163,7 +163,7 @@ public:
         std::vector<Snapshot> snapshots;
         ~DrawBindings();
     };
-    enum class WholeCopy : std::uint8_t { NotAnalysed, IndexVertex, IndexInstance, IndexMemory, IndexUserData, IndexOther, NoDrawRange, IndexAtDraw, Offset, Soffset, ScalarOffset, Wrap, Opcode, Alias, Swizzled, AddTid, BeyondFourGiB, OverHalf, Disabled, Count };
+    enum class WholeCopy : std::uint8_t { NotAnalysed, IndexVertex, IndexInstance, IndexMemory, IndexUserData, IndexOther, NoDrawRange, IndexAtDraw, IndexAtDrawUserWord, IndexAtDrawUnderflow, IndexAtDrawOverflow, Offset, Soffset, ScalarOffset, Wrap, Opcode, Alias, Swizzled, AddTid, BeyondFourGiB, OverHalf, Disabled, Count };
     static const char* WholeCopyName(WholeCopy reason);
     using ByteRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
     struct ReadAnalysis {

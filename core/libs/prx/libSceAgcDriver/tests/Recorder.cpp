@@ -3712,7 +3712,7 @@ void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
     const auto halfRanges = ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byExpression, 65536u, &reason, &draw);
     Require(halfRanges.has_value() && *halfRanges == ShaderResources::ByteRanges{{80u, 112u}}, "records vertex / 2 of vertices 10 to 12 were not placed at bytes 80 to 112");
     byExpression.ranges.front().indexExpression.front().op = ShaderRecompiler::BufferIndexOp::UserData;
-    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byExpression, 65536u, &reason, &draw).has_value() && reason == ShaderResources::WholeCopy::IndexAtDraw, "an index expression of an unknown user word was given read ranges");
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byExpression, 65536u, &reason, &draw).has_value() && reason == ShaderResources::WholeCopy::IndexAtDrawUserWord, "an index expression of an unknown user word was given read ranges");
     const std::vector<std::uint32_t> userWords{0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 100u};
     ShaderResources::DrawIndexRanges drawWithUserData{10u, 12u, 0u, 0u};
     drawWithUserData.firstUserSgpr = 8u;
@@ -3721,7 +3721,7 @@ void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
     byUserWord.ranges = {{0u, 0u, 0u, 16u, ShaderRecompiler::BufferIndexSource::Expression, ShaderRecompiler::BufferIndexOrigin::VertexIndex, 0u, {{ShaderRecompiler::BufferIndexOp::UserData, 0u, 0u, 18u, 0u}, {ShaderRecompiler::BufferIndexOp::VertexIndex, 0u, 0u, 0u, 0u}, {ShaderRecompiler::BufferIndexOp::Add, 0u, 1u, 0u, 0u}}}};
     const auto userRanges = ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byUserWord, 65536u, &reason, &drawWithUserData);
     Require(userRanges.has_value() && *userRanges == ShaderResources::ByteRanges{{1760u, 1808u}}, "records user word 18 + vertex of vertices 10 to 12 with the word at 100 were not placed at bytes 1760 to 1808");
-    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byUserWord, 65536u, &reason, &draw).has_value() && reason == ShaderResources::WholeCopy::IndexAtDraw, "an index expression of a user word the draw did not supply was given read ranges");
+    Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byUserWord, 65536u, &reason, &draw).has_value() && reason == ShaderResources::WholeCopy::IndexAtDrawUserWord, "an index expression of a user word the draw did not supply was given read ranges");
     const auto vertexRanges = ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byVertex, 65536u, &reason, &draw);
     Require(vertexRanges.has_value() && *vertexRanges == ShaderResources::ByteRanges{{512u, 672u}}, "records 3 * vertex + 2 to 3 * vertex + 5 of vertices 10 to 12 were not placed at bytes 512 to 672");
     Require(!ShaderResources::GuestReadRanges(words(0x10000, 16u, 4096u, 0u), &byVertex, 65536u, &reason).has_value() && reason == ShaderResources::WholeCopy::NoDrawRange, "a vertex-indexed load without the draw's vertex range was given read ranges");

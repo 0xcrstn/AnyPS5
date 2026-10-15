@@ -40,9 +40,15 @@ struct BufferIndexInputs {
     std::span<const std::uint32_t> userData{};
 };
 
-inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferIndex(const std::vector<BufferIndexNode>& nodes, const BufferIndexInputs& inputs) {
+enum class BufferIndexFailure : std::uint8_t { None, UserWord, Underflow, Overflow, Malformed, Count };
+
+inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferIndex(const std::vector<BufferIndexNode>& nodes, const BufferIndexInputs& inputs, BufferIndexFailure* failure = nullptr) {
     using Interval = std::pair<std::uint64_t, std::uint64_t>;
     constexpr std::uint64_t Max32 = 0xffffffffull;
+    const auto fail = [&](BufferIndexFailure why) -> std::optional<Interval> {
+        if (failure != nullptr) *failure = why;
+        return std::nullopt;
+    };
     std::vector<Interval> values;
     values.reserve(nodes.size());
     const auto ones = [](std::uint64_t value) {
@@ -54,7 +60,7 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
         const auto& node = nodes[index];
         const bool leaf = node.op == BufferIndexOp::Range || node.op == BufferIndexOp::VertexIndex || node.op == BufferIndexOp::InstanceIndex || node.op == BufferIndexOp::UserData;
         const bool binary = node.op == BufferIndexOp::Add || node.op == BufferIndexOp::Sub || node.op == BufferIndexOp::Mul || node.op == BufferIndexOp::MulHigh || node.op == BufferIndexOp::And || node.op == BufferIndexOp::Or || node.op == BufferIndexOp::Min || node.op == BufferIndexOp::Max || node.op == BufferIndexOp::Select;
-        if ((!leaf && node.left >= index) || (binary && node.right >= index)) return std::nullopt;
+        if ((!leaf && node.left >= index) || (binary && node.right >= index)) return fail(BufferIndexFailure::Malformed);
         const auto& a = node.left < values.size() ? values[node.left] : Interval{0, 0};
         const auto& b = node.right < values.size() ? values[node.right] : Interval{0, 0};
         Interval result{0, 0};
@@ -72,28 +78,28 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
             if (inputs.vertexFoldSgpr >= 0 && node.low == static_cast<std::uint32_t>(inputs.vertexFoldSgpr)) result = {inputs.vertexFold, inputs.vertexFold};
             else if (inputs.instanceFoldSgpr >= 0 && node.low == static_cast<std::uint32_t>(inputs.instanceFoldSgpr)) result = {inputs.instanceFold, inputs.instanceFold};
             else if (node.low >= inputs.firstUserSgpr && node.low - inputs.firstUserSgpr < inputs.userData.size()) result = {inputs.userData[node.low - inputs.firstUserSgpr], inputs.userData[node.low - inputs.firstUserSgpr]};
-            else return std::nullopt;
+            else return fail(BufferIndexFailure::UserWord);
             break;
         case BufferIndexOp::Add:
             result = {a.first + b.first, a.second + b.second};
             break;
         case BufferIndexOp::Sub:
-            if (a.first < b.second) return std::nullopt;
+            if (a.first < b.second) return fail(BufferIndexFailure::Underflow);
             result = {a.first - b.second, a.second - b.first};
             break;
         case BufferIndexOp::Mul:
-            if (b.second != 0 && a.second > Max32 / b.second) return std::nullopt;
+            if (b.second != 0 && a.second > Max32 / b.second) return fail(BufferIndexFailure::Overflow);
             result = {a.first * b.first, a.second * b.second};
             break;
         case BufferIndexOp::MulHigh:
             result = {(a.first * b.first) >> 32u, (a.second * b.second) >> 32u};
             break;
         case BufferIndexOp::ShiftLeft:
-            if (node.low >= 32u) return std::nullopt;
+            if (node.low >= 32u) return fail(BufferIndexFailure::Malformed);
             result = {a.first << node.low, a.second << node.low};
             break;
         case BufferIndexOp::ShiftRight:
-            if (node.low >= 32u) return std::nullopt;
+            if (node.low >= 32u) return fail(BufferIndexFailure::Malformed);
             result = {a.first >> node.low, a.second >> node.low};
             break;
         case BufferIndexOp::And:
@@ -103,7 +109,7 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
             result = {std::max(a.first, b.first), ones(std::max(a.second, b.second))};
             break;
         case BufferIndexOp::Divide:
-            if (node.low == 0) return std::nullopt;
+            if (node.low == 0) return fail(BufferIndexFailure::Malformed);
             result = {a.first / node.low, a.second / node.low};
             break;
         case BufferIndexOp::Min:
@@ -113,7 +119,7 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
             result = {std::max(a.first, b.first), std::max(a.second, b.second)};
             break;
         case BufferIndexOp::Extract: {
-            if (node.low >= 32u || node.high == 0 || node.high >= 32u) return std::nullopt;
+            if (node.low >= 32u || node.high == 0 || node.high >= 32u) return fail(BufferIndexFailure::Malformed);
             const auto low = a.first >> node.low;
             const auto high = a.second >> node.low;
             const auto mask = (std::uint64_t{1} << node.high) - 1u;
@@ -124,12 +130,13 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
             result = {std::min(a.first, b.first), std::max(a.second, b.second)};
             break;
         default:
-            return std::nullopt;
+            return fail(BufferIndexFailure::Malformed);
         }
-        if (result.second > Max32 || result.first > result.second) return std::nullopt;
+        if (result.second > Max32) return fail(BufferIndexFailure::Overflow);
+        if (result.first > result.second) return fail(BufferIndexFailure::Malformed);
         values.push_back(result);
     }
-    if (values.empty()) return std::nullopt;
+    if (values.empty()) return fail(BufferIndexFailure::Malformed);
     return values.back();
 }
 

@@ -187,6 +187,8 @@ void DrawIndices() {
     userInputs.userData = userWords;
     userInputs.firstUserSgpr = 19u;
     Require(!EvaluateBufferIndex(offsetted.ranges[0].indexExpression, userInputs), "a user word below the draw's first user SGPR was taken as known");
+    auto failure = BufferIndexFailure::None;
+    Require(!EvaluateBufferIndex(offsetted.ranges[0].indexExpression, userInputs, &failure) && failure == BufferIndexFailure::UserWord, "an index needing a user word the draw lacks was not reported as such");
     auto& extracted = fixture.builder.Emit(IrOpcode::BitFieldUExtract, IrType::U32, {&vertex, &fixture.builder.Constant(2u), &fixture.builder.Constant(4u)});
     BufferReadRanges field;
     analysis.Note(field, fixture.Load(IrOpcode::LoadBufferU32, extracted, fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 1u));
@@ -198,6 +200,14 @@ void DrawIndices() {
     BufferReadRanges modulo;
     analysis.Note(modulo, fixture.Load(IrOpcode::LoadBufferU32, remainder, fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 1u));
     Require(modulo.ranges.front().indexSource == BufferIndexSource::Expression && !EvaluateBufferIndex(modulo.ranges.front().indexExpression, inputs), "vertex - (vertex / 3) * 3, which interval arithmetic cannot bound below, was given a range");
+    failure = BufferIndexFailure::None;
+    Require(!EvaluateBufferIndex(modulo.ranges.front().indexExpression, inputs, &failure) && failure == BufferIndexFailure::Underflow, "vertex - (vertex / 3) * 3 was not reported as possibly going below 0");
+    const std::vector<BufferIndexNode> scaled{{BufferIndexOp::VertexIndex, 0u, 0u, 0u, 0u}, {BufferIndexOp::Range, 0u, 0u, 0x10000u, 0x10000u}, {BufferIndexOp::Mul, 0u, 1u, 0u, 0u}};
+    failure = BufferIndexFailure::None;
+    Require(!EvaluateBufferIndex(scaled, BufferIndexInputs{0u, 0x20000u, 0u, 0u}, &failure) && failure == BufferIndexFailure::Overflow, "vertex * 65536 over vertices 0 to 131072 was not reported as passing 32 bits");
+    const std::vector<BufferIndexNode> forward{{BufferIndexOp::Add, 1u, 1u, 0u, 0u}};
+    failure = BufferIndexFailure::None;
+    Require(!EvaluateBufferIndex(forward, inputs, &failure) && failure == BufferIndexFailure::Malformed, "an expression referring forward was not reported as malformed");
     auto& mixed = fixture.builder.BitwiseXor(vertex, fixture.builder.Constant(5u));
     BufferReadRanges blocked;
     analysis.Note(blocked, fixture.Load(IrOpcode::LoadBufferU32, mixed, fixture.builder.Constant(0u), fixture.builder.Constant(0u)), Memory(0u, 1u));
