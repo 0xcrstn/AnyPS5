@@ -211,7 +211,13 @@ public:
         double allocateUs = 0;
         double updateUs = 0;
     };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsStatistics* statistics = nullptr, const DrawIndexRanges* drawRanges = nullptr) const;
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsStatistics* statistics = nullptr, const DrawIndexRanges* drawRanges = nullptr, std::span<const DrawSnapshotArena::Prefill> prefills = {}) const;
+    struct SnapshotRequest {
+        std::uint64_t begin;
+        std::size_t bytes;
+        std::optional<DrawSnapshotArena::CopyRanges> ranges;
+    };
+    std::vector<SnapshotRequest> PlanDrawSnapshots(std::span<const MovedBuffer> moved, const DrawIndexRanges* drawRanges) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     struct MovedReadOnlyPlan {
         std::vector<MovedBuffer> moved;

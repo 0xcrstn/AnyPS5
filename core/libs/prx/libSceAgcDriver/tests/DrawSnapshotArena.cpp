@@ -589,6 +589,40 @@ void DeviceTwinTests(Fixture& fixture) {
     DrawSnapshotArena::SetDeviceTwins(false);
 }
 
+void WorkerCopyTests(Fixture& fixture) {
+    DrawSnapshotArena::SetEnabled(true);
+    DrawSnapshotArena::SetExtendBytes(0);
+    auto& recorder = fixture.GetRecorder();
+    auto& arena = recorder.SnapshotArena();
+    const auto whole = [] { return std::optional<DrawSnapshotArena::CopyRanges>{}; };
+    const auto address = fixture.Address() + 131072;
+    std::memset(fixture.Bytes(131072), 0x71, 65536);
+    GuestMemory::BumpCollectEpoch();
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto prefill = arena.PrepareCopy(address, 4096, registry, std::nullopt);
+    Require(prefill.has_value() && prefill->copiedBytes == 4096 && prefill->first == address, "a worker did not copy an unserved draw input");
+    const auto adopted = arena.TakePrefilled(recorder, address, 4096, registry, whole, *prefill);
+    Require(adopted.has_value() && adopted->copied && Holds(Snapshot{address, nullptr, {}, adopted->buffer, adopted->offset, adopted->bytes}, std::byte{0x71}), "the encode did not adopt a worker's copy");
+    const auto again = arena.Take(recorder, address, 4096, registry);
+    Require(again.has_value() && !again->copied && again->buffer == adopted->buffer && again->offset == adopted->offset, "an adopted copy was not indexed for later draws");
+    Require(!arena.PrepareCopy(address, 4096, registry, std::nullopt).has_value(), "a worker copied a range the arena already serves");
+    const auto stale = address + 16384;
+    auto early = arena.PrepareCopy(stale, 4096, registry, std::nullopt);
+    Require(early.has_value(), "a worker did not copy the second input");
+    std::memset(fixture.Bytes(131072 + 16384), 0x73, 64);
+    GuestMemory::BumpCollectEpoch();
+    const auto fresh = arena.TakePrefilled(recorder, stale, 4096, registry, whole, *early);
+    Require(fresh.has_value() && fresh->bytes[0] == std::byte{0x73} && fresh->bytes[64] == std::byte{0x71}, "a worker's copy made before a CPU store was adopted");
+    const auto partial = address + 32768;
+    const DrawSnapshotArena::CopyRanges ranges{{0, 256}, {1024, 2048}};
+    auto limited = arena.PrepareCopy(partial, 4096, registry, ranges);
+    Require(limited.has_value() && limited->copiedBytes == 1280, "a worker did not copy only the read ranges");
+    const auto bounded = arena.TakePrefilled(recorder, partial, 4096, registry, [&] { return std::optional<DrawSnapshotArena::CopyRanges>{ranges}; }, *limited);
+    Require(bounded.has_value() && bounded->limited && bounded->bytes[0] == std::byte{0x71} && bounded->bytes[1500] == std::byte{0x71}, "the encode did not adopt a worker's range-limited copy");
+    fixture.Release();
+    recorder.Sync();
+}
+
 void InPlaceTests(Fixture& fixture) {
     const bool previous = ShaderResources::InPlaceDrawInputsEnabled();
     ShaderResources::SetInPlaceDrawInputs(true);
@@ -905,6 +939,7 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
         PendingWriteTests(fixture);
         GpuReadTests(fixture);
         DeviceTwinTests(fixture);
+        WorkerCopyTests(fixture);
         DisabledTests(fixture);
         EpochDirtySetTests(fixture);
     }

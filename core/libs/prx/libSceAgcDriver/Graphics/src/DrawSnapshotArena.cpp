@@ -48,6 +48,11 @@ std::atomic<bool>& DeviceTwinsFlag() {
     return flag;
 }
 
+std::atomic<bool>& WorkerCopiesFlag() {
+    static std::atomic<bool> flag{std::getenv("APS5_WORKER_SNAPSHOT_COPIES") != nullptr};
+    return flag;
+}
+
 std::atomic<std::uint64_t> nextIdentity{1};
 std::atomic<DrawSnapshotArena*> activeArena{nullptr};
 
@@ -107,6 +112,19 @@ void DrawSnapshotArena::SetDeviceTwins(bool twins) {
     DeviceTwinsFlag().store(twins, std::memory_order_relaxed);
 }
 
+bool DrawSnapshotArena::WorkerCopies() {
+    return WorkerCopiesFlag().load(std::memory_order_relaxed);
+}
+
+void DrawSnapshotArena::SetWorkerCopies(bool enabled) {
+    WorkerCopiesFlag().store(enabled, std::memory_order_relaxed);
+}
+
+bool DrawSnapshotArena::VerifyWorkerCopies() {
+    static const bool verify = std::getenv("APS5_VERIFY_WORKER_SNAPSHOT_COPIES") != nullptr;
+    return verify;
+}
+
 DrawSnapshotArena::DrawSnapshotArena(const Context& context) : context(context), alignment(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4)), identity(nextIdentity.fetch_add(1, std::memory_order_relaxed)) {
     Require((alignment & (alignment - 1)) == 0 && alignment <= PlacementAlignment, "the storage buffer offset alignment does not divide the arena placement alignment");
     activeArena.store(this, std::memory_order_release);
@@ -124,20 +142,30 @@ void DrawSnapshotArena::ReportActive(double elapsedSeconds) {
     const auto takes = taken.takes != 0 ? static_cast<double>(taken.takes) : 1.0;
     std::size_t heldBytes = 0;
     std::size_t busy = 0;
-    for (const auto& chunk : arena->chunks) {
-        heldBytes += chunk->buffer->Bytes().size();
-        if (chunk.use_count() > 1) ++busy;
+    std::size_t chunkCount = 0;
+    std::size_t entryCount = 0;
+    {
+        std::lock_guard lock(arena->mutex);
+        for (const auto& chunk : arena->chunks) {
+            heldBytes += chunk->buffer->Bytes().size();
+            if (chunk.use_count() > 1) ++busy;
+        }
+        chunkCount = arena->chunks.size();
+        entryCount = arena->entries.size();
     }
-    std::fprintf(stderr, "[draw-arena] (%.3f s) %llu takes (%.1f MiB requested): %llu hits (%.1f%%), %llu stale, %llu copies (%.1f MiB copied, %llu exact, %llu unindexed); partial %llu copies (%llu extended in place, %.1f MiB left uncopied); refused: size %llu, budget %llu; chunks %zu (%zu in flight, %.0f MiB, %llu created, %llu recycled), %zu entries; verify %llu checked, %llu differing; device twins%s: %llu views, %llu prologue copies (%.1f MiB), %llu refused; placed words: %llu (%.1f KiB), %llu reused, %llu refused\n", elapsedSeconds, static_cast<unsigned long long>(taken.takes), static_cast<double>(taken.requestedBytes) / 1048576.0, static_cast<unsigned long long>(taken.hits), 100.0 * static_cast<double>(taken.hits) / takes, static_cast<unsigned long long>(taken.stale), static_cast<unsigned long long>(taken.copies), static_cast<double>(taken.copiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.exactSegments), static_cast<unsigned long long>(taken.unindexed), static_cast<unsigned long long>(taken.partialCopies), static_cast<unsigned long long>(taken.extendedCopies), static_cast<double>(taken.uncopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.refusedSize), static_cast<unsigned long long>(taken.refusedBudget), arena->chunks.size(), busy, static_cast<double>(heldBytes) / 1048576.0, static_cast<unsigned long long>(taken.chunksCreated), static_cast<unsigned long long>(taken.chunksRecycled), arena->entries.size(), static_cast<unsigned long long>(taken.verified), static_cast<unsigned long long>(taken.verifyDiffering), DeviceTwins() ? "" : " (off)", static_cast<unsigned long long>(taken.twinViews), static_cast<unsigned long long>(taken.twinCopies), static_cast<double>(taken.twinCopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.twinsRefused), static_cast<unsigned long long>(taken.placed), static_cast<double>(taken.placedBytes) / 1024.0, static_cast<unsigned long long>(taken.placedReuses), static_cast<unsigned long long>(taken.placeRefused));
+    std::fprintf(stderr, "[draw-arena] (%.3f s) %llu takes (%.1f MiB requested): %llu hits (%.1f%%), %llu stale, %llu copies (%.1f MiB copied, %llu exact, %llu unindexed); partial %llu copies (%llu extended in place, %.1f MiB left uncopied); refused: size %llu, budget %llu; chunks %zu (%zu in flight, %.0f MiB, %llu created, %llu recycled), %zu entries; verify %llu checked, %llu differing; device twins%s: %llu views, %llu prologue copies (%.1f MiB), %llu refused; placed words: %llu (%.1f KiB), %llu reused, %llu refused\n", elapsedSeconds, static_cast<unsigned long long>(taken.takes), static_cast<double>(taken.requestedBytes) / 1048576.0, static_cast<unsigned long long>(taken.hits), 100.0 * static_cast<double>(taken.hits) / takes, static_cast<unsigned long long>(taken.stale), static_cast<unsigned long long>(taken.copies), static_cast<double>(taken.copiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.exactSegments), static_cast<unsigned long long>(taken.unindexed), static_cast<unsigned long long>(taken.partialCopies), static_cast<unsigned long long>(taken.extendedCopies), static_cast<double>(taken.uncopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.refusedSize), static_cast<unsigned long long>(taken.refusedBudget), chunkCount, busy, static_cast<double>(heldBytes) / 1048576.0, static_cast<unsigned long long>(taken.chunksCreated), static_cast<unsigned long long>(taken.chunksRecycled), entryCount, static_cast<unsigned long long>(taken.verified), static_cast<unsigned long long>(taken.verifyDiffering), DeviceTwins() ? "" : " (off)", static_cast<unsigned long long>(taken.twinViews), static_cast<unsigned long long>(taken.twinCopies), static_cast<double>(taken.twinCopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.twinsRefused), static_cast<unsigned long long>(taken.placed), static_cast<double>(taken.placedBytes) / 1024.0, static_cast<unsigned long long>(taken.placedReuses), static_cast<unsigned long long>(taken.placeRefused));
+    if (WorkerCopies()) std::fprintf(stderr, "[draw-arena] worker copies: %llu prefilled (%.1f MiB), %llu already served, %llu adopted at the encode, %llu refused there\n", static_cast<unsigned long long>(taken.prefilled), static_cast<double>(taken.prefilledBytes) / 1048576.0, static_cast<unsigned long long>(taken.prefillsServed), static_cast<unsigned long long>(taken.adopted), static_cast<unsigned long long>(taken.adoptRefused));
 }
 
 DrawSnapshotArena::Counters DrawSnapshotArena::TakeCounters() {
+    std::lock_guard lock(mutex);
     const auto taken = counters;
     counters = {};
     return taken;
 }
 
 std::size_t DrawSnapshotArena::BusyChunks() const {
+    std::lock_guard lock(mutex);
     return static_cast<std::size_t>(std::count_if(chunks.begin(), chunks.end(), [](const std::shared_ptr<Chunk>& chunk) { return chunk.use_count() > 1; }));
 }
 
@@ -340,9 +368,133 @@ std::optional<std::span<std::byte>> DrawSnapshotArena::reserve(std::size_t bytes
 }
 
 std::optional<DrawSnapshotArena::View> DrawSnapshotArena::Reuse(Recorder& recorder, const Placed& placed) {
+    std::lock_guard lock(mutex);
     if (placed.arena != identity || placed.chunk >= chunks.size() || chunks[placed.chunk]->serial != placed.serial) return std::nullopt;
     ++counters.placedReuses;
     return view(recorder, placed.chunk, placed.offset, placed.bytes, false, 0);
+}
+
+bool DrawSnapshotArena::served(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges* ranges) const {
+    auto found = entries.upper_bound(address);
+    for (std::size_t depth = 0; depth < LookupDepth && found != entries.begin(); ++depth) {
+        --found;
+        const auto begin = found->first;
+        const auto& entry = found->second;
+        if (entry.end < address + bytes || (address - begin) % alignment != 0) continue;
+        if (entry.chunkSerial != chunks[entry.chunk]->serial || entry.registryGeneration != registryGeneration || entry.limited != (ranges != nullptr)) continue;
+        if (ranges != nullptr) {
+            const auto shift = address - begin;
+            const bool covers = std::all_of(ranges->begin(), ranges->end(), [&](const auto& range) {
+                return range.first == range.second || std::any_of(entry.copiedRanges.begin(), entry.copiedRanges.end(), [&](const auto& copied) { return copied.first <= shift + range.first && copied.second >= shift + range.second; });
+            });
+            if (!covers) continue;
+        }
+        if (GuestMemory::CollectWrites(begin, static_cast<std::size_t>(entry.end - begin)) == 0) continue;
+        const bool unchanged = ranges == nullptr ? GuestMemory::UnchangedSince(address, bytes, entry.generation) : std::all_of(ranges->begin(), ranges->end(), [&](const auto& range) { return range.first == range.second || GuestMemory::UnchangedSince(address + range.first, static_cast<std::size_t>(range.second - range.first), entry.generation); });
+        if (unchanged) return true;
+    }
+    return false;
+}
+
+std::optional<DrawSnapshotArena::Prefill> DrawSnapshotArena::PrepareCopy(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, std::optional<CopyRanges> ranges) {
+    Prefill prefill;
+    std::span<std::byte> target;
+    {
+        std::lock_guard lock(mutex);
+        if (bytes == 0 || bytes > ChunkBytes() || (ranges.has_value() && DeviceTwins())) return std::nullopt;
+        if (served(address, bytes, registryGeneration, nullptr) || (ranges.has_value() && served(address, bytes, registryGeneration, &*ranges))) {
+            ++counters.prefillsServed;
+            return std::nullopt;
+        }
+        auto first = address;
+        auto last = address + bytes;
+        std::uint64_t generation = 0;
+        if (!ranges.has_value()) {
+            const auto widenedFirst = address - (address % SegmentGranule) / alignment * alignment;
+            const auto widenedLast = AlignUp(address + bytes, SegmentGranule) + ExtendBytes();
+            const auto widenedBytes = static_cast<std::size_t>(widenedLast - widenedFirst);
+            if (widenedBytes <= ChunkBytes() && GuestMemory::Accessible(reinterpret_cast<const void*>(widenedFirst), widenedBytes)) {
+                if (const auto widened = GuestMemory::CollectWrites(widenedFirst, widenedBytes); widened != 0) {
+                    first = widenedFirst;
+                    last = widenedLast;
+                    generation = widened;
+                }
+            }
+        }
+        if (generation == 0) generation = GuestMemory::CollectWrites(address, bytes);
+        if (generation == 0) return std::nullopt;
+        const auto segmentBytes = static_cast<std::size_t>(last - first);
+        const auto placement = allocate(segmentBytes);
+        if (!placement.has_value()) {
+            ++counters.refusedBudget;
+            return std::nullopt;
+        }
+        auto& chunk = chunks[placement->chunk];
+        if (ranges.has_value()) chunk->containsPartial = true;
+        prefill.pin = chunk;
+        prefill.arena = identity;
+        prefill.chunk = placement->chunk;
+        prefill.serial = chunk->serial;
+        prefill.offset = placement->offset;
+        prefill.first = first;
+        prefill.last = last;
+        prefill.address = address;
+        prefill.bytes = bytes;
+        prefill.generation = generation;
+        prefill.registryGeneration = registryGeneration;
+        prefill.dirtySerial = GuestMemory::EpochDirtySetEnabled() ? GuestMemory::DirtySerial() : 0;
+        target = chunk->buffer->Bytes().subspan(placement->offset, segmentBytes);
+    }
+    if (ranges.has_value()) {
+        for (const auto& [from, to] : *ranges) {
+            std::memcpy(target.data() + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
+            prefill.copiedBytes += static_cast<std::size_t>(to - from);
+        }
+    } else {
+        std::memcpy(target.data(), reinterpret_cast<const void*>(prefill.first), target.size());
+        prefill.copiedBytes = target.size();
+    }
+    prefill.ranges = std::move(ranges);
+    {
+        std::lock_guard lock(mutex);
+        ++counters.prefilled;
+        counters.prefilledBytes += prefill.copiedBytes;
+    }
+    return prefill;
+}
+
+std::optional<DrawSnapshotArena::View> DrawSnapshotArena::adopt(Recorder& recorder, const Prefill& prefill, std::uint64_t registryGeneration) {
+    const auto refuse = [&]() -> std::optional<View> {
+        ++counters.adoptRefused;
+        return std::nullopt;
+    };
+    if (prefill.arena != identity || prefill.chunk >= chunks.size() || chunks[prefill.chunk]->serial != prefill.serial || prefill.registryGeneration != registryGeneration) return refuse();
+    const auto segmentBytes = static_cast<std::size_t>(prefill.last - prefill.first);
+    if (GuestMemory::CollectWrites(prefill.first, segmentBytes) == 0) return refuse();
+    const bool unchanged = !prefill.ranges.has_value() ? GuestMemory::UnchangedSince(prefill.first, segmentBytes, prefill.generation) : std::all_of(prefill.ranges->begin(), prefill.ranges->end(), [&](const auto& range) { return range.first == range.second || GuestMemory::UnchangedSince(prefill.address + range.first, static_cast<std::size_t>(range.second - range.first), prefill.generation); });
+    if (!unchanged) return refuse();
+    auto& chunk = *chunks[prefill.chunk];
+    const auto bytes = chunk.buffer->Bytes().subspan(prefill.offset, segmentBytes);
+    if (VerifyWorkerCopies()) {
+        const bool same = !prefill.ranges.has_value() ? std::memcmp(bytes.data(), reinterpret_cast<const void*>(prefill.first), segmentBytes) == 0 : std::all_of(prefill.ranges->begin(), prefill.ranges->end(), [&](const auto& range) { return std::memcmp(bytes.data() + range.first, reinterpret_cast<const void*>(prefill.address + range.first), static_cast<std::size_t>(range.second - range.first)) == 0; });
+        Require(same, "APS5_VERIFY_WORKER_SNAPSHOT_COPIES: a worker's snapshot copy differs from the guest memory its write generation reports unchanged");
+    }
+    if (!prefill.ranges.has_value() && chunk.twin != nullptr && !chunk.containsPartial) chunk.pending.push_back({prefill.offset, prefill.offset, segmentBytes});
+    if (entries.size() >= MaxEntries) entries.clear();
+    Entry entry{prefill.last, prefill.generation, prefill.registryGeneration, prefill.chunk, prefill.serial, prefill.offset, prefill.dirtySerial};
+    if (prefill.ranges.has_value()) {
+        entry.copiedRanges = *prefill.ranges;
+        entry.limited = true;
+    }
+    entries[prefill.first] = std::move(entry);
+    ++counters.copies;
+    ++counters.adopted;
+    counters.copiedBytes += prefill.copiedBytes;
+    if (prefill.ranges.has_value()) {
+        ++counters.partialCopies;
+        counters.uncopiedBytes += prefill.bytes - prefill.copiedBytes;
+    }
+    return view(recorder, prefill.chunk, prefill.offset + (prefill.address - prefill.first), prefill.bytes, true, segmentBytes, prefill.copiedBytes, prefill.ranges.has_value());
 }
 
 std::optional<DrawSnapshotArena::View> DrawSnapshotArena::Take(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration) {

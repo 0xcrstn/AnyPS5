@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <utility>
@@ -54,6 +55,27 @@ public:
         std::uint64_t placedBytes = 0;
         std::uint64_t placedReuses = 0;
         std::uint64_t placeRefused = 0;
+        std::uint64_t prefilled = 0;
+        std::uint64_t prefilledBytes = 0;
+        std::uint64_t prefillsServed = 0;
+        std::uint64_t adopted = 0;
+        std::uint64_t adoptRefused = 0;
+    };
+    struct Prefill {
+        std::shared_ptr<const void> pin;
+        std::uint64_t arena = 0;
+        std::size_t chunk = 0;
+        std::uint64_t serial = 0;
+        VkDeviceSize offset = 0;
+        std::uint64_t first = 0;
+        std::uint64_t last = 0;
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        std::uint64_t generation = 0;
+        std::uint64_t registryGeneration = 0;
+        std::uint64_t dirtySerial = 0;
+        std::optional<CopyRanges> ranges;
+        std::size_t copiedBytes = 0;
     };
     struct Placed {
         std::uint64_t arena = 0;
@@ -71,12 +93,26 @@ public:
     std::optional<View> Take(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration);
     template <class RangeProvider>
     std::optional<View> Take(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, RangeProvider&& ranges) {
+        std::lock_guard lock(mutex);
         if (!beginTake(bytes)) return std::nullopt;
         if (auto hit = lookup(recorder, address, bytes, registryGeneration)) return hit;
         return copy(recorder, address, bytes, registryGeneration, ranges());
     }
+    template <class RangeProvider>
+    std::optional<View> TakePrefilled(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, RangeProvider&& ranges, const Prefill& prefill) {
+        std::lock_guard lock(mutex);
+        if (!beginTake(bytes)) return std::nullopt;
+        if (auto hit = lookup(recorder, address, bytes, registryGeneration)) return hit;
+        auto wanted = ranges();
+        if (prefill.address == address && prefill.bytes == bytes && wanted == prefill.ranges) {
+            if (auto adopted = adopt(recorder, prefill, registryGeneration)) return adopted;
+        }
+        return copy(recorder, address, bytes, registryGeneration, std::move(wanted));
+    }
+    std::optional<Prefill> PrepareCopy(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, std::optional<CopyRanges> ranges);
     template <class Fill>
     std::optional<View> Place(Recorder& recorder, std::size_t bytes, Fill&& fill, Placed* placed) {
+        std::lock_guard lock(mutex);
         const auto target = reserve(bytes, placed);
         if (!target) return std::nullopt;
         fill(*target);
@@ -84,8 +120,14 @@ public:
     }
     std::optional<View> Reuse(Recorder& recorder, const Placed& placed);
     Counters TakeCounters();
-    std::size_t ChunkCount() const { return chunks.size(); }
-    std::size_t EntryCount() const { return entries.size(); }
+    std::size_t ChunkCount() const {
+        std::lock_guard lock(mutex);
+        return chunks.size();
+    }
+    std::size_t EntryCount() const {
+        std::lock_guard lock(mutex);
+        return entries.size();
+    }
     std::size_t BusyChunks() const;
     std::uint64_t Identity() const { return identity; }
 
@@ -102,6 +144,9 @@ public:
     static void SetVerify(bool verify);
     static bool DeviceTwins();
     static void SetDeviceTwins(bool twins);
+    static bool WorkerCopies();
+    static void SetWorkerCopies(bool enabled);
+    static bool VerifyWorkerCopies();
     static constexpr std::size_t SegmentGranule = 4096;
     static constexpr std::size_t MaxEntries = 16384;
     static constexpr std::size_t LookupDepth = 8;
@@ -141,6 +186,9 @@ private:
     View view(Recorder& recorder, std::size_t chunk, VkDeviceSize offset, std::size_t bytes, bool copied, std::size_t chargedBytes, std::size_t copiedBytes = 0, bool limited = false);
     std::optional<View> lookup(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges* ranges = nullptr);
     std::optional<View> extend(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges& ranges);
+    std::optional<View> adopt(Recorder& recorder, const Prefill& prefill, std::uint64_t registryGeneration);
+    bool served(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges* ranges) const;
+    mutable std::mutex mutex;
 
     Context context;
     VkDeviceSize alignment;
