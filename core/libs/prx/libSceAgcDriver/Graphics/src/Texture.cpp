@@ -93,7 +93,7 @@ std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 
-std::atomic<bool> handOverOff{false};
+std::atomic<bool> handOverOff{std::getenv("APS5_NO_ALIAS_HANDOVER") != nullptr};
 std::atomic<std::uint64_t> handedOverUnits{0}, handOverDeviceUnits{0}, handOverSuperseded{0}, handOverStoredLater{0}, handOverFallbacks{0};
 
 struct HandOverFilter {
@@ -2892,6 +2892,8 @@ std::vector<StorageTexture::ImportSegment> StorageTexture::importSegments() cons
 const HostImport* StorageTexture::surfaceImport() const {
     const auto bytes = static_cast<std::size_t>(guestBytes);
     if (const auto* import = HostImportFor(context, descriptor.baseAddress, bytes)) return import;
+    static const bool unjoined = std::getenv("APS5_NO_SPANNING_IMPORT") != nullptr;
+    if (unjoined) return nullptr;
     if (blockUnits && UnitShadowEnabled()) {
         std::vector<RegisteredPiece> pieces;
         if (!RegisteredReadableCovers(descriptor.baseAddress, bytes, &pieces)) return nullptr;
