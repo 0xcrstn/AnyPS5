@@ -212,6 +212,7 @@ public:
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
     void UseMirrors(Recorder& recorder) const;
+    void PublishResidentReads(Recorder& recorder) const;
     void RefreshMirrorsForDirectUse(Recorder& recorder) const;
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
