@@ -28,7 +28,7 @@ VkDescriptorSet TextureDetiler::allocateFrom(DescriptorRing& ring, VkDescriptorS
     if (ring.pools.empty() || ring.used == setsPerPool) {
         const auto completed = recorder != nullptr ? recorder->CompletedThrough() : std::numeric_limits<std::uint64_t>::max();
         auto next = ring.pools.size();
-        for (std::size_t step = 1; step < ring.pools.size(); ++step) {
+        for (std::size_t step = 1; step <= ring.pools.size(); ++step) {
             const auto index = (ring.current + step) % ring.pools.size();
             if (ring.serials[index] <= completed) {
                 next = index;
