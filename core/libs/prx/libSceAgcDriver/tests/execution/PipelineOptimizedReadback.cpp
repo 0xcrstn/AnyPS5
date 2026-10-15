@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
@@ -66,6 +67,7 @@ struct PipelineTrace {
     bool allowOptimization = false;
     std::vector<VkPipeline> fast;
     std::vector<VkPipeline> optimized;
+    std::vector<VkPipeline> whole;
     VkCommandBuffer boundCommands = VK_NULL_HANDLE;
     VkPipeline bound = VK_NULL_HANDLE;
     std::vector<VkPipeline> drawn;
@@ -91,7 +93,9 @@ VKAPI_ATTR VkResult VKAPI_CALL CreatePipelines(VkDevice device, VkPipelineCache 
     std::lock_guard lock(Trace->mutex);
     for (std::uint32_t index = 0; index < count; ++index) {
         if (pipelines[index] == VK_NULL_HANDLE || (infos[index].flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) != 0) continue;
-        auto& handles = (infos[index].flags & VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT) != 0 ? Trace->optimized : Trace->fast;
+        bool linked = false;
+        for (auto* next = static_cast<const VkBaseInStructure*>(infos[index].pNext); next != nullptr; next = next->pNext) linked |= next->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR;
+        auto& handles = !linked ? Trace->whole : (infos[index].flags & VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT) != 0 ? Trace->optimized : Trace->fast;
         handles.push_back(pipelines[index]);
     }
     return result;
@@ -148,7 +152,14 @@ void CheckDrawn(PipelineTrace& trace, bool optimized) {
     Require(std::find(expected.begin(), expected.end(), trace.drawn.front()) != expected.end(), optimized ? "readback draw did not bind an optimized pipeline" : "readback draw did not bind a fast-linked pipeline");
 }
 
-void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace, std::uint32_t waveSize, VkFormat depthFormat, bool optimize) {
+void RequireSameOutput(std::span<const std::byte> reference, std::span<const std::byte> actual, std::string_view mode) {
+    Require(reference.size() == actual.size(), std::string(mode) + ": readback size differs from the fast-linked pipeline");
+    for (std::size_t index = 0; index < reference.size(); ++index) {
+        Require(reference[index] == actual[index], std::string(mode) + ": byte " + std::to_string(index) + " differs from the fast-linked pipeline");
+    }
+}
+
+void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace, std::uint32_t waveSize, VkFormat depthFormat, bool optimize, bool injectMismatch) {
     const bool masked = depthFormat == VK_FORMAT_UNDEFINED;
     const auto target = device.Target();
     const auto vertices = masked ? std::span<const std::array<float, 4>>(Triangle) : std::span<const std::array<float, 4>>(DepthTriangles);
@@ -217,12 +228,31 @@ void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace,
         CheckPixels(masked, phase);
     };
     render(false, "fast link");
+    const std::vector<std::byte> fastPixels(Pixels.begin(), Pixels.end());
     trace.ReleaseOptimization();
     WaitForOptimizedPipelines(context.device);
     Require(PipelineLibraryCountersOf(context.device).linked == 1, "the readback pipeline was not linked from graphics libraries");
     Require(trace.optimized.size() == (optimize ? 1u : 0u), "the optimized pipeline creation count differs from the requested mode");
     render(optimize, "completed link");
-    std::printf("pipeline readback passed: fast draws %u, optimized draws %u, optimized creations %zu\n", optimize ? 1u : 2u, optimize ? 1u : 0u, trace.optimized.size());
+    RequireSameOutput(fastPixels, Pixels, optimize ? "link-time optimized" : "second fast-linked");
+    auto whole = context;
+    whole.graphicsPipelineLibrary = false;
+    ClearCachedPipelines(context.device);
+    Pixels.fill(Kept);
+    trace.drawn.clear();
+    trace.bound = VK_NULL_HANDLE;
+    trace.boundCommands = VK_NULL_HANDLE;
+    AgcDriver::Graphics::Draw(whole, state, draw, shaders);
+    device.WaitIdle();
+    {
+        std::lock_guard lock(trace.mutex);
+        Require(trace.drawn.size() == 1 && std::find(trace.whole.begin(), trace.whole.end(), trace.drawn.front()) != trace.whole.end(), "the monolithic draw did not bind a pipeline created whole");
+    }
+    CheckPixels(masked, "monolithic");
+    std::vector<std::byte> wholePixels(Pixels.begin(), Pixels.end());
+    if (injectMismatch) wholePixels[wholePixels.size() / 2u] ^= std::byte{1};
+    RequireSameOutput(fastPixels, wholePixels, "monolithic");
+    std::printf("pipeline readback passed: fast draws %u, optimized draws %u, optimized creations %zu, monolithic output matches\n", optimize ? 1u : 2u, optimize ? 1u : 0u, trace.optimized.size());
 }
 
 }
@@ -231,9 +261,11 @@ int main(int argc, char** argv) {
     try {
         std::string_view mode = "d32";
         bool force = false;
+        bool injectMismatch = false;
         for (int index = 1; index < argc; ++index) {
             const std::string_view argument = argv[index];
             if (argument == "--force-lto") force = true;
+            else if (argument == "--inject-mismatch") injectMismatch = true;
             else {
                 Require(argument == "color32" || argument == "color64" || argument == "d32" || argument == "d16", "unknown pipeline readback case");
                 mode = argument;
@@ -267,7 +299,14 @@ int main(int argc, char** argv) {
         context.deviceProc = Resolve;
         OptimizationDrain drain{context.device};
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        Run(*device, context, trace, mode == "color32" ? 32u : 64u, masked ? VK_FORMAT_UNDEFINED : (mode == "d16" ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT), optimize);
+        try {
+            Run(*device, context, trace, mode == "color32" ? 32u : 64u, masked ? VK_FORMAT_UNDEFINED : (mode == "d16" ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT), optimize, injectMismatch);
+        } catch (const std::exception& error) {
+            if (!injectMismatch || std::string_view(error.what()).find("monolithic: byte") == std::string_view::npos) throw;
+            std::printf("pipeline readback detected the injected mismatch: %s\n", error.what());
+            return 0;
+        }
+        Require(!injectMismatch, "the injected pipeline mode mismatch was not detected");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

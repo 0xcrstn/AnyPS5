@@ -183,6 +183,11 @@ void ValidateSampleMask(const Context& context, const State& state, std::span<co
 
 namespace {
 
+bool VerifyPipelineModes() {
+    static const bool verify = std::getenv("APS5_VERIFY_PIPELINE_MODES") != nullptr;
+    return verify;
+}
+
 thread_local bool prebuilding = false;
 thread_local bool prebuilt = false;
 
@@ -607,6 +612,20 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             ShaderCompileTrace::Event linkEvent("pipeline.graphics_from_libraries");
             traceStages(linkEvent);
             pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+            if (VerifyPipelineModes()) {
+                VkPipeline monolithic = VK_NULL_HANDLE;
+                VkResult created;
+                {
+                    auto pipelineCacheLock = context.LockPipelineCacheForUse();
+                    created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &monolithic);
+                }
+                Require(created == VK_SUCCESS, "APS5_VERIFY_PIPELINE_MODES: the monolithic form of a library-linked pipeline failed with VkResult " + std::to_string(static_cast<int>(created)));
+                context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, monolithic, nullptr);
+                if (optimized != nullptr) {
+                    WaitForOptimizedPipelines(context.device);
+                    Require(optimized->state.load() != OptimizedPipeline::Failed, "APS5_VERIFY_PIPELINE_MODES: link-time optimization failed with VkResult " + std::to_string(static_cast<int>(optimized->failure.load())));
+                }
+            }
         } else {
             PipelineCreationTrace trace("pipeline.graphics", context.pipelineCreationFeedback, pipelineInfo.stageCount);
             traceStages(trace.Event());
@@ -1156,7 +1175,6 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         }
         constexpr std::size_t bound = 1024;
         while (store.entries.size() > bound) {
-            // Only an entry no recorded draw still holds may go (Kept keeps its shared_ptr until the fence).
             const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
             if (victim == store.entries.end()) break;
             store.index.erase(victim->hash);
