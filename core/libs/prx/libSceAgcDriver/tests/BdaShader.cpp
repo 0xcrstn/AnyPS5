@@ -12,13 +12,13 @@
 
 namespace {
 
-ShaderRecompiler::BdaTable::Translation testTranslation = ShaderRecompiler::BdaTable::Translation::Legacy;
-ShaderRecompiler::BdaTable::Relative testRelative = ShaderRecompiler::BdaTable::Relative::Off;
-ShaderRecompiler::RewriteMode testSpanHelpers = ShaderRecompiler::RewriteMode::Off;
+ShaderRecompiler::BdaTable::Translation testTranslation = ShaderRecompiler::BdaTable::TranslationSetting();
+ShaderRecompiler::BdaTable::Relative testRelative = ShaderRecompiler::BdaTable::RelativeSetting();
+ShaderRecompiler::RewriteMode testSpanHelpers = ShaderRecompiler::BdaSpanHelpersSetting();
 std::uint32_t testSpanInjection = 0;
-ShaderRecompiler::RewriteMode testWriteNotes = ShaderRecompiler::RewriteMode::Off;
+ShaderRecompiler::RewriteMode testWriteNotes = ShaderRecompiler::BdaWriteNotesSetting();
 std::uint64_t testNoteInjection = 0;
-bool testInlineFastPath = false;
+bool testInlineFastPath = ShaderRecompiler::BdaTable::InlineFastPathSetting();
 
 template<typename TEmit>
 std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, std::uint32_t extracted = 0, bool writes = false, const std::function<void(ShaderRecompiler::SpirvEmitterState&)>& prologue = {}) {
