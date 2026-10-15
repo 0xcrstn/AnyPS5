@@ -1403,6 +1403,14 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    add_test(NAME agc_recorder_completion_labels COMMAND agc_driver_recorder_tests --completion-labels-only)
+    add_test(NAME agc_recorder_completion_labels_late COMMAND agc_driver_recorder_tests --completion-labels-only)
+    set_tests_properties(agc_recorder_completion_labels agc_recorder_completion_labels_late PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_recorder_completion_labels_late PROPERTIES ENVIRONMENT "APS5_LABEL_TRUST_LATE=1")
+    if(WIN32)
+        set_tests_properties(agc_recorder_completion_labels agc_recorder_completion_labels_late PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_unchanged_cpu_stamps COMMAND agc_driver_recorder_tests --unchanged-cpu-stamps-only)
     set_tests_properties(agc_unchanged_cpu_stamps PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
@@ -1472,6 +1480,15 @@ if(BUILD_TESTING)
     set_tests_properties(agc_parallel_revalidate_verify PROPERTIES ENVIRONMENT "APS5_PARALLEL_RESOLVE=1;APS5_PARALLEL_REVALIDATE=1;APS5_EPOCH_DIRTY_SET=1;APS5_VERIFY_PARALLEL_REVALIDATE=1")
     if(WIN32)
         set_tests_properties(agc_parallel_revalidate agc_parallel_revalidate_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_staged_draw_builds COMMAND agc_driver_recorder_tests --staged-draw-builds-only)
+    add_test(NAME agc_staged_draw_builds_verify COMMAND agc_driver_recorder_tests --staged-draw-builds-only)
+    set_tests_properties(agc_staged_draw_builds agc_staged_draw_builds_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_staged_draw_builds PROPERTIES ENVIRONMENT "APS5_PARALLEL_RESOLVE=1;APS5_STAGED_DRAW_BUILDS=1")
+    set_tests_properties(agc_staged_draw_builds_verify PROPERTIES ENVIRONMENT "APS5_PARALLEL_RESOLVE=1;APS5_STAGED_DRAW_BUILDS=1;APS5_VERIFY_STAGED_DRAW_BUILDS=1")
+    if(WIN32)
+        set_tests_properties(agc_staged_draw_builds agc_staged_draw_builds_verify PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_chunk_commands COMMAND agc_driver_recorder_tests --chunk-commands-only)
@@ -2068,6 +2085,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_queue_topology_same_family_verify PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    set_property(TEST agc_driver_same_family_missing_order APPEND PROPERTY ENVIRONMENT "APS5_QUEUE_TOPOLOGY=same-family;APS5_QUEUE_TOPOLOGY_VERIFY=1")
+    add_test(NAME agc_driver_same_family_missing_order_injected COMMAND agc_driver_same_family_missing_order_tests --missing-order)
+    set_tests_properties(agc_driver_same_family_missing_order_injected PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_TOPOLOGY=same-family;APS5_QUEUE_TOPOLOGY_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_same_family_missing_order_injected PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_label_publication_verify COMMAND agc_driver_label_publication_order_tests --verify)
     set_tests_properties(agc_driver_label_publication_verify PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
@@ -2083,6 +2108,32 @@ if(BUILD_TESTING)
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_BDA_RANGE_CACHE=1;APS5_VERIFY_BDA_RANGE_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
         set_tests_properties(agc_driver_bda_device_range_cache agc_driver_bda_device_range_cache_verify PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    set_property(TEST agc_driver_compute_pipeline_outside_gpu_mutex APPEND PROPERTY ENVIRONMENT "APS5_PIPELINE_PREWARM=0")
+    add_test(NAME agc_driver_dispatch_moved_templates_unprepared COMMAND agc_driver_dispatch_moved_templates_tests)
+    set_tests_properties(agc_driver_dispatch_moved_templates_unprepared PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PREPARED_MOVED_SETS=0" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_dispatch_moved_templates_unprepared PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_global_loads_unlocked_verify COMMAND agc_driver_global_loads_tests)
+    add_test(NAME agc_driver_global_loads_locked COMMAND agc_driver_global_loads_tests)
+    set_tests_properties(agc_driver_global_loads_unlocked_verify PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_UNLOCKED_ADDRESS_BUILDS=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_driver_global_loads_locked PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_UNLOCKED_ADDRESS_BUILDS=0" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_global_loads_unlocked_verify agc_driver_global_loads_locked PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_dispatch_epoch_proofs_verify COMMAND agc_driver_dispatch_epoch_proofs_tests)
+    set_tests_properties(agc_driver_dispatch_epoch_proofs agc_driver_dispatch_epoch_proofs_verify PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_property(TEST agc_driver_dispatch_epoch_proofs_verify APPEND PROPERTY ENVIRONMENT "APS5_VERIFY_PARALLEL_DISPATCH_REVALIDATE=1")
+    if(WIN32)
+        set_tests_properties(agc_driver_dispatch_epoch_proofs_verify PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_property(TEST agc_driver_compute_pipeline_outside_gpu_mutex APPEND PROPERTY ENVIRONMENT "APS5_PIPELINE_CONTENT_DEDUP=0")

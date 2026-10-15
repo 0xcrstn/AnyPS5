@@ -2094,10 +2094,19 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
     // reference: no GPU wait, no device lock (the mutating thread may be a driver thread holding
     // it). The registry rescans; a range still pinned by a build or a batch holding the space comes
     // back here and finishes lease batches below.
-    if (auto dropped = Spaces().current.exchange(nullptr); dropped != nullptr) {
-        Spaces().droppedByWaiter.store(true, std::memory_order_relaxed);
-        Spaces().waiterDrops.fetch_add(1, std::memory_order_relaxed);
+    std::vector<std::shared_ptr<ShaderResources>> templates;
+    try {
+        SharedResourceCache().RemoveAddressTemplates(templates);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[gpu] address template eviction failed: %s\n", error.what());
+    }
+    if (auto dropped = Spaces().current.exchange(nullptr); dropped != nullptr || !templates.empty()) {
+        if (dropped != nullptr) {
+            Spaces().droppedByWaiter.store(true, std::memory_order_relaxed);
+            Spaces().waiterDrops.fetch_add(1, std::memory_order_relaxed);
+        }
         dropped.reset();
+        templates.clear();
         auto& state = Leases();
         std::lock_guard lock(state.mutex);
         ++state.stats.contentionWaits;
@@ -2937,6 +2946,31 @@ void GuestBufferMemory::AcquireRegistered() {
     }
 }
 
+bool GuestBufferMemory::AcquireCachedSpace() {
+    Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
+    if (!addressSpaceCacheEnabled()) return false;
+    auto current = Spaces().current.load();
+    if (current == nullptr || !current->sparseMirrors.empty() || !current->writableMirrors.empty() || !current->heapRuns.empty()) return false;
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (current->device != context.device || current->generation != generation || current->importsEpoch != state.epoch) return false;
+        importFloor = state.useCounter + 1;
+        const auto stamp = ++state.useCounter;
+        for (const auto& region : current->base) {
+            if (region.direct != nullptr) region.direct->lastUse = stamp;
+        }
+    }
+    ensurePinWaiter();
+    static const bool sortedLookup = std::getenv("APS5_NO_SORTED_SNAPSHOT_LOOKUP") == nullptr;
+    Spaces().hits.fetch_add(1, std::memory_order_relaxed);
+    space = std::move(current);
+    for (const auto& range : space->copied) addCopiedRange(range);
+    regionsSorted = sortedLookup;
+    return true;
+}
+
 void GuestBufferMemory::validate(std::uint64_t address, std::size_t bytes) const {
     Require(!uploaded, "guest memory ownership is frozen for GPU execution");
     Require(address != 0 && bytes != 0, "empty guest memory range");
@@ -3763,6 +3797,54 @@ void GuestBufferMemory::CompletePointerWrites(std::span<const Coherence::Interva
     if (pointerToken.Held()) pointerToken.Complete(written);
 }
 
+void GuestBufferMemory::storePointerHeaps() const {
+    std::vector<std::uint8_t> reached(pointerHeaps.size(), PointerStoreEveryHeap() ? 1 : 0);
+    if (!PointerStoreEveryHeap() && !pointerHeaps.empty()) {
+        StorageTexture::MarkPendingReached(pointerHeaps, reached);
+        MarkShadowedReached(pointerHeaps, reached);
+    }
+    for (std::size_t index = 0; index < pointerHeaps.size(); ++index) {
+        const auto [begin, end] = pointerHeaps[index];
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (reached[index] != 0) static_cast<void>(StorageTexture::StoreForPointerAccess(begin, bytes, pointerExempt));
+        else if (VerifyPointerStorePretest()) Require(!StorageTexture::StoreForPointerAccess(begin, bytes, pointerExempt), "APS5_VERIFY_POINTER_STORE_PRETEST: a pointer heap no pending image or unit shadow reaches stored or published storage results");
+    }
+    if (Coherence::Tracking()) {
+        for (const auto& [begin, end] : pointerHeaps) StorageTexture::AuditPointerReads(begin, static_cast<std::size_t>(end - begin), pointerExempt);
+    }
+}
+
+bool GuestBufferMemory::ReusableAddressSpace() const {
+    if (space == nullptr || !lease.empty() || !uploaded || committed || pointerWrites) return false;
+    if (!space->copied.empty() || !space->writableMirrors.empty() || !space->heapRuns.empty() || !space->heapMirrors.empty() || !space->sparseMirrors.empty()) return false;
+    if (HasCopiedWrites() || HasStagedRegions()) return false;
+    return std::none_of(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy || region.buffer != nullptr || region.mirror != nullptr || region.sparse; });
+}
+
+std::uint64_t GuestBufferMemory::AddressSpaceSerial() const {
+    return space != nullptr ? space->serial : 0;
+}
+
+bool GuestBufferMemory::AddressSpaceCurrent() const {
+    if (space == nullptr || space->device != context.device) return false;
+    if (Spaces().current.load().get() != space.get()) return false;
+    if (space->generation != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return false;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return space->importsEpoch == state.epoch;
+}
+
+void GuestBufferMemory::RefreshAddressUse() const {
+    Require(space != nullptr && uploaded && !committed, "an address template's use needs its uploaded address space");
+    completeSpaceWrites();
+    storePointerHeaps();
+    if (AnyDeviceResident()) {
+        if (auto* active = Recorder::Current()) {
+            for (const auto& [begin, end] : DeviceReads()) PublishDeviceResident(*active, begin, static_cast<std::size_t>(end - begin), ResidentSite::AddressBased);
+        }
+    }
+}
+
 void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     pointerHeaps.clear();
@@ -3972,19 +4054,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         }
         for (const auto& region : regions) heap(region);
     }
-    std::vector<std::uint8_t> reached(pointerHeaps.size(), PointerStoreEveryHeap() ? 1 : 0);
-    if (!PointerStoreEveryHeap() && !pointerHeaps.empty()) {
-        StorageTexture::MarkPendingReached(pointerHeaps, reached);
-        MarkShadowedReached(pointerHeaps, reached);
-    }
-    for (std::size_t index = 0; index < pointerHeaps.size(); ++index) {
-        const auto [begin, end] = pointerHeaps[index];
-        const auto bytes = static_cast<std::size_t>(end - begin);
-        if (reached[index] != 0) static_cast<void>(StorageTexture::StoreForPointerAccess(begin, bytes, pointerExempt));
-        else if (VerifyPointerStorePretest()) Require(!StorageTexture::StoreForPointerAccess(begin, bytes, pointerExempt), "APS5_VERIFY_POINTER_STORE_PRETEST: a pointer heap no pending image or unit shadow reaches stored or published storage results");
-    }
+    storePointerHeaps();
     if (Coherence::Tracking() && !pointerHeaps.empty()) {
-        for (const auto& [begin, end] : pointerHeaps) StorageTexture::AuditPointerReads(begin, static_cast<std::size_t>(end - begin), pointerExempt);
         if (pointerWrites) {
             std::vector<Coherence::Interval> heaps;
             heaps.reserve(pointerHeaps.size());

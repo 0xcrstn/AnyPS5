@@ -90,6 +90,7 @@ public:
         skipPeerOnce = true;
     }
     static bool QueueOrderVerify();
+    static void SuppressOrderWaitsForTest(bool suppress);
     struct QueueOrderStatistics {
         std::uint64_t requiredWaits = 0;
         std::uint64_t peerWaits = 0;
@@ -222,7 +223,7 @@ public:
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
     static bool VerifyInPlaceDrawInputs();
-    void NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes);
+    bool NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
     using ReadList = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
     void NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind);
@@ -385,7 +386,7 @@ public:
     // BehindCompletion replaces the other reasons when the refused entry's value reaches memory
     // only through a completion action of its batch (AfterCompletions: the GPU has no view of the
     // range, or a write-back overwrote the GPU's store): a poller must reap that batch to converge.
-    enum class LabelRefusal : std::uint8_t { None = 0, TrustOff, Queued, Overwritten, Unclosed, BehindCompletion };
+    enum class LabelRefusal : std::uint8_t { None = 0, TrustOff, Queued, Overwritten, Unclosed, BehindCompletion, Unordered };
     // Per calling thread (lookups run on the waiting worker): late candidates seen, in both modes,
     // and the refusals by reason ([packets] line deltas).
     struct LateStatistics {
@@ -664,6 +665,7 @@ private:
             std::uint64_t generation;
         };
         std::vector<InPlaceInput> inPlaceInputs;
+        std::vector<std::uint64_t> inPlaceLeases;
         struct ReadListNote {
             std::shared_ptr<const ReadList> ranges;
             std::size_t position;
@@ -674,6 +676,7 @@ private:
         std::uint64_t serial = 0;
         std::uint64_t traceId = 0;
         bool submitted = false;
+        std::atomic<std::uint64_t> submitOrder{0};
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
@@ -907,6 +910,14 @@ private:
     std::uint64_t writtenBackSequence = 0;
     // PendingLabel without the table mutex (the caller holds it, or the GPU mutex).
     std::optional<LabelHit> lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const;
+    struct LabelPick {
+        const LabelEntry* entry = nullptr;
+        bool queued = false;
+        bool foreign = false;
+    };
+    LabelPick pickLabelLocked(std::uint64_t dword, std::uint32_t tag) const;
+    static std::optional<LabelHit> evaluateLabel(std::span<const LabelEntry* const> entries, std::uint64_t afterStamp, LabelRefusal* refusal);
+    static std::optional<bool> LaterLabel(const LabelEntry& first, const LabelEntry& second);
     // Whether the in-flight batch with that serial has not signaled its fence (false when it is
     // not in flight any more): what makes a wait for it a real GPU wait (ThreadHookWaits).
     bool unsignaled(std::uint64_t serial) const;
