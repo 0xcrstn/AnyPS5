@@ -157,6 +157,7 @@ public:
             VkBuffer handle = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
             std::span<const std::byte> bytes;
+            bool inPlace = false;
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation fragmentAllocation;
@@ -195,6 +196,8 @@ public:
         std::array<std::uint64_t, static_cast<std::size_t>(WholeCopy::Count)> wholeBytes{};
         std::uint64_t arenaHits = 0;
         std::uint64_t arenaCopies = 0;
+        std::uint64_t inPlace = 0;
+        std::uint64_t inPlaceBytes = 0;
         double checkUs = 0;
         double collectUs = 0;
         double lookupUs = 0;

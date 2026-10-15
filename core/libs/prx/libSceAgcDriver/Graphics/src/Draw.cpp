@@ -620,7 +620,7 @@ void reportRecordParts(const DrawProfile& profile, double elapsedSeconds) {
         const auto snapshotDraws = profile.bindingDraws != 0 ? static_cast<double>(profile.bindingDraws) : 1.0;
         const auto twins = Recorder::TwinCounters();
         static Recorder::SnapshotTwinCounters reportedTwins{};
-        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw; %llu copies limited to the read ranges, %.1f KiB left uncopied per such draw), %llu skipped, %llu descriptor writes; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.limited), static_cast<double>(bindings.uncopiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots: %llu draws took %llu (%.1f each: %llu reused, %llu copied, %.1f KiB copied per such draw; %llu copies limited to the read ranges, %.1f KiB left uncopied per such draw), %llu skipped, %llu bound in place (%.1f MiB), %llu descriptor writes; passes: %llu continued, %llu begun after a barrier, %llu begun without one", static_cast<unsigned long long>(profile.bindingDraws), static_cast<unsigned long long>(bindings.snapshots), static_cast<double>(bindings.snapshots) / snapshotDraws, static_cast<unsigned long long>(bindings.reused), static_cast<unsigned long long>(bindings.copied), static_cast<double>(bindings.copiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.limited), static_cast<double>(bindings.uncopiedBytes) / 1024.0 / snapshotDraws, static_cast<unsigned long long>(bindings.skipped), static_cast<unsigned long long>(bindings.inPlace), static_cast<double>(bindings.inPlaceBytes) / 1048576.0, static_cast<unsigned long long>(bindings.descriptorWrites), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.passBarriers), static_cast<unsigned long long>(profile.passesBegun - std::min(profile.passesBegun, profile.passBarriers)));
         if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) {
             std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; device twins%s: %llu snapshot reads bound to one (%.1f MiB), %llu made (%.1f MiB copied in batch prologues), %llu refreshed by changed blocks (%.1f MiB), %llu evicted, %llu reads of unkept snapshots", Recorder::SnapshotTwinsEnabled() ? "" : " (off)", static_cast<unsigned long long>(twins.bound - reportedTwins.bound), static_cast<double>(twins.boundBytes - reportedTwins.boundBytes) / 1048576.0, static_cast<unsigned long long>(twins.made - reportedTwins.made), static_cast<double>(twins.madeBytes - reportedTwins.madeBytes) / 1048576.0, static_cast<unsigned long long>(twins.patched - reportedTwins.patched), static_cast<double>(twins.patchedBytes - reportedTwins.patchedBytes) / 1048576.0, static_cast<unsigned long long>(twins.dropped - reportedTwins.dropped), static_cast<unsigned long long>(twins.unkept - reportedTwins.unkept));
         }
@@ -685,6 +685,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         profile.bindings.reused += bindings.reused;
         profile.bindings.copied += bindings.copied;
         profile.bindings.skipped += bindings.skipped;
+        profile.bindings.inPlace += bindings.inPlace;
+        profile.bindings.inPlaceBytes += bindings.inPlaceBytes;
         profile.bindings.copiedBytes += bindings.copiedBytes;
         profile.bindings.descriptorWrites += bindings.descriptorWrites;
         profile.bindings.limited += bindings.limited;
@@ -2139,6 +2141,10 @@ Recorder::BoundPlacement drawPlacement(const ShaderResources& resources, const S
     if (bindings != nullptr) {
         for (const auto& snapshot : bindings->snapshots) {
             const auto bytes = static_cast<std::uint64_t>(snapshot.bytes.size());
+            if (snapshot.inPlace) {
+                placement.inPlace += bytes;
+                continue;
+            }
             if (snapshot.address != 0) placement.inPlace -= std::min(placement.inPlace, bytes);
             (snapshot.twin != nullptr ? placement.device : placement.hostCopies) += bytes;
         }

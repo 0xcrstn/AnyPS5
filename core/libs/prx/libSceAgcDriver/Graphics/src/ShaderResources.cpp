@@ -4606,6 +4606,14 @@ bool MovedWordRing() {
     return MovedWordRingFlag().load(std::memory_order_relaxed);
 }
 
+bool InPlaceDrawInputs() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_IN_PLACE_DRAW_INPUTS");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 bool AddressBasedDrawSnapshots() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_BDA_DRAW_SNAPSHOTS");
@@ -4817,6 +4825,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (statistics != nullptr) ++statistics->skipped;
                 continue;
             }
+            if (InPlaceDrawInputs()) {
+                if (statistics != nullptr) {
+                    ++statistics->inPlace;
+                    statistics->inPlaceBytes += item.size;
+                }
+                continue;
+            }
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
@@ -4825,6 +4840,18 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             continue;
         }
         lap(&DrawBindingsStatistics::checkUs);
+        if (override != moved.end() && InPlaceDrawInputs()) {
+            if (const auto* import = InPlaceDrawInput(context, begin, bytes, std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4))) {
+                selected.push_back(index);
+                result->snapshots.push_back({begin, nullptr, {}, import->buffer, begin - import->base, std::span<const std::byte>(reinterpret_cast<const std::byte*>(begin), bytes), true});
+                if (statistics != nullptr) {
+                    ++statistics->inPlace;
+                    statistics->inPlaceBytes += bytes;
+                }
+                lap(&DrawBindingsStatistics::lookupUs);
+                continue;
+            }
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         std::optional<ByteRanges> readRanges;
         std::size_t covered = 0;
