@@ -137,6 +137,13 @@ public:
     // reconciles imports and refreshes mirrors, which needs the lock.
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0);
     void Complete();
+    struct StagedDraw {};
+    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, StagedDraw);
+    void CompleteDraw(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
+    bool StagedAddressLocked() const { return lockedBuild; }
+    bool UnlockedAddressBuild() const { return usesBda && unlockedPrepare; }
+    static bool VerifyUnlockedAddressBuilds();
+    bool SameBuildAs(const ShaderResources& other) const;
     bool Completed() const { return completed; }
     ~ShaderResources();
     ShaderResources(const ShaderResources&) = delete;
@@ -524,7 +531,7 @@ private:
     void applyAnisoOverride();
     void forgetDeferredInputs();
     void release() noexcept;
-    void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
+    bool prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool unlocked = false);
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
     void reportDescriptorCaches() const;
@@ -717,6 +724,10 @@ private:
     // Stage A runs without the device lock (a deferred, non-address-based build).
     bool unlockedPrepare = false;
     bool completed = false;
+    ColorTarget stagedTarget{};
+    std::uint32_t stagedColorAttachments = 0;
+    std::uint64_t stagedIndexAddress = 0;
+    std::size_t stagedIndexBytes = 0;
     std::chrono::steady_clock::time_point phaseStart;
 };
 

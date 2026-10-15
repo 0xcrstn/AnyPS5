@@ -10937,6 +10937,46 @@ std::uint64_t revalidations(const ParallelResolveCounts& counts, ShaderResources
     return counts.revalidations[static_cast<std::size_t>(verdict)];
 }
 
+bool stagedDrawBuildTests(const Device& device, Recorder& recorder) {
+    if (!StagedDrawBuilds()) {
+        std::cout << "skipped, the staged draw build test needs APS5_PARALLEL_RESOLVE=1 and APS5_STAGED_DRAW_BUILDS not 0\n";
+        return false;
+    }
+    return withResolveScene(device, recorder, [&](ResolveScene& scene) {
+        const auto& context = scene.context;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto before = ParallelResolveStatistics();
+        const auto first = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        const auto staged = ParallelResolveStatistics();
+        if (staged.stagedBuilt == before.stagedBuilt) {
+            std::cout << "skipped, the scene's first draw was not staged as a template miss\n";
+            return false;
+        }
+        Require(staged.stagedAdopted == before.stagedAdopted, "a staged draw build was adopted before its encode");
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *first);
+        scene.check("a draw whose build was staged on the side rendered other pixels");
+        const auto adopted = ParallelResolveStatistics();
+        Require(adopted.stagedAdopted - before.stagedAdopted == 1, "the staged draw build was not adopted at encode");
+        Require(!VerifyStagedDrawBuilds() || adopted.stagedVerified - before.stagedVerified == 1, "APS5_VERIFY_STAGED_DRAW_BUILDS checked no adopted build");
+        const auto second = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        const auto repeated = ParallelResolveStatistics();
+        const bool cached = repeated.resourcesResolved == adopted.resourcesResolved + 1;
+        Require(cached != (repeated.stagedBuilt == adopted.stagedBuilt + 1), "a draw repeating an adopted build was neither served by its cached template nor staged again");
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *second);
+        scene.check("a draw repeating an adopted build rendered other pixels");
+        Require(cached || ParallelResolveStatistics().stagedAdopted - adopted.stagedAdopted == 1, "a second staged build of the same draw was not adopted");
+        const auto discarded = ResolveDraw(context, scene.state, scene.indexed, scene.shaders);
+        static_cast<void>(discarded);
+        scene.clear();
+        Draw(context, scene.state, scene.indexed, scene.shaders);
+        scene.check("a serial draw after an unused staged build rendered other pixels");
+        std::cout << "staged draw build tests passed" << (VerifyStagedDrawBuilds() ? " (verified)" : "") << "\n";
+        return true;
+    });
+}
+
 bool parallelRevalidateTests(const Device& device, Recorder& recorder) {
     if (!ParallelRevalidateRequested()) {
         std::cout << "skipped, the parallel revalidate test needs APS5_PARALLEL_RESOLVE=1 and APS5_PARALLEL_REVALIDATE=1\n";
@@ -11490,6 +11530,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--parallel-revalidate-only") {
             return parallelRevalidateTests(device, recorder) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--staged-draw-builds-only") {
+            return stagedDrawBuildTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {
             pendingWriteSnapshotTests(device, recorder);

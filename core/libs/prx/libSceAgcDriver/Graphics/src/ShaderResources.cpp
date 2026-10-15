@@ -1208,7 +1208,34 @@ ShaderResources::ShaderResources(const Context& context, std::span<const Compile
 
 ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots) : ShaderResources(context, compute, snapshots, false) {}
 
+ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, StagedDraw) : context(context), guestMemory(context), stagedTarget(target), stagedColorAttachments(colorAttachments), stagedIndexAddress(indexAddress), stagedIndexBytes(indexBytes) {
+    drawBuild = true;
+    if (!prepareAddressBindings(shaders, snapshots, true)) {
+        lockedBuild = true;
+        return;
+    }
+    unlockedPrepare = true;
+    buildPrepare(shaders, &stagedTarget, colorAttachments, indexAddress, indexBytes);
+}
+
+void ShaderResources::CompleteDraw(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
+    Require(drawBuild && !completed && (unlockedPrepare || lockedBuild), "a staged draw build was completed twice or never staged");
+    if (lockedBuild) {
+        prepareAddressBindings(shaders, snapshots);
+        buildPrepare(shaders, &stagedTarget, stagedColorAttachments, stagedIndexAddress, stagedIndexBytes);
+    }
+    buildComplete();
+}
+
 namespace {
+
+bool UnlockedAddressBuilds() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_UNLOCKED_ADDRESS_BUILDS");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
 
 // Whether a compute stage maps registered guest memory through BDA tables (see prepareAddressBindings).
 bool UsesAddressTables(const CompiledShader& compute) {
@@ -1234,11 +1261,27 @@ ShaderResources::ShaderResources(const Context& context, const CompiledShader& c
     // imports retires buffers to the recorder, refreshing mirrors waits for recorded work): that is
     // device-lock work, so their whole build waits for Complete(). Without tables the call only
     // checks the bindings.
-    lockedBuild = UsesAddressTables(compute);
-    if (lockedBuild) return;
+    if (UsesAddressTables(compute)) {
+        lockedBuild = !UnlockedAddressBuilds() || !prepareAddressBindings(shaders, snapshots, true);
+        if (lockedBuild) return;
+    } else {
+        prepareAddressBindings(shaders, snapshots);
+    }
     unlockedPrepare = true;
-    prepareAddressBindings(shaders, snapshots);
     buildPrepare(shaders, nullptr, 0, 0, 0);
+}
+
+bool ShaderResources::VerifyUnlockedAddressBuilds() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_UNLOCKED_ADDRESS_BUILDS");
+        return UnlockedAddressBuilds() && text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+bool ShaderResources::SameBuildAs(const ShaderResources& other) const {
+    if (GuestBufferViews() != other.GuestBufferViews() || textures != other.textures || StorageImages() != other.StorageImages()) return false;
+    return layoutKey == other.layoutKey && fragmentLayoutKey == other.fragmentLayoutKey && usesBda == other.usesBda && bdaReadOnly == other.bdaReadOnly && Reusable() == other.Reusable();
 }
 
 void ShaderResources::Complete() {
@@ -2528,7 +2571,7 @@ const char* ShaderResources::EpochProofVerdictName(EpochProofVerdict verdict) {
 
 ShaderResources::EpochProofResult ShaderResources::ResolveEpochProof() const {
     EpochProofResult result;
-    if (!reusable || !ParallelRevalidateRequested() || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return result;
+    if (!reusable || !EpochProofsOffThread() || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return result;
     struct RangesTag {};
     auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, RangesTag>();
     std::uint64_t serial = 0;
@@ -2955,7 +2998,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (!reusable || shaders.empty()) return false;
     if (addressTemplate && !guestMemory.AddressSpaceCurrent()) return false;
     std::unique_lock<std::recursive_mutex> proofLock(proofMutex, std::defer_lock);
-    if (ParallelRevalidateRequested()) proofLock.lock();
+    if (EpochProofsOffThread()) proofLock.lock();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto dirtySerialBefore = GuestMemory::DirtySerial();
