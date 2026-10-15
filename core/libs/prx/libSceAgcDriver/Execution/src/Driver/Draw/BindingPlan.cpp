@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include <algorithm>
@@ -134,7 +135,8 @@ ShaderMemory::IncrementalState& Driver::incrementalBinding(const std::shared_ptr
         std::unordered_map<const ShaderRecompiler::SourceHandle*, std::array<Way, Ways>> shaders;
         std::uint64_t clock = 0;
     };
-    static thread_local Table table;
+    struct TableStorage {};
+    auto& table = HostThreadLocal<Table, TableStorage>();
     auto found = table.shaders.find(handle.get());
     if (found == table.shaders.end()) {
         if (table.shaders.size() >= Shaders) table.shaders.clear();
