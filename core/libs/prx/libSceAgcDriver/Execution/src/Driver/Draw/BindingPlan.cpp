@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
 
@@ -32,6 +33,17 @@ bool SameAttribute(const ShaderRecompiler::VertexAttribute& a, const ShaderRecom
     return a.location == b.location && a.components == b.components && a.fetchIndex == b.fetchIndex && a.formatComponents == b.formatComponents && std::memcmp(&a.resource, &b.resource, sizeof(a.resource)) == 0;
 }
 
+std::string HexText(std::uint64_t value) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
+}
+
+void ThrowStageMismatch(std::uint32_t queue, std::uint64_t submission, std::size_t packetOffset, std::size_t stage, std::uint64_t program, SnapshotPart part) {
+    const auto index = static_cast<std::size_t>(part) < SnapshotParts ? static_cast<std::size_t>(part) : 0;
+    throw std::runtime_error("AGC driver: binding plan verify: queue " + std::to_string(queue) + " submission " + std::to_string(submission) + " packet at dword " + std::to_string(packetOffset) + ": stage " + std::to_string(stage) + " (program " + HexText(program) + ") differs from the full capture and materialize, first in: " + SnapshotPartNames[index]);
 }
 
 bool SameStageResult(const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b) {
@@ -82,7 +94,10 @@ bool Driver::bindingPlan() {
 }
 
 bool Driver::verifyBindingPlan() {
-    static const bool verify = std::getenv("APS5_VERIFY_BINDING_PLAN") != nullptr;
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_BINDING_PLAN");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
     return verify;
 }
 
@@ -129,8 +144,7 @@ void Driver::planDrawDecode(const QueueState& queue, const Submission& submissio
         if (verify) ++bindingPlanCounters.verifiedDecodes;
         if (mismatch) {
             ++bindingPlanCounters.decodeMismatches;
-            static std::atomic<std::uint64_t> reports{0};
-            if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[binding-plan] verify: the decode kept for key 0x%llx differs from a fresh decode after patching %zu user words\n", static_cast<unsigned long long>(key), patches.size());
+            throw std::runtime_error("AGC driver: binding plan verify: queue " + std::to_string(submission.queue) + " submission " + std::to_string(submission.serial) + " packet at dword " + std::to_string(currentPacketOffset()) + ": the decode kept for key " + HexText(key) + " differs from a fresh decode after patching " + std::to_string(patches.size()) + " user words");
         }
         if (profile) reportBindingPlan();
         return;

@@ -131,6 +131,7 @@ enum class SnapshotPart : std::uint8_t { None, Buffer, Image, Sampler, FlatData,
 inline constexpr std::size_t SnapshotParts = static_cast<std::size_t>(SnapshotPart::Count);
 inline constexpr const char* SnapshotPartNames[SnapshotParts] = {"none", "buffer descriptor", "image descriptor", "sampler", "flat SRT data word (pure leaf)", "flat SRT other word", "user data", "uniform fill", "poisoned read", "null-root reads", "result only"};
 SnapshotPart FirstSnapshotDifference(const ShaderRecompiler::ResourceCapture& full, const ShaderRecompiler::ResourceSnapshot& planned);
+[[noreturn]] void ThrowStageMismatch(std::uint32_t queue, std::uint64_t submission, std::size_t packetOffset, std::size_t stage, std::uint64_t program, SnapshotPart part);
 
 struct BindingPlanCounters {
     std::uint64_t draws = 0, decodeHits = 0, decodeMisses = 0, decodesPatched = 0, stages = 0, templateHits = 0, keyWords = 0, valueWords = 0, verifiedStages = 0, stageMismatches = 0, verifiedDecodes = 0, decodeMismatches = 0;
