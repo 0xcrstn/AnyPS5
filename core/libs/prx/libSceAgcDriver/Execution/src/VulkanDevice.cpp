@@ -4178,7 +4178,17 @@ bool VerifyMovedTemplates() {
     return verify;
 }
 
+bool PreparedMovedSets() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_PREPARED_MOVED_SETS");
+        return MovedTemplatesSwitch() && (text == nullptr || std::strcmp(text, "0") != 0);
+    }();
+    return enabled;
+}
+
 struct MovedTemplateTotals {
+    std::atomic<std::uint64_t> preparedAdopted{0};
+    std::atomic<std::uint64_t> preparedRefused{0};
     std::atomic<std::uint64_t> hits{0};
     std::atomic<std::uint64_t> buffers{0};
     std::atomic<std::uint64_t> refused{0};
@@ -4308,6 +4318,7 @@ struct PreparedDispatch {
     std::shared_ptr<ComputePipelineObjects> objects;
     std::vector<std::uint32_t> describedLayoutKey;
     Graphics::ShaderResources::EpochProofResult epochProof;
+    std::optional<Graphics::ShaderResources::PreparedMovedDispatch> moved;
 };
 
 struct RecipeHit {
@@ -4686,7 +4697,7 @@ bool VulkanDevice::MovedDispatchTemplates() {
 
 VulkanDevice::MovedTemplateStatistics VulkanDevice::MovedTemplateCounters() {
     auto& totals = MovedTemplates();
-    return {totals.hits.load(std::memory_order_relaxed), totals.buffers.load(std::memory_order_relaxed), totals.refused.load(std::memory_order_relaxed), totals.verified.load(std::memory_order_relaxed)};
+    return {totals.hits.load(std::memory_order_relaxed), totals.buffers.load(std::memory_order_relaxed), totals.refused.load(std::memory_order_relaxed), totals.verified.load(std::memory_order_relaxed), totals.preparedAdopted.load(std::memory_order_relaxed), totals.preparedRefused.load(std::memory_order_relaxed)};
 }
 
 void VulkanDevice::NoteRecipe(RecipeEvent event, bool indirect) {
@@ -5045,6 +5056,13 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         phase(PreparedDispatch::PreparePrecollect);
     }
     if (cached != nullptr) prepared->epochProof = ResolveDispatchProof(*cached);
+    if (cached != nullptr && PreparedMovedSets()) {
+        try {
+            prepared->moved = cached->PrepareMovedDispatchBuffers(compute);
+        } catch (const std::exception&) {
+            prepared->moved.reset();
+        }
+    }
     // The pre-sync. Stage B's image lookups that read guest memory on the CPU (PresyncSurfaces)
     // wait, through the flush hook and under the mutex, for the recorded work writing those
     // surfaces: every other worker queues behind that wait. So the wait is made here instead,
@@ -5524,13 +5542,24 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             const auto proof = preparedObject ? prepared->epochProof : Graphics::ShaderResources::EpochProofResult{};
             if (ProveDispatchTemplate(*cached, shaders[0], proof, programAddress, nullptr)) {
                 std::optional<std::vector<Graphics::ShaderResources::MovedDispatchBuffer>> moved;
-                if (MovedTemplatesSwitch()) moved = cached->MovedDispatchBuffers(shaders[0], RecorderFor(GuestMemory::GpuLockThreadTag()));
+                std::shared_ptr<Graphics::ShaderResources::DrawBindings> preparedSet;
+                if (MovedTemplatesSwitch() && preparedObject && prepared->moved.has_value()) {
+                    moved = cached->CheckMovedDispatchBuffers(*prepared->moved, RecorderFor(GuestMemory::GpuLockThreadTag()));
+                    (moved.has_value() ? MovedTemplates().preparedAdopted : MovedTemplates().preparedRefused).fetch_add(1, std::memory_order_relaxed);
+                    if (moved.has_value()) preparedSet = prepared->moved->set;
+                }
+                if (MovedTemplatesSwitch() && !moved.has_value()) moved = cached->MovedDispatchBuffers(shaders[0], RecorderFor(GuestMemory::GpuLockThreadTag()));
                 if (MovedTemplatesSwitch() && !moved.has_value()) {
                     MovedTemplates().refused.fetch_add(1, std::memory_order_relaxed);
                     cached = nullptr;
                 } else {
                     if (moved.has_value() && !moved->empty()) {
-                        movedSet = cached->BindMovedDispatchBuffers(RecorderFor(GuestMemory::GpuLockThreadTag()), *moved);
+                        if (preparedSet != nullptr) {
+                            movedSet = std::move(preparedSet);
+                            RecorderFor(GuestMemory::GpuLockThreadTag()).Keep(movedSet);
+                        } else {
+                            movedSet = cached->BindMovedDispatchBuffers(RecorderFor(GuestMemory::GpuLockThreadTag()), *moved);
+                        }
                         for (const auto& entry : *moved) movedReads.emplace_back(entry.begin, entry.begin + entry.view.range);
                         if (VerifyMovedTemplates()) {
                             auto fresh = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0);
@@ -5596,6 +5625,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         if (MovedTemplatesSwitch()) {
             const auto moved = MovedDispatchTemplates() ? MovedTemplateCounters() : MovedTemplateStatistics{};
             AgcDriver::ProfilePrint_nid_no_patch("[rescache] moved read-only buffers (dispatch, cumulative): %llu template hits rebound %llu moved buffers, %llu hits refused (a moved buffer not bindable as a build would bind it), %llu verified against a fresh build\n", static_cast<unsigned long long>(moved.hits), static_cast<unsigned long long>(moved.buffers), static_cast<unsigned long long>(moved.refused), static_cast<unsigned long long>(moved.verified));
+            if (PreparedMovedSets()) AgcDriver::ProfilePrint_nid_no_patch("[rescache] moved buffer sets prepared off the record thread (dispatch, cumulative): %llu adopted, %llu refused by the ordered check\n", static_cast<unsigned long long>(MovedTemplates().preparedAdopted.load(std::memory_order_relaxed)), static_cast<unsigned long long>(MovedTemplates().preparedRefused.load(std::memory_order_relaxed)));
         }
         AgcDriver::ProfilePrint_nid_no_patch("[rescache] address-based dispatch builds with stage A off the GPU mutex (cumulative): %llu\n", static_cast<unsigned long long>(UnlockedAddressCounts().load(std::memory_order_relaxed)));
         if (Graphics::ParallelDispatchRevalidate()) AgcDriver::ProfilePrint_nid_no_patch("[rescache] dispatch template proofs from the preparation (cumulative), by verdict:%s; verified %llu\n", DispatchProofReport().c_str(), static_cast<unsigned long long>(DispatchProofs().verified.load(std::memory_order_relaxed)));
