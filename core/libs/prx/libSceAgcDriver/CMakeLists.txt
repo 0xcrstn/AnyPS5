@@ -1978,6 +1978,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_queue_topology_same_family_verify PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    set_property(TEST agc_driver_same_family_missing_order APPEND PROPERTY ENVIRONMENT "APS5_QUEUE_TOPOLOGY=same-family;APS5_QUEUE_TOPOLOGY_VERIFY=1")
+    add_test(NAME agc_driver_same_family_missing_order_injected COMMAND agc_driver_same_family_missing_order_tests --missing-order)
+    set_tests_properties(agc_driver_same_family_missing_order_injected PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_TOPOLOGY=same-family;APS5_QUEUE_TOPOLOGY_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_same_family_missing_order_injected PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_label_publication_verify COMMAND agc_driver_label_publication_order_tests --verify)
     set_tests_properties(agc_driver_label_publication_verify PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
