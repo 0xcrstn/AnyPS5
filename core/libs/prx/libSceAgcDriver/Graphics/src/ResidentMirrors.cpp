@@ -302,15 +302,15 @@ void reportMirrors() {
 bool ResidentMirrorsEnabled() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_RESIDENT_MIRRORS");
-        if (text == nullptr || std::string_view(text) == "1") return ConfiguredBudget().value_or(1) != 0;
-        if (std::string_view(text) == "0") return false;
+        if (text == nullptr || std::string_view(text) == "0") return false;
+        if (std::string_view(text) == "1") return ConfiguredBudget().value_or(1) != 0;
         throw std::runtime_error("APS5_RESIDENT_MIRRORS must be 0 or 1");
     }();
     return enabled;
 }
 
 bool BufferMirrorsEnabled() {
-    static const bool enabled = SwitchOn("APS5_RESIDENT_BUFFER_MIRRORS") && ConfiguredBudget().value_or(1) != 0;
+    static const bool enabled = std::getenv("APS5_RESIDENT_BUFFER_MIRRORS") != nullptr && SwitchOn("APS5_RESIDENT_BUFFER_MIRRORS") && ConfiguredBudget().value_or(1) != 0;
     return enabled;
 }
 
