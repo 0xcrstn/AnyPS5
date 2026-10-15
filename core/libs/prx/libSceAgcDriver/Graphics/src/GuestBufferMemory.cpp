@@ -4979,6 +4979,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::ShadowedRanges(s
             result.push_back(range);
             continue;
         }
+        static_cast<void>(GuestMemory::CollectWrites(range.begin, static_cast<std::size_t>(bytes)));
         const std::pair<std::uint64_t, std::uint64_t> run{0, bytes};
         const auto sources = ShadowSources(context, *import, range.begin, std::span(&run, 1), {}, false);
         for (const auto& source : sources) {
@@ -5006,6 +5007,7 @@ bool GuestBufferMemory::SlabReadsCurrent() const {
         const auto bytes = read.end - read.begin;
         const auto* import = HostImportFor(context, read.begin, static_cast<std::size_t>(bytes));
         if (import == nullptr) return false;
+        static_cast<void>(GuestMemory::CollectWrites(read.begin, static_cast<std::size_t>(bytes)));
         const std::pair<std::uint64_t, std::uint64_t> run{0, bytes};
         const auto sources = ShadowSources(context, *import, read.begin, std::span(&run, 1), {}, false);
         if (sources.size() != 1 || !sources[0].shadow || sources[0].slab != read.slab || sources[0].offset != read.offset) return false;
