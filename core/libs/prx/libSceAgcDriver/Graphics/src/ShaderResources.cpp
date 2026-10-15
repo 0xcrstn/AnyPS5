@@ -3032,7 +3032,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             auto& revalidations = Revalidations();
             revalidations.epochVerifyChecks.fetch_add(1, std::memory_order_relaxed);
             if (!ok) revalidations.epochVerifyDisagreements.fetch_add(1, std::memory_order_relaxed);
-            GuestMemory::NoteDirtySetVerify(ok, {"resources", epochSerialBefore, epochProof.dirtySerial, 0}, proofRanges);
+            static constexpr std::array<const char*, static_cast<std::size_t>(ProofFailure::Count)> sites{"resources", "resources-imports", "resources-evicted", "resources-pending", "resources-changed", "resources-keys", "resources-other"};
+            const auto site = ok ? sites[0] : sites[std::min(static_cast<std::size_t>(failure), sites.size() - 1)];
+            GuestMemory::NoteDirtySetVerify(ok, {site, epochSerialBefore, epochProof.dirtySerial, 0}, proofRanges);
         }
         if (ok && fast && GuestMemory::EpochDirtySetEnabled()) recordEpochProof(dirtySerialBefore);
         else if (!ok) epochProof.valid = false;

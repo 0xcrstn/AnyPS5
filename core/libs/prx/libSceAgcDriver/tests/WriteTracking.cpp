@@ -923,6 +923,31 @@ void CheckEpochDirtyBlockGranularity() {
     Require(DirtySerial() == enabled && UnchangedSinceDirtySerial(tail, 1, enabled), "an already enabled dirty log invalidated its current proof");
 }
 
+void CheckEpochDirtySampleOrder() {
+    struct Restore {
+        bool enabled = EpochDirtySetEnabled();
+        ~Restore() { SetEpochDirtySet(enabled); }
+    } restore;
+    SetEpochDirtySet(true);
+    PartlyCommitted range;
+    range.Commit(0);
+    const auto base = range.Address();
+    std::memset(range.Data(), 0x22, Block);
+    const auto lateGeneration = CollectWritesUncached(base, Block);
+    Require(lateGeneration != 0, "the sample-order range is not collected");
+    Require(MarkWritten(base + 64, 16) != 0, "the sample-order driver store is not stamped");
+    const auto lateSerial = DirtySerial();
+    Require(UnchangedSinceDirtySerial(base, Block, lateSerial) && !UnchangedSince(base, Block, lateGeneration), "a serial sampled after the generation did not reproduce the dirty-set verify disagreement");
+    const auto serial = DirtySerial();
+    const auto generation = CollectWritesUncached(base, Block);
+    Require(generation != 0, "the sample-order range is not collected again");
+    Require(MarkWritten(base + 64, 16) != 0, "the second sample-order driver store is not stamped");
+    Require(!UnchangedSinceDirtySerial(base, Block, serial) && !UnchangedSince(base, Block, generation), "a serial sampled before the generation missed a later store");
+    const auto quietSerial = DirtySerial();
+    const auto quietGeneration = CollectWritesUncached(base, Block);
+    Require(UnchangedSinceDirtySerial(base, Block, quietSerial) == UnchangedSince(base, Block, quietGeneration), "a serial sampled before the generation disagreed without a store");
+}
+
 void CheckEpochDirtyCollectedPages() {
     struct Restore {
         bool enabled = EpochDirtySetEnabled();
@@ -1151,6 +1176,7 @@ int main() {
         CheckEpochDirtyImportFailure();
         CheckEpochDirtyUnstampedBatch();
         CheckEpochDirtyBlockGranularity();
+        CheckEpochDirtySampleOrder();
         CheckEpochDirtyCollectedPages();
         CheckEpochDirtyConcurrentPublication();
 #ifdef _WIN32
