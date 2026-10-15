@@ -3907,6 +3907,29 @@ void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
         Require(same, "a whole snapshot does not hold the guest bytes");
         snapshotRecorder.Sync();
     }
+    {
+        ShaderRecompiler::BufferReadRanges mostly;
+        mostly.ranges = {{0u, 0u, 256u, 12256u}};
+        ShaderRecompiler::RecompileResult mostlyProgram;
+        mostlyProgram.bindings.push_back(binding(&mostly));
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &mostlyProgram, 0};
+        ShaderResources resources(snapshotContext, shader);
+        ShaderResources::DrawBindingsStatistics statistics;
+        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, {}, &statistics);
+        Require(bindings != nullptr && bindings->snapshots.size() == 1, "an input read over most of its bytes was not snapshotted");
+        const char* rangesOnly = std::getenv("APS5_SNAPSHOT_READ_RANGES");
+        if (rangesOnly != nullptr && std::string(rangesOnly) == "1") {
+            Require(statistics.limited == 1 && statistics.copiedBytes == 12000u && statistics.overHalfReadBytes == 0, "with APS5_SNAPSHOT_READ_RANGES=1 an input read over most of its bytes did not copy only its 12000 read bytes");
+        } else {
+            Require(statistics.limited == 0 && statistics.copiedBytes == elementBytes, "an input read over most of its bytes was not copied whole");
+            Require(statistics.wholeCopies[static_cast<std::size_t>(ShaderResources::WholeCopy::OverHalf)] == 1 && statistics.overHalfReadBytes == 12000u, "a whole copy of an input read over most of its bytes did not count its 12000 read bytes under over half");
+        }
+        const auto contents = bindings->snapshots[0].buffer->Bytes();
+        bool same = true;
+        for (std::size_t i = 256; i < 12256; ++i) same = same && contents[i] == static_cast<std::byte>(static_cast<std::uint8_t>((4096 + i) * 7u + 3u));
+        Require(same, "a snapshot of an input read over most of its bytes does not hold the read guest bytes");
+        snapshotRecorder.Sync();
+    }
     recorder.Activate();
 }
 

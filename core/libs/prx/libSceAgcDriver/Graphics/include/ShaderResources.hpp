@@ -201,6 +201,7 @@ public:
         std::uint64_t arenaCopies = 0;
         std::uint64_t inPlace = 0;
         std::uint64_t inPlaceBytes = 0;
+        std::uint64_t overHalfReadBytes = 0;
         double checkUs = 0;
         double collectUs = 0;
         double lookupUs = 0;

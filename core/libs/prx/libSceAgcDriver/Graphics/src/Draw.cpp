@@ -644,6 +644,7 @@ void reportRecordParts(const DrawProfile& profile, double elapsedSeconds) {
         const auto name = ShaderRecompiler::IrOpcodeName(static_cast<ShaderRecompiler::IrOpcode>(opcode));
         r += std::snprintf(reasons + r, sizeof(reasons) - static_cast<std::size_t>(r), "%s %.*s %llu", opcode == blocking.front().first ? " unbounded indices stop at:" : ",", static_cast<int>(name.size()), name.data(), static_cast<unsigned long long>(count));
     }
+    if (bindings.wholeCopies[static_cast<std::size_t>(ShaderResources::WholeCopy::OverHalf)] != 0 && r > 0 && static_cast<std::size_t>(r) < sizeof(reasons)) r += std::snprintf(reasons + r, sizeof(reasons) - static_cast<std::size_t>(r), " over half read %.1f MiB of them;", static_cast<double>(bindings.overHalfReadBytes) / 1048576.0);
     if (any) std::fprintf(stderr, "%s\n", reasons);
 }
 
@@ -697,6 +698,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
             profile.bindings.wholeCopies[reason] += bindings.wholeCopies[reason];
             profile.bindings.wholeBytes[reason] += bindings.wholeBytes[reason];
         }
+        profile.bindings.overHalfReadBytes += bindings.overHalfReadBytes;
         profile.bindings.checkUs += bindings.checkUs;
         profile.bindings.collectUs += bindings.collectUs;
         profile.bindings.lookupUs += bindings.lookupUs;
