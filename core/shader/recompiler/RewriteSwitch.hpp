@@ -35,6 +35,11 @@ inline RewriteMode BdaWriteNotesSetting() {
     return mode;
 }
 
+inline RewriteMode FlushProofsSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_FLUSH_PROOFS", std::getenv("APS5_FLUSH_PROOFS"));
+    return mode;
+}
+
 inline RewriteMode BdaSpanHelpersSetting() {
     static const RewriteMode mode = ParseRewriteMode("APS5_BDA_SPAN_HELPERS", std::getenv("APS5_BDA_SPAN_HELPERS"));
     return mode;
