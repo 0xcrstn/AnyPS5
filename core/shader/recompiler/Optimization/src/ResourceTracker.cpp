@@ -121,6 +121,7 @@ public:
         }
         SplitDescriptorPhis();
         PlanTableColumns();
+        GateTableArms();
         std::unordered_map<const IrBlock*, std::uint32_t> blockIndices;
         for (const IrBlock* block : m_program.BlockOrder()) {
             blockIndices.emplace(block, static_cast<std::uint32_t>(blockIndices.size()));
@@ -978,7 +979,7 @@ private:
     }
 
     template <typename Dword>
-    void ReplaceWithArmCopies(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount, std::span<IrValue* const> conditions, Dword&& dword) {
+    void ReplaceWithArmCopies(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount, std::span<IrValue* const> conditions, Dword&& dword, std::vector<IrValue*>* created = nullptr) {
         std::vector<IrValue*> copies;
         const auto flags = inst.Flags<MemoryFlags>();
         if (!conditions.empty()) {
@@ -1005,6 +1006,9 @@ private:
             std::uint64_t rawFlags = 0;
             std::memcpy(&rawFlags, &copyFlags, sizeof(copyFlags));
             copies.push_back(EmitBefore(inst, inst.Opcode(), inst.Type(), arguments, rawFlags));
+        }
+        if (created != nullptr) {
+            *created = copies;
         }
 
         IrValue* result = copies.back();
@@ -1080,6 +1084,7 @@ private:
         std::string failure;
         bool foldedControlValue = false;
         std::vector<std::vector<IrValue*>> arms;
+        std::vector<std::vector<bool>> carried;
         std::map<WebKey, IrValue*> selectors;
         std::vector<std::pair<IrBlock*, IrValue*>> phis;
         std::vector<std::tuple<IrBlock*, IrValue*, IrValue*>> lanes;
@@ -1286,9 +1291,12 @@ private:
                 web.foldedControlValue = true;
                 return &m_builder.Constant(0u);
             }
+            std::vector<bool> carried;
             for (const WebValue& element : tuple) {
-                if (Rematerialize(element.value, position, false, phiSearchDepth) == nullptr && !ReachesReadUnchanged(element, position)) {
-                    return GiveUp(web, "a descriptor dword is not rebuilt from user data, the SRT and uniform operations before the read, and its value does not reach the read unchanged (" + RebuildBlocker(element.value, phiSearchDepth) + ")");
+                const bool rebuilt = Rematerialize(element.value, position, false, phiSearchDepth) != nullptr;
+                carried.push_back(!rebuilt && !ReachesReadUnchanged(element, position));
+                if (carried.back() && (!element.direct || !DirectDescriptorArms())) {
+                    return GiveUp(web, "a descriptor dword is not rebuilt from user data, the SRT and uniform operations before the read, and it is chosen through a per-lane selection (" + RebuildBlocker(element.value, phiSearchDepth) + ")");
                 }
             }
             std::vector<IrValue*> values;
@@ -1299,11 +1307,16 @@ private:
                 return std::ranges::equal(values, arm, [&](IrValue* left, IrValue* right) { return EquivalentValue(m_program.Resources(), left, right); });
             });
             if (same != web.arms.end()) {
+                auto& known = web.carried[static_cast<std::size_t>(same - web.arms.begin())];
+                for (std::size_t index = 0; index < known.size(); index++) {
+                    known[index] = known[index] || carried[index];
+                }
                 return &m_builder.Constant(static_cast<std::uint32_t>(same - web.arms.begin()));
             }
             if (web.arms.size() == DescriptorWeb::maxArms) {
                 return GiveUp(web, "more than 64 distinct descriptors");
             }
+            web.carried.push_back(std::move(carried));
             web.arms.push_back(std::move(values));
             return &m_builder.Constant(static_cast<std::uint32_t>(web.arms.size() - 1u));
         }
@@ -1430,6 +1443,106 @@ private:
         return &node;
     }
 
+    struct CarriedColumn {
+        std::uint32_t arm = 0;
+        std::uint32_t slot = 0;
+        TableColumnPlan plan;
+        IrValue* offset = nullptr;
+    };
+
+    struct ArmGate {
+        IrValue* read = nullptr;
+        IrValue* selector = nullptr;
+        std::uint32_t arm = 0;
+    };
+
+    IrValue* MirrorOffset(IrValue* value, const IrValue& leaf, std::unordered_map<IrValue*, IrValue*>& mirrored, std::vector<std::pair<IrBlock*, IrValue*>>& phis, std::string& failure) {
+        value = value->Resolve();
+        if (value->IsPhi()) {
+            IrValue* invariant = ResolveInvariantPhi(m_program.Resources(), value);
+            if (invariant != nullptr && !invariant->Resolve()->IsPhi()) {
+                return MirrorOffset(invariant, leaf, mirrored, phis, failure);
+            }
+            if (const auto known = mirrored.find(value); known != mirrored.end()) {
+                return known->second;
+            }
+            IrBlock* block = value->Parent();
+            if (block == nullptr || value->PhiBlockCount() != block->Predecessors().size()) {
+                failure = "a descriptor Phi on the path of a table read does not match its block's predecessors";
+                return nullptr;
+            }
+            IrValue& phi = m_program.CreateValue(IrOpcode::Phi, IrType::U32);
+            mirrored.emplace(value, &phi);
+            phis.emplace_back(block, &phi);
+            for (IrBlock* predecessor : block->Predecessors()) {
+                IrValue* incoming = PhiIncoming(*value, predecessor);
+                if (incoming == nullptr) {
+                    failure = "a descriptor Phi on the path of a table read has no value for one of its predecessors";
+                    return nullptr;
+                }
+                IrValue* edge = MirrorOffset(incoming, leaf, mirrored, phis, failure);
+                if (edge == nullptr) {
+                    return nullptr;
+                }
+                phi.AddPhiOperand(predecessor, edge);
+            }
+            return &phi;
+        }
+        if (EquivalentValue(m_program.Resources(), value, &leaf)) {
+            return value->Argument(1)->Resolve();
+        }
+        if (value->Opcode() == IrOpcode::SelectU32 || value->Opcode() == IrOpcode::ReadFirstLane) {
+            failure = "a table read is chosen through a per-lane selection";
+            return nullptr;
+        }
+        return &m_builder.Constant(0u);
+    }
+
+    static void DropValues(std::span<IrValue* const> values) {
+        for (IrValue* value : values) {
+            for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
+                value->ReplaceArgument(index, nullptr);
+            }
+        }
+        for (IrValue* value : values) {
+            value->Invalidate();
+        }
+    }
+
+    void PlanCarriedColumns(const DescriptorWeb& web, IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount, const std::array<std::size_t, 2>& offsets, std::vector<CarriedColumn>& columns, std::vector<std::pair<IrBlock*, IrValue*>>& phis, std::string& failure) {
+        const auto& memory = m_program.Resources().memoryInfo.at(inst.Flags<MemoryFlags>().index);
+        for (std::uint32_t arm = 0; arm < web.arms.size(); arm++) {
+            for (std::uint32_t slot = 0; slot < handleCount; slot++) {
+                if (!split[slot]) {
+                    continue;
+                }
+                const auto width = handles[slot]->ArgumentCount();
+                const auto first = web.carried[arm].begin() + static_cast<std::ptrdiff_t>(offsets[slot]);
+                if (std::none_of(first, first + static_cast<std::ptrdiff_t>(width), [](bool carried) { return carried; })) {
+                    continue;
+                }
+                IrValue& probe = m_program.CreateValue(handles[slot]->Opcode(), handles[slot]->Type(), handles[slot]->Flags<std::uint64_t>());
+                for (std::size_t dword = 0; dword < width; dword++) {
+                    probe.AddArgument(web.arms[arm][offsets[slot] + dword]);
+                }
+                CarriedColumn column{arm, slot, {}, nullptr};
+                const bool planned = TryMakeTableColumn(probe, slot == 1u, slot == 0u && memory.imageR128, column.plan);
+                const std::array<IrValue*, 1> probes{&probe};
+                DropValues(probes);
+                if (!planned || column.plan.reads.empty() || m_sources[column.plan.source].tableColumn->indirect || column.plan.offset != column.plan.reads.front()->Argument(1)->Resolve()) {
+                    failure = "a descriptor chosen on one path is neither rebuilt at the read nor read from a table by key (" + describeValueChain(web.arms[arm][offsets[slot]], 3u) + ")";
+                    return;
+                }
+                std::unordered_map<IrValue*, IrValue*> mirrored;
+                column.offset = MirrorOffset(handles[slot]->Argument(0), *column.plan.reads.front(), mirrored, phis, failure);
+                if (column.offset == nullptr) {
+                    return;
+                }
+                columns.push_back(std::move(column));
+            }
+        }
+    }
+
     void SplitDescriptorWeb(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount) {
         std::vector<WebValue> tuple;
         std::array<std::size_t, 2> offsets {};
@@ -1441,7 +1554,18 @@ private:
         }
         DescriptorWeb web;
         IrValue* selector = WebSelector(std::move(tuple), web, inst);
+        std::vector<CarriedColumn> columns;
+        std::vector<std::pair<IrBlock*, IrValue*>> offsetPhis;
+        if (selector != nullptr && !web.arms.empty()) {
+            std::string failure;
+            PlanCarriedColumns(web, inst, handles, split, handleCount, offsets, columns, offsetPhis, failure);
+            if (!failure.empty()) {
+                GiveUp(web, std::move(failure));
+                selector = nullptr;
+            }
+        }
         const bool select = selector != nullptr && web.arms.size() > 1u;
+        const bool carry = selector != nullptr && !web.arms.empty() && !columns.empty();
         if (select) {
             for (const auto& [block, phi] : web.phis) {
                 block->InsertInstructionBefore(nullptr, phi);
@@ -1454,22 +1578,25 @@ private:
                 }
             }
         } else {
+            std::vector<IrValue*> dropped;
             for (const auto& [block, phi] : web.phis) {
-                for (std::size_t index = 0; index < phi->ArgumentCount(); index++) {
-                    phi->ReplaceArgument(index, nullptr);
-                }
+                dropped.push_back(phi);
             }
             for (const auto& [block, before, node] : web.lanes) {
-                for (std::size_t index = 0; index < node->ArgumentCount(); index++) {
-                    node->ReplaceArgument(index, nullptr);
-                }
+                dropped.push_back(node);
             }
-            for (const auto& [block, phi] : web.phis) {
-                phi->Invalidate();
+            DropValues(dropped);
+        }
+        if (carry) {
+            for (const auto& [block, phi] : offsetPhis) {
+                block->InsertInstructionBefore(nullptr, phi);
             }
-            for (const auto& [block, before, node] : web.lanes) {
-                node->Invalidate();
+        } else {
+            std::vector<IrValue*> dropped;
+            for (const auto& [block, phi] : offsetPhis) {
+                dropped.push_back(phi);
             }
+            DropValues(dropped);
         }
         if (selector == nullptr || web.arms.empty()) {
             const std::string reason = !web.failure.empty() ? web.failure : web.foldedControlValue ? std::string("every path's descriptor depends on the program counter, EXEC or a lane mask") : std::string("no descriptor was found on any path");
@@ -1486,9 +1613,47 @@ private:
             const std::array<IrValue*, 2> compare {selector, &m_builder.Constant(arm)};
             conditions.push_back(EmitBefore(inst, IrOpcode::IEqual32, IrType::Bool, compare));
         }
+        const auto carried = [&](std::uint32_t arm, std::uint32_t slot) {
+            return std::ranges::any_of(columns, [&](const CarriedColumn& column) { return column.arm == arm && column.slot == slot; });
+        };
+        std::vector<IrValue*> copies;
         ReplaceWithArmCopies(inst, handles, split, handleCount, conditions, [&](std::uint32_t arm, std::uint32_t slot, std::size_t dword) {
-            return ArmDword(web.arms[arm][offsets[slot] + dword], inst);
-        });
+            return carried(arm, slot) ? handles[slot]->Argument(dword)->Resolve() : ArmDword(web.arms[arm][offsets[slot] + dword], inst);
+        }, &copies);
+        for (auto& column : columns) {
+            IrValue* copy = copies.at(column.arm);
+            column.plan.handle = copy->Argument(column.slot)->Resolve();
+            column.plan.offset = column.offset;
+            m_tableColumns.push_back(std::move(column.plan));
+        }
+        if (web.arms.size() > 1u) {
+            for (std::uint32_t arm = 0; arm < copies.size(); arm++) {
+                m_armGates.push_back({copies[arm], selector, arm});
+            }
+        }
+    }
+
+    void GateTableArms() {
+        for (const auto& gate : m_armGates) {
+            IrValue& read = *gate.read;
+            const auto info = ImageOpcodeInfoOf(read.Opcode());
+            const std::uint32_t handleCount = info.needsSampler ? 2u : 1u;
+            bool table = false;
+            for (std::uint32_t slot = 0; slot < handleCount && slot < read.ArgumentCount(); slot++) {
+                table = table || FindTableColumn(*read.Argument(slot)->Resolve()) != nullptr;
+            }
+            if (!table) {
+                continue;
+            }
+            IrValue* exec = read.Argument(read.ArgumentCount() - 1u);
+            if (exec->Resolve()->Type() != IrType::Bool) {
+                fail(std::string(IrOpcodeName(read.Opcode())) + " split across descriptors has no EXEC operand to keep a table read's faults to its own path");
+            }
+            const std::array<IrValue*, 2> compare {gate.selector, &m_builder.Constant(gate.arm)};
+            IrValue* chosen = EmitBefore(read, IrOpcode::IEqual32, IrType::Bool, compare);
+            const std::array<IrValue*, 2> both {exec, chosen};
+            read.ReplaceArgument(read.ArgumentCount() - 1u, EmitBefore(read, IrOpcode::LogicalAnd, IrType::Bool, both));
+        }
     }
 
     void NoteUnsplitImage(const IrValue& inst) {
@@ -1573,7 +1738,19 @@ private:
             }
             referenced.push_back(value);
             const std::array<IrValue*, 1> arguments{value};
-            EmitBefore(position, IrOpcode::ReferenceU32, IrType::Void, arguments);
+            if (value->Parent() == nullptr || DefinitionDominates(*value, position)) {
+                EmitBefore(position, IrOpcode::ReferenceU32, IrType::Void, arguments);
+                continue;
+            }
+            auto& instructions = value->Parent()->Instructions();
+            const auto next = std::next(std::ranges::find(instructions, value));
+            IrValue& reference = m_program.CreateValue(IrOpcode::ReferenceU32, IrType::Void);
+            reference.AddArgument(value);
+            if (next == instructions.end()) {
+                value->Parent()->AppendInstruction(&reference);
+            } else {
+                value->Parent()->InsertInstructionBefore(*next, &reference);
+            }
         }
     }
 
@@ -1998,6 +2175,7 @@ private:
     std::unordered_map<const IrValue*, std::string> m_splitFailures;
     std::unordered_map<const IrBlock*, std::size_t> m_blockIndices;
     std::vector<std::vector<bool>> m_dominators;
+    std::vector<ArmGate> m_armGates;
 };
 
 }

@@ -2774,12 +2774,24 @@ void verifyDescriptorTableWeb() {
     auto chainCode = prologue;
     chainCode.insert(chainCode.end(), {0xf42c0210u, 0x4a000000u, 0xbf8cc07fu, 0xbf068014u, 0xbf850002u, 0xf40c0200u, 0xfa000080u, 0xbf068015u, 0xbf850002u, 0xf40c0200u, 0xfa0000a0u});
     chainCode.insert(chainCode.end(), epilogue.begin(), epilogue.end());
-    auto chain = makeRequest(chainCode);
+    std::vector<std::uint32_t> conditionalCode(prologue.begin(), prologue.begin() + 9);
+    conditionalCode.insert(conditionalCode.end(), {0xf40c0200u, 0xfa000080u, 0xbf8cc07fu, 0xbf068014u, 0xbf850007u, 0xf420090eu, 0xfa000000u, 0xbf8cc07fu, 0x9325a024u, 0xf42c0210u, 0x4a000000u, 0xbf8cc07fu, 0xbf068015u, 0xbf850002u, 0xf40c0200u, 0xfa0000a0u});
+    conditionalCode.insert(conditionalCode.end(), epilogue.begin(), epilogue.end());
+    auto loopCode = prologue;
+    loopCode.insert(loopCode.end(), {0xf40c0200u, 0xfa000080u, 0xbe910380u, 0xbf8cc07fu, 0xf42c0a10u, 0x4a000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbe880428u, 0xbe8a042au, 0xbe8c042cu, 0xbe8e042eu, 0x80118111u, 0xbf0a8211u, 0xbf85fff1u, 0xbf810000u});
+    const std::array<std::tuple<const std::vector<std::uint32_t>*, std::size_t, const char*>, 3> shapes{{
+        {&chainCode, 3u, "a T# chosen by Phis between a constant buffer table read and two SRT T#s"},
+        {&conditionalCode, 3u, "a T# read from a constant buffer table on one branch only, then chosen by Phis with two SRT T#s"},
+        {&loopCode, 2u, "a T# read from a constant buffer table in a loop and sampled in the next iteration"},
+    }};
     const char* direct = std::getenv("APS5_DESCRIPTOR_WEB_DIRECT");
-    if (direct != nullptr && std::string_view(direct) == "off") {
-        expectFailure([&] { static_cast<void>(GetResourcePlan(chain)); }, "GetImageResource dword 0 is not a valid runtime value", "descriptor table web: APS5_DESCRIPTOR_WEB_DIRECT=off accepted a T# Phi whose base edge is a table read");
-    } else {
-        const auto plan = GetResourcePlan(chain);
+    for (const auto& [shapeCode, imageCount, shape] : shapes) {
+        auto request = makeRequest(*shapeCode);
+        if (direct != nullptr && std::string_view(direct) == "off") {
+            expectFailure([&] { static_cast<void>(GetResourcePlan(request)); }, "GetImageResource dword 0 is not a valid runtime value", (std::string("descriptor table web: APS5_DESCRIPTOR_WEB_DIRECT=off accepted ") + shape).c_str());
+            continue;
+        }
+        const auto plan = GetResourcePlan(request);
         std::size_t columns = 0;
         std::uint32_t columnImage = 0;
         for (std::uint32_t image = 0; image < plan->info.images.size(); image++) {
@@ -2790,13 +2802,13 @@ void verifyDescriptorTableWeb() {
                 require(column->stride == 32u && column->offset == 0u && !column->address, "descriptor table web: the table edge's column does not read 32-byte T# records through the buffer");
             }
         }
-        require(plan->info.images.size() == 3u && columns == 1u, "descriptor table web: a T# chosen by Phis between a constant buffer table read and two SRT T#s was not planned as one table column and two SRT images");
+        require(plan->info.images.size() == imageCount && columns == 1u, (std::string("descriptor table web: ") + shape + " was not planned as one table column and its SRT images").c_str());
         require(plan->info.images[columnImage].table != NoTable, "descriptor table web: the table edge's image was not assigned a table");
         for (const auto& [key, expected] : {std::pair{2u, tableSecond}, std::pair{1u, tableFirst}}) {
             guest.index[0] = key;
-            auto request = makeRequest(chainCode);
+            auto keyed = makeRequest(*shapeCode);
             AgcDriver::ShaderMemory memory({});
-            const auto capture = memory.Capture(request);
+            const auto capture = memory.Capture(keyed);
             const auto& tables = capture->snapshot.tables;
             require(tables.tables.size() == 1u && key < tables.tables[0].codes.size(), "descriptor table web: the capture has no table for the constant buffer key");
             const auto code = tables.tables[0].codes[key];
@@ -2804,20 +2816,16 @@ void verifyDescriptorTableWeb() {
             const auto holds = [&](const std::array<std::uint32_t, 8>& words) {
                 return std::ranges::any_of(capture->snapshot.images, [&](const DescriptorValue& value) { return std::equal(words.begin(), words.end(), value.dwords.begin()); });
             };
-            require(holds(srtFirst) && holds(srtSecond), "descriptor table web: the snapshot does not hold both SRT T#s");
-            request.context.memory = memory.Regions();
-            const auto compiled = Recompile(request, *capture);
+            require(holds(srtFirst) && (imageCount == 2u || holds(srtSecond)), "descriptor table web: the snapshot does not hold the SRT T#s");
+            keyed.context.memory = memory.Regions();
+            const auto compiled = Recompile(keyed, *capture);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-            static_cast<void>(ValidateAndOptimizeSpirv(compiled->spirv, request.target.vulkanVersion, request.target.spirvVersion));
+            static_cast<void>(ValidateAndOptimizeSpirv(compiled->spirv, keyed.target.vulkanVersion, keyed.target.spirvVersion));
 #else
             static_cast<void>(compiled);
 #endif
         }
     }
-    auto loopCode = prologue;
-    loopCode.insert(loopCode.end(), {0xf40c0200u, 0xfa000080u, 0xbe910380u, 0xbf8cc07fu, 0xf42c0a10u, 0x4a000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbe880428u, 0xbe8a042au, 0xbe8c042cu, 0xbe8e042eu, 0x80118111u, 0xbf0a8211u, 0xbf85fff1u, 0xbf810000u});
-    auto loop = makeRequest(loopCode);
-    expectFailure([&] { static_cast<void>(GetResourcePlan(loop)); }, "GetImageResource dword 0 is not a valid runtime value", "descriptor table web: a T# read in a loop before the iteration's table read replaced it was bound to the new table read");
 }
 
 void verifyUndefinedImageFormats() {
