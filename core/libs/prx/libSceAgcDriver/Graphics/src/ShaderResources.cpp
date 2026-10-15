@@ -1520,6 +1520,36 @@ void ValidateDescriptorLayout(const Context& context, std::span<const VkDescript
         }
     }
     Require(heapTotals[VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE] <= context.limits.maxDescriptorSetSampledImages && heapTotals[VK_DESCRIPTOR_TYPE_STORAGE_IMAGE] <= context.limits.maxDescriptorSetStorageImages && heapTotals[VK_DESCRIPTOR_TYPE_SAMPLER] <= context.limits.maxDescriptorSetSamplers, "typed heaps exceed descriptor set capacity");
+    Require(heapTotals[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC] <= context.limits.maxDescriptorSetStorageBuffersDynamic, "dynamic storage buffers exceed descriptor set capacity");
+}
+
+std::atomic<bool>& DrawParamsFlag() {
+    static std::atomic<bool> flag{std::getenv("APS5_DRAW_PARAMS") == nullptr || std::strcmp(std::getenv("APS5_DRAW_PARAMS"), "0") != 0};
+    return flag;
+}
+
+bool VerifyDrawParams() {
+    static const bool enabled = std::getenv("APS5_VERIFY_DRAW_PARAMS") != nullptr;
+    return enabled;
+}
+
+bool DrawParamsBinding(const CompiledShader& shader, const ShaderRecompiler::DescriptorBinding& binding) {
+    if (!DrawParamsFlag().load(std::memory_order_relaxed) || shader.stage == ShaderRecompiler::ShaderStage::Compute || binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers || binding.kind != ShaderRecompiler::DescriptorKind::StorageBuffer || binding.count == 0) return false;
+    for (std::uint32_t element = 0; element < binding.count; ++element) {
+        if (element >= binding.bufferWritten.size() || binding.bufferWritten[element]) return false;
+        if (element < binding.bufferAtomic.size() && binding.bufferAtomic[element]) return false;
+    }
+    return true;
+}
+
+template<typename TLayouts>
+void AssignDynamicBuffers(const Context& context, TLayouts&& layouts) {
+    std::uint32_t total = 0;
+    for (auto* layout : layouts) {
+        if (total + layout->descriptorCount > context.limits.maxDescriptorSetStorageBuffersDynamic) continue;
+        layout->descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        total += layout->descriptorCount;
+    }
 }
 
 void ValidateRuntimeResources(const CompiledShader& shader, std::span<const std::uint32_t> words) {
@@ -1632,6 +1662,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                 storageBuffers += binding.count;
                 requireStageLimits();
                 Binding item{{binding.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, binding.count, flags, nullptr}, {}};
+                item.drawParams = DrawParamsBinding(shader, binding);
                 if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
                     Require(binding.guestDescriptor.size() == static_cast<std::uint64_t>(binding.count) * 4, "guest buffer descriptor must contain four DWORDs per array element");
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
@@ -1710,6 +1741,13 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             Require(storageBuffers <= context.descriptorIndexingLimits.maxDescriptorSetUpdateAfterBindStorageBuffers, "pipeline descriptors exceed device limits");
             updateAfterBind = true;
         }
+        if (!updateAfterBind) {
+            std::vector<VkDescriptorSetLayoutBinding*> candidates;
+            for (auto& binding : bindings) {
+                if (binding.drawParams) candidates.push_back(&binding.layout);
+            }
+            AssignDynamicBuffers(context, candidates);
+        }
         timing.bindingsMs = phase(BuildPhase::Bindings);
         // For every build, locked ones included: their stage B then takes the fast path too, and the
         // collects cost the same wherever they run.
@@ -1718,6 +1756,15 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         guestMemory.UploadPrepare(usesBda);
         timing.uploadMs = phase(BuildPhase::Upload);
         splitSets = SplitsSets(context, shaders);
+        for (std::size_t index = 0; index < bindings.size(); ++index) {
+            if (bindings[index].layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) dynamicSlots[setOf(bindings[index])].push_back(index);
+        }
+        for (std::size_t set = 0; set < dynamicSlots.size(); ++set) {
+            std::sort(dynamicSlots[set].begin(), dynamicSlots[set].end(), [&](std::size_t left, std::size_t right) { return bindings[left].layout.binding < bindings[right].layout.binding; });
+            std::uint32_t count = 0;
+            for (const auto index : dynamicSlots[set]) count += bindings[index].layout.descriptorCount;
+            templateOffsets[set].assign(count, 0u);
+        }
         std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
         for (const auto& binding : bindings) {
             const auto set = setOf(binding);
@@ -1796,7 +1843,9 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             // The set is sized from the plan: every image element becomes exactly one descriptor
             // when stage B looks it up.
             std::vector<VkDescriptorPoolSize> sizes;
-            if (storageBuffers != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<std::uint32_t>(storageBuffers)});
+            const auto dynamicBuffers = static_cast<std::uint64_t>(templateOffsets[0].size());
+            if (storageBuffers > dynamicBuffers) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<std::uint32_t>(storageBuffers - dynamicBuffers)});
+            if (dynamicBuffers != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, static_cast<std::uint32_t>(dynamicBuffers)});
             const auto tableDescriptors = tableBindings[0] != std::numeric_limits<std::size_t>::max() ? tableDescriptorCount(0) : 0u;
             if (plannedSampledImages + tableDescriptors != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, plannedSampledImages + tableDescriptors});
             if (plannedStorageImages != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, plannedStorageImages});
@@ -1851,6 +1900,7 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
     std::array<VkShaderStageFlags, 2> tableFlags{};
     bool updateAfterBind = false;
     std::uint64_t storageBuffers = 0;
+    std::vector<std::pair<std::size_t, std::size_t>> dynamicCandidates;
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
         const VkShaderStageFlags flags = VulkanStage(shader.stage);
@@ -1875,6 +1925,7 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
                 storageBuffers += binding.count;
             }
             if (stageStorageBuffers > context.limits.maxPerStageDescriptorStorageBuffers || stageResources > context.limits.maxPerStageResources) updateAfterBind = true;
+            if (DrawParamsBinding(shader, binding)) dynamicCandidates.emplace_back(static_cast<std::size_t>(set), descriptions[set].size());
             descriptions[set].push_back({binding.binding, type, binding.count, flags, nullptr});
             bindingFlags[set].push_back(0);
         }
@@ -1885,6 +1936,11 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
         bindingFlags[set].push_back(VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT);
     }
     if (storageBuffers > context.limits.maxDescriptorSetStorageBuffers) updateAfterBind = true;
+    if (!updateAfterBind) {
+        std::vector<VkDescriptorSetLayoutBinding*> candidates;
+        for (const auto& [set, index] : dynamicCandidates) candidates.push_back(&descriptions[set][index]);
+        AssignDynamicBuffers(context, candidates);
+    }
     for (std::size_t set = 0; set < descriptions.size(); ++set) {
         for (std::size_t index = 0; index < descriptions[set].size(); ++index) {
             if (updateAfterBind && descriptions[set][index].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) bindingFlags[set][index] |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
@@ -1946,7 +2002,7 @@ void ShaderResources::buildComplete() {
             std::size_t imageCount = 0;
             for (const auto& binding : bindings) {
                 bufferCount += binding.allocations.size();
-                if (binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) imageCount += binding.flags != 0 ? binding.imageAllocations.size() : binding.layout.descriptorCount;
+                if (binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) imageCount += binding.flags != 0 ? binding.imageAllocations.size() : binding.layout.descriptorCount;
             }
             auto& buffers = descriptorBuffers;
             auto& images = descriptorImages;
@@ -1992,6 +2048,7 @@ void ShaderResources::buildComplete() {
                 write.descriptorType = binding.layout.descriptorType;
                 switch (binding.layout.descriptorType) {
                     case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
                         write.pBufferInfo = buffers.data() + buffers.size();
                         for (const auto index : binding.allocations) {
                             buffers.push_back(descriptor(allocations[index]));
@@ -3624,6 +3681,7 @@ namespace {
 std::uint32_t SetDescriptorLimit(const VkPhysicalDeviceLimits& limits, VkDescriptorType type) {
     switch (type) {
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: return limits.maxDescriptorSetStorageBuffers;
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return limits.maxDescriptorSetStorageBuffersDynamic;
         case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: return limits.maxDescriptorSetSampledImages;
         case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: return limits.maxDescriptorSetStorageImages;
         case VK_DESCRIPTOR_TYPE_SAMPLER: return limits.maxDescriptorSetSamplers;
@@ -3633,8 +3691,8 @@ std::uint32_t SetDescriptorLimit(const VkPhysicalDeviceLimits& limits, VkDescrip
 
 // What one chain pool holds; a set needing more of any type gets a dedicated pool.
 constexpr std::uint32_t ChainPoolSets = 1024;
-constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
-constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolCreateSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 + 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
+constexpr std::array<VkDescriptorPoolSize, 5> ChainPoolSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
+constexpr std::array<VkDescriptorPoolSize, 5> ChainPoolCreateSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 + 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
 }
 
 DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount) {
@@ -4884,6 +4942,14 @@ bool AddressBasedDrawSnapshots() {
 }
 }
 
+bool ShaderResources::DrawParamsEnabled() {
+    return DrawParamsFlag().load(std::memory_order_relaxed);
+}
+
+void ShaderResources::SetDrawParams(bool enabled) {
+    DrawParamsFlag().store(enabled, std::memory_order_relaxed);
+}
+
 void ShaderResources::SetInPlaceDrawInputs(bool enabled) {
     InPlaceDrawInputsFlag().store(enabled, std::memory_order_relaxed);
 }
@@ -5287,6 +5353,74 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     lap(&DrawBindingsStatistics::checkUs);
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    std::vector<std::size_t> snapshotIndices(allocations.size(), selected.size());
+    for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
+    const bool drawParams = DrawParamsEnabled();
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 1);
+    std::vector<std::uint8_t> offsetInDescriptor(selected.size(), 0u);
+    for (const auto& binding : bindings) {
+        const bool dynamic = binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        for (const auto allocation : binding.allocations) {
+            const auto snapshotIndex = snapshotIndices[allocation];
+            if (snapshotIndex == selected.size()) continue;
+            const auto offset = result->snapshots[snapshotIndex].offset;
+            if (!dynamic || !drawParams || offset % alignment != 0 || offset > std::numeric_limits<std::uint32_t>::max()) offsetInDescriptor[snapshotIndex] = 1u;
+        }
+    }
+    for (std::size_t set = 0; set < dynamicSlots.size(); ++set) {
+        auto& offsets = result->dynamicOffsets[set];
+        offsets.reserve(templateOffsets[set].size());
+        for (const auto index : dynamicSlots[set]) {
+            for (const auto allocation : bindings[index].allocations) {
+                const auto snapshotIndex = snapshotIndices[allocation];
+                const bool dynamicOffset = snapshotIndex != selected.size() && offsetInDescriptor[snapshotIndex] == 0u;
+                offsets.push_back(dynamicOffset ? static_cast<std::uint32_t>(result->snapshots[snapshotIndex].offset) : 0u);
+            }
+        }
+    }
+    const auto descriptorOffset = [&](std::size_t snapshotIndex) { return offsetInDescriptor[snapshotIndex] != 0u ? result->snapshots[snapshotIndex].offset : VkDeviceSize{0}; };
+    const auto patchWrites = [&](std::vector<VkWriteDescriptorSet>& writes, std::vector<VkDescriptorBufferInfo>& buffers) {
+        auto nextWrite = writes.begin();
+        for (const auto& binding : bindings) {
+            while (nextWrite != writes.end() && nextWrite->dstBinding == binding.layout.binding) {
+                auto& write = *nextWrite++;
+                write.dstSet = setOf(binding) == 0 ? result->allocation.set : result->fragmentAllocation.set;
+                if (binding.allocations.empty()) continue;
+                const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+                write.pBufferInfo = buffers.data() + offset;
+                for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+                    const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
+                    if (snapshotIndex == selected.size()) continue;
+                    const auto& snapshot = result->snapshots[snapshotIndex];
+                    buffers[offset + element] = {snapshot.handle, descriptorOffset(snapshotIndex), snapshot.bytes.size()};
+                }
+            }
+        }
+        Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
+    };
+    const auto verifyDrawParams = [&](const std::vector<VkWriteDescriptorSet>& writes, const std::vector<VkDescriptorBufferInfo>& buffers) {
+        for (std::size_t set = 0; set < result->dynamicOffsets.size(); ++set) {
+            std::vector<const Binding*> ordered;
+            for (const auto& binding : bindings) {
+                if (setOf(binding) == set && binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) ordered.push_back(&binding);
+            }
+            std::sort(ordered.begin(), ordered.end(), [](const Binding* left, const Binding* right) { return left->layout.binding < right->layout.binding; });
+            std::size_t next = 0;
+            for (const auto* binding : ordered) {
+                const auto write = std::find_if(writes.begin(), writes.end(), [&](const VkWriteDescriptorSet& entry) { return entry.dstBinding == binding->layout.binding && entry.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && entry.dstSet == (set == 0 ? result->allocation.set : result->fragmentAllocation.set); });
+                Require(write != writes.end() && write->descriptorCount == binding->allocations.size(), "APS5_VERIFY_DRAW_PARAMS: a dynamic buffer binding has no matching descriptor write");
+                const auto position = static_cast<std::size_t>(write->pBufferInfo - buffers.data());
+                for (std::size_t element = 0; element < binding->allocations.size(); ++element, ++next) {
+                    Require(next < result->dynamicOffsets[set].size(), "APS5_VERIFY_DRAW_PARAMS: fewer dynamic offsets than dynamic buffer descriptors");
+                    const auto& bound = buffers[position + element];
+                    const auto snapshotIndex = snapshotIndices[binding->allocations[element]];
+                    const auto expected = snapshotIndex != selected.size() ? VkDescriptorBufferInfo{result->snapshots[snapshotIndex].handle, result->snapshots[snapshotIndex].offset, result->snapshots[snapshotIndex].bytes.size()} : descriptorBuffers[position + element];
+                    Require(bound.buffer == expected.buffer && bound.offset + result->dynamicOffsets[set][next] == expected.offset && bound.range == expected.range, "APS5_VERIFY_DRAW_PARAMS: a dynamic buffer descriptor and its draw offset bind another range than the draw's input");
+                }
+            }
+            Require(next == result->dynamicOffsets[set].size(), "APS5_VERIFY_DRAW_PARAMS: more dynamic offsets than dynamic buffer descriptors");
+        }
+    };
     const bool persistent = RecordBindingsMode() == RecordBindings::Persistent;
     std::vector<std::array<std::uint64_t, 4>> persistentKey;
     if (persistent) {
@@ -5294,7 +5428,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         persistentKey.push_back({recorder.SnapshotArena().Identity(), selected.size(), 0, 0});
         for (std::size_t index = 0; index < selected.size(); ++index) {
             const auto& snapshot = result->snapshots[index];
-            persistentKey.push_back({selected[index], reinterpret_cast<std::uint64_t>(snapshot.handle), snapshot.offset, snapshot.bytes.size()});
+            persistentKey.push_back({selected[index], reinterpret_cast<std::uint64_t>(snapshot.handle), descriptorOffset(index), snapshot.bytes.size()});
         }
         std::shared_ptr<const DrawBindings> reused;
         {
@@ -5306,6 +5440,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             result->allocation = reused->allocation;
             result->fragmentAllocation = reused->fragmentAllocation;
             result->persistent = std::move(reused);
+            if (VerifyDrawParams()) {
+                auto buffers = descriptorBuffers;
+                auto writes = descriptorWrites;
+                patchWrites(writes, buffers);
+                verifyDrawParams(writes, buffers);
+            }
             recorder.Keep(result);
             for (const auto& snapshot : result->snapshots) {
                 if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
@@ -5328,25 +5468,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     lap(&DrawBindingsStatistics::allocateUs);
     auto buffers = descriptorBuffers;
     auto writes = descriptorWrites;
-    std::vector<std::size_t> snapshotIndices(allocations.size(), selected.size());
-    for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
-    auto nextWrite = writes.begin();
-    for (const auto& binding : bindings) {
-        while (nextWrite != writes.end() && nextWrite->dstBinding == binding.layout.binding) {
-            auto& write = *nextWrite++;
-            write.dstSet = setOf(binding) == 0 ? result->allocation.set : result->fragmentAllocation.set;
-            if (binding.allocations.empty()) continue;
-            const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
-            write.pBufferInfo = buffers.data() + offset;
-            for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
-                const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
-                if (snapshotIndex == selected.size()) continue;
-                const auto& snapshot = result->snapshots[snapshotIndex];
-                buffers[offset + element] = {snapshot.handle, snapshot.offset, snapshot.bytes.size()};
-            }
-        }
-    }
-    Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
+    patchWrites(writes, buffers);
+    if (VerifyDrawParams()) verifyDrawParams(writes, buffers);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) {
@@ -5411,8 +5534,8 @@ void ShaderResources::SetRecordBindingsMode(RecordBindings mode) {
 }
 
 void ShaderResources::Bind(const CommandSink& commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
-    if (_set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, bindPoint, layout, 0, _set);
-    if (fragment.set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, fragment.set);
+    if (_set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, bindPoint, layout, 0, _set, templateOffsets[0]);
+    if (fragment.set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, fragment.set, templateOffsets[1]);
 }
 
 namespace {

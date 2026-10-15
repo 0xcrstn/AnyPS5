@@ -1354,9 +1354,11 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_draw_snapshot_arena COMMAND agc_driver_recorder_tests --draw-snapshot-arena-only)
-    set_tests_properties(agc_draw_snapshot_arena PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    add_test(NAME agc_draw_snapshot_arena_draw_params_verify COMMAND agc_driver_recorder_tests --draw-snapshot-arena-only)
+    set_tests_properties(agc_draw_snapshot_arena agc_draw_snapshot_arena_draw_params_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_draw_snapshot_arena_draw_params_verify PROPERTIES ENVIRONMENT "APS5_VERIFY_DRAW_PARAMS=1")
     if(WIN32)
-        set_tests_properties(agc_draw_snapshot_arena PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_draw_snapshot_arena agc_draw_snapshot_arena_draw_params_verify PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     foreach(epochDirtyMode IN ITEMS off on verify)

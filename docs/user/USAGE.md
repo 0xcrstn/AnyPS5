@@ -254,6 +254,10 @@ In runs with `APS5_PROFILE_DRAW` (as `run.ps1 -Perf` and `-Debug` set it), `APS5
 
 `APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. `0` (the default) turns it off. The `[labels]` line counts these submits.
 
+### Draw descriptor offsets
+
+`APS5_DRAW_PARAMS` (on unless set to `0`): the read-only guest buffers of a draw's shaders are dynamic storage buffers, up to the device's dynamic buffer limit and only in sets without update-after-bind. A draw passes its inputs' offsets when it binds the set, so one persistent descriptor set serves every draw whose inputs sit in the same buffer, wherever in it. `APS5_VERIFY_DRAW_PARAMS` checks every dynamic descriptor plus its draw offset against the range the draw reads.
+
 ### Address-based shader experiments
 
 These switches change how recompiled shaders reach guest memory through addresses. Each accepts the values shown; any other value stops the title at start. `verify` runs the old and the new form side by side and stops the title with a description of the first difference.
