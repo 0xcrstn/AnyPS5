@@ -40,6 +40,11 @@ inline RewriteMode FlushProofsSetting() {
     return mode;
 }
 
+inline RewriteMode BdaProvenanceSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_BDA_PROVENANCE", std::getenv("APS5_BDA_PROVENANCE"), RewriteMode::On);
+    return mode;
+}
+
 inline RewriteMode WindowRegistersSetting() {
     static const RewriteMode mode = ParseRewriteMode("APS5_WINDOW_REGISTERS", std::getenv("APS5_WINDOW_REGISTERS"), RewriteMode::On);
     return mode;

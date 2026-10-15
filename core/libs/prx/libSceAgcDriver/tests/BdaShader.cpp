@@ -14,6 +14,7 @@ namespace {
 
 ShaderRecompiler::BdaTable::Translation testTranslation = ShaderRecompiler::BdaTable::TranslationSetting();
 ShaderRecompiler::BdaTable::Relative testRelative = ShaderRecompiler::BdaTable::RelativeSetting();
+ShaderRecompiler::RewriteMode testProvenance = ShaderRecompiler::BdaProvenanceSetting();
 ShaderRecompiler::RewriteMode testSpanHelpers = ShaderRecompiler::BdaSpanHelpersSetting();
 std::uint32_t testSpanInjection = 0;
 ShaderRecompiler::RewriteMode testWriteNotes = ShaderRecompiler::BdaWriteNotesSetting();
@@ -51,6 +52,7 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     state.bdaStopsInvocations = stops;
     state.bdaTranslation = testTranslation;
     state.bdaRelative = testRelative;
+    state.bdaProvenance = testProvenance;
     state.bdaSpanHelpers = testSpanHelpers;
     state.bdaWriteNotes = testWriteNotes;
     state.bdaInlineFastPath = testInlineFastPath;
@@ -279,6 +281,10 @@ std::vector<std::uint32_t> MakeRepairTestShader(std::uint32_t function, ShaderRe
 
 void SetBdaTestRelative(ShaderRecompiler::BdaTable::Relative relative) {
     testRelative = relative;
+}
+
+void SetBdaTestProvenance(ShaderRecompiler::RewriteMode mode) {
+    testProvenance = mode;
 }
 
 ShaderRecompiler::BdaTable::Relative BdaTestRelative() {

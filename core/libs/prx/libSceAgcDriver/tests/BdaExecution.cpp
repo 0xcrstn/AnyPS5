@@ -528,6 +528,22 @@ void RunBdaTranslationTests(const Context& context) {
             Require(report.state == Abi::FaultState::Ready && report.reason == Table::RelativeMismatchReason() && report.address == guest && report.instruction == 0x1234, "APS5_BDA_RELATIVE=verify did not fail on an injected capability mismatch");
         }
     }
+    SetBdaTestRelative(Table::Relative::On);
+    for (const auto provenance : {ShaderRecompiler::RewriteMode::On, ShaderRecompiler::RewriteMode::Verify}) {
+        SetBdaTestProvenance(provenance);
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        const std::uint32_t sentinel = 0xdeadbeef;
+        std::memcpy(output.Bytes().data(), &sentinel, sizeof(sentinel));
+        Pipeline pipeline(context, MakeBdaCapabilityTestShader(guest, second.DeviceAddress()), {&validTable, &fault, &output});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        std::uint32_t result = 0;
+        std::memcpy(&result, output.Bytes().data(), sizeof(result));
+        if (provenance == ShaderRecompiler::RewriteMode::On) Require(report.state == Abi::FaultState::Empty && result == 0x44u, "APS5_BDA_PROVENANCE=on did not translate through the installed capability");
+        else Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::ProvenanceMismatch && report.address == guest && report.instruction == 0x1234, "APS5_BDA_PROVENANCE=verify did not fail on an installed capability that disagrees with the table");
+    }
+    SetBdaTestProvenance(ShaderRecompiler::BdaProvenanceSetting());
     SetBdaTestRelative(previousRelative);
 }
 

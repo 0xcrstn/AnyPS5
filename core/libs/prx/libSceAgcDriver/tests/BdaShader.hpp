@@ -10,6 +10,7 @@
 void SetBdaTestTranslation(ShaderRecompiler::BdaTable::Translation translation);
 ShaderRecompiler::BdaTable::Translation BdaTestTranslation();
 void SetBdaTestRelative(ShaderRecompiler::BdaTable::Relative relative);
+void SetBdaTestProvenance(ShaderRecompiler::RewriteMode mode);
 ShaderRecompiler::BdaTable::Relative BdaTestRelative();
 std::vector<std::uint32_t> MakeBdaCapabilityTestShader(std::uint64_t address, std::uint64_t capabilityBase);
 void SetBdaTestSpanHelpers(ShaderRecompiler::RewriteMode mode, std::uint32_t injection = 0);

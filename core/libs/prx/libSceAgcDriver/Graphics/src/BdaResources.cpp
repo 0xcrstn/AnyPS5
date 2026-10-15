@@ -337,6 +337,7 @@ void BdaResources::CheckFault() const {
     }
     message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::TranslationMismatch) message << "; the legacy and radix BDA translations differ for this access (APS5_BDA_ABI=verify)";
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::ProvenanceMismatch) message << "; the capability installed from this access's base resource differs from the table lookup (APS5_BDA_PROVENANCE=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RelativeMismatch) message << "; the cached BDA range capability differs from the table lookup for this access (APS5_BDA_RELATIVE=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::FlushProofMismatch) {
         message.str({});

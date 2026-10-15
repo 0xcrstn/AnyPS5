@@ -316,6 +316,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.sharedFloatFunctions = target.sharedFloatFunctions.value_or(SharedFloatFunctions());
     state.bdaTranslation = BdaTable::TranslationSetting();
     state.bdaRelative = BdaTable::RelativeSetting();
+    state.bdaProvenance = BdaProvenanceSetting();
     state.bdaInlineFastPath = BdaTable::InlineFastPathSetting();
     state.lazyLog2Repair = LazyLog2RepairSetting();
     state.lazyTrigSeries = LazyTrigSeriesSetting();

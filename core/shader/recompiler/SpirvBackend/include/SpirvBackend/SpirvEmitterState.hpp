@@ -12,6 +12,7 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -141,6 +142,11 @@ struct SpirvEmitterState {
     bool bdaInlineFastPath = false;
     std::map<std::array<std::uint32_t, 3>, std::uint32_t> bdaResolveFunctions;
     std::array<std::uint32_t, 4> bdaCapability {};
+    RewriteMode bdaProvenance = RewriteMode::Off;
+    std::unordered_map<const IrValue*, std::vector<std::pair<const IrValue*, const IrValue*>>> bdaRootsBefore;
+    std::unordered_map<const IrValue*, std::vector<std::pair<const IrValue*, const IrValue*>>> bdaRootsAfter;
+    std::unordered_map<const IrBlock*, std::vector<std::pair<const IrValue*, const IrValue*>>> bdaRootsAtStart;
+    std::map<std::tuple<const IrValue*, const IrValue*, std::uint32_t>, std::array<std::uint32_t, 4>> bdaRootCapabilities;
     RewriteMode lazyLog2Repair = RewriteMode::Off;
     RewriteMode lazyTrigSeries = RewriteMode::Off;
     RewriteMode bdaSpanHelpers = RewriteMode::Off;

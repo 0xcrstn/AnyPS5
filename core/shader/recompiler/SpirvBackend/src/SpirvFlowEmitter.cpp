@@ -890,6 +890,7 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
     // and a read from the next write. The block may be entered right after a write.
     bool ldsWritten = true;
     bool ldsRead = false;
+    bool firstNonPhi = true;
     for (const IrValue* inst : block->Instructions()) {
         if (inst->Opcode() == IrOpcode::Phi) {
             if (emittedNonPhi) {
@@ -932,10 +933,13 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             SpirvValueEmitContext& lane = half == 0 ? ctx : *ctx.otherHalf;
             state.laneHalf = half;
             if (half == 0 || (inst->Opcode() != IrOpcode::Barrier && inst->Opcode() != IrOpcode::MeshAllocate)) {
+                if (inst->Opcode() != IrOpcode::Phi) EmitBdaRootBefore(lane, *inst, firstNonPhi);
                 EmitStructuredInstruction(lane, functionState, *inst);
+                if (inst->Opcode() != IrOpcode::Phi) EmitBdaRootAfter(lane, *inst);
             }
         }
         state.laneHalf = 0;
+        if (inst->Opcode() != IrOpcode::Phi) firstNonPhi = false;
     }
 }
 
