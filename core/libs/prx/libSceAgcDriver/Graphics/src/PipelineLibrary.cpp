@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -403,9 +404,14 @@ std::array<std::uint64_t, 4>& ThreadBuiltLibraryParts() {
     return built;
 }
 
+namespace {
+
+struct LibraryBuildNotesTag {};
+
+}
+
 std::vector<LibraryBuildNote>& ThreadLibraryBuildNotes() {
-    thread_local std::vector<LibraryBuildNote> notes;
-    return notes;
+    return HostThreadLocal<std::vector<LibraryBuildNote>, LibraryBuildNotesTag>();
 }
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device) {
