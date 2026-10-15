@@ -2790,7 +2790,11 @@ std::atomic<std::uint64_t>& InPlaceInputsChangedAfterSubmit() {
 }
 
 void Recorder::NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0 || !VerifyInPlaceDrawInputs()) return;
+    if (bytes == 0) return;
+    if (Coherence::InputLeases()) {
+        if (const auto lease = Coherence::AcquireReadLease({address, address + bytes}, Coherence::CurrentVersion()); lease != 0) OnCompleteWithoutGuestAccess([lease] { Coherence::RetireReadLease(lease); });
+    }
+    if (!VerifyInPlaceDrawInputs()) return;
     ensureOpen();
     const auto generation = GuestMemory::CollectWritesUncached(address, bytes);
     Require(generation != 0, "APS5_VERIFY_IN_PLACE_DRAW_INPUTS: an input bound in place has no write generation to verify against");

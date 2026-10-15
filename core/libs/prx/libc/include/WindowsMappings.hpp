@@ -38,10 +38,18 @@ public:
             const auto found = views.find(base);
             if (found == views.end() || found->second.resident || found->second.page->pins != 0 || !writable(found->second.protection)) return 0;
             const auto page = found->second.page;
-            for (const auto& [otherBase, other] : views) {
-                static_cast<void>(otherBase);
-                if (other.page != page && other.offset < found->second.offset + pageBytes && found->second.offset < other.offset + pageBytes && sameSection(other.section->handle, found->second.section->handle)) return 0;
+            if (page->aliasCheckedAt != viewsChanged) {
+                page->foreignAlias = false;
+                for (const auto& [otherBase, other] : views) {
+                    static_cast<void>(otherBase);
+                    if (other.page != page && other.offset < found->second.offset + pageBytes && found->second.offset < other.offset + pageBytes && sameSection(other.section->handle, found->second.section->handle)) {
+                        page->foreignAlias = true;
+                        break;
+                    }
+                }
+                page->aliasCheckedAt = viewsChanged;
             }
+            if (page->foreignAlias) return 0;
             for (const auto alias : page->aliases) {
                 const auto& view = views.at(alias);
                 const auto protection = view.protection & 0xffu;
@@ -261,6 +269,7 @@ public:
                     shared->aliases.push_back(base + at);
                     const auto added = views.emplace(base + at, View{shared, protection, {}, 0, owned, offset + done + at, 0, 0, true, slot}).first;
                     added->second.identity = ++viewIdentity;
+                    ++viewsChanged;
                     invalidate(*shared);
                 }
                 remember(freshRanges, base, base + runBytes);
@@ -282,6 +291,7 @@ public:
             shared->aliases.push_back(base);
             const auto added = views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0, 0, false, slot}).first;
             added->second.identity = ++viewIdentity;
+            ++viewsChanged;
             if (guarded != 0) protectAccess(base, added->second, allSubpages);
             remember(freshRanges, base, base + pageBytes);
             invalidate(*shared);
@@ -731,6 +741,8 @@ private:
         std::uint32_t pins = 0;
         std::array<std::uint32_t, subpages> accessGuards{};
         std::array<std::uint32_t, subpages> readableGuards{};
+        std::uint64_t aliasCheckedAt = 0;
+        bool foreignAlias = false;
     };
     struct ProtectedPage {
         std::shared_ptr<SharedPage> page;
@@ -1005,6 +1017,7 @@ private:
             }
             std::erase(view.page->aliases, page);
             views.erase(found);
+            ++viewsChanged;
         }
         forget(freshRanges, start, stop);
         residentRuns.erase(run);
@@ -1147,6 +1160,7 @@ private:
                 if (found != views.end()) {
                     std::erase(found->second.page->aliases, cursor);
                     views.erase(found);
+                    ++viewsChanged;
                     forget(freshRanges, cursor, cursor + pageBytes);
                 }
             } else if (memory.Type == MEM_PRIVATE) {
@@ -1211,6 +1225,7 @@ private:
     std::atomic<bool (*)()> resolverBypass{nullptr};
     std::uint64_t nextAccessToken = 0;
     std::uint64_t viewIdentity = 0;
+    std::uint64_t viewsChanged = 1;
     struct ActiveAccessResolversTag {};
     static std::vector<std::uint64_t>& activeAccessResolvers() { return HostThreadLocal<std::vector<std::uint64_t>, ActiveAccessResolversTag>(); }
 
