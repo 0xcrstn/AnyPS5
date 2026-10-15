@@ -17,7 +17,7 @@ ShaderRecompiler::BdaTable::Relative testRelative = ShaderRecompiler::BdaTable::
 ShaderRecompiler::RewriteMode testSpanHelpers = ShaderRecompiler::RewriteMode::Off;
 std::uint32_t testSpanInjection = 0;
 ShaderRecompiler::RewriteMode testWriteNotes = ShaderRecompiler::RewriteMode::Off;
-std::uint32_t testNoteInjection = 0;
+std::uint64_t testNoteInjection = 0;
 bool testInlineFastPath = false;
 
 template<typename TEmit>
@@ -54,7 +54,8 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     state.bdaSpanHelpers = testSpanHelpers;
     state.bdaWriteNotes = testWriteNotes;
     state.bdaInlineFastPath = testInlineFastPath;
-    state.rewriteMismatchInjection = testSpanInjection != 0u ? testSpanInjection : testNoteInjection;
+    state.rewriteMismatchInjection = testSpanInjection;
+    state.bdaWriteNoteInjection = testNoteInjection;
     DefineGetBdaPointer(state);
     const auto main = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), main, spv::FunctionControlMaskNone, TypeFunction(state));
@@ -101,7 +102,7 @@ void SetBdaTestInlineFastPath(bool enabled) {
     testInlineFastPath = enabled;
 }
 
-void SetBdaTestWriteNotes(ShaderRecompiler::RewriteMode mode, std::uint32_t injection) {
+void SetBdaTestWriteNotes(ShaderRecompiler::RewriteMode mode, std::uint64_t injection) {
     testWriteNotes = mode;
     testNoteInjection = injection;
 }

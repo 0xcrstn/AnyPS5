@@ -146,6 +146,7 @@ struct SpirvEmitterState {
     RewriteMode bdaSpanHelpers = RewriteMode::Off;
     RewriteMode bdaWriteNotes = RewriteMode::Off;
     std::uint32_t rewriteMismatchInjection = 0;
+    std::uint64_t bdaWriteNoteInjection = 0;
     std::map<std::array<std::uint32_t, 4>, std::uint32_t> bdaSpecializedSpanFunctions;
     bool nativeF16ModesEmitted = false;
     bool f16DenormPreserveEmitted = false;

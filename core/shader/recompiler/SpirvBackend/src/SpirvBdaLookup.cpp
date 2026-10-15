@@ -479,7 +479,7 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
     std::uint32_t page64 = 0;
     std::uint32_t hit = 0;
     if (cached) {
-        lastPage = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u64), spv::StorageClassPrivate, BdaConstant(state, state.rewriteMismatchInjection != 0u ? state.rewriteMismatchInjection : ~std::uint64_t{0}));
+        lastPage = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u64), spv::StorageClassPrivate, BdaConstant(state, state.bdaWriteNoteInjection != 0u ? state.bdaWriteNoteInjection : ~std::uint64_t{0}));
         state.module.AddName(lastPage, "bda_last_noted_page");
         page64 = binary(spv::OpShiftRightLogical, u64, address, BdaConstant(state, BdaAbi::WrittenPageShift));
         const auto last = state.module.AllocateId();

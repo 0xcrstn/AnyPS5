@@ -666,8 +666,8 @@ void RunBdaWriteNoteTests(const Context& context) {
     const auto table = MakeTable(context, ranges, ranges.size());
     Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    const auto page = static_cast<std::uint32_t>(guest >> Abi::WrittenPageShift);
-    const auto store = [&](RewriteMode mode, std::uint32_t injection) {
+    const std::uint64_t page = guest >> Abi::WrittenPageShift;
+    const auto store = [&](RewriteMode mode, std::uint64_t injection) {
         SetBdaTestWriteNotes(mode, injection);
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         Pipeline pipeline(context, MakeBdaStoreTestShader(guest + 4, 0xa1b2c3d4u, 32u, false), {table.get(), &fault, &output});
