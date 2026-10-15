@@ -1026,19 +1026,20 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         hookLocks.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) {
-            const HookSyncScope attribution(*recorder, address, bytes);
+        Recorder::ForEachActive([&](Recorder& recorder) {
+            if (!recorder.PendingWriteOverlaps(address, bytes)) return;
+            const HookSyncScope attribution(recorder, address, bytes);
             Recorder::CountSync(1);
             // The wait runs without the mutex when this acquisition is the outermost one (a stage-A
             // read, a game thread); the recorder is not dereferenced after the call.
-            recorder->SyncThrough(address, bytes, true);
-        }
+            recorder.SyncThrough(address, bytes, true);
+        });
     }
     if (AnyDeviceResidentOverlaps(address, bytes)) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
         Require(completionDepth == 0, "a completion action reached unpublished device-resident buffer results");
-        auto* recorder = Recorder::Active();
+        auto* recorder = Recorder::Current();
         Require(recorder != nullptr, "reading device-resident buffer results needs an active recorder");
         if (PublishDeviceResident(*recorder, address, bytes, GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Scanout ? ResidentSite::Scanout : ResidentSite::Hook) != 0) {
             Recorder::CountSync(1);
@@ -1078,12 +1079,12 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         // only the full Sync() gives there.
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
-        if (auto* recorder = Recorder::Active(); recorder != nullptr) {
-            const RecordedStoreSyncScope attribution(*recorder, address, bytes, classification, stored, HookSyncProfiled() ? RecordedStoreKey() : HookSyncKey{});
+        Recorder::ForEachActive([&](Recorder& recorder) {
+            const RecordedStoreSyncScope attribution(recorder, address, bytes, classification, stored, HookSyncProfiled() ? RecordedStoreKey() : HookSyncKey{});
             Recorder::CountSync(2);
-            if (HookFullSync() || completionDepth != 0) recorder->Sync();
-            else recorder->SyncThrough(address, bytes, true);
-        }
+            if (HookFullSync() || completionDepth != 0) recorder.Sync();
+            else recorder.SyncThrough(address, bytes, true);
+        });
     }
 }
 
