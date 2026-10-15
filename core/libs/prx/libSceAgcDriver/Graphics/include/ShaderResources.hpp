@@ -217,6 +217,24 @@ public:
     };
     std::optional<MovedReadOnlyPlan> PlanMovedReadOnlyBuffers(std::span<const CompiledShader> shaders) const;
     std::optional<std::vector<MovedBuffer>> CheckMovedReadOnlyBuffers(const MovedReadOnlyPlan& plan, Recorder& recorder) const;
+    struct MovedDispatchBuffer {
+        std::size_t allocation;
+        std::uint64_t address;
+        std::size_t size;
+        VkDescriptorBufferInfo view;
+        std::uint64_t begin;
+    };
+    std::optional<std::vector<MovedDispatchBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder& recorder) const;
+    std::shared_ptr<DrawBindings> BindMovedDispatchBuffers(Recorder& recorder, std::span<const MovedDispatchBuffer> moved) const;
+    struct GuestBufferView {
+        std::uint64_t address;
+        std::size_t size;
+        bool written;
+        std::uint64_t begin;
+        VkDeviceSize range;
+        bool operator==(const GuestBufferView& other) const = default;
+    };
+    std::vector<GuestBufferView> GuestBufferViews(std::span<const MovedDispatchBuffer> moved = {}) const;
     static std::size_t MaxDrawSnapshotBytes();
     static void SetMovedWordRing(bool enabled);
     static void SetInPlaceDrawInputs(bool enabled);
