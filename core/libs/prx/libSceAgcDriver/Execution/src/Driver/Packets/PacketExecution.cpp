@@ -33,6 +33,10 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 }
 
 void Driver::execute(const Submission& submission) {
+    struct RetireStores {
+        const Submission& submission;
+        ~RetireStores() { retireRegisterListStores(submission); }
+    } retireStores{submission};
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;
@@ -335,7 +339,11 @@ void Driver::execute(const Submission& submission) {
             dumpSampleCounters(Pm4::SampleDumpAddress(packet));
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
-                if (Pm4::IndirectRegisterOpcode(opcode)) Pm4::ExecuteIndirectRegisters(packet, submission.registerLists.at(cursor), queue);
+                if (Pm4::IndirectRegisterOpcode(opcode)) {
+                    const auto list = submission.registerLists.find(cursor);
+                    if (list != submission.registerLists.end()) Pm4::ExecuteIndirectRegisters(packet, list->second, queue);
+                    else Pm4::ExecuteIndirectRegisters(packet, Pm4::ReadIndirectRegisters(packet), queue);
+                }
                 else Pm4::Execute(packet, queue);
                 if (opcode == 0x49 || opcode == 0x37) {
                     if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelStore(label->address, label->Bytes(), ++eventSerial, submission.queue);

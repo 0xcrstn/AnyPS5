@@ -59,6 +59,8 @@ alignas(16) std::array<float, 12> Values{};
 alignas(16) volatile std::uint32_t Condition = 1;
 bool NopBeforeCondition = false;
 bool WideStore = false;
+bool TableWrite = false;
+alignas(16) std::array<std::uint32_t, 4> RegisterPairs{};
 alignas(64) volatile std::uint32_t EndOfPipe = 0;
 std::byte* ColorMemory = nullptr;
 
@@ -178,7 +180,14 @@ std::vector<std::uint32_t> Frame(bool writeData) {
         if (NopBeforeCondition) words.insert(words.end(), {0xc0001000u, 0u});
         words.insert(words.end(), {0xc0032200u, static_cast<std::uint32_t>(condition), static_cast<std::uint32_t>(static_cast<std::uint64_t>(condition) >> 32u), 0u, 9u});
     }
-    SetPixelTable(words, ValueTable.data());
+    if (TableWrite) {
+        const auto value = reinterpret_cast<std::uintptr_t>(ValueTable.data());
+        const auto table = reinterpret_cast<std::uintptr_t>(RegisterPairs.data());
+        words.insert(words.end(), {0xc0063700u, 0x500u, static_cast<std::uint32_t>(table), static_cast<std::uint32_t>(static_cast<std::uint64_t>(table) >> 32u), 0x00cu, static_cast<std::uint32_t>(value), 0x00du, static_cast<std::uint32_t>(static_cast<std::uint64_t>(value) >> 32u)});
+        words.insert(words.end(), {0xc0036300u, static_cast<std::uint32_t>(table), static_cast<std::uint32_t>(static_cast<std::uint64_t>(table) >> 32u), 0x80000000u, 2u});
+    } else {
+        SetPixelTable(words, ValueTable.data());
+    }
     words.insert(words.end(), {0xc0012d00u, 3u, 2u});
     ReleaseMemory(words, &EndOfPipe, 1u, 2u);
     return words;
@@ -190,6 +199,8 @@ std::uint32_t CentreRed(const std::string& what, bool writeData = false) {
     Values = {};
     Values[0] = 1.0f;
     Condition = 1;
+    const auto full = reinterpret_cast<std::uintptr_t>(FullTable.data());
+    RegisterPairs = {0x00cu, static_cast<std::uint32_t>(full), 0x00du, static_cast<std::uint32_t>(static_cast<std::uint64_t>(full) >> 32u)};
     auto words = Frame(writeData);
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, what + ": the submission failed");
@@ -247,6 +258,19 @@ void DrawsSeeWideWriteData(bool jobs) {
     else Require(after.memoryPackets > before.memoryPackets, "no wide WRITE_DATA was recorded as an ordered memory job while draws were in flight");
 }
 
+void IndirectRegistersSeeWriteData() {
+    const auto before = AgcDriver::DriverDetail::Driver::DeferredRegisterLists();
+    TableWrite = true;
+    for (std::uint64_t frame = 0; frame < 4; ++frame) {
+        const auto name = "a SET_SH_REG_INDIRECT after a WRITE_DATA of its register list in the same command buffer, frame " + std::to_string(frame);
+        const auto red = CentreRed(name);
+        Require(red + 1u >= 128u && red <= 129u, name + ": the draw wrote red " + std::to_string(red) + ", expected 128 through the list the WRITE_DATA stored");
+    }
+    TableWrite = false;
+    const auto deferred = AgcDriver::DriverDetail::Driver::DeferredRegisterLists() - before;
+    Require(deferred == 4u, std::to_string(deferred) + " register lists were left for their packet over 4 command buffers that write them first, expected 4");
+}
+
 void ConditionsSeeWriteData() {
     for (std::uint64_t frame = 0; frame < 4; ++frame) {
         NopBeforeCondition = frame % 2 == 1;
@@ -287,6 +311,7 @@ int main() {
         Register(BufferPixelHeader, BufferPixelCode.data(), sizeof(BufferPixelCode), 1);
         DrawsSeeEarlierLabels(jobs);
         ConditionsSeeWriteData();
+        IndirectRegistersSeeWriteData();
         DrawsSeeWideWriteData(AgcDriver::DriverDetail::ParseMemoryPacketJobs(std::getenv("APS5_MEMORY_PACKET_JOBS")));
         AgcDriverShutdown_nid_postfix();
         std::cout << "Draws on the preparation workers see the values earlier RELEASE_MEM labels stored " << (jobs ? "with labels recorded as ordered jobs" : "with labels recorded by queue 0") << " (" << AgcDriver::DriverDetail::LabelRecordJobTotals().endOfPipe << " end-of-pipe labels recorded as jobs)" << std::endl;

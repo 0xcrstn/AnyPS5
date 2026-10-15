@@ -59,6 +59,7 @@ struct DeferredLabel;
 class Driver {
 public:
     static Driver& Get();
+    static std::uint64_t DeferredRegisterLists();
     void ParkPacket(ParkedOp op);
     QueueScheduler& Scheduler() { return queueScheduler; }
     static std::uint64_t GpuMapImportThreads();
@@ -106,6 +107,7 @@ private:
     static void copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words);
     static bool copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget);
     static void readRegisterLists(Submission& submission);
+    static void retireRegisterListStores(const Submission& submission);
     void waitForFlipRoom(const Submission& submission);
     void holdFlipBehindWorker(const Submission& submission);
     bool awaitsTitle(std::uint64_t awaited) const;

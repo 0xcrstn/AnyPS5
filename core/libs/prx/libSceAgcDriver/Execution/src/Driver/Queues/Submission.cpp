@@ -8,6 +8,14 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
+#include <algorithm>
+#include <atomic>
+#include <deque>
+#include <mutex>
+#include <span>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -131,17 +139,78 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
     return false;
 }
 
+namespace {
+
+struct SubmissionStores {
+    std::uint64_t sequence;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+};
+
+struct PendingStores {
+    std::mutex mutex;
+    std::unordered_map<std::uint32_t, std::deque<SubmissionStores>> queues;
+    std::uint64_t next = 0;
+    std::atomic<std::uint64_t> deferred{0};
+};
+
+PendingStores& pendingStores() {
+    static auto* stores = new PendingStores;
+    return *stores;
+}
+
+}
+
+std::uint64_t Driver::DeferredRegisterLists() {
+    return pendingStores().deferred.load(std::memory_order_relaxed);
+}
+
+void Driver::retireRegisterListStores(const Submission& submission) {
+    if (submission.storeSequence == 0) return;
+    auto& stores = pendingStores();
+    std::lock_guard lock(stores.mutex);
+    auto& queued = stores.queues[submission.queue];
+    std::erase_if(queued, [&](const SubmissionStores& entry) { return entry.sequence == submission.storeSequence; });
+}
+
 void Driver::readRegisterLists(Submission& submission) {
     submission.registerLists.clear();
+    auto& stores = pendingStores();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> earlier;
+    {
+        std::lock_guard lock(stores.mutex);
+        if (const auto found = stores.queues.find(submission.queue); found != stores.queues.end()) {
+            for (const auto& entry : found->second) earlier.insert(earlier.end(), entry.ranges.begin(), entry.ranges.end());
+        }
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
+    const auto storedBefore = [&](std::uint64_t address, std::size_t bytes) {
+        const auto overlaps = [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return address < range.second && range.first < address + bytes; };
+        return std::any_of(earlier.begin(), earlier.end(), overlaps) || std::any_of(own.begin(), own.end(), overlaps);
+    };
     for (std::size_t cursor = 0; cursor < submission.commands.size(); cursor += Pm4::PacketWords(submission.commands[cursor])) {
         const auto header = submission.commands[cursor];
-        if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
+        if ((header >> 30u) != 3u) continue;
+        const auto packet = std::span<const std::uint32_t>(submission.commands).subspan(cursor, Pm4::PacketWords(header));
+        if (!Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) {
+            for (const auto& store : Pm4::DecodeStores(packet)) {
+                if (store.bytes != 0) own.emplace_back(store.address, store.address + store.bytes);
+            }
+            continue;
+        }
+        if (const auto read = Pm4::CommandProcessorReadOf(packet); read.has_value() && storedBefore(read->address, read->bytes)) {
+            stores.deferred.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         try {
             submission.registerLists.emplace(cursor, Pm4::ReadIndirectRegisters(std::span<const std::uint32_t>(submission.commands).subspan(cursor, Pm4::PacketWords(header))));
         } catch (const std::exception& error) {
             throw std::runtime_error("AGC driver: " + Pm4::Name(header) + " at DWORD " + std::to_string(cursor) + ": " + error.what());
         }
     }
+    if (own.empty()) return;
+    std::lock_guard lock(stores.mutex);
+    submission.storeSequence = ++stores.next;
+    stores.queues[submission.queue].push_back({submission.storeSequence, std::move(own)});
 }
 
 void Driver::waitForFlipRoom(const Submission& submission) {
