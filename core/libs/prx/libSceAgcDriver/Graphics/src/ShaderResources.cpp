@@ -4835,6 +4835,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 continue;
             }
             if (InPlaceDrawInputs()) {
+                recorder.NoteInPlaceDrawInput(item.address, item.size);
                 if (statistics != nullptr) {
                     ++statistics->inPlace;
                     statistics->inPlaceBytes += item.size;
@@ -4853,6 +4854,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (const auto* import = InPlaceDrawInput(context, begin, bytes, std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4))) {
                 selected.push_back(index);
                 result->snapshots.push_back({begin, nullptr, {}, import->buffer, begin - import->base, std::span<const std::byte>(reinterpret_cast<const std::byte*>(begin), bytes), true});
+                recorder.NoteInPlaceDrawInput(begin, bytes);
                 if (statistics != nullptr) {
                     ++statistics->inPlace;
                     statistics->inPlaceBytes += bytes;

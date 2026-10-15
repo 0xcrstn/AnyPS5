@@ -165,6 +165,8 @@ public:
     enum class ReadKind : std::uint8_t { DispatchElement = 0, GpuCopy, AddressBased, Indirect, StorageUpload, CopySource, DrawInput, Count };
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
+    static bool VerifyInPlaceDrawInputs();
+    void NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
     using ReadList = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
     void NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind);
@@ -595,6 +597,12 @@ private:
             ReadKind kind;
         };
         std::vector<Read> reads;
+        struct InPlaceInput {
+            std::uint64_t begin;
+            std::uint64_t end;
+            std::uint64_t generation;
+        };
+        std::vector<InPlaceInput> inPlaceInputs;
         struct ReadListNote {
             std::shared_ptr<const ReadList> ranges;
             std::size_t position;

@@ -29,6 +29,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -2586,6 +2587,19 @@ void Recorder::readGpuTiming(Batch& batch) {
     reportBarriers();
 }
 
+bool Recorder::VerifyInPlaceDrawInputs() {
+    static const bool enabled = std::getenv("APS5_VERIFY_IN_PLACE_DRAW_INPUTS") != nullptr;
+    return enabled;
+}
+
+void Recorder::NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || !VerifyInPlaceDrawInputs()) return;
+    ensureOpen();
+    const auto generation = GuestMemory::CollectWritesUncached(address, bytes);
+    Require(generation != 0, "APS5_VERIFY_IN_PLACE_DRAW_INPUTS: an input bound in place has no write generation to verify against");
+    open->inPlaceInputs.push_back({address, address + bytes, generation});
+}
+
 bool Recorder::FlipReadCheck() {
     static const bool enabled = std::getenv("APS5_FLIP_READ_CHECK") != nullptr;
     return enabled;
@@ -3646,6 +3660,14 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    for (const auto& input : open->inPlaceInputs) {
+        GuestMemory::CollectWritesUncached(input.begin, static_cast<std::size_t>(input.end - input.begin));
+        if (GuestMemory::UnchangedSince(input.begin, static_cast<std::size_t>(input.end - input.begin), input.generation)) continue;
+        char message[256];
+        std::snprintf(message, sizeof(message), "APS5_VERIFY_IN_PLACE_DRAW_INPUTS: a CPU store reached the draw input 0x%llx+0x%llx bound in place before its batch was submitted", static_cast<unsigned long long>(input.begin), static_cast<unsigned long long>(input.end - input.begin));
+        throw std::runtime_error(message);
+    }
+    open->inPlaceInputs.clear();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     if (open->guestCompletions && AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Completion);
