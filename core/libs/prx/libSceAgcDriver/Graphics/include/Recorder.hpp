@@ -93,6 +93,8 @@ public:
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     bool HasGuestCompletions() const;
+    bool GuestWriteBacksOwed() const;
+    static bool LabelPublicationOrdered();
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
@@ -590,6 +592,7 @@ private:
         std::unordered_set<const void*> keptOwners;
         std::vector<std::function<void()>> completions;
         bool guestCompletions = false;
+        bool guestWriteBacks = false;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
@@ -641,6 +644,7 @@ private:
         // Dword addresses this batch noted in the label table (removed when it finishes).
         std::vector<std::uint64_t> labelDwords;
         std::vector<std::multimap<std::uint64_t, std::uint64_t>::iterator> wideLabels;
+        std::vector<std::uint64_t> labelStamps;
         // Labels stored by this batch's completion actions (see AfterCompletions); subtracted from
         // the lock-free pending count when the batch finishes, whether or not its completions ran.
         std::uint32_t completionLabelCount = 0;

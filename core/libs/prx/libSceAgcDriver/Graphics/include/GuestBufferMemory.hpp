@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "BdaAbi.hpp"
@@ -270,6 +271,10 @@ public:
     void UploadFinish(bool addressable);
     void SetPointerAccess(bool writes, std::vector<std::pair<std::uint64_t, std::uint64_t>> exempt);
     void ForgetPointerShadows() const;
+    std::span<const std::pair<std::uint64_t, std::uint64_t>> PointerHeaps() const { return pointerHeaps; }
+    bool PointerWrites() const { return pointerWrites; }
+    void PointerRecorded();
+    void CompletePointerWrites(std::span<const Coherence::Interval> written) const;
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
@@ -468,6 +473,7 @@ private:
     bool pointerWrites = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pointerExempt;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pointerHeaps;
+    mutable Coherence::ProducerToken pointerToken;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> readsOverBase;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
     std::uint64_t accountedHostCopyBytes = 0;

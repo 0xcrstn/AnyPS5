@@ -20,6 +20,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
+#include "BdaShader.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -4326,6 +4329,305 @@ void pointerAccessShadowTests(const Device& device, Recorder& recorder) {
         Require(sources.size() == 1 && !sources[0].shadow, "a unit under an address-based build that stores through pointers still reads from its slab");
     }
     std::cout << "pointer access over unit shadows: ok\n";
+}
+
+class AddressProgram {
+public:
+    AddressProgram(const Context& context, std::span<const std::uint32_t> code, const std::array<VkDescriptorBufferInfo, 3>& buffers) : context(context) {
+        try {
+            std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
+            for (std::uint32_t index = 0; index < bindings.size(); ++index) bindings[index] = {index, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+            VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            setInfo.bindingCount = bindings.size();
+            setInfo.pBindings = bindings.data();
+            Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &setInfo, nullptr, &setLayout), "vkCreateDescriptorSetLayout");
+            const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            poolInfo.maxSets = 1;
+            poolInfo.poolSizeCount = 1;
+            poolInfo.pPoolSizes = &size;
+            Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool");
+            VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, pool, 1, &setLayout};
+            Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &set), "vkAllocateDescriptorSets");
+            for (std::uint32_t index = 0; index < buffers.size(); ++index) {
+                VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                write.dstSet = set;
+                write.dstBinding = index;
+                write.descriptorCount = 1;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                write.pBufferInfo = &buffers[index];
+                context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 1, &write, 0, nullptr);
+            }
+            VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layoutInfo.setLayoutCount = 1;
+            layoutInfo.pSetLayouts = &setLayout;
+            Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout");
+            VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            moduleInfo.codeSize = code.size_bytes();
+            moduleInfo.pCode = code.data();
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
+            VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+            pipelineInfo.layout = layout;
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines");
+        } catch (...) {
+            release();
+            throw;
+        }
+    }
+    AddressProgram(const AddressProgram&) = delete;
+    AddressProgram& operator=(const AddressProgram&) = delete;
+    ~AddressProgram() { release(); }
+
+    void Record(Recorder& recorder) const {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        context.Function<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        recorder.MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    }
+
+private:
+    void release() noexcept {
+        if (pipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+        if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        if (layout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+        if (pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+        if (setLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, setLayout, nullptr);
+        pipeline = VK_NULL_HANDLE;
+        module = VK_NULL_HANDLE;
+        layout = VK_NULL_HANDLE;
+        pool = VK_NULL_HANDLE;
+        setLayout = VK_NULL_HANDLE;
+    }
+
+    Context context;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+int coherenceOrderingTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    namespace Coherence = AgcDriver::Coherence;
+    const auto& base = device.GetContext();
+    if (!base.bufferDeviceAddress) {
+        std::cout << "skipped, buffer device addresses are unavailable\n";
+        return 77;
+    }
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 6 * unit;
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared coherence section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    struct Release {
+        void* block;
+        ~Release() {
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+#else
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "unit shadows are on without write watching");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+#endif
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            Coherence::SetModesForTests(Coherence::Mode::Reference, Coherence::Mode::Reference, Coherence::Mode::Reference);
+            Coherence::ResetForTests();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the coherence block refused or compared: not tested\n";
+        return 77;
+    }
+    CollectWritesUncached(address, bytes);
+    const auto* words = static_cast<const std::uint8_t*>(block);
+    const auto copyBuffer = base.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto retile = [&](std::uint64_t begin, std::uint8_t value, Coherence::Version version) {
+        auto destination = ShadowDestinationFor(base, *import, begin, begin + unit);
+        Require(destination.has_value() && destination->seedUnits.empty(), "a whole-unit retile piece has no destination");
+        auto pattern = std::make_shared<Buffer>(base, static_cast<std::size_t>(unit), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(pattern->Bytes().data(), value, pattern->Bytes().size());
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(destination->slab);
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, SlabOffset(*import, *destination->slab, begin), unit};
+        copyBuffer(commands, pattern->Handle(), destination->buffer, 1, &piece);
+        RecordMemoryBarrier(base, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const ShadowedRange range{begin, begin + unit, destination->slab};
+        MarkShadowed(*import, std::span(&range, 1), TrackerGeneration(), version);
+    };
+    auto output = std::make_shared<Buffer>(base, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    struct Use {
+        std::unique_ptr<GuestBufferMemory> memory;
+        std::unique_ptr<BdaResources> bda;
+        std::unique_ptr<AddressProgram> program;
+    };
+    const auto record = [&](bool writes, std::vector<std::uint32_t> code) {
+        Use use;
+        use.memory = std::make_unique<GuestBufferMemory>(base);
+        use.memory->AcquireRegistered();
+        use.memory->SetPointerAccess(writes, {});
+        use.memory->Upload(true);
+        use.bda = std::make_unique<BdaResources>(base, *use.memory);
+        std::memset(output->Bytes().data(), 0, output->Bytes().size());
+        use.program = std::make_unique<AddressProgram>(base, code, std::array<VkDescriptorBufferInfo, 3>{use.bda->Table(), use.bda->Fault(), VkDescriptorBufferInfo{output->Handle(), 0, 16}});
+        use.program->Record(recorder);
+        if (writes) {
+            use.memory->ForgetPointerShadows();
+            use.memory->PointerRecorded();
+            if (Coherence::Ordering()) recorder.NotePendingWrites(use.memory->PointerHeaps());
+        }
+        return use;
+    };
+    const auto complete = [&](Use& use) {
+        recorder.Sync();
+        use.bda->CheckFault();
+        use.memory->CompletePointerWrites(use.bda->WrittenRanges());
+        use.memory->WriteBack();
+    };
+    const auto dword = [&] {
+        std::uint32_t value = 0;
+        std::memcpy(&value, output->Bytes().data(), sizeof(value));
+        return value;
+    };
+    const auto filled = [&](std::uint64_t from, std::uint64_t to, std::uint8_t value) {
+        for (auto at = from; at < to; ++at) {
+            if (words[at] != value) return false;
+        }
+        return true;
+    };
+    constexpr std::uint32_t stored = 0xa1b2c3d4u;
+    constexpr std::uint64_t storeOffset = 16;
+
+    Coherence::SetModesForTests(Coherence::Mode::Reference, Coherence::Mode::Verify, Coherence::Mode::Reference);
+    Coherence::ResetForTests();
+    retile(address, 0x22, 0);
+    {
+        auto writer = record(true, MakeBdaStoreTestShader(address + storeOffset, stored, 32, false));
+        Require(Coherence::CurrentCounters().activeWriters == 1, "the pointer writer was not reserved before its completion");
+        StorageTexture::FlushAllPending("flip", PublishScope::Whole);
+        complete(writer);
+    }
+    Require(filled(0, storeOffset, 0x22) && filled(storeOffset + 4, unit, 0x22), "the bytes around a pointer store lost the shadow published before it");
+    Require(words[storeOffset] == 0xd4 && words[storeOffset + 1] == 0xc3 && words[storeOffset + 2] == 0xb2 && words[storeOffset + 3] == 0xa1, "a pointer store did not survive a flip recorded before its completion");
+    {
+        auto reader = record(false, MakeBdaDwordReadTestShader(address + storeOffset, 1, false, true));
+        complete(reader);
+    }
+    Require(dword() == stored, "a later address-based reader did not see the pointer store");
+    auto counters = Coherence::CurrentCounters();
+    Require(counters.stalePublications == 0 && counters.staleReads == 0 && counters.completions >= 1 && counters.activeWriters == 0, "ordered pointer store: " + Coherence::Report());
+
+    for (const auto audit : {Coherence::Mode::Verify, Coherence::Mode::New}) {
+        Coherence::SetModesForTests(audit, Coherence::Mode::Reference, Coherence::Mode::Reference);
+        Coherence::ResetForTests();
+        const auto old = Coherence::NextVersion();
+        const auto target = address + 2 * unit;
+        auto writer = record(true, MakeBdaStoreTestShader(target + storeOffset, stored, 32, false));
+        retile(target, 0x55, old);
+        std::string failure;
+        try {
+            StorageTexture::FlushAllPending("flip", PublishScope::Whole);
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+        complete(writer);
+        if (audit == Coherence::Mode::Verify) {
+            Require(failure.find("stale publication: shadow-unit") != std::string::npos, "audit verify accepted an old shadow published over a recorded pointer writer: " + failure);
+            Coherence::SetModesForTests(Coherence::Mode::Reference, Coherence::Mode::Reference, Coherence::Mode::Reference);
+            StorageTexture::FlushAllPending("teardown", PublishScope::Whole);
+            recorder.Sync();
+        } else {
+            Require(failure.empty(), "audit 1 threw: " + failure);
+            Require(Coherence::CurrentCounters().stalePublications != 0, "audit 1 did not flag an old shadow published over a recorded pointer writer: " + Coherence::Report());
+        }
+    }
+
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address + 4 * unit;
+    resource.width = 128;
+    resource.height = 128;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == unit, "the coherence image does not fill its 64 KiB block");
+    auto image = StorageTexture::Create(context, detiler, resource, 0);
+    const auto paint = [&](const VkClearColorValue& color) {
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+    };
+
+    Coherence::SetModesForTests(Coherence::Mode::New, Coherence::Mode::Reference, Coherence::Mode::Reference);
+    Coherence::ResetForTests();
+    paint({{1.0f, 0.0f, 0.0f, 1.0f}});
+    {
+        auto reader = record(false, MakeBdaDwordReadTestShader(address + 4 * unit, 1, false, true));
+        complete(reader);
+    }
+    Require(Coherence::CurrentCounters().staleReads != 0, "audit 1 did not flag a read-only address-based build reading host bytes under a pending image");
+    Require(StorageTexture::FindPending(address + 4 * unit, unit) == image, "the reference reader stored the pending image");
+
+    Coherence::SetModesForTests(Coherence::Mode::Reference, Coherence::Mode::Verify, Coherence::Mode::Reference);
+    Coherence::ResetForTests();
+    {
+        auto reader = record(false, MakeBdaDwordReadTestShader(address + 4 * unit, 1, false, true));
+        complete(reader);
+    }
+    Require(StorageTexture::FindPending(address + 4 * unit, unit) == nullptr, "an ordered read-only address-based build left the image pending over its heap");
+    Require(dword() == 0xff0000ffu, "an ordered read-only address-based build read stale bytes under a pending image");
+    counters = Coherence::CurrentCounters();
+    Require(counters.staleReads == 0 && counters.stalePublications == 0, "ordered pointer reader: " + Coherence::Report());
+    std::cout << "coherence ordering with address-based stores and loads: ok\n";
+    return 0;
 }
 
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
@@ -10337,6 +10639,13 @@ int main(int argc, char** argv) {
             }
             unitShadowTests(device, recorder);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--coherence-ordering-only") {
+            if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, unit shadows or host imports are unavailable\n";
+                return 77;
+            }
+            return coherenceOrderingTests(device, recorder);
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pointer-access-shadow-only") {
             if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {

@@ -130,6 +130,7 @@ void Driver::execute(const Submission& submission) {
             return std::string(text) + describeWait(packet);
         });
         auto nextCursor = cursor + count;
+        const auto turn = queueScheduler.Begin(submission.queue, submission.serial, cursor, submission.received);
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
@@ -209,7 +210,10 @@ void Driver::execute(const Submission& submission) {
         if (!waitPacket) ++packetsInFlight;
         recent.Record(cursor);
         if (header == RenderingWaitPacketHeader) {
-            timed(&WorkerProfile::waitMs, [&] { submission.renderingWaits.at(cursor)->Wait(); });
+            timed(&WorkerProfile::waitMs, [&] {
+                const auto blocked = queueScheduler.Block(submission.queue);
+                submission.renderingWaits.at(cursor)->Wait();
+            });
         } else if (submission.flips.contains(cursor)) {
             if (opcode == 0x49) {
                 if (!wroteOnGpu) {

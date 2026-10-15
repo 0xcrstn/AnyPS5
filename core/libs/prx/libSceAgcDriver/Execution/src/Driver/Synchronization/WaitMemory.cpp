@@ -7,6 +7,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
 #include <mutex>
 #include <set>
 #ifdef _WIN32
@@ -59,7 +62,43 @@ std::vector<Driver::PendingWait>& Driver::pendingWaits() {
     return HostThreadLocal<std::vector<PendingWait>, WaitsTag>();
 }
 
-void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received) {
+std::uint64_t& Driver::waitFloor() {
+    struct FloorTag {};
+    return HostThreadLocal<std::uint64_t, FloorTag>();
+}
+
+WaitFloorMode Driver::waitFloorMode() {
+    static const WaitFloorMode mode = [] {
+        const char* value = std::getenv("APS5_WAIT_FLOOR");
+        if (value == nullptr || std::strcmp(value, "activation") == 0) return WaitFloorMode::Activation;
+        if (std::strcmp(value, "submission") == 0) return WaitFloorMode::Submission;
+        throw std::runtime_error(std::string("APS5_WAIT_FLOOR: unknown mode ") + value + " (activation or submission)");
+    }();
+    return mode;
+}
+
+bool Driver::verifyWaitObservations() {
+    static const bool verify = [] {
+        const char* value = std::getenv("APS5_VERIFY_WAIT_OBSERVATIONS");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return verify;
+}
+
+void Driver::dischargeWait(WaitObservation& observation, std::span<const std::uint32_t> packet) {
+    observation.discharged = eventSerial.load(std::memory_order_acquire);
+    observation.dischargedAt = std::chrono::steady_clock::now();
+    auto& floor = waitFloor();
+    if (verifyWaitObservations() && !ObservationProven(observation, floor)) throw std::runtime_error("APS5_VERIFY_WAIT_OBSERVATIONS: unproven wait observation: " + DescribeObservation(observation) + ", queue floor " + std::to_string(floor));
+    floor = std::max(floor, observation.discharged);
+    if (observation.FromRecordedStore() && observation.CrossQueue()) notePendingWait(packet, observation);
+    importRelease(observation);
+    noteWaitChain(observation, packet);
+}
+
+void Driver::notePendingWait(std::span<const std::uint32_t> packet, const WaitObservation& observation) {
+    const auto queue = observation.queue;
+    const auto received = observation.received;
     if (packet.size() > std::tuple_size_v<decltype(PendingWait::words)>) return;
     static const bool allQueues = std::getenv("APS5_LAND_WAITS_ALL_QUEUES") != nullptr;
     if (!allQueues && queue == 0) return;
@@ -72,6 +111,7 @@ void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_
     std::copy(packet.begin(), packet.end(), wait.words.begin());
     wait.count = packet.size();
     wait.received = received;
+    wait.observation = observation;
     waits.push_back(wait);
 }
 
@@ -90,6 +130,7 @@ void Driver::landPendingWaits(std::uint32_t queue) {
         const auto packet = std::span<const std::uint32_t>(wait.words).first(wait.count);
         ++stats.lands;
         if (Pm4::WaitSatisfiedUnchecked(packet)) continue;
+        if (!wait.observation.FromRecordedStore() || !wait.observation.CrossQueue()) throw std::runtime_error("landing a wait without a recorded cross-queue observation: " + DescribeObservation(wait.observation));
         const auto started = std::chrono::steady_clock::now();
         waitMemory(packet, queue, none, wait.received, false, true);
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -113,6 +154,37 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     auto& outcomes = waitOutcomes();
     const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
     const std::size_t awaitedBytes = Pm4::WaitAwaitedBytes(packet);
+    const bool wideWait = ((packet[0] >> 8u) & 0xffu) == 0x93u;
+    WaitObservation observation{};
+    observation.address = awaited;
+    observation.bytes = static_cast<std::uint32_t>(awaitedBytes);
+    observation.function = packet[1] & 7u;
+    observation.reference = wideWait ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : packet[4];
+    observation.mask = wideWait ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : packet[5];
+    observation.queue = queue;
+    observation.received = received;
+    observation.activation = requireMemory ? received : WaitActivationStamp(waitFloorMode(), received, waitFloor());
+    observation.activatedAt = std::chrono::steady_clock::now();
+    const std::uint64_t activation = observation.activation;
+    const auto discharge = [&](WaitSource source) {
+        observation.source = source;
+        if (source == WaitSource::Entry || source == WaitSource::Memory || source == WaitSource::HeldAtSubmit) {
+            const bool readable = GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(awaited)), awaitedBytes);
+            observation.value = !readable ? 0 : wideWait ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+        }
+        if (!requireMemory) dischargeWait(observation, packet);
+    };
+    const auto historyHit = [&]() -> bool {
+        if (requireMemory) return false;
+        const auto match = storedSince(packet, awaited, awaitedBytes, activation);
+        if (!match.has_value()) return false;
+        ++(match->queue == queue ? outcomes.storedSinceSameQueue : outcomes.storedSinceOtherQueue);
+        observation.value = match->value;
+        observation.producerQueue = match->queue;
+        observation.producerStamp = match->stamp;
+        discharge(WaitSource::History);
+        return true;
+    };
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)), packet[4],
                                *reinterpret_cast<const volatile std::uint32_t*>(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)));
@@ -135,15 +207,18 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
+        discharge(WaitSource::Entry);
         return;
     }
-    if (heldAtSubmit) return;
-    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
-        ++(writer == queue ? outcomes.storedSinceSameQueue : outcomes.storedSinceOtherQueue);
-        if (writer != queue) notePendingWait(packet, queue, received);
-        else epochPoint.bump = false;
+    if (heldAtSubmit) {
+        discharge(WaitSource::HeldAtSubmit);
         return;
     }
+    if (historyHit()) {
+        if (observation.producerQueue == queue) epochPoint.bump = false;
+        return;
+    }
+    if (!requireMemory && activation != received && storedSince(packet, awaited, awaitedBytes, received).has_value()) ++outcomes.belowFloor;
 
     static const bool labelShortcut = std::getenv("APS5_NO_LABEL_SHORTCUT") == nullptr;
     const bool labelTable = labelShortcut && !requireMemory;
@@ -183,9 +258,11 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
             if (!hit->late) epochPoint.bump = false;
-        } else {
-            notePendingWait(packet, queue, received);
         }
+        observation.value = hit->value;
+        observation.producerQueue = hit->queue;
+        observation.producerStamp = hit->stamp;
+        discharge(hit->late ? WaitSource::TableLate : WaitSource::Table);
         return true;
     };
 
@@ -195,7 +272,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     if (unlocked) {
         if (labelTable) {
             Graphics::Recorder::LabelRefusal refusal{};
-            if (takeLabel(Graphics::Recorder::LookupLabel(awaited, awaitedBytes, received, &refusal), refusal, false, true)) return;
+            if (takeLabel(Graphics::Recorder::LookupLabel(awaited, awaitedBytes, activation, &refusal), refusal, false, true)) return;
         }
     }
     const bool lockedEntry = !unlocked || Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes);
@@ -218,7 +295,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
             if (labelTable) {
                 Graphics::Recorder::LabelRefusal refusal{};
-                if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, false, false)) return;
+                if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, activation, &refusal), refusal, false, false)) return;
             }
 
             if (!overlapSubmit || localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) localDevice->SubmitRecorded(false);
@@ -256,7 +333,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (changed && unlocked && labelTable) {
 
             Graphics::Recorder::LabelRefusal refusal{};
-            if (takeLabel(Graphics::Recorder::LookupLabel(awaited, awaitedBytes, received, &refusal), refusal, true, true)) {
+            if (takeLabel(Graphics::Recorder::LookupLabel(awaited, awaitedBytes, activation, &refusal), refusal, true, true)) {
                 if (pollProfile) ++poll.tableHits;
                 return true;
             }
@@ -293,7 +370,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             recheck = false;
             if (labelTable) {
                 Graphics::Recorder::LabelRefusal refusal{};
-                if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, true, false)) {
+                if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, activation, &refusal), refusal, true, false)) {
                     if (pollProfile) ++poll.tableHits;
                     return true;
                 }
@@ -327,6 +404,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
     if (entryTryFailed && pollService(false)) return;
 
+    const auto schedulerBlock = requireMemory ? QueueScheduler::Blocked{} : queueScheduler.Block(queue);
     noteWaitBlocked(queue, awaited, true);
     struct BlockedWait {
         Driver& driver;
@@ -339,10 +417,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
-        if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
-            ++(writer == queue ? outcomes.storedSinceSameQueue : outcomes.storedSinceOtherQueue);
-            if (writer != queue) notePendingWait(packet, queue, received);
-            else epochPoint.bump = false;
+        if (historyHit()) {
+            if (observation.producerQueue == queue) epochPoint.bump = false;
             return;
         }
         ++polls;
@@ -361,7 +437,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
-                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return;
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
+                    ++outcomes.landedSettled;
+                    return;
+                }
             }
         }
         if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
@@ -394,7 +473,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
             if (const auto reportDevice = device.Load(); reportDevice != nullptr) {
                 Graphics::Recorder::LabelRefusal refusal{};
-                const auto hit = reportDevice->PendingLabel(awaited, awaitedBytes, received, &refusal);
+                const auto hit = reportDevice->PendingLabel(awaited, awaitedBytes, activation, &refusal);
                 const auto since = Graphics::Recorder::PendingLabelSince();
                 const auto age = since.has_value() ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - *since).count() : -1.0;
                 std::fprintf(stderr, "[gpu]   recorder: table %s (refusal %u), open batch writes it %d, snapshot write overlaps %d, pending completion labels %llu, write-back completions %llu, pending label age %.1f ms, write generation %llu seen %llu, queue 0 dormant %d, completions pending %d, label due %d\n",
@@ -406,6 +485,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     }
     ++outcomes.polled;
+    discharge(WaitSource::Memory);
 }
 
 }

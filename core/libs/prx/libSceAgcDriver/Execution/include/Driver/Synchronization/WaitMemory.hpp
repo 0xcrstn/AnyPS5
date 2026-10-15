@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_WAITMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/LabelStores.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitObservation.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <array>
 #include <chrono>
@@ -40,6 +41,7 @@ struct WaitOutcomes {
     std::uint64_t atEntry = 0, fromRecorder = 0, fromRecorderSameQueue = 0, fromRecorderPolling = 0, polled = 0, timedOut = 0, pollSubmits = 0, pollReaps = 0;
     std::uint64_t fromRecorderUnlocked = 0, entriesUnlocked = 0, entryTriesFailed = 0, fromRecorderLate = 0, lateRefusedCpuStore = 0;
     std::uint64_t heldAtSubmit = 0, storedSinceSameQueue = 0, storedSinceOtherQueue = 0;
+    std::uint64_t belowFloor = 0, landedSettled = 0;
 };
 
 struct EpochBumps {

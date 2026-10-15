@@ -18,6 +18,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
+#include "prx/libSceAgcDriver/Execution/include/QueueScheduler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -54,6 +56,8 @@ namespace AgcDriver::DriverDetail {
 class Driver {
 public:
     static Driver& Get();
+    void ParkPacket(ParkedOp op);
+    QueueScheduler& Scheduler() { return queueScheduler; }
     static std::uint64_t GpuMapImportThreads();
     ~Driver();
     void Shutdown();
@@ -278,9 +282,10 @@ private:
     static PendingDrawPhases& pendingDrawPhases();
     void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures);
     void noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
-    bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer = nullptr);
+    std::optional<StoredMatch> storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp);
     static void traceLabel(std::span<const std::uint32_t> packet, std::uint32_t queue);
     std::string describeWait(std::span<const std::uint32_t> packet);
+    static std::string describeObservedChain(std::uint64_t target);
     static std::array<WriteRecord, 16384>& writeHistory();
     static std::size_t& writeCursor();
     static void dumpPackets(std::span<const std::uint32_t> commands, const std::uint32_t* guest = nullptr);
@@ -353,9 +358,19 @@ private:
         std::array<std::uint32_t, 8> words;
         std::size_t count;
         std::uint64_t received;
+        WaitObservation observation;
     };
     static std::vector<PendingWait>& pendingWaits();
-    static void notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received);
+    static void notePendingWait(std::span<const std::uint32_t> packet, const WaitObservation& observation);
+    static std::uint64_t& waitFloor();
+    static WaitFloorMode waitFloorMode();
+    static bool verifyWaitObservations();
+    void dischargeWait(WaitObservation& observation, std::span<const std::uint32_t> packet);
+    void noteWaitChain(const WaitObservation& observation, std::span<const std::uint32_t> packet);
+    void noteRelease(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
+    void importRelease(const WaitObservation& observation);
+    static WaitObservation& lastObservation();
+    static void reportWaitChain(std::uint32_t queue);
     void landPendingWaits(std::uint32_t queue);
     struct ResolvedDispatch {
         std::uint64_t address = 0, key = 0, indirectArguments = 0;
@@ -432,6 +447,7 @@ private:
     std::atomic<std::uint64_t> packetsDone{0};
 
     std::atomic<std::uint64_t> eventSerial{0};
+    QueueScheduler queueScheduler{QueueScheduler::ConfiguredMode(), QueueScheduler::ConfiguredVerify()};
     alignas(64) std::shared_ptr<ShaderRegistry> shaders = std::make_shared<ShaderRegistry>();
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>> dispatchCache;
@@ -508,6 +524,8 @@ private:
 
     std::mutex labelStoresMutex;
     std::unordered_map<std::uint64_t, std::array<LabelStore, LabelStoreHistory>> labelStores;
+    std::mutex releasesMutex;
+    std::array<Coherence::Release, 4096> releases;
 
     std::vector<std::shared_ptr<VulkanDevice>> replacedDevices;
     std::stop_token shutdownToken = LibcShutdownToken_nid_postfix();

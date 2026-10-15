@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_UNITSHADOW_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_UNITSHADOW_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <atomic>
 #include <cstddef>
@@ -136,7 +137,7 @@ VkDeviceSize SlabOffset(const HostImport& import, const ShadowSlab& slab, std::u
 // After a retile's copies were recorded: the units of `ranges` (guest) hold the newest bytes at
 // `generation`, unpublished. A unit whose slab is no longer the one the copies went into is not
 // marked (counted `slab lost`). Bumps StorageTexture's pending serial.
-void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation);
+void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation, Coherence::Version version = 0);
 // retireImport: publishes the fresh units whose memory `registered` still names as a readable
 // registered range into the (old) import buffer, hands the slabs to the batch and drops the shadow.
 // The import retires because its registration vanished or changed size, so the rest of its memory
