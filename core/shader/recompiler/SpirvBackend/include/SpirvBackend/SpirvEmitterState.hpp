@@ -145,6 +145,8 @@ struct SpirvEmitterState {
     RewriteMode lazyTrigSeries = RewriteMode::Off;
     RewriteMode bdaSpanHelpers = RewriteMode::Off;
     RewriteMode bdaWriteNotes = RewriteMode::Off;
+    RewriteMode ballotReuse = RewriteMode::Off;
+    std::map<std::array<std::uint32_t, 3>, std::uint32_t> blockBallots;
     std::uint32_t rewriteMismatchInjection = 0;
     std::uint64_t bdaWriteNoteInjection = 0;
     std::map<std::array<std::uint32_t, 4>, std::uint32_t> bdaSpecializedSpanFunctions;

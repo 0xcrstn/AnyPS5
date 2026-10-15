@@ -143,6 +143,47 @@ std::vector<std::uint32_t> MakeFlushCheckTestShader(std::uint32_t value, ShaderR
     return state.module.Finalize();
 }
 
+std::vector<std::uint32_t> MakeBallotReuseTestShader(ShaderRecompiler::RewriteMode mode, bool inject) {
+    using namespace ShaderRecompiler;
+    IrProgram program;
+    program.Resources().stage = IrShaderStage::Compute;
+    program.Info().usesFaultBuffer = true;
+    SpirvEmitterState state(program, {});
+    EmitBaseHeader(state.module, program);
+    state.module.EmitCapability(spv::CapabilityGroupNonUniform);
+    state.module.EmitCapability(spv::CapabilityGroupNonUniformBallot);
+    const auto define = [&](std::uint32_t binding) {
+        const auto variable = state.module.DefineGlobalVariable(TypeStorageBufferPointer(state), spv::StorageClassStorageBuffer);
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0u);
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+        return variable;
+    };
+    static_cast<void>(define(0));
+    state.faultBufferVariable = define(1);
+    static_cast<void>(define(2));
+    DefineBdaFaultFunction(state);
+    state.ballotReuse = mode;
+    state.mainFunc = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
+    EmitLabel(state, state.module.AllocateId());
+    SpirvValueEmitContext ctx(state);
+    IrBuilder builder(program);
+    auto& predicate = builder.Constant(true);
+    if (inject) {
+        const auto zero = ConstantU32(state, 0u);
+        const auto empty = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), empty, zero, zero, zero, zero);
+        state.blockBallots.emplace(std::array<std::uint32_t, 3>{state.currentLabel, ctx.Def(&predicate), 0u}, empty);
+    }
+    static_cast<void>(ctx.Ballot(&predicate));
+    static_cast<void>(ctx.Ballot(&predicate));
+    state.module.AddFunction(spv::OpReturn);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeLocalSize, 1u, 1u, 1u);
+    state.module.EmitEntryPoint(spv::ExecutionModelGLCompute, state.mainFunc, "main", {});
+    return state.module.Finalize();
+}
+
 std::vector<std::uint32_t> MakeRepairTestShader(std::uint32_t function, ShaderRecompiler::RewriteMode mode, std::uint32_t injection) {
     using namespace ShaderRecompiler;
     IrProgram program;

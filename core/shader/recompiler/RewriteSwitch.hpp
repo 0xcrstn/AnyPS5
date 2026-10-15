@@ -40,6 +40,11 @@ inline RewriteMode FlushProofsSetting() {
     return mode;
 }
 
+inline RewriteMode BallotReuseSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_BALLOT_REUSE", std::getenv("APS5_BALLOT_REUSE"), RewriteMode::On);
+    return mode;
+}
+
 inline RewriteMode InterpolationFactsSetting() {
     static const RewriteMode mode = ParseRewriteMode("APS5_INTERPOLATION_FACTS", std::getenv("APS5_INTERPOLATION_FACTS"), RewriteMode::On);
     return mode;

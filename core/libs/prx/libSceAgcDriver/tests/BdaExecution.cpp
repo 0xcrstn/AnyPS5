@@ -1,4 +1,5 @@
 #include "BdaShader.hpp"
+#include <spirv/unified1/spirv.hpp>
 #include "BdaTranslationFixtures.hpp"
 #include "BdaAbi.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <tuple>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -686,6 +688,31 @@ void RunBdaWriteNoteTests(const Context& context) {
     const auto [report, noted] = store(RewriteMode::Verify, page);
     Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::WriteNoteMismatch && report.address == guest + 4 && noted == 1u, "APS5_BDA_WRITE_NOTES=verify did not fail on an injected cache entry");
     SetBdaTestWriteNotes(ShaderRecompiler::BdaWriteNotesSetting());
+}
+
+void RunBallotReuseTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    using ShaderRecompiler::RewriteMode;
+    const auto ballots = [](const std::vector<std::uint32_t>& words) {
+        std::uint32_t count = 0;
+        for (std::size_t index = 5; index < words.size() && (words[index] >> 16u) != 0u; index += words[index] >> 16u) count += (words[index] & 0xffffu) == spv::OpGroupNonUniformBallot;
+        return count;
+    };
+    Require(ballots(MakeBallotReuseTestShader(RewriteMode::Off, false)) == 2u, "APS5_BALLOT_REUSE=off did not emit both ballots");
+    Require(ballots(MakeBallotReuseTestShader(RewriteMode::On, false)) == 1u, "APS5_BALLOT_REUSE=on did not reuse a ballot of the same value in the same block");
+    Require(ballots(MakeBallotReuseTestShader(RewriteMode::On, true)) == 0u, "APS5_BALLOT_REUSE=on did not reuse the injected ballot");
+    Require(ballots(MakeBallotReuseTestShader(RewriteMode::Verify, false)) == 2u, "APS5_BALLOT_REUSE=verify did not emit both ballots");
+    Buffer unused(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    for (const auto [mode, inject, faults] : {std::tuple{RewriteMode::Verify, false, false}, std::tuple{RewriteMode::Verify, true, true}, std::tuple{RewriteMode::On, true, false}}) {
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        Pipeline pipeline(context, MakeBallotReuseTestShader(mode, inject), {&unused, &fault, &unused});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        if (faults) Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::BallotReuseMismatch && report.address == 1u && report.bytes == 0u, "APS5_BALLOT_REUSE=verify did not stop on an injected ballot");
+        else Require(report.state == Abi::FaultState::Empty, "a ballot reuse test faulted without a mismatch");
+    }
 }
 
 void RunFlushProofCheckTests(const Context& context) {
