@@ -14,6 +14,18 @@ ReadOnlyAddressPasses ParseReadOnlyAddressPasses(const char* text) {
     throw std::runtime_error(std::string("APS5_READONLY_ADDRESS_PASSES must be 0, 1 or verify, not ") + text);
 }
 
+DepthPassMerge ParseDepthPassMerge(const char* text) {
+    if (text == nullptr || std::strcmp(text, "1") == 0) return DepthPassMerge::On;
+    if (std::strcmp(text, "0") == 0) return DepthPassMerge::Off;
+    if (std::strcmp(text, "verify") == 0) return DepthPassMerge::Verify;
+    throw std::runtime_error(std::string("APS5_DEPTH_PASS_MERGE must be 0, 1 or verify, not ") + text);
+}
+
+DepthPassMerge DepthPassMergeSetting() {
+    static const auto setting = ParseDepthPassMerge(std::getenv("APS5_DEPTH_PASS_MERGE"));
+    return setting;
+}
+
 ReadOnlyAddressPasses ReadOnlyAddressPassesSetting() {
     static const auto setting = ParseReadOnlyAddressPasses(std::getenv("APS5_READONLY_ADDRESS_PASSES"));
     return setting;

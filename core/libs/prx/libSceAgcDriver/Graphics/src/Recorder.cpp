@@ -1606,6 +1606,7 @@ constexpr const char* PassBreakNames[PassBreaks] = {"closed", "forced", "sample-
 std::atomic<std::uint64_t> passBreaks[PassBreaks]{};
 std::atomic<std::uint64_t> readOnlyAddressDraws{0}, avoidableAddressBreaks{0};
 std::atomic<std::uint64_t> dispatchBarriersSkipped{0}, dispatchBarrierConflicts{0}, dispatchBarrierFlushes{0};
+std::atomic<std::uint64_t> depthPassMerges{0};
 
 PassBreak PassBreakFor(PassHazard hazard) {
     switch (hazard) {
@@ -1627,8 +1628,9 @@ void CountPassBreak(PassBreak reason) {
 
 }
 
-Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
+Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, bool depth) {
     ensureOpen();
+    open->drawDepth = depth;
     if (access.knownAddressWrites && DrawOrGpuProfiled()) readOnlyAddressDraws.fetch_add(1, std::memory_order_relaxed);
     auto& pass = open->renderPass;
     const auto coveredStart = [&] {
@@ -1649,6 +1651,10 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     if (hazard == PassHazard::UnknownWrite && DrawOrGpuProfiled() && open->passHazards.CheckKnownAddressWrites(access, pass.key == key) != PassHazard::UnknownWrite) avoidableAddressBreaks.fetch_add(1, std::memory_order_relaxed);
     if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
+    if (hazard == PassHazard::None && DrawOrGpuProfiled() && (depth || pass.depth)) {
+        const bool depthMerge = MergeBarriers() && !pass.afterPass && (!fenced || depth) && !pass.fencedBesidesDepth;
+        if (merge || depthMerge) depthPassMerges.fetch_add(1, std::memory_order_relaxed);
+    }
     const bool elide = merge && hazard == PassHazard::None;
     CountPassBreak(hazard != PassHazard::None ? PassBreakFor(hazard) : merge ? PassBreak::Target : PassBreak::TargetFenced);
     endOpenRenderPass(!merge);
@@ -1675,6 +1681,8 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     pass.open = true;
     pass.key = key;
     pass.fenced = pass.fenced || fenced;
+    pass.fencedBesidesDepth = pass.fencedBesidesDepth || (fenced && !open->drawDepth);
+    pass.depth = pass.depth || open->drawDepth;
     open->passHazards.Add(access);
     if (pass.chunked && chunks != nullptr) chunks->Post();
 }
@@ -2196,6 +2204,7 @@ void reportBarriers() {
     }
     static constexpr const char* SwitchModes[] = {"0", "1", "verify"};
     AgcDriver::ProfilePrint_nid_no_patch("; render passes begun by reason:%s; read-only address-based draws (APS5_READONLY_ADDRESS_PASSES=%s): %llu, unknown-write breaks only they caused %llu", breaks.c_str(), SwitchModes[static_cast<std::size_t>(ReadOnlyAddressPassesSetting())], static_cast<unsigned long long>(readOnlyAddressDraws.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(avoidableAddressBreaks.exchange(0, std::memory_order_relaxed)));
+    AgcDriver::ProfilePrint_nid_no_patch("; depth pass changes without barriers (APS5_DEPTH_PASS_MERGE=%s): %llu %s", SwitchModes[static_cast<std::size_t>(DepthPassMergeSetting())], static_cast<unsigned long long>(depthPassMerges.exchange(0, std::memory_order_relaxed)), DepthPassMergeSetting() == DepthPassMerge::On ? "merged" : "mergeable");
     AgcDriver::ProfilePrint_nid_no_patch("; dispatch trailing barriers (APS5_DISPATCH_BARRIERS=%s): %llu %s past independent dispatches, %llu flushed by a conflicting dispatch, %llu deferred ones flushed by other work", SwitchModes[static_cast<std::size_t>(Recorder::DispatchBarriersSetting())], static_cast<unsigned long long>(dispatchBarriersSkipped.exchange(0, std::memory_order_relaxed)), Recorder::DispatchBarriersSetting() == Recorder::DispatchBarriers::On ? "deferred" : "deferrable", static_cast<unsigned long long>(dispatchBarrierConflicts.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(dispatchBarrierFlushes.exchange(0, std::memory_order_relaxed)));
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;

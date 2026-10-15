@@ -30,6 +30,11 @@ enum class ReadOnlyAddressPasses : std::uint8_t { Off, On, Verify };
 ReadOnlyAddressPasses ParseReadOnlyAddressPasses(const char* text);
 ReadOnlyAddressPasses ReadOnlyAddressPassesSetting();
 
+enum class DepthPassMerge : std::uint8_t { Off, On, Verify };
+
+DepthPassMerge ParseDepthPassMerge(const char* text);
+DepthPassMerge DepthPassMergeSetting();
+
 enum class PassHazard : std::uint8_t { None, ReadAfterWrite, WriteAfterWrite, WriteAfterRead, Image, UnknownRead, UnknownWrite };
 
 class GuestRangeSet {

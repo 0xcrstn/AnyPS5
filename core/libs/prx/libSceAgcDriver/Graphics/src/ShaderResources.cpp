@@ -5709,6 +5709,14 @@ bool ShaderResources::HasCachedStorageImages() const {
     return std::none_of(textures.begin(), textures.end(), [](const auto& texture) { return texture != nullptr && texture->StorageSource() != nullptr && !texture->StorageSource()->Cached(); });
 }
 
+std::vector<std::pair<VkImage, bool>> ShaderResources::PassImages() const {
+    auto images = StorageImages();
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->Image() != VK_NULL_HANDLE) images.emplace_back(texture->Image(), false);
+    }
+    return images;
+}
+
 bool ShaderResources::ReadsImage(const StorageTexture* image) const {
     if (image == nullptr) return false;
     for (const auto& texture : textures) {
