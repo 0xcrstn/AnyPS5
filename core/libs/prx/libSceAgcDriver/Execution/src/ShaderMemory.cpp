@@ -1321,6 +1321,177 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureVa
     return result;
 }
 
+void ShaderMemory::PlanRoots(const ShaderRecompiler::IrResourcePlan& plan, std::vector<std::uint32_t>& roots, bool& allRoots) {
+    roots.clear();
+    allRoots = false;
+    std::vector<const ShaderRecompiler::IrValue*> pending;
+    const auto add = [&](const ShaderRecompiler::IrValue* value) {
+        if (value != nullptr) pending.push_back(value);
+    };
+    for (const auto& source : plan.descriptorSources) {
+        if (source.dwordCount > source.dwords.size()) {
+            allRoots = true;
+            return;
+        }
+        for (std::uint32_t index = 0; index < source.dwordCount; ++index) add(source.dwords[index]);
+    }
+    for (const auto& read : plan.srtReads) add(read.value);
+    for (const auto& block : plan.controlFlow) add(block.condition);
+    for (const auto* value : plan.uniformFill.values) add(value);
+    std::unordered_set<const ShaderRecompiler::IrValue*> visited;
+    try {
+        while (!pending.empty()) {
+            const auto* value = pending.back()->Resolve();
+            pending.pop_back();
+            if (!visited.insert(value).second) continue;
+            if (value->Opcode() == ShaderRecompiler::IrOpcode::GetUserData) {
+                if (value->ArgumentCount() == 0 || value->Argument(0) == nullptr || value->Argument(0)->Register().index < plan.userDataBase) {
+                    allRoots = true;
+                    return;
+                }
+                roots.push_back(value->Argument(0)->Register().index - plan.userDataBase);
+            }
+            for (const auto* argument : value->Arguments()) add(argument);
+        }
+    } catch (const std::exception&) {
+        allRoots = true;
+        return;
+    }
+    std::sort(roots.begin(), roots.end());
+    roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+}
+
+bool ShaderMemory::SameSpecializationWords(const ShaderRecompiler::ResourceSnapshot& a, const ShaderRecompiler::ResourceSnapshot& b) {
+    if (a.buffers.size() != b.buffers.size() || a.images.size() != b.images.size() || a.samplers.size() != b.samplers.size() || !(a.uniformFill == b.uniformFill)) return false;
+    const auto present = [](const std::array<std::uint32_t, 8>& words) { return words[2] != 0u && (words[0] != 0u || (words[1] & 0xffffu) != 0u) ? 4u | (words[0] & 3u) : 0u; };
+    for (std::size_t index = 0; index < a.buffers.size(); ++index) {
+        const auto& left = a.buffers[index];
+        const auto& right = b.buffers[index];
+        if (left.dwordCount != right.dwordCount || (left.dwords[1] & 0xffff0000u) != (right.dwords[1] & 0xffff0000u) || left.dwords[3] != right.dwords[3] || present(left.dwords) != present(right.dwords)) return false;
+    }
+    for (std::size_t index = 0; index < a.images.size(); ++index) {
+        const auto& left = a.images[index];
+        const auto& right = b.images[index];
+        const bool leftBound = left.dwords[0] != 0u || (left.dwords[1] & 0xffu) != 0u;
+        const bool rightBound = right.dwords[0] != 0u || (right.dwords[1] & 0xffu) != 0u;
+        if (left.dwordCount != right.dwordCount || leftBound != rightBound || (left.dwords[1] & ~0xffu) != (right.dwords[1] & ~0xffu) || !std::equal(left.dwords.begin() + 2, left.dwords.end(), right.dwords.begin() + 2)) return false;
+    }
+    for (std::size_t index = 0; index < a.samplers.size(); ++index) {
+        const auto& left = a.samplers[index];
+        const auto& right = b.samplers[index];
+        if (left.dwordCount != right.dwordCount || !std::equal(left.dwords.begin(), left.dwords.begin() + 4, right.dwords.begin())) return false;
+    }
+    return true;
+}
+
+bool ShaderMemory::PlanReadsCurrent(const PlanInstance& instance) {
+    for (const auto& [address, word] : instance.reads) {
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) return false;
+        std::uint32_t now = 0;
+        std::memcpy(&now, reinterpret_cast<const void*>(address), sizeof(now));
+        if (now != word) return false;
+    }
+    return true;
+}
+
+ShaderMemory::PlanFallback ShaderMemory::planFallback(const PlanInstance& instance, std::span<const std::uint32_t> userData, std::uint64_t shaderBase) const {
+    if (instance.latest == nullptr) return PlanFallback::First;
+    if (instance.values == nullptr) return PlanFallback::Unrecorded;
+    if (instance.shaderBase != shaderBase || instance.userData.size() != userData.size()) return PlanFallback::Inputs;
+    if (instance.allRoots) {
+        if (!std::equal(userData.begin(), userData.end(), instance.userData.begin())) return PlanFallback::Inputs;
+    } else {
+        for (const auto root : instance.roots) {
+            if (root >= userData.size() || userData[root] != instance.userData[root]) return PlanFallback::Inputs;
+        }
+    }
+    const auto& nodes = instance.nodes;
+    if (nodes.generation == 0 || nodes.allocation != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || instance.forgetSerial != GuestMemory::ForgetSerial()) return PlanFallback::Memory;
+    for (const auto base : nodes.pages) {
+        if (pendingWrite != nullptr && pendingWrite(base, PageBytes, {}) != PendingWrite::None) return PlanFallback::Memory;
+        if (GuestMemory::CollectWrites(base, PageBytes) == 0 || !GuestMemory::UnchangedSince(base, PageBytes, nodes.generation)) return PlanFallback::Memory;
+    }
+    return PlanFallback::None;
+}
+
+ShaderMemory::PlanCapture ShaderMemory::CapturePlanned(const ShaderRecompiler::PreparedShaderInvocation& invocation, PlanInstance& instance, bool keepReads) {
+    PlanCapture result;
+    const auto& request = invocation.Request();
+    const auto userData = request.context.userData;
+    const auto shaderBase = request.shader.codeAddress;
+    if (instance.handle != invocation.Handle()) {
+        instance = PlanInstance{};
+        instance.handle = invocation.Handle();
+    }
+    result.fallback = planFallback(instance, userData, shaderBase);
+    if (result.fallback == PlanFallback::None) {
+        result.nodesKept = instance.nodes.instance != nullptr ? instance.nodes.instance->values.size() : 0;
+        if (std::equal(userData.begin(), userData.end(), instance.userData.begin())) {
+            result.outcome = PlanOutcome::Reused;
+        } else {
+            auto patched = std::make_shared<ShaderRecompiler::ResourceCapture>(*instance.values);
+            patched->snapshot.userData.assign(userData.begin(), userData.begin() + static_cast<std::ptrdiff_t>(instance.values->plan->userDataCount));
+            instance.values = std::move(patched);
+            instance.latest = instance.values;
+            instance.userData.assign(userData.begin(), userData.end());
+            result.outcome = PlanOutcome::Patched;
+        }
+        result.values = instance.values;
+        return result;
+    }
+    const auto previous = std::move(instance.latest);
+    instance.latest = nullptr;
+    instance.values = nullptr;
+    instance.reads.clear();
+    const auto forgetSerial = GuestMemory::ForgetSerial();
+    const auto readsBefore = recentReads.size();
+    const auto* tapeBefore = instance.nodes.instance != nullptr ? instance.nodes.instance->tape : nullptr;
+    const auto runsBefore = instance.nodes.instance != nullptr ? instance.nodes.instance->runs : 0;
+    auto values = CaptureValues(invocation, instance.nodes);
+    const auto* tape = instance.nodes.instance.get();
+    const bool served = tape != nullptr && tape->tape != nullptr && (tape->tape != tapeBefore || tape->runs != runsBefore);
+    if (tape != nullptr) {
+        result.nodesKept = tape->keptReads + tape->keptValues;
+        result.nodesFresh = tape->freshReads;
+    }
+    if (keepReads && direct) {
+        for (auto index = readsBefore; index < recentReads.size(); ++index) instance.reads.emplace_back(directReads[recentReads[index]].address, directReads[recentReads[index]].word);
+    }
+    result.outcome = PlanOutcome::Reevaluated;
+    result.values = values;
+    const auto& plan = *values->plan;
+    if (UsesImageTables(plan)) {
+        result.fallback = PlanFallback::ImageTables;
+        return result;
+    }
+    if (previous != nullptr && previous->plan == values->plan && !SameSpecializationWords(previous->snapshot, values->snapshot)) {
+        auto handle = std::move(instance.handle);
+        instance = PlanInstance{};
+        instance.handle = std::move(handle);
+        std::vector<ShaderRecompiler::MemoryRegion> code;
+        code.reserve(initial.size());
+        for (const auto& [address, bytes] : initial) code.push_back({address, bytes});
+        ShaderMemory full(code, pendingWrite, observe, hookWaits);
+        result.values = full.CaptureValues(invocation);
+        result.fallback = PlanFallback::Specialization;
+        result.outcome = PlanOutcome::Full;
+        result.nodesKept = 0;
+        result.nodesFresh = 0;
+        return result;
+    }
+    instance.latest = values;
+    if (!served || !direct || forgetSerial % 2u != 0u || userData.size() < plan.userDataCount) return result;
+    if (instance.rootsPlan != values->plan) {
+        PlanRoots(plan, instance.roots, instance.allRoots);
+        instance.rootsPlan = values->plan;
+    }
+    instance.values = std::move(values);
+    instance.userData.assign(userData.begin(), userData.end());
+    instance.shaderBase = shaderBase;
+    instance.forgetSerial = forgetSerial;
+    return result;
+}
+
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation, bool valuesOnly) {
     // The capture's word and page reads (through `read`) are attributed to it ([hooksync], [guestmem]).
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);

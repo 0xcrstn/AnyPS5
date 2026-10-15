@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommandSink.hpp"
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
@@ -27,6 +28,8 @@ namespace AgcDriver::Graphics {
 
 class Buffer;
 class DrawSnapshotArena;
+class ChunkedRecording;
+class ChunkPool;
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -72,6 +75,11 @@ public:
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     std::uint64_t OpenPassSerial() const;
+    static bool ChunkedRecordingEnabled();
+    bool ChunkPass();
+    CommandSink OpenChunk(const Context& drawContext, const ChunkInheritance& inheritance, const ChunkDraw& draw);
+    CommandSink PassSink(const Context& drawContext, const ChunkDraw& draw);
+    static void DrainChunks();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
     // label store (RecordStore), or before a command that writes or reads a queued range (the
@@ -167,6 +175,8 @@ public:
     enum class ReadKind : std::uint8_t { DispatchElement = 0, GpuCopy, AddressBased, Indirect, StorageUpload, CopySource, DrawInput, Count };
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
+    static bool VerifyInPlaceDrawInputs();
+    void NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
     using ReadList = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
     void NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind);
@@ -415,6 +425,9 @@ public:
     // labels waiting in completion actions (the CPU must reap their batch for them to land);
     static std::uint64_t PendingCompletionLabels();
     static std::uint64_t KeyStoreSerial();
+    static std::uint64_t LedgerSerial();
+    static std::uint64_t FinishedBatches();
+    static bool AccessNeedsFlush(std::uint64_t address, std::size_t bytes);
     // write-back completions (OnComplete) of unfinished batches: a reaper retires them when every
     // worker sleeps, as for the labels above;
     static std::uint64_t PendingWriteBackCompletions();
@@ -598,6 +611,12 @@ private:
             ReadKind kind;
         };
         std::vector<Read> reads;
+        struct InPlaceInput {
+            std::uint64_t begin;
+            std::uint64_t end;
+            std::uint64_t generation;
+        };
+        std::vector<InPlaceInput> inPlaceInputs;
         struct ReadListNote {
             std::shared_ptr<const ReadList> ranges;
             std::size_t position;
@@ -696,6 +715,8 @@ private:
             std::uint64_t serial = 0;
             std::uint32_t timing = NoTiming;
             std::function<void(VkCommandBuffer)> afterPass;
+            bool chunked = false;
+            ChunkInheritance inheritance;
         } renderPass;
         PassHazards passHazards;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
@@ -710,6 +731,8 @@ private:
             std::uint64_t end;
         };
         std::vector<KeyStore> keyStores;
+        std::shared_ptr<ChunkPool> chunkPool;
+        std::string chunkFailure;
     };
     struct LabelEntry {
         std::uint32_t value;
@@ -782,6 +805,8 @@ private:
     PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
     PFN_vkCmdPushConstants cmdPushConstants = nullptr;
     PFN_vkCmdDispatch cmdDispatch = nullptr;
+    PFN_vkCmdExecuteCommands cmdExecuteCommands = nullptr;
+    std::unique_ptr<ChunkedRecording> chunks;
     template<typename TFunction>
     TFunction function(TFunction resolved, const char* name) const {
         return resolved != nullptr ? resolved : context.Function<TFunction>(name);

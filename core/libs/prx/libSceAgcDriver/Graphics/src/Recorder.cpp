@@ -5,12 +5,14 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LabelVersions.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ChunkedRecording.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
@@ -515,6 +517,8 @@ constexpr std::int64_t NoPendingLabel = std::numeric_limits<std::int64_t>::min()
 std::atomic<std::int64_t> pendingLabelSince{NoPendingLabel};
 std::atomic<std::uint64_t> writeGeneration{0};
 std::atomic<std::uint64_t> publishGeneration{0};
+std::atomic<std::uint64_t> ledgerSerial{0};
+std::atomic<std::uint64_t> finishedBatches{0};
 std::atomic<std::uint64_t> completionLabels{0};
 std::atomic<std::uint64_t> writeBackCompletions{0};
 std::atomic<std::uint64_t> completionStoresSkipped{0};
@@ -524,6 +528,10 @@ std::atomic<std::uint64_t> writeBacksOverLabels{0};
 // Completion labels that entered the pending count at a write-back (see NoteWrittenBack).
 std::atomic<std::uint64_t> completionLabelsCountedLate{0};
 std::atomic<std::uint64_t> workSinceSubmit{0};
+
+void bumpLedger() {
+    ledgerSerial.fetch_add(1, std::memory_order_acq_rel);
+}
 
 // APS5_COUNT_ALL_COMPLETION_LABELS=1: a completion label also stored on the GPU counts as pending
 // from its registration, as before (see Recorder::AfterCompletions).
@@ -1116,6 +1124,10 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         cmdPushConstants = context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants");
         cmdDispatch = context.Function<PFN_vkCmdDispatch>("vkCmdDispatch");
     }
+    if (ChunkedRecording::Enabled() && context.deviceProc != nullptr) {
+        cmdExecuteCommands = context.Function<PFN_vkCmdExecuteCommands>("vkCmdExecuteCommands");
+        chunks = std::make_unique<ChunkedRecording>(context);
+    }
     if (!timelineSemaphores) return;
     // The timeline starts at 0 and every Submit signals its serial (1, 2, ...): a value that only
     // grows, so a thread waiting for it outside the mutex can never observe a reset or a reused
@@ -1241,6 +1253,7 @@ Recorder* Recorder::Active() {
 
 void Recorder::Activate() {
     activeRecorder = this;
+    if (chunks != nullptr) chunks->Activate();
     {
         std::lock_guard tableLock(labelTableMutex);
         labelTableOwner = this;
@@ -1403,6 +1416,22 @@ std::uint64_t Recorder::KeyStoreSerial() {
     return keyStoreCount.load(std::memory_order_relaxed);
 }
 
+std::uint64_t Recorder::LedgerSerial() {
+    return ledgerSerial.load(std::memory_order_acquire);
+}
+
+std::uint64_t Recorder::FinishedBatches() {
+    return finishedBatches.load(std::memory_order_acquire);
+}
+
+bool Recorder::AccessNeedsFlush(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return false;
+    if (!HookSnapshotEnabled() || AgcDriver::Graphics::SnapshotOverlaps(address, bytes)) return true;
+    if (AnyDeviceResidentOverlaps(address, bytes)) return true;
+    const std::array range{std::pair{address, address + bytes}};
+    return StorageTexture::AnyPendingOverlaps(range) || AnyShadowedOverlaps(address, bytes);
+}
+
 namespace {
 
 bool DrawOrGpuProfiled();
@@ -1442,7 +1471,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
         if (!barrier) CountMerged(CommandClass::Draw);
         return DrawPassStart{commands, false, barrier};
     };
-    if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+    if (!pass.open || forced || (countingSamples && ((segmentMode() && !segmentSlotReady(*open)) || pass.chunked))) {
         CountPassBreak(!pass.open ? PassBreak::Closed : forced ? PassBreak::Forced : PassBreak::SampleSlot);
         const auto start = coveredStart();
         open->passHazards.Clear();
@@ -1479,14 +1508,60 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     pass.key = key;
     pass.fenced = pass.fenced || fenced;
     open->passHazards.Add(access);
+    if (pass.chunked && chunks != nullptr) chunks->Post();
 }
 
 std::uint64_t Recorder::OpenPassSerial() const {
     return open != nullptr && open->renderPass.open ? open->renderPass.serial : 0;
 }
 
+bool Recorder::ChunkedRecordingEnabled() {
+    return ChunkedRecording::Enabled();
+}
+
+bool Recorder::ChunkPass() {
+    if (chunks == nullptr) return false;
+    if (GpuTimingEnabled()) {
+        ChunkedRecording::CountInline(ChunkInlineReason::GpuTiming);
+        return false;
+    }
+    if (countingSamples) {
+        ChunkedRecording::CountInline(ChunkInlineReason::OcclusionSamples);
+        return false;
+    }
+    return true;
+}
+
+CommandSink Recorder::OpenChunk(const Context& drawContext, const ChunkInheritance& inheritance, const ChunkDraw& draw) {
+    Require(chunks != nullptr && open != nullptr && !open->renderPass.open, "a chunk is opened outside a beginning render pass");
+    auto& pass = open->renderPass;
+    pass.chunked = true;
+    pass.inheritance = inheritance;
+    return chunks->Begin(drawContext, open->chunkPool, inheritance, draw);
+}
+
+CommandSink Recorder::PassSink(const Context& drawContext, const ChunkDraw& draw) {
+    Require(open != nullptr, "no batch is open for the render pass");
+    auto& pass = open->renderPass;
+    if (!pass.chunked || chunks == nullptr) return CommandSink(open->commands);
+    if (!chunks->IsOpen()) return chunks->Begin(drawContext, open->chunkPool, pass.inheritance, draw);
+    return chunks->Next(draw);
+}
+
+void Recorder::DrainChunks() {
+    ChunkedRecording::DrainActive();
+}
+
 void Recorder::endOpenRenderPass(bool barrier) {
     auto& pass = open->renderPass;
+    std::string chunkFailure;
+    bool chunkMismatch = false;
+    if (pass.chunked && chunks != nullptr) {
+        auto closed = chunks->Close();
+        if (closed.commands != VK_NULL_HANDLE) cmdExecuteCommands(open->commands, 1, &closed.commands);
+        chunkFailure = std::move(closed.failure);
+        chunkMismatch = closed.mismatch;
+    }
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
@@ -1502,10 +1577,15 @@ void Recorder::endOpenRenderPass(bool barrier) {
     open->coveredAccess = !barrier ? 0 : pass.afterPass ? storedAccess : passedAccess;
     open->hostReadOwed = true;
     pass = {};
+    if (chunkFailure.empty()) return;
+    open->chunkFailure = chunkFailure;
+    if (chunkMismatch) throw std::logic_error(chunkFailure);
+    throw std::runtime_error(chunkFailure);
 }
 
 void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end) {
     ensureOpen();
+    bumpLedger();
     NoteMirroredWrite(begin, end);
     // A queued label store over the keys lands first (program order: the key store is later).
     FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
@@ -1536,6 +1616,7 @@ bool Recorder::AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::ui
 
 void Recorder::FlushKeyStores() {
     if (open == nullptr || open->keyStores.empty()) return;
+    bumpLedger();
     recordKeyStores(true);
 }
 
@@ -1616,6 +1697,7 @@ void Recorder::ensureOpen() {
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
     ensureOpen();
+    bumpLedger();
     NoteMirroredWrite(address, address + bytes.size());
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
@@ -1809,6 +1891,7 @@ bool Recorder::AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint6
 
 void Recorder::FlushStores() {
     if (open == nullptr || open->run.queued.empty()) return;
+    bumpLedger();
     closeStoreRun(false);
 }
 
@@ -2590,6 +2673,36 @@ void Recorder::readGpuTiming(Batch& batch) {
     reportBarriers();
 }
 
+bool Recorder::VerifyInPlaceDrawInputs() {
+    static const bool enabled = std::getenv("APS5_VERIFY_IN_PLACE_DRAW_INPUTS") != nullptr;
+    return enabled;
+}
+
+namespace {
+
+bool StrictInPlaceDrawInputs() {
+    static const bool strict = [] {
+        const char* value = std::getenv("APS5_VERIFY_IN_PLACE_DRAW_INPUTS");
+        return value != nullptr && std::strcmp(value, "strict") == 0;
+    }();
+    return strict;
+}
+
+std::atomic<std::uint64_t>& InPlaceInputsChangedAfterSubmit() {
+    static std::atomic<std::uint64_t> changed{0};
+    return changed;
+}
+
+}
+
+void Recorder::NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || !VerifyInPlaceDrawInputs()) return;
+    ensureOpen();
+    const auto generation = GuestMemory::CollectWritesUncached(address, bytes);
+    Require(generation != 0, "APS5_VERIFY_IN_PLACE_DRAW_INPUTS: an input bound in place has no write generation to verify against");
+    open->inPlaceInputs.push_back({address, address + bytes, generation});
+}
+
 bool Recorder::FlipReadCheck() {
     static const bool enabled = std::getenv("APS5_FLIP_READ_CHECK") != nullptr;
     return enabled;
@@ -3034,6 +3147,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     ensureOpen();
+    bumpLedger();
     const auto end = address + bytes;
     NoteMirroredWrite(address, end);
     open->writes.emplace_back(address, end);
@@ -3061,6 +3175,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
         return;
     }
     NoteMirroredWrite(address, address + bytes);
+    bumpLedger();
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
@@ -3158,6 +3273,7 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
     publishedResidentWrites = !resident.empty();
     publishedWriteRanges = merged;
     pendingWrites.store(std::move(merged), std::memory_order_release);
+    bumpLedger();
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -3455,6 +3571,7 @@ void Recorder::markBehindCompletion(const Batch& batch, std::uint64_t begin, std
 
 void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
     ensureOpen();
+    bumpLedger();
     NoteMirroredWrite(address, address + bytes.size());
     // The table entry before the write note: the note bumps the write generation a poller
     // watches, and a poller that sees the bump then finds the label without the GPU mutex.
@@ -3673,8 +3790,33 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    for (const auto& input : open->inPlaceInputs) {
+        GuestMemory::CollectWritesUncached(input.begin, static_cast<std::size_t>(input.end - input.begin));
+        if (GuestMemory::UnchangedSince(input.begin, static_cast<std::size_t>(input.end - input.begin), input.generation)) continue;
+        char message[256];
+        std::snprintf(message, sizeof(message), "APS5_VERIFY_IN_PLACE_DRAW_INPUTS: a CPU store reached the draw input 0x%llx+0x%llx bound in place before its batch was submitted", static_cast<unsigned long long>(input.begin), static_cast<unsigned long long>(input.end - input.begin));
+        throw std::runtime_error(message);
+    }
+    if (!open->inPlaceInputs.empty()) {
+        OnCompleteWithoutGuestAccess([inputs = std::move(open->inPlaceInputs)] {
+            for (const auto& input : inputs) {
+                const auto bytes = static_cast<std::size_t>(input.end - input.begin);
+                GuestMemory::CollectWritesUncached(input.begin, bytes);
+                if (GuestMemory::UnchangedSince(input.begin, bytes, input.generation)) continue;
+                char message[256];
+                std::snprintf(message, sizeof(message), "APS5_VERIFY_IN_PLACE_DRAW_INPUTS: a CPU store reached the draw input 0x%llx+0x%llx bound in place before its batch completed", static_cast<unsigned long long>(input.begin), static_cast<unsigned long long>(input.end - input.begin));
+                if (StrictInPlaceDrawInputs()) throw std::runtime_error(message);
+                const auto changed = InPlaceInputsChangedAfterSubmit().fetch_add(1, std::memory_order_relaxed) + 1;
+                if (changed <= 20 || changed % 1000 == 0) std::fprintf(stderr, "[in-place-inputs] %s (%llu so far; after the submit, so possibly after the GPU read)
+", message, static_cast<unsigned long long>(changed));
+            }
+        });
+        open->inPlaceInputs.clear();
+    }
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
+    if (chunks != nullptr && chunks->IsOpen()) chunks->Discard();
+    if (!open->chunkFailure.empty()) throw std::runtime_error("the open batch is not submitted: its chunked recording failed: " + open->chunkFailure);
     if (open->guestCompletions && AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Completion);
     const bool segments = segmentMode();
     if (!segments) {
@@ -3806,6 +3948,7 @@ void Recorder::FinishUpTo(std::uint64_t serial) {
     // recorded here is the bookkeeping only (a caller that did not wait first, WaitForLeases, shows
     // up in the site table by its own address).
     ++syncCounts[0];
+    bumpLedger();
     announcedSource = 4;
     const void* site = std::exchange(announcedSite, nullptr);
     const auto previousSite = inFlight.empty() || inFlight.front()->serial > serial ? activeSyncSite : BeginSyncSite(0, site != nullptr ? site : __builtin_return_address(0));
@@ -3821,6 +3964,7 @@ void Recorder::Sync() {
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
+    bumpLedger();
     Submit();
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
@@ -4126,6 +4270,7 @@ bool Recorder::Reap() {
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
     inFlightKeptBytes -= batch->keptBytes;
+    bumpLedger();
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;
@@ -4143,6 +4288,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 recorder.publishPendingWrites();
             } catch (...) {
             }
+            finishedBatches.fetch_add(1, std::memory_order_acq_rel);
+            bumpLedger();
         }
     } finishingScope{*this, batch.get()};
     finishing.push_back(batch.get());
@@ -4281,6 +4428,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 }
 
 void Recorder::release(Batch& batch) noexcept {
+    if (batch.chunkPool != nullptr) {
+        if (chunks != nullptr) chunks->Recycle(std::move(batch.chunkPool));
+        batch.chunkPool.reset();
+    }
     if (batch.prologue != VK_NULL_HANDLE) {
         if (sparePrologues.size() < 64) {
             try {

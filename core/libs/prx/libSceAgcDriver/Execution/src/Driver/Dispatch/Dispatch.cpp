@@ -353,7 +353,7 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
     const auto& compiled = *compiledResult;
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     for (const auto& region : captured) snapshots.push_back({region.guestAddress, region.bytes});
-    if (drawRecordState().active && !settleDrawRecords(snapshots)) return;
+    if (drawRecordState().active && !settleDrawRecords(snapshots, true)) return;
     std::array<std::uint32_t, 3> groups{packet[1], packet[2], packet[3]};
     if (indirectArguments == 0 && (packet[4] & 0x20u) != 0) {
 

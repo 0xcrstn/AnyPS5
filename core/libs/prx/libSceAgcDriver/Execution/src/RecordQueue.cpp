@@ -62,23 +62,31 @@ void RecordQueue::RunPending() {
     } reset;
     for (;;) {
         Job job;
+        bool drop = false;
         {
             std::lock_guard lock(mutex);
             if (jobs.empty()) return;
             job = std::move(jobs.front());
             jobs.pop_front();
+            const auto ticket = ++popped;
+            drop = stopAfterFailure && (failure != nullptr || ticket <= dropThrough);
         }
-        const auto start = std::chrono::steady_clock::now();
-        try {
-            job();
-        } catch (...) {
-            failed.fetch_add(1, std::memory_order_relaxed);
-            std::lock_guard lock(mutex);
-            if (failure == nullptr) failure = std::current_exception();
+        if (drop) {
+            job = nullptr;
+            dropped.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const auto start = std::chrono::steady_clock::now();
+            try {
+                job();
+            } catch (...) {
+                failed.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard lock(mutex);
+                if (failure == nullptr) failure = std::current_exception();
+            }
+            job = nullptr;
+            jobNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+            (workerThread ? byWorker : byOthers).fetch_add(1, std::memory_order_relaxed);
         }
-        job = nullptr;
-        jobNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
-        (workerThread ? byWorker : byOthers).fetch_add(1, std::memory_order_relaxed);
         {
             std::lock_guard lock(mutex);
             finished.fetch_add(1, std::memory_order_acq_rel);
@@ -100,7 +108,14 @@ void RecordQueue::WaitFinished(std::uint64_t ticket) {
 
 std::exception_ptr RecordQueue::TakeFailure() {
     std::lock_guard lock(mutex);
-    return std::exchange(failure, nullptr);
+    auto taken = std::exchange(failure, nullptr);
+    if (taken != nullptr && stopAfterFailure) dropThrough = posted.load(std::memory_order_acquire);
+    return taken;
+}
+
+void RecordQueue::StopAfterFailure(bool stop) {
+    std::lock_guard lock(mutex);
+    stopAfterFailure = stop;
 }
 
 RecordQueue::Statistics RecordQueue::Counts() const {
@@ -110,6 +125,7 @@ RecordQueue::Statistics RecordQueue::Counts() const {
     counts.byWorker = byWorker.load(std::memory_order_relaxed);
     counts.byOthers = byOthers.load(std::memory_order_relaxed);
     counts.failed = failed.load(std::memory_order_relaxed);
+    counts.dropped = dropped.load(std::memory_order_relaxed);
     counts.waits = waits.load(std::memory_order_relaxed);
     counts.blockedWaits = blockedWaits.load(std::memory_order_relaxed);
     counts.waitedNs = waitedNs.load(std::memory_order_relaxed);

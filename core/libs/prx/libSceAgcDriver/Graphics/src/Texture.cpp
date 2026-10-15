@@ -349,6 +349,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "texture");
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
+        owned->placement = DeviceMemoryPlacement(DeviceMemoryKind::Texture, context.HostPlaced(allocation.memoryTypeIndex), requirements.size);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
 
         {
@@ -1210,6 +1211,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         memoryBytes = requirements.size;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "storage texture");
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory storage texture");
+        placement = DeviceMemoryPlacement(DeviceMemoryKind::StorageTexture, context.HostPlaced(allocation.memoryTypeIndex), requirements.size);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
     } catch (...) {
         release();
@@ -1601,6 +1603,7 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
     const bool volume = descriptor.dimension == TextureDimension::k3D;
     Require((depthSlice == 0 && layers == 1) || (volume && mip == 0 && layers != 0 && depthSlice + layers - 1u <= descriptor.depthOrLastArray), "attachment slice is outside the storage image");
     Require(layer == 0 || (!volume && descriptor.dimension == TextureDimension::k2DArray && descriptor.baseArray + layer <= descriptor.depthOrLastArray), "attachment layer is outside the storage image");
+    std::lock_guard lock(attachmentViewsMutex);
     const auto found = attachmentViews.find({format, mip, depthSlice, layers, layer});
     if (found != attachmentViews.end()) return found->second;
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
@@ -1616,6 +1619,12 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView attachment");
     attachmentViews.emplace(std::tuple{format, mip, depthSlice, layers, layer}, created);
     return created;
+}
+
+VkImageView StorageTexture::FindAttachmentView(VkFormat format, std::uint32_t mip, std::uint32_t depthSlice, std::uint32_t layers, std::uint32_t layer) const {
+    std::lock_guard lock(attachmentViewsMutex);
+    const auto found = attachmentViews.find({format, mip, depthSlice, layers, layer});
+    return found != attachmentViews.end() ? found->second : VK_NULL_HANDLE;
 }
 
 VkImageView StorageTexture::AttachmentProxyView() {
@@ -5651,6 +5660,7 @@ void StorageTexture::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    placement.Reset();
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

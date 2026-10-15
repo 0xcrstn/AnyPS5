@@ -2,13 +2,67 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_COMPUTEPIPELINEAHEADREQUEST_HPP
 
 #include "Recompiler.hpp"
+#include "CompileTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PipelineContentIndex.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
+#include <span>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace AgcDriver {
+
+inline std::vector<std::uint64_t> ComputePipelineRecipeFields(const ShaderRecompiler::RecompileResult& shader, bool pushes, std::span<const std::uint32_t> layoutKey) {
+    std::vector<std::uint64_t> fields;
+    const auto words = shader.spirv.Words();
+    fields.push_back(words.size());
+    fields.push_back(ShaderCompileTrace::HashOf(words));
+    fields.push_back(shader.specialization.size());
+    for (const auto& constant : shader.specialization) fields.push_back((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
+    fields.push_back(shader.bindings.size());
+    for (const auto& binding : shader.bindings) {
+        fields.push_back(static_cast<std::uint64_t>(binding.kind));
+        fields.push_back(static_cast<std::uint64_t>(binding.role));
+        fields.push_back((static_cast<std::uint64_t>(binding.descriptorSet) << 32u) | binding.binding);
+        fields.push_back(binding.count);
+    }
+    fields.push_back(shader.hostSubgroupSize);
+    fields.push_back(shader.workgroupMemoryDwords);
+    fields.push_back(shader.runtimeAbiVersion);
+    fields.push_back(shader.bdaAbiVersion);
+    fields.push_back(pushes ? 1u : 0u);
+    fields.push_back(layoutKey.size());
+    fields.push_back(ShaderCompileTrace::HashOf(layoutKey));
+    std::uint64_t mixed = 0x9e3779b97f4a7c15ull;
+    for (const auto word : words) {
+        mixed = (mixed ^ word) * 0xff51afd7ed558ccdull;
+        mixed ^= mixed >> 29u;
+    }
+    fields.push_back(mixed);
+    for (const auto word : layoutKey) fields.push_back(word);
+    return fields;
+}
+
+inline std::uint64_t ComputePipelineRecipeHash(const ShaderRecompiler::RecompileResult& shader, bool pushes, std::span<const std::uint32_t> layoutKey) {
+    const auto fields = ComputePipelineRecipeFields(shader, pushes, layoutKey);
+    return ShaderCompileTrace::HashOf(std::span<const std::uint64_t>(fields));
+}
+
+inline PipelineContentKey ComputePipelineContentKey(const ShaderRecompiler::RecompileResult& shader, bool pushes, std::span<const std::uint32_t> layoutKey) {
+    const auto fields = ComputePipelineRecipeFields(shader, pushes, layoutKey);
+    return HashPipelineContent(fields);
+}
+
+inline void RequireSameComputeRecipe(std::uint64_t built, std::uint64_t demanded, std::uint64_t programAddress) {
+    if (built == demanded) return;
+    char text[160];
+    std::snprintf(text, sizeof(text), "APS5_VERIFY_COMPILE_JOBS: compute pipeline for program 0x%llx was built from a different recipe than the dispatch demands", static_cast<unsigned long long>(programAddress));
+    throw std::runtime_error(text);
+}
 
 struct ComputePipelineAheadRequest {
     ShaderRecompiler::RecompileResult shader;
