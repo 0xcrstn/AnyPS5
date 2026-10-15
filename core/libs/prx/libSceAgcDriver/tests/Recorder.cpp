@@ -2105,7 +2105,24 @@ void viewPastLastMipTests(const Device& device, Recorder& recorder) {
     Require(texel(*past, 3) == 0x77777777u, "the level past the last mip was not read from its addrlib tail slot");
 }
 
+struct OwnCollectEpoch {
+    std::uint64_t previous = AgcDriver::GuestMemory::ExchangeCollectEpoch(0);
+    OwnCollectEpoch() = default;
+    ~OwnCollectEpoch() { AgcDriver::GuestMemory::ExchangeCollectEpoch(previous); }
+    OwnCollectEpoch(const OwnCollectEpoch&) = delete;
+    OwnCollectEpoch& operator=(const OwnCollectEpoch&) = delete;
+};
+
+struct PerDrawSnapshots {
+    bool enabled = DrawSnapshotArena::Enabled();
+    PerDrawSnapshots() { DrawSnapshotArena::SetEnabled(false); }
+    ~PerDrawSnapshots() { DrawSnapshotArena::SetEnabled(enabled); }
+    PerDrawSnapshots(const PerDrawSnapshots&) = delete;
+    PerDrawSnapshots& operator=(const PerDrawSnapshots&) = delete;
+};
+
 void resourceReadTests(const Device& device, Recorder& recorder) {
+    const PerDrawSnapshots perDraw;
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: resource read notes not tested\n";
@@ -2181,10 +2198,11 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         const auto commands = snapshotRecorder.Commands();
         RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         const auto copy = snapshotContext.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
-        VkBufferCopy region{0, 0, elementBytes};
-        copy(commands, first->snapshots[0].buffer->Handle(), downloaded->Handle(), 1, &region);
-        region.dstOffset = elementBytes;
-        copy(commands, second->snapshots[0].buffer->Handle(), downloaded->Handle(), 1, &region);
+        Require(first->snapshots[0].handle != VK_NULL_HANDLE && second->snapshots[0].handle != VK_NULL_HANDLE, "a draw snapshot has no buffer to bind");
+        VkBufferCopy region{first->snapshots[0].offset, 0, elementBytes};
+        copy(commands, first->snapshots[0].handle, downloaded->Handle(), 1, &region);
+        region = {second->snapshots[0].offset, elementBytes, elementBytes};
+        copy(commands, second->snapshots[0].handle, downloaded->Handle(), 1, &region);
         RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         snapshotLifetime = first;
         first.reset();
@@ -3009,6 +3027,7 @@ bool sparseRunImportTests(const Device& device, bool copied) {
 }
 
 void misalignedRegionTests(const Device& device, Recorder& recorder) {
+    const PerDrawSnapshots perDraw;
     const auto& context = device.GetContext();
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
     constexpr std::size_t bytes = 65536;
@@ -3096,6 +3115,7 @@ void misalignedRegionTests(const Device& device, Recorder& recorder) {
 }
 
 void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
+    const PerDrawSnapshots perDraw;
     const auto& context = device.GetContext();
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
     if (context.hostImportAlignment == 0) {
@@ -3218,6 +3238,7 @@ private:
 };
 
 void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
+    const PerDrawSnapshots perDraw;
     auto context = device.GetContext();
     DescriptorUpdates updates(context);
     {
@@ -3257,8 +3278,11 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
             Require(actual.buffers.size() == original.buffers.size() && actual.images.size() == original.images.size(), "snapshot update omitted unchanged descriptors");
             for (const auto& [key, before] : original.buffers) {
                 const auto after = actual.buffers.at(key);
-                const auto expected = key.first == (allocation == 0 ? 2u : 7u) ? draw->snapshots.front().buffer->Handle() : before.buffer;
-                Require(after.buffer == expected && after.offset == before.offset && after.range == before.range, "snapshot update replaced the wrong buffer or changed its range");
+                const bool movedBinding = key.first == (allocation == 0 ? 2u : 7u);
+                const auto& snapshot = draw->snapshots.front();
+                const auto expected = movedBinding ? snapshot.handle : before.buffer;
+                const auto expectedOffset = movedBinding ? snapshot.offset + before.offset : before.offset;
+                Require(after.buffer == expected && after.offset == expectedOffset && after.range == before.range, "snapshot update replaced the wrong buffer or changed its range");
             }
             for (const auto& [key, before] : original.images) {
                 const auto after = actual.images.at(key);
@@ -3271,6 +3295,7 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
 }
 
 void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
+    const PerDrawSnapshots perDraw;
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
@@ -3363,6 +3388,8 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
 }
 
 void drawSnapshotPatchTests(const Device& device) {
+    const OwnCollectEpoch ownEpoch;
+    const PerDrawSnapshots perDraw;
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 4 * 65536;
     std::unique_lock gpu(GpuMutex());
@@ -3470,6 +3497,8 @@ void drawSnapshotPatchTests(const Device& device) {
 }
 
 void drawSnapshotEpochTests(const Device& device) {
+    const OwnCollectEpoch ownEpoch;
+    const PerDrawSnapshots perDraw;
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 4 * 65536;
     std::unique_lock gpu(GpuMutex());
@@ -3551,6 +3580,7 @@ void drawSnapshotEpochTests(const Device& device) {
 }
 
 void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
+    const PerDrawSnapshots perDraw;
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
     const char* previous = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
@@ -3824,6 +3854,7 @@ void unwrittenSnapshotTests(const Device& device) {
 }
 
 void drawInputReuseTests(const Device& device, Recorder& recorder) {
+    const PerDrawSnapshots perDraw;
     using namespace AgcDriver::GuestMemory;
     using Use = Recorder::SnapshotUse;
     constexpr std::size_t bytes = 65536;
@@ -3900,6 +3931,7 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
 }
 
 void lowestIndexTests() {
+    const OwnCollectEpoch ownEpoch;
     using AgcDriver::Graphics::KnownLowestDrawIndex;
     using AgcDriver::Graphics::LowestDrawIndex;
     const std::array<std::uint16_t, 5> strip{0xffffu, 40u, 0xffffu, 37u, 52u};
@@ -3941,6 +3973,7 @@ void lowestIndexTests() {
 }
 
 void drawSnapshotRangeTests(const Device& device, Recorder& recorder) {
+    const PerDrawSnapshots perDraw;
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
     lowestIndexTests();
@@ -5956,6 +5989,7 @@ void parkedImportUnmapTests(const Device& device) {
 }
 
 void importWatchTests(const Device& device) {
+    const OwnCollectEpoch ownEpoch;
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
 #ifdef _WIN32
@@ -11175,6 +11209,7 @@ std::uint64_t revalidations(const ParallelResolveCounts& counts, ShaderResources
 }
 
 bool stagedDrawBuildTests(const Device& device, Recorder& recorder) {
+    const OwnCollectEpoch ownEpoch;
     if (!StagedDrawBuilds()) {
         std::cout << "skipped, the staged draw build test needs APS5_PARALLEL_RESOLVE=1 and APS5_STAGED_DRAW_BUILDS not 0\n";
         return false;
@@ -11215,6 +11250,7 @@ bool stagedDrawBuildTests(const Device& device, Recorder& recorder) {
 }
 
 bool parallelRevalidateTests(const Device& device, Recorder& recorder) {
+    const OwnCollectEpoch ownEpoch;
     if (!ParallelRevalidateRequested()) {
         std::cout << "skipped, the parallel revalidate test needs APS5_PARALLEL_RESOLVE=1 and APS5_PARALLEL_REVALIDATE=1\n";
         return false;

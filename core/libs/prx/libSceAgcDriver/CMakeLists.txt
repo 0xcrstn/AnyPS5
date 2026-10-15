@@ -1391,6 +1391,12 @@ if(BUILD_TESTING)
         set_tests_properties(agc_pipeline_cache agc_pipeline_cache_file PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_recorder COMMAND agc_driver_recorder_tests)
+    set_tests_properties(agc_driver_recorder PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_driver_recorder PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_store_runs COMMAND agc_driver_recorder_tests --store-runs-only)
     add_test(NAME agc_store_runs_deferred_barriers_off COMMAND agc_driver_recorder_tests --store-runs-only)
     add_test(NAME agc_store_runs_deferred_barriers_verify COMMAND agc_driver_recorder_tests --store-runs-only)
