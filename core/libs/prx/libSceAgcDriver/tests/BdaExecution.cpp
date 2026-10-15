@@ -338,6 +338,22 @@ void RunBdaExecutionTests(const Context& context) {
             span(4, -8, 0b0001u, coherent, stops, {0, 0, 0, 0}, Abi::FaultReason::Overflow, 4, 0);
         }
     }
+    Buffer lower(context, 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    Buffer upper(context, 3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    lower.Bytes()[0] = std::byte{0x61};
+    lower.Bytes()[1] = std::byte{0x62};
+    upper.Bytes()[0] = std::byte{0x71};
+    upper.Bytes()[1] = std::byte{0x72};
+    upper.Bytes()[2] = std::byte{0x73};
+    const auto separate = ranges;
+    constexpr std::uint64_t overlapping = 0x7fff9abc0001ULL;
+    ranges = {{{overlapping, overlapping + 2, lower.DeviceAddress(), Abi::Read, 0}, {overlapping + 1, overlapping + 4, upper.DeviceAddress(), Abi::Read, 0}}};
+    run(overlapping, 8, 0x61, static_cast<Abi::FaultReason>(0));
+    run(overlapping + 1, 8, 0x71, static_cast<Abi::FaultReason>(0));
+    run(overlapping, 32, 0x73727161, static_cast<Abi::FaultReason>(0));
+    run(overlapping + 2, 16, 0x7372, static_cast<Abi::FaultReason>(0));
+    run(overlapping + 4, 8, 0, Abi::FaultReason::Unmapped);
+    ranges = separate;
     ranges[0].permissions = 0;
     run(guest, 8, 0, Abi::FaultReason::Permission);
     RunBdaDwordWriteTests(context);
@@ -456,9 +472,12 @@ void RunBdaTranslationTests(const Context& context) {
         }
     }
     const auto previous = BdaTestTranslation();
+    const auto previousRelative = BdaTestRelative();
     SetBdaTestTranslation(Table::Translation::Verify);
+    SetBdaTestRelative(Table::Relative::Off);
     Buffer first(context, 3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     Buffer second(context, 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    second.Bytes()[0] = std::byte{0x44};
     constexpr std::uint64_t guest = 0x7fff12340001ULL;
     const std::array<Abi::Range, 2> ranges{{{guest, guest + 3, first.DeviceAddress(), Abi::Read, 0}, {guest + 3, guest + 5, second.DeviceAddress(), Abi::Read, 0}}};
     auto words = Table::Build(ranges, Table::Translation::Verify);
@@ -485,4 +504,25 @@ void RunBdaTranslationTests(const Context& context) {
         Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::TranslationMismatch && report.address == guest && report.instruction == 0x1234, "APS5_BDA_ABI=verify did not fail on an injected radix mismatch");
     }
     SetBdaTestTranslation(previous);
+    const auto valid = Table::Build(ranges, previous);
+    Buffer validTable(context, valid.size() * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::memcpy(validTable.Bytes().data(), valid.data(), valid.size() * sizeof(std::uint32_t));
+    for (const auto relative : {Table::Relative::On, Table::Relative::Verify}) {
+        SetBdaTestRelative(relative);
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        const std::uint32_t sentinel = 0xdeadbeef;
+        std::memcpy(output.Bytes().data(), &sentinel, sizeof(sentinel));
+        Pipeline pipeline(context, MakeBdaCapabilityTestShader(guest, second.DeviceAddress()), {&validTable, &fault, &output});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        std::uint32_t result = 0;
+        std::memcpy(&result, output.Bytes().data(), sizeof(result));
+        if (relative == Table::Relative::On) {
+            Require(report.state == Abi::FaultState::Empty && result == 0x44u, "APS5_BDA_RELATIVE=on did not translate through its capability");
+        } else {
+            Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::RelativeMismatch && report.address == guest && report.instruction == 0x1234, "APS5_BDA_RELATIVE=verify did not fail on an injected capability mismatch");
+        }
+    }
+    SetBdaTestRelative(previousRelative);
 }

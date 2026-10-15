@@ -16,6 +16,7 @@
 namespace ShaderRecompiler::BdaTable {
 
 enum class Translation : std::uint32_t { Legacy, Radix, Verify };
+enum class Relative : std::uint32_t { Off, On, Verify };
 
 inline constexpr std::uint32_t RadixVersion = 2;
 inline constexpr std::uint32_t HeaderWords = sizeof(BdaAbi::Header) / sizeof(std::uint32_t);
@@ -47,6 +48,20 @@ inline Translation ParseTranslation(const char* value) {
 inline Translation TranslationSetting() {
     static const Translation translation = ParseTranslation(std::getenv("APS5_BDA_ABI"));
     return translation;
+}
+
+inline Relative ParseRelative(const char* value) {
+    if (value == nullptr) return Relative::Off;
+    const std::string_view text(value);
+    if (text == "off") return Relative::Off;
+    if (text == "on") return Relative::On;
+    if (text == "verify") return Relative::Verify;
+    throw std::runtime_error("APS5_BDA_RELATIVE must be off, on or verify, not \"" + std::string(text) + "\"");
+}
+
+inline Relative RelativeSetting() {
+    static const Relative relative = ParseRelative(std::getenv("APS5_BDA_RELATIVE"));
+    return relative;
 }
 
 inline std::uint32_t RangeBaseWord(Translation translation) {

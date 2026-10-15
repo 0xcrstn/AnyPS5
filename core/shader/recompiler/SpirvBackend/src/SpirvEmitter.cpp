@@ -255,6 +255,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.float16DenormPreserve = target.float16DenormPreserve;
     state.sharedFloatFunctions = std::getenv("APS5_NO_SHARED_FLOAT_FUNCTIONS") == nullptr;
     state.bdaTranslation = BdaTable::TranslationSetting();
+    state.bdaRelative = BdaTable::RelativeSetting();
     static const bool guestLines = std::getenv("APS5_SPIRV_GUEST_LINES") != nullptr;
     if (guestLines) state.guestLineFile = state.module.AddString("guest");
     state.hostSubgroupSize = target.subgroupSize;

@@ -8,6 +8,9 @@
 
 void SetBdaTestTranslation(ShaderRecompiler::BdaTable::Translation translation);
 ShaderRecompiler::BdaTable::Translation BdaTestTranslation();
+void SetBdaTestRelative(ShaderRecompiler::BdaTable::Relative relative);
+ShaderRecompiler::BdaTable::Relative BdaTestRelative();
+std::vector<std::uint32_t> MakeBdaCapabilityTestShader(std::uint64_t address, std::uint64_t capabilityBase);
 std::vector<std::uint32_t> MakeBdaResolveTestShader(std::uint32_t permission);
 std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset = 0);
 std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops);

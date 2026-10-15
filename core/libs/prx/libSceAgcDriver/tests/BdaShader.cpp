@@ -3,6 +3,8 @@
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
+#include <functional>
+#include <stdexcept>
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
@@ -10,9 +12,10 @@
 namespace {
 
 ShaderRecompiler::BdaTable::Translation testTranslation = ShaderRecompiler::BdaTable::Translation::Legacy;
+ShaderRecompiler::BdaTable::Relative testRelative = ShaderRecompiler::BdaTable::Relative::Off;
 
 template<typename TEmit>
-std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, std::uint32_t extracted = 0, bool writes = false) {
+std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, std::uint32_t extracted = 0, bool writes = false, const std::function<void(ShaderRecompiler::SpirvEmitterState&)>& prologue = {}) {
     using namespace ShaderRecompiler;
     IrProgram program;
     program.Resources().stage = IrShaderStage::Compute;
@@ -41,10 +44,12 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     }
     state.bdaStopsInvocations = stops;
     state.bdaTranslation = testTranslation;
+    state.bdaRelative = testRelative;
     DefineGetBdaPointer(state);
     const auto main = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), main, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.module.AllocateId());
+    if (prologue) prologue(state);
     SpirvValueEmitContext ctx(state);
     auto& instruction = writes ? program.CreateValue(IrOpcode::StoreAddressU32, IrType::Void) : extracted != 0u ? program.CreateValue(IrOpcode::LoadAddressU32x4, IrType::U32x4) : program.CreateValue(IrOpcode::LoadAddressU32, IrType::U32);
     IrBuilder ir(program);
@@ -80,6 +85,27 @@ void SetBdaTestTranslation(ShaderRecompiler::BdaTable::Translation translation) 
 
 ShaderRecompiler::BdaTable::Translation BdaTestTranslation() {
     return testTranslation;
+}
+
+void SetBdaTestRelative(ShaderRecompiler::BdaTable::Relative relative) {
+    testRelative = relative;
+}
+
+ShaderRecompiler::BdaTable::Relative BdaTestRelative() {
+    return testRelative;
+}
+
+std::vector<std::uint32_t> MakeBdaCapabilityTestShader(std::uint64_t address, std::uint64_t capabilityBase) {
+    using namespace ShaderRecompiler;
+    return MakeShader(address, false, true, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
+        return std::vector<std::uint32_t>{EmitBdaRead(ctx, instruction, base, 8u)};
+    }, 0u, false, [&](SpirvEmitterState& state) {
+        if (state.bdaCapability[0] == 0) throw std::runtime_error("the capability test shader needs APS5_BDA_RELATIVE");
+        state.module.AddFunction(spv::OpStore, state.bdaCapability[0], BdaConstant(state, address));
+        state.module.AddFunction(spv::OpStore, state.bdaCapability[1], BdaConstant(state, address + 1u));
+        state.module.AddFunction(spv::OpStore, state.bdaCapability[2], BdaConstant(state, capabilityBase));
+        state.module.AddFunction(spv::OpStore, state.bdaCapability[3], ConstantU32(state, BdaAbi::Read));
+    });
 }
 
 std::vector<std::uint32_t> MakeBdaResolveTestShader(std::uint32_t permission) {
