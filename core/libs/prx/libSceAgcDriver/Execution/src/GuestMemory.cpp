@@ -1528,6 +1528,12 @@ std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
 }
 
+std::uint64_t ExchangeCollectEpoch(std::uint64_t epoch) {
+    const auto previous = threadCollectEpoch;
+    threadCollectEpoch = epoch;
+    return previous;
+}
+
 std::uint64_t CollectEpoch() {
     return collectMemoEnabled() ? threadCollectEpoch : 0;
 }
@@ -2181,14 +2187,13 @@ bool GpuMutexType::HeldByOtherThread() const {
 }
 
 bool GpuMutexType::try_lock() {
-    if (!tryLockMutex()) return false;
-    runLockHook();
-    return true;
+    if (gateBusy()) return false;
+    return tryLockMutex();
 }
 
 void GpuMutexType::lock() {
+    gateWait();
     lockMutex();
-    runLockHook();
 }
 
 bool GpuMutexType::tryLockMutex() {
@@ -2218,20 +2223,28 @@ bool GpuMutexType::tryLockMutex() {
 
 namespace {
 std::atomic<void (*)()> gpuUnlockHook{nullptr};
-std::atomic<void (*)()> gpuLockHook{nullptr};
+std::atomic<void (*)()> gpuLockWait{nullptr};
+std::atomic<bool (*)()> gpuLockBusy{nullptr};
 }
 
 void SetGpuUnlockHook(void (*hook)()) {
     gpuUnlockHook.store(hook, std::memory_order_release);
 }
 
-void SetGpuLockHook(void (*hook)()) {
-    gpuLockHook.store(hook, std::memory_order_release);
+void SetGpuLockGate(void (*wait)(), bool (*busy)()) {
+    gpuLockBusy.store(busy, std::memory_order_release);
+    gpuLockWait.store(wait, std::memory_order_release);
 }
 
-void GpuMutexType::runLockHook() {
-    if (depth != 1) return;
-    if (auto* hook = gpuLockHook.load(std::memory_order_acquire); hook != nullptr) hook();
+void GpuMutexType::gateWait() {
+    if (HeldByThisThread()) return;
+    if (auto* wait = gpuLockWait.load(std::memory_order_acquire); wait != nullptr) wait();
+}
+
+bool GpuMutexType::gateBusy() const {
+    if (HeldByThisThread()) return false;
+    auto* busy = gpuLockBusy.load(std::memory_order_acquire);
+    return busy != nullptr && busy();
 }
 
 std::uint64_t GpuHoldSerial() {

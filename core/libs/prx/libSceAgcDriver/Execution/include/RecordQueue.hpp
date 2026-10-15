@@ -29,6 +29,7 @@ public:
     bool Pending() const { return Finished() != Posted(); }
     void RunPending();
     static bool Running();
+    static bool OnWorker();
     void WaitFinished(std::uint64_t ticket);
     void WaitIdle() { WaitFinished(Posted()); }
     std::exception_ptr TakeFailure();
