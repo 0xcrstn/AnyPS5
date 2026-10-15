@@ -318,14 +318,14 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.
     RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
-    if (auto* active = Recorder::Active(); active != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) PublishDeviceResidentOfImport(*active, it->second.buffer, ResidentSite::Retire);
+    if (auto* active = Recorder::Current(); active != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) PublishDeviceResidentOfImport(*active, it->second.buffer, ResidentSite::Retire);
     else Require(!AnyDeviceResidentOverlaps(it->second.base, static_cast<std::size_t>(it->second.bytes)), "retiring device-resident buffer results needs an active locked recorder");
     forgetStagingShadows(device, it->second.base, it->second.base + it->second.bytes);
     ForgetMirrors(device, it->second.base, it->second.base + it->second.bytes);
     ++state.epoch;
     state.liveBytes -= it->second.bytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     if (recorder == nullptr) return;
     if (hold) recorder->KeepThroughHold(std::move(holder));
     else if (!recorder->Idle()) recorder->Keep(std::move(holder));
@@ -1031,11 +1031,16 @@ void noteCopyReason(ImportRefusal reason, std::uint64_t begin, std::uint64_t byt
 
 #ifdef _WIN32
 bool drainBeforeDemote() {
-    auto* recorder = Recorder::Active();
-    if (recorder == nullptr || recorder->Idle()) return true;
-    if (!GuestMemory::GpuMutex().HeldByThisThread() || !recorder->HasTimeline()) return false;
-    recorder->WaitSerial(recorder->SubmitAndEpoch());
-    return true;
+    bool drained = true;
+    Recorder::ForEachActive([&](Recorder& recorder) {
+        if (!drained || recorder.Idle()) return;
+        if (!GuestMemory::GpuMutex().HeldByThisThread() || !recorder.HasTimeline()) {
+            drained = false;
+            return;
+        }
+        recorder.WaitSerial(recorder.SubmitAndEpoch());
+    });
+    return drained;
 }
 #endif
 
@@ -1635,11 +1640,12 @@ void syncRange(std::uint64_t address, std::uint64_t bytes) {
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::MirrorRefresh);
     GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
     auto& state = Mirrors();
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes))) {
+    Recorder::ForEachActive([&](Recorder& recorder) {
+        if (!recorder.PendingWriteOverlaps(address, static_cast<std::size_t>(bytes))) return;
         Recorder::CountSync(4);
         ++state.syncs;
-        recorder->Sync();
-    }
+        recorder.Sync();
+    });
     ++state.refreshes;
 }
 
@@ -2101,14 +2107,15 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
     }
     if (GuestMemory::GpuMutex().HeldByThisThread()) {
         try {
-            auto* recorder = Recorder::Active();
-            if (recorder != nullptr && !recorder->Idle()) {
-                Recorder::CountSync(4);
-                recorder->Sync();
-                synced = true;
-                drained = true;
-            }
-            if (recorder != nullptr) recorder->FlushDeferredReleases();
+            Recorder::ForEachActive([&](Recorder& recorder) {
+                if (!recorder.Idle()) {
+                    Recorder::CountSync(4);
+                    recorder.Sync();
+                    synced = true;
+                    drained = true;
+                }
+                recorder.FlushDeferredReleases();
+            });
             const auto end = static_cast<std::uint64_t>(address) + bytes;
             auto& imports = Imports();
             if (releaseParkedImports(imports, address, end)) retiredImport = true;
@@ -2127,13 +2134,17 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                     retiredImport = true;
                 }
             }
-            if (retiredImport && recorder != nullptr && !recorder->Idle()) {
-                Recorder::CountSync(4);
-                recorder->Sync();
-                synced = true;
-                drained = true;
+            if (retiredImport) {
+                Recorder::ForEachActive([&](Recorder& recorder) {
+                    if (!recorder.Idle()) {
+                        Recorder::CountSync(4);
+                        recorder.Sync();
+                        synced = true;
+                        drained = true;
+                    }
+                    recorder.FlushDeferredReleases();
+                });
             }
-            if (retiredImport && recorder != nullptr) recorder->FlushDeferredReleases();
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] lease wait failed: %s\n", error.what());
         }
@@ -2141,7 +2152,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
         try {
             std::lock_guard lock(GuestMemory::GpuMutex());
             auto& state = Leases();
-            auto* recorder = Recorder::Active();
+            auto* recorder = Recorder::Current();
             const auto target = state.newestLeaseSerial;
             if (recorder != nullptr && recorder == state.leaseRecorder && target > state.finishedLeaseSerial) {
                 // The open batch may be the target; FinishUpTo waits front to back up to it only.
@@ -2239,7 +2250,7 @@ void CountLeaseOutcome(bool synced, std::uint64_t batchSerial) {
         // Serials grow with the submissions, so the newest noted one covers every earlier lease batch
         // of the same recorder.
         GuestMemory::AssertGpuLockHeld("CountLeaseOutcome");
-        if (const auto* recorder = Recorder::Active(); recorder != state.leaseRecorder) {
+        if (const auto* recorder = Recorder::Current(); recorder != state.leaseRecorder) {
             state.leaseRecorder = recorder;
             state.newestLeaseSerial = 0;
             state.finishedLeaseSerial = 0;
@@ -3633,7 +3644,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             // staged region (see stagingEligible) takes the same path, aligned or not, with a
             // device-local buffer that the CPU fallback replaces (none without a recorder to
             // record the copies: UploadFinish then binds the region in place).
-            bool staged = Recorder::Active() != nullptr && stagingEligible(region, addressable);
+            bool staged = Recorder::Current() != nullptr && stagingEligible(region, addressable);
             const bool misaligned = !bindableInPlace(region.begin - entry->base, addressable);
             if (staged && !(shadowReusable(region) && stagingShadowCached(context.device, region.begin, region.end))) {
                 const auto allocateStart = std::chrono::steady_clock::now();
@@ -3717,7 +3728,7 @@ void GuestBufferMemory::notePrepareCopy(const Region& region) {
 }
 
 void GuestBufferMemory::completeSpaceWrites() const {
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     if (recorder == nullptr || Recorder::InCompletion()) return;
     const auto& base = space->base;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
@@ -3823,7 +3834,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     }
     // Regions the GPU copies out of their import (see Region::gpuCopy), recorded together below.
     // No recorder (tests) keeps them on the CPU path.
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     std::vector<Region*> gpuCopies;
     // One clock pair around the loop (an address-based build has ~1200 regions): the [buffers]
     // 'import lookup' is the loop less the mirror refreshes and the CPU copies, timed apart.
@@ -3926,7 +3937,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // do not read texture memory through pointers); APS5_BDA_FLUSH=1 flushes for them too.
             static const bool bdaFlush = std::getenv("APS5_BDA_FLUSH") != nullptr;
             if (!(addressable && region.hostBacked) || bdaFlush) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
-            if (auto* active = Recorder::Active(); active != nullptr && AnyDeviceResident()) PublishDeviceResident(*active, region.begin, static_cast<std::size_t>(bytes), addressable ? ResidentSite::AddressBased : ResidentSite::InPlace);
+            if (auto* active = Recorder::Current(); active != nullptr && AnyDeviceResident()) PublishDeviceResident(*active, region.begin, static_cast<std::size_t>(bytes), addressable ? ResidentSite::AddressBased : ResidentSite::InPlace);
             continue;
         }
         if (copyOnGpu) {
@@ -3983,7 +3994,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     }
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     if (addressable && AnyDeviceResident()) {
-        if (auto* active = Recorder::Active()) {
+        if (auto* active = Recorder::Current()) {
             for (const auto& [begin, end] : DeviceReads()) PublishDeviceResident(*active, begin, static_cast<std::size_t>(end - begin), ResidentSite::AddressBased);
         }
     }
@@ -4109,7 +4120,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> requested, bool
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool capture = std::getenv("APS5_CAPTURE_GPU_COPIES") != nullptr;
     Require(!capture || CaptureTrace::Enabled(), "GPU copy capture requires APS5_CAPTURE_TRACE");
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     Require(recorder != nullptr, "GPU buffer copies need an active recorder");
     // A queued DCC key store or label store over a copied range lands before the copy reads it.
     for (const auto* region : requested) {
@@ -4880,7 +4891,7 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         copies.push_back(&region);
     }
     if (copies.empty()) return;
-    Require(Recorder::Active() == &recorder, "staging copies recorded into a recorder that is not the device's");
+    Require(Recorder::Current() == &recorder, "staging copies recorded into a recorder that is not the device's");
     if (profile) Copies().stagedReused.fetch_add(copies.size(), std::memory_order_relaxed);
     recordGpuCopies(copies, false);
 }

@@ -167,9 +167,14 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
     bool cleared = clearToTexel(resident, texel, color.elementBytes, refusal);
     const auto keyBytes = static_cast<std::size_t>(color.bytes / 256);
     if (!cleared && keyBytes != 0) {
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(color.dccAddress, keyBytes)) {
+        bool synced = false;
+        Recorder::ForEachActive([&](Recorder& recorder) {
+            if (!recorder.PendingWriteOverlaps(color.dccAddress, keyBytes)) return;
             Recorder::CountSync(2);
-            recorder->SyncThrough(color.dccAddress, keyBytes);
+            recorder.SyncThrough(color.dccAddress, keyBytes);
+            synced = true;
+        });
+        if (synced) {
             if (CurrentDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
             cleared = clearToTexel(resident, texel, color.elementBytes, refusal);
         }
@@ -220,7 +225,7 @@ CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::v
     const auto address = color.cmaskAddress;
     const auto bytes = layout.Bytes();
     const bool locked = GuestMemory::GpuMutex().HeldByThisThread();
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     if (locked && recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) {
         Recorder::CountSync(2);
         recorder->SyncThrough(address, bytes);
@@ -291,7 +296,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, con
     const auto bytes = layout.Bytes();
     Require(color.cmaskBytes == bytes, "CMASK size differs from the color target's CMASK layout");
     if (cmaskProved(color.cmaskAddress, bytes)) return false;
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     if (resident != nullptr && context.detiler != nullptr && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) {
         const auto* import = HostImportFor(context, color.cmaskAddress, bytes);
         const auto view = import != nullptr ? resident->ElementView() : VK_NULL_HANDLE;
@@ -1744,7 +1749,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         resolved.contentKey = found != nullptr ? *found->key : DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         if (auto cached = found != nullptr ? found->cached : SharedResourceCache().Find(resolved.contentKey)) {
             const bool valid = found != nullptr && found->proof != nullptr ? revalidateAdopted(*cached, shaders, *found->proof, state, draw) : cached->Revalidate(shaders);
-            auto* recorder = Recorder::Active();
+            auto* recorder = Recorder::Current();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = found != nullptr ? cached->CheckMovedReadOnlyBuffers(*found->plan, *recorder) : cached->MovedReadOnlyBuffers(shaders, *recorder);
             if (moved.has_value()) {
@@ -3025,7 +3030,7 @@ void drawBody(const Context& context, const State& state, const Pm4::DrawParamet
     const int dumpLimit = DumpTargetLimit();
     static std::mutex dumpMutex;
     static std::map<std::uint64_t, int> dumped;
-    const auto reused = dumpLimit == 0 ? reusableTargets(context, state, Recorder::Active()) : std::vector<std::shared_ptr<StorageTexture>>{};
+    const auto reused = dumpLimit == 0 ? reusableTargets(context, state, Recorder::Current()) : std::vector<std::shared_ptr<StorageTexture>>{};
     forgetContinuedTargets();
     std::vector<TargetBinding> targets(state.colors.size());
     std::vector<VkImageView> targetViews;
@@ -3128,7 +3133,7 @@ void drawBody(const Context& context, const State& state, const Pm4::DrawParamet
     if (targetVerdict == TargetVerdict::Held && state.depth && targetViews.back() != earlyTargets->depthView) targetVerdict = TargetVerdict::DepthDiffers;
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto resolved = early != nullptr ? encodeDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, *early) : resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
     auto& resources = resolved.resources;
@@ -3833,7 +3838,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         return result;
     };
     Require(!draw.indirect, "a draw recipe covers direct draws only");
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     if (!RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
     if (recipe.hasDepth != state.depth.has_value()) return miss(DrawRecipeMiss::TargetGone);
     const std::size_t expectedViews = state.colors.size() + (recipe.hasDepth ? 1u : 0u);

@@ -559,7 +559,7 @@ std::array<std::uint64_t, 4> untrackedKey(std::uint64_t address, std::size_t byt
     if (GuestMemory::CollectEpoch() == 0) return {};
     const auto hint = GuestMemory::UntrackedHint(address, bytes);
     if (hint == 0) return {};
-    const auto* recorder = Recorder::Active();
+    const auto* recorder = Recorder::Current();
     const std::array<std::uint64_t, 4> key{hint, GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
     return (key[2] & 1u) == 0 ? key : std::array<std::uint64_t, 4>{};
 }
@@ -573,7 +573,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return target;
     }
     RequireNoMultisampleTarget(resource.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a texture read");
-    if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
+    if (auto* recorder = Recorder::Current(); recorder != nullptr) recorder->BoundKeptBytes();
     if (auto depth = DepthSurfaceTexture(context, words, resource, components)) {
         logLookup({depth.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true});
         return depth;
@@ -936,7 +936,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled) return StorageTexture::Create(context, *context.detiler, viewed, mip);
     static_cast<void>(words);
-    if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
+    if (auto* recorder = Recorder::Current(); recorder != nullptr) recorder->BoundKeptBytes();
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto& counters = TextureCounts();
@@ -968,7 +968,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
             CachedStorageTexture entry{key, mip, StorageTexture::Create(context, *context.detiler, resource, mip)};
             static const bool keepNew = std::getenv("APS5_NO_KEEP_NEW_STORAGE") == nullptr;
-            if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
+            if (auto* recorder = Recorder::Current(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
             entry.accounted = heldBytes(*entry.texture);
             const auto budget = storageBudget(context);
             while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) evicted.push_back(evictStorage(cache, std::prev(cache.entries.end())));
@@ -985,7 +985,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     for (const auto& image : evicted) {
         std::vector<std::shared_ptr<ShaderResources>> resources;
         SharedResourceCache().RemoveImage(image.get(), &resources);
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) {
+        if (auto* recorder = Recorder::Current(); recorder != nullptr && recorder->Recording()) {
             for (auto& resource : resources) recorder->Keep(std::move(resource));
         }
     }
@@ -1093,7 +1093,7 @@ void ClearCachedTextures(VkDevice device) {
     for (const auto& image : cleared) {
         std::vector<std::shared_ptr<ShaderResources>> resources;
         SharedResourceCache().RemoveImage(image.get(), &resources);
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) {
+        if (auto* recorder = Recorder::Current(); recorder != nullptr && recorder->Recording()) {
             for (auto& resource : resources) recorder->Keep(std::move(resource));
         }
     }
@@ -2901,7 +2901,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
 
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || Recorder::InCompletion()) return false;
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     if (recorder == nullptr) return false;
     const auto drawWriters = DrawCopiedWriters();
     const bool labels = Recorder::PendingCompletionLabels() != 0;
@@ -3164,7 +3164,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
-    if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+    if (auto* recorder = Recorder::Current(); recorder != nullptr) {
         try {
             guestMemory.RecordStagingCopies(*recorder);
         } catch (const std::exception& error) {

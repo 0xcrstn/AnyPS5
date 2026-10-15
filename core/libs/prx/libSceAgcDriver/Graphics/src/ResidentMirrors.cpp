@@ -273,7 +273,7 @@ std::shared_ptr<ResidentMirror> mirrorOf(const Context& context, const HostImpor
     if (!enabled || BudgetBytes() == 0 || import.bytes == 0 || import.unwatched || import.dmaBuf || !context.bufferDeviceAddress) return {};
     if (!GuestMemory::Watched(import.base, static_cast<std::size_t>(import.bytes))) return {};
     auto& registry = Mirrors();
-    const auto* recorder = Recorder::Active();
+    const auto* recorder = Recorder::Current();
     const auto batch = recorder != nullptr ? recorder->Submissions() + 1 : 0;
     std::lock_guard lock(registry.mutex);
     auto& seen = registry.seen[import.base];

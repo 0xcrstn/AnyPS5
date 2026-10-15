@@ -338,7 +338,9 @@ CommandBatch::CommandBatch(const Context& context) : context(context) {
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer");
         // Work recorded so far goes first in queue order, so this batch sees its results.
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Submit();
+        Recorder::ForEachActive([](Recorder& recorder) {
+            if (recorder.Recording()) recorder.Submit();
+        });
     } catch (...) {
         release();
         throw;
@@ -391,7 +393,7 @@ void CommandBatch::Wait() {
     if (result == VK_SUCCESS || result == VK_ERROR_DEVICE_LOST) pending = false;
     Check(result, "vkWaitForFences graphics");
     // Recorded batches preceded this one, so their completions (write-backs) can run now.
-    if (auto* recorder = Recorder::Active()) recorder->Reap();
+    Recorder::ForEachActive([](Recorder& recorder) { recorder.Reap(); });
 }
 
 }

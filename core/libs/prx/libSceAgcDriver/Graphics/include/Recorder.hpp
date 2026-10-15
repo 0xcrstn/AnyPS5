@@ -60,6 +60,7 @@ struct RecorderDomain {
     std::atomic<std::uint64_t> workSinceSubmit{0};
     std::mutex labelTableMutex;
     Recorder* labelTableOwner = nullptr;
+    Recorder* active = nullptr;
 };
 
 class Recorder {
@@ -67,9 +68,34 @@ public:
     static constexpr std::uint32_t PhysicalQueues = 4;
     static RecorderDomain& Domain(std::uint32_t physicalQueue);
     static Recorder* ForPhysicalQueue(std::uint32_t physicalQueue);
+    static constexpr std::uint32_t GuestQueues = 256;
+    static void MapGuestQueue(std::uint32_t guestQueue, std::uint32_t physicalQueue);
+    static std::uint32_t PhysicalQueueOf(std::uint32_t guestQueue);
+    static RecorderDomain& DomainOf(std::uint32_t guestQueue);
+    static Recorder* Current();
+    template<typename TAction>
+    static void ForEachActive(TAction&& action) {
+        for (std::uint32_t queue = 0; queue < PhysicalQueues; ++queue) {
+            if (auto* recorder = ForPhysicalQueue(queue)) action(*recorder);
+        }
+    }
     std::uint32_t PhysicalQueue() const { return physicalQueue; }
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
-    explicit Recorder(const Context& context, bool timelineSemaphores = false);
+    explicit Recorder(const Context& context, bool timelineSemaphores = false, std::uint32_t physicalQueue = 0);
+    VkSemaphore Timeline() const { return timeline; }
+    void SetPeer(Recorder* peer) { this->peer = peer; }
+    void RequireOrderAfter(const Recorder& producer, std::uint64_t serial);
+    void DropOrderWaitsForTest() {
+        orderWaits.clear();
+        skipPeerOnce = true;
+    }
+    static bool QueueOrderVerify();
+    struct QueueOrderStatistics {
+        std::uint64_t requiredWaits = 0;
+        std::uint64_t peerWaits = 0;
+        std::uint64_t waitedSubmits = 0;
+    };
+    QueueOrderStatistics QueueOrderCounts() const { return queueOrder; }
     ~Recorder();
     Recorder(const Recorder&) = delete;
     Recorder& operator=(const Recorder&) = delete;
@@ -429,6 +455,7 @@ public:
     // before). A write-back over any tracked label dword is counted on the [recorder] line (must
     // stay 0: it would mean a CPU store landed over a label recorded on the GPU).
     static void NoteWrittenBack(std::uint64_t address, std::size_t bytes);
+    void noteWrittenBack(std::uint64_t address, std::size_t bytes);
 
     // Lock-free readers for the queue workers' packet loops and WAIT_REG_MEM polls (values of the
     // active recorder; a torn-down recorder never publishes):
@@ -893,6 +920,11 @@ private:
     std::uint64_t id = 0;
     std::uint32_t physicalQueue = 0;
     RecorderDomain& domain;
+    Recorder* peer = nullptr;
+    bool skipPeerOnce = false;
+    std::map<VkSemaphore, std::uint64_t> orderWaits;
+    std::map<VkSemaphore, std::uint64_t> requiredOrder;
+    QueueOrderStatistics queueOrder;
     // Every access holds the table mutex (Recorder.cpp): the recorded entries are mutated under
     // GuestMemory::GpuMutex as well, the queued ones (NoteQueuedLabel) under the table mutex alone.
     // Ordered, so a range (a noted write, PendingLabelIn) finds its dwords by lower_bound.

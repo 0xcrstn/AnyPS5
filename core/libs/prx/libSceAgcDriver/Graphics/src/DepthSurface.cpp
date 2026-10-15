@@ -28,7 +28,7 @@ std::uint64_t depthWrites = 0;
 std::atomic<std::uint64_t> depthSurfaceSerial{0};
 
 Recorder* RecorderFor(const Context& context) {
-    auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Current();
     return recorder != nullptr && recorder->Device() == context.device ? recorder : nullptr;
 }
 
@@ -308,7 +308,7 @@ private:
     }
 
     void copyPlane(PlaneStorage& plane, const std::shared_ptr<StorageTexture>& storage, bool stencil, bool toStorage) {
-        auto* recorder = Recorder::Active();
+        auto* recorder = Recorder::Current();
         Require(recorder != nullptr, "depth surface storage copies need an active recorder");
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto bytes = static_cast<std::size_t>(target.extent.width) * target.extent.height * (stencil ? 1u : d16 ? 2u : 4u);
@@ -560,7 +560,7 @@ public:
 
     void Copy(std::span<const LayeredSlice> slices, bool toStorage) {
         if (slices.empty()) return;
-        auto* recorder = Recorder::Active();
+        auto* recorder = Recorder::Current();
         Require(recorder != nullptr, "depth surface storage copies need an active recorder");
         const auto commands = recorder->Commands();
         recorder->Keep(storage);

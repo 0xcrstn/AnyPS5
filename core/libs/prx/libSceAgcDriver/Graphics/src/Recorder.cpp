@@ -44,7 +44,6 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-Recorder* activeRecorder = nullptr;
 
 bool DrawProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -640,7 +639,7 @@ using WriteRanges = Recorder::WriteRanges;
 // work. A range leaves the snapshot only after its batch's completions (CPU write-backs) ran, so a
 // reader that sees no overlap either precedes the note (the queues are unordered then, as on the
 // GPU) or follows the write-back.
-AtomicSharedPtr<const WriteRanges> pendingWrites;
+AtomicSharedPtr<const WriteRanges> pendingWritesByQueue[Recorder::PhysicalQueues];
 
 bool HookSnapshotEnabled() {
     // Debug aid: APS5_NO_HOOK_SNAPSHOT=1 takes the GpuMutex on every access as before.
@@ -657,13 +656,16 @@ bool SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::s
 
 bool SnapshotOverlaps(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0) return false;
-    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
-    return SnapshotOverlaps(snapshot.get(), address, bytes);
+    for (auto& published : pendingWritesByQueue) {
+        const auto snapshot = published.load(std::memory_order_acquire);
+        if (SnapshotOverlaps(snapshot.get(), address, bytes)) return true;
+    }
+    return false;
 }
 
 // Whether one merged range of the snapshot contains [address, end) entirely.
-bool SnapshotCovers(std::uint64_t address, std::uint64_t end) {
-    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
+bool SnapshotCovers(std::uint32_t physicalQueue, std::uint64_t address, std::uint64_t end) {
+    const auto snapshot = pendingWritesByQueue[physicalQueue].load(std::memory_order_acquire);
     if (snapshot == nullptr || snapshot->empty()) return false;
     const auto it = std::partition_point(snapshot->begin(), snapshot->end(), [&](const auto& range) { return range.second <= address; });
     return it != snapshot->end() && it->first <= address && end <= it->second;
@@ -1027,19 +1029,20 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         hookLocks.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) {
-            const HookSyncScope attribution(*recorder, address, bytes);
+        Recorder::ForEachActive([&](Recorder& recorder) {
+            if (!recorder.PendingWriteOverlaps(address, bytes)) return;
+            const HookSyncScope attribution(recorder, address, bytes);
             Recorder::CountSync(1);
             // The wait runs without the mutex when this acquisition is the outermost one (a stage-A
             // read, a game thread); the recorder is not dereferenced after the call.
-            recorder->SyncThrough(address, bytes, true);
-        }
+            recorder.SyncThrough(address, bytes, true);
+        });
     }
     if (AnyDeviceResidentOverlaps(address, bytes)) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
         Require(completionDepth == 0, "a completion action reached unpublished device-resident buffer results");
-        auto* recorder = Recorder::Active();
+        auto* recorder = Recorder::Current();
         Require(recorder != nullptr, "reading device-resident buffer results needs an active recorder");
         if (PublishDeviceResident(*recorder, address, bytes, GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Scanout ? ResidentSite::Scanout : ResidentSite::Hook) != 0) {
             Recorder::CountSync(1);
@@ -1079,15 +1082,22 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         // only the full Sync() gives there.
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
-        if (auto* recorder = Recorder::Active(); recorder != nullptr) {
-            const RecordedStoreSyncScope attribution(*recorder, address, bytes, classification, stored, HookSyncProfiled() ? RecordedStoreKey() : HookSyncKey{});
+        Recorder::ForEachActive([&](Recorder& recorder) {
+            const RecordedStoreSyncScope attribution(recorder, address, bytes, classification, stored, HookSyncProfiled() ? RecordedStoreKey() : HookSyncKey{});
             Recorder::CountSync(2);
-            if (HookFullSync() || completionDepth != 0) recorder->Sync();
-            else recorder->SyncThrough(address, bytes, true);
-        }
+            if (HookFullSync() || completionDepth != 0) recorder.Sync();
+            else recorder.SyncThrough(address, bytes, true);
+        });
     }
 }
 
+}
+
+template<typename TValue>
+std::uint64_t SumDomains(std::atomic<TValue> RecorderDomain::*counter, std::memory_order order) {
+    std::uint64_t sum = 0;
+    for (std::uint32_t queue = 0; queue < Recorder::PhysicalQueues; ++queue) sum += static_cast<std::uint64_t>((Recorder::Domain(queue).*counter).load(order));
+    return sum;
 }
 
 RecorderDomain& Recorder::Domain(std::uint32_t physicalQueue) {
@@ -1096,12 +1106,57 @@ RecorderDomain& Recorder::Domain(std::uint32_t physicalQueue) {
     return domains[physicalQueue];
 }
 
-Recorder* Recorder::ForPhysicalQueue(std::uint32_t physicalQueue) {
-    Require(physicalQueue < PhysicalQueues, "recorder for an unknown physical queue");
-    return physicalQueue == 0 ? activeRecorder : nullptr;
+namespace {
+
+std::array<std::atomic<std::uint8_t>, Recorder::GuestQueues>& GuestQueueMap() {
+    static std::array<std::atomic<std::uint8_t>, Recorder::GuestQueues> map{};
+    return map;
 }
 
-Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)), domain(Domain(0)) {
+}
+
+void Recorder::MapGuestQueue(std::uint32_t guestQueue, std::uint32_t physicalQueue) {
+    Require(guestQueue < GuestQueues && physicalQueue < PhysicalQueues, "guest queue mapped outside the known queues");
+    GuestQueueMap()[guestQueue].store(static_cast<std::uint8_t>(physicalQueue), std::memory_order_release);
+}
+
+std::uint32_t Recorder::PhysicalQueueOf(std::uint32_t guestQueue) {
+    return guestQueue < GuestQueues ? GuestQueueMap()[guestQueue].load(std::memory_order_acquire) : 0u;
+}
+
+RecorderDomain& Recorder::DomainOf(std::uint32_t guestQueue) {
+    return Domain(PhysicalQueueOf(guestQueue));
+}
+
+Recorder* Recorder::Current() {
+    return ForPhysicalQueue(PhysicalQueueOf(GuestMemory::GpuLockThreadTag()));
+}
+
+Recorder* Recorder::ForPhysicalQueue(std::uint32_t physicalQueue) {
+    Require(physicalQueue < PhysicalQueues, "recorder for an unknown physical queue");
+    return Domain(physicalQueue).active;
+}
+
+bool Recorder::QueueOrderVerify() {
+    static const bool verify = [] {
+        const char* value = std::getenv("APS5_QUEUE_TOPOLOGY_VERIFY");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return verify;
+}
+
+void Recorder::RequireOrderAfter(const Recorder& producer, std::uint64_t serial) {
+    Require(&producer != this, "a recorder cannot be ordered after itself");
+    Require(producer.timeline != VK_NULL_HANDLE, "ordering after another physical queue needs its timeline semaphore");
+    if (serial == 0) return;
+    auto& wait = orderWaits[producer.timeline];
+    wait = std::max(wait, serial);
+    auto& required = requiredOrder[producer.timeline];
+    required = std::max(required, serial);
+    ++queueOrder.requiredWaits;
+}
+
+Recorder::Recorder(const Context& context, bool timelineSemaphores, std::uint32_t physicalQueue) : context(context), id(nextRecorderId.fetch_add(1)), physicalQueue(physicalQueue), domain(Domain(physicalQueue)) {
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -1155,9 +1210,9 @@ Recorder::~Recorder() {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
     }
     holdKept.clear();
-    if (activeRecorder == this) {
-        activeRecorder = nullptr;
-        pendingWrites.store(nullptr, std::memory_order_release);
+    if (domain.active == this) {
+        domain.active = nullptr;
+        pendingWritesByQueue[physicalQueue].store(nullptr, std::memory_order_release);
         domain.publishGeneration.fetch_add(1, std::memory_order_release);
         domain.pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
         domain.completionLabels.store(0, std::memory_order_release);
@@ -1219,41 +1274,45 @@ Recorder::~Recorder() {
 }
 
 std::optional<std::chrono::steady_clock::time_point> Recorder::PendingLabelSince() {
-    const auto since = Domain(0).pendingLabelSince.load(std::memory_order_acquire);
+    auto since = NoPendingLabel;
+    for (std::uint32_t queue = 0; queue < PhysicalQueues; ++queue) {
+        const auto value = Domain(queue).pendingLabelSince.load(std::memory_order_acquire);
+        if (value != NoPendingLabel && (since == NoPendingLabel || value < since)) since = value;
+    }
     if (since == NoPendingLabel) return std::nullopt;
     return std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(since));
 }
 
 std::uint64_t Recorder::WriteGeneration() {
-    return Domain(0).writeGeneration.load(std::memory_order_acquire);
+    return SumDomains(&RecorderDomain::writeGeneration, std::memory_order_acquire);
 }
 
 std::uint64_t Recorder::PublishGeneration() {
-    return Domain(0).publishGeneration.load(std::memory_order_acquire);
+    return SumDomains(&RecorderDomain::publishGeneration, std::memory_order_acquire);
 }
 
 std::uint64_t Recorder::PendingCompletionLabels() {
-    return Domain(0).completionLabels.load(std::memory_order_acquire);
+    return SumDomains(&RecorderDomain::completionLabels, std::memory_order_acquire);
 }
 
 std::uint64_t Recorder::PendingWriteBackCompletions() {
-    return Domain(0).writeBackCompletions.load(std::memory_order_acquire);
+    return SumDomains(&RecorderDomain::writeBackCompletions, std::memory_order_acquire);
 }
 
 std::uint64_t Recorder::RecordedWorkSinceSubmit() {
-    return Domain(0).workSinceSubmit.load(std::memory_order_relaxed);
+    return SumDomains(&RecorderDomain::workSinceSubmit, std::memory_order_relaxed);
 }
 
 void Recorder::CountRecordedWork() {
-    Domain(0).workSinceSubmit.fetch_add(1, std::memory_order_relaxed);
+    DomainOf(GuestMemory::GpuLockThreadTag()).workSinceSubmit.fetch_add(1, std::memory_order_relaxed);
 }
 
 Recorder* Recorder::Active() {
-    return activeRecorder;
+    return Domain(0).active;
 }
 
 void Recorder::Activate() {
-    activeRecorder = this;
+    domain.active = this;
     if (chunks != nullptr) chunks->Activate();
     {
         std::lock_guard tableLock(domain.labelTableMutex);
@@ -1263,14 +1322,29 @@ void Recorder::Activate() {
 }
 
 std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) {
-    std::lock_guard tableLock(Domain(0).labelTableMutex);
-    if (Domain(0).labelTableOwner == nullptr) return std::nullopt;
-    return Domain(0).labelTableOwner->lookupLabel(address, bytes, afterStamp, refusal);
+    std::optional<LabelHit> found;
+    if (refusal != nullptr) *refusal = LabelRefusal::None;
+    for (std::uint32_t queue = 0; queue < PhysicalQueues; ++queue) {
+        auto& table = Domain(queue);
+        std::lock_guard tableLock(table.labelTableMutex);
+        if (table.labelTableOwner == nullptr) continue;
+        LabelRefusal reason = LabelRefusal::None;
+        auto hit = table.labelTableOwner->lookupLabel(address, bytes, afterStamp, &reason);
+        if (refusal != nullptr && reason != LabelRefusal::None) *refusal = reason;
+        if (!hit.has_value()) continue;
+        Require(!found.has_value(), "a label is pending on two physical queues; composing their label tables is not implemented");
+        found = hit;
+    }
+    return found;
 }
 
 bool Recorder::WideLabelIn(std::uint64_t address, std::size_t bytes) {
-    std::lock_guard tableLock(Domain(0).labelTableMutex);
-    return Domain(0).labelTableOwner != nullptr && Domain(0).labelTableOwner->wideLabelInLocked(address, bytes);
+    for (std::uint32_t queue = 0; queue < PhysicalQueues; ++queue) {
+        auto& table = Domain(queue);
+        std::lock_guard tableLock(table.labelTableMutex);
+        if (table.labelTableOwner != nullptr && table.labelTableOwner->wideLabelInLocked(address, bytes)) return true;
+    }
+    return false;
 }
 
 bool Recorder::wideLabelInLocked(std::uint64_t address, std::size_t bytes) const {
@@ -1301,9 +1375,10 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
     auto group = std::move(LabelGroupDwords());
     LabelGroupDwords().clear();
     if (trackerGeneration == 0) return;
-    std::lock_guard tableLock(Domain(0).labelTableMutex);
-    if (Domain(0).labelTableOwner == nullptr) return;
-    auto& recorded = Domain(0).labelTableOwner->labels;
+    auto& home = DomainOf(GuestMemory::GpuLockThreadTag());
+    std::lock_guard tableLock(home.labelTableMutex);
+    if (home.labelTableOwner == nullptr) return;
+    auto& recorded = home.labelTableOwner->labels;
     for (const auto& [dword, stamp] : group) {
         // Only an entry still ours (stamps are unique): a later note of the dword has its own group.
         // And only while its batch is unsubmitted: a submitted one (a drain or APS5_LABEL_SUBMIT_NOW
@@ -1313,7 +1388,7 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
         if (found != recorded.end() && found->second.stamp == stamp && found->second.batch != nullptr && !found->second.batch->submitted) found->second.generation = trackerGeneration;
     }
     // A poller that refused the group as unclosed re-consults the table on the next generation.
-    Domain(0).writeGeneration.fetch_add(1, std::memory_order_release);
+    home.writeGeneration.fetch_add(1, std::memory_order_release);
 }
 
 void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
@@ -1322,27 +1397,29 @@ void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte>
     // enter it in (no owner: the callback records it outright, by a CPU store when need be).
     QueuedLabelRanges().emplace_back(address, address + bytes.size());
     queuedLabelsNoted.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard tableLock(Domain(0).labelTableMutex);
-    if (Domain(0).labelTableOwner == nullptr) return;
-    auto& recorded = Domain(0).labelTableOwner->labels;
-    auto& table = SeparateQueuedLabels() ? Domain(0).labelTableOwner->queuedLabels : recorded;
+    auto& home = DomainOf(queue);
+    std::lock_guard tableLock(home.labelTableMutex);
+    if (home.labelTableOwner == nullptr) return;
+    auto& recorded = home.labelTableOwner->labels;
+    auto& table = SeparateQueuedLabels() ? home.labelTableOwner->queuedLabels : recorded;
     for (std::size_t offset = 0; offset + 4 <= bytes.size(); offset += 4) {
         std::uint32_t value = 0;
         std::memcpy(&value, bytes.data() + offset, 4);
         if (const auto found = recorded.find(address + offset); found != recorded.end() && found->second.batch != nullptr) queuedLabelsOverRecorded.fetch_add(1, std::memory_order_relaxed);
         table.insert_or_assign(address + offset, LabelEntry{value, queue, stamp, nullptr});
     }
-    Domain(0).labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
+    home.labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
 }
 
 void Recorder::ForgetQueuedLabels() {
     if (QueuedLabelRanges().empty()) return;
     auto ranges = std::move(QueuedLabelRanges());
     QueuedLabelRanges().clear();
-    std::lock_guard tableLock(Domain(0).labelTableMutex);
-    if (Domain(0).labelTableOwner == nullptr) return;
-    auto& recorded = Domain(0).labelTableOwner->labels;
-    auto& queued = Domain(0).labelTableOwner->queuedLabels;
+    auto& home = DomainOf(GuestMemory::GpuLockThreadTag());
+    std::lock_guard tableLock(home.labelTableMutex);
+    if (home.labelTableOwner == nullptr) return;
+    auto& recorded = home.labelTableOwner->labels;
+    auto& queued = home.labelTableOwner->queuedLabels;
     const auto tag = GuestMemory::GpuLockThreadTag();
     for (const auto& [begin, end] : ranges) {
         for (auto dword = begin; dword + 4 <= end; dword += 4) {
@@ -1351,7 +1428,7 @@ void Recorder::ForgetQueuedLabels() {
             if (found != recorded.end() && found->second.batch == nullptr) recorded.erase(found);
         }
     }
-    Domain(0).labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
+    home.labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
 }
 
 void Recorder::SetQueuedLabelRecorder(void (*recorder)()) {
@@ -1371,7 +1448,23 @@ bool Recorder::SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes) {
 }
 
 std::shared_ptr<const Recorder::WriteRanges> Recorder::PendingWriteSnapshot() {
-    return pendingWrites.load(std::memory_order_acquire);
+    auto first = pendingWritesByQueue[0].load(std::memory_order_acquire);
+    std::vector<std::shared_ptr<const WriteRanges>> others;
+    for (std::uint32_t queue = 1; queue < PhysicalQueues; ++queue) {
+        if (auto snapshot = pendingWritesByQueue[queue].load(std::memory_order_acquire); snapshot != nullptr && !snapshot->empty()) others.push_back(std::move(snapshot));
+    }
+    if (others.empty()) return first;
+    auto merged = std::make_shared<WriteRanges>();
+    if (first != nullptr) merged->insert(merged->end(), first->begin(), first->end());
+    for (const auto& snapshot : others) merged->insert(merged->end(), snapshot->begin(), snapshot->end());
+    std::sort(merged->begin(), merged->end());
+    WriteRanges coalesced;
+    for (const auto& range : *merged) {
+        if (!coalesced.empty() && range.first <= coalesced.back().second) coalesced.back().second = std::max(coalesced.back().second, range.second);
+        else coalesced.push_back(range);
+    }
+    *merged = std::move(coalesced);
+    return merged;
 }
 
 bool Recorder::SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::size_t bytes) {
@@ -1418,11 +1511,11 @@ std::uint64_t Recorder::KeyStoreSerial() {
 }
 
 std::uint64_t Recorder::LedgerSerial() {
-    return Domain(0).ledgerSerial.load(std::memory_order_acquire);
+    return SumDomains(&RecorderDomain::ledgerSerial, std::memory_order_acquire);
 }
 
 std::uint64_t Recorder::FinishedBatches() {
-    return Domain(0).finishedBatches.load(std::memory_order_acquire);
+    return SumDomains(&RecorderDomain::finishedBatches, std::memory_order_acquire);
 }
 
 bool Recorder::AccessNeedsFlush(std::uint64_t address, std::size_t bytes) {
@@ -3156,10 +3249,10 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
-    if (activeRecorder == this) domain.writeGeneration.fetch_add(1, std::memory_order_release);
+    if (domain.active == this) domain.writeGeneration.fetch_add(1, std::memory_order_release);
     // Consecutive dispatches write the same output buffers: a range the snapshot already contains
     // leaves the published union unchanged, so the O(N log N) rebuild is skipped.
-    if (SnapshotCovers(address, end)) {
+    if (SnapshotCovers(physicalQueue, address, end)) {
         ++snapshotCovered;
         return false;
     }
@@ -3184,8 +3277,8 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writeNotes.push_back(++writeNoteCount);
     batch.writeValues.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
-    if (activeRecorder == this) domain.writeGeneration.fetch_add(1, std::memory_order_release);
-    if (!SnapshotCovers(address, address + bytes)) {
+    if (domain.active == this) domain.writeGeneration.fetch_add(1, std::memory_order_release);
+    if (!SnapshotCovers(physicalQueue, address, address + bytes)) {
         const std::array ranges{std::pair{address, address + bytes}};
         publishPendingWrites(ranges);
     }
@@ -3226,11 +3319,12 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
 }
 
 void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
-    if (activeRecorder != this) {
+    if (domain.active != this) {
         publishedWriteRangesValid = false;
         return;
     }
     const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto& pendingWrites = pendingWritesByQueue[physicalQueue];
     const auto previous = pendingWrites.load(std::memory_order_acquire);
     const auto owned = publishedWriteRanges.lock();
     const auto resident = DeviceResidentRanges(context.device);
@@ -3586,7 +3680,7 @@ void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes
         open->wideLabels.push_back(wideLabels.emplace(address, address + bytes.size()));
         wideLabelBytes = std::max<std::uint64_t>(wideLabelBytes, bytes.size());
     }
-    if (activeRecorder == this && domain.pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
+    if (domain.active == this && domain.pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         domain.pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
     noteWriteOn(*open, address, bytes.size(), true);
@@ -3723,7 +3817,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
     // poller that sees the bump then finds the label without the GPU mutex.
     noteLabelOn(batch, address, bytes, stamp, queue, behindCompletion);
     noteWriteOn(batch, address, bytes.size(), true);
-    if (&batch == open.get() && activeRecorder == this && domain.pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
+    if (&batch == open.get() && domain.active == this && domain.pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         domain.pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
 }
@@ -3736,15 +3830,21 @@ bool Recorder::AfterRecordedWork(std::function<void()> action) {
     batch.guestCompletions = true;
     ++batch.completionLabelCount;
     domain.completionLabels.fetch_add(1, std::memory_order_acq_rel);
-    if (&batch == open.get() && activeRecorder == this && domain.pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
+    if (&batch == open.get() && domain.active == this && domain.pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         domain.pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
     return true;
 }
 
 void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
-    Recorder* recorder = activeRecorder;
-    if (recorder == nullptr || bytes == 0) return;
+    for (std::uint32_t queue = 0; queue < PhysicalQueues; ++queue) {
+        if (auto* recorder = Domain(queue).active) recorder->noteWrittenBack(address, bytes);
+    }
+}
+
+void Recorder::noteWrittenBack(std::uint64_t address, std::size_t bytes) {
+    Recorder* recorder = this;
+    if (bytes == 0) return;
     GuestMemory::AssertGpuLockHeld("Recorder::NoteWrittenBack");
     const auto end = address + bytes;
     {
@@ -3762,7 +3862,7 @@ void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
             if (label.counted || label.begin >= end || address >= label.end) continue;
             label.counted = true;
             ++batch.completionLabelCount;
-            Domain(0).completionLabels.fetch_add(1, std::memory_order_acq_rel);
+            domain.completionLabels.fetch_add(1, std::memory_order_acq_rel);
             completionLabelsCountedLate.fetch_add(1, std::memory_order_relaxed);
             recorder->markBehindCompletion(batch, label.begin, label.end);
         }
@@ -3787,7 +3887,7 @@ void Recorder::Submit() {
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
     // count behind, and the callers that act on it would otherwise take the mutex for nothing at
     // every packet or submission end until a real batch is next submitted.
-    if (activeRecorder == this) domain.workSinceSubmit.store(0, std::memory_order_relaxed);
+    if (domain.active == this) domain.workSinceSubmit.store(0, std::memory_order_relaxed);
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
@@ -3862,8 +3962,39 @@ void Recorder::Submit() {
         submission.signalSemaphoreCount = 1;
         submission.pSignalSemaphores = &timeline;
     }
+    if (peer != nullptr && peer->timeline != VK_NULL_HANDLE && peer->submissions != 0 && !skipPeerOnce) {
+        auto& wait = orderWaits[peer->timeline];
+        wait = std::max(wait, peer->submissions);
+        ++queueOrder.peerWaits;
+    }
+    if (QueueOrderVerify()) {
+        for (const auto& [semaphore, value] : requiredOrder) {
+            const auto found = orderWaits.find(semaphore);
+            if (found == orderWaits.end() || found->second < value) throw std::runtime_error("APS5_QUEUE_TOPOLOGY_VERIFY: a batch on physical queue " + std::to_string(physicalQueue) + " is submitted without waiting for producer serial " + std::to_string(value) + " of another physical queue");
+        }
+    }
+    std::vector<VkSemaphore> waitSemaphores;
+    std::vector<std::uint64_t> waitValues;
+    std::vector<VkPipelineStageFlags> waitStages;
+    for (const auto& [semaphore, value] : orderWaits) {
+        waitSemaphores.push_back(semaphore);
+        waitValues.push_back(value);
+        waitStages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    }
+    if (!waitSemaphores.empty()) {
+        Require(timeline != VK_NULL_HANDLE, "a batch that waits for another physical queue needs a timeline semaphore");
+        timelineInfo.waitSemaphoreValueCount = static_cast<std::uint32_t>(waitValues.size());
+        timelineInfo.pWaitSemaphoreValues = waitValues.data();
+        submission.waitSemaphoreCount = static_cast<std::uint32_t>(waitSemaphores.size());
+        submission.pWaitSemaphores = waitSemaphores.data();
+        submission.pWaitDstStageMask = waitStages.data();
+        ++queueOrder.waitedSubmits;
+    }
     const auto submitStart = std::chrono::steady_clock::now();
     Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    orderWaits.clear();
+    requiredOrder.clear();
+    skipPeerOnce = false;
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
@@ -3882,7 +4013,7 @@ void Recorder::Submit() {
     LabelVersions::MarkAll(batch->labelStamps, LabelVersions::Milestone::Submitted);
     inFlight.push_back(std::move(batch));
     inFlightKeptBytes += inFlight.back()->keptBytes;
-    if (activeRecorder == this) domain.pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    if (domain.active == this) domain.pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
 }
 
 std::uint64_t Recorder::SubmitAndEpoch() {
