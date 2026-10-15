@@ -184,6 +184,23 @@ GPU results in storage images and render targets stay on the GPU until something
 
 A title's own CPU reads of that memory are not seen, so a title that waits for a GPU label and then reads the results reads stale memory. `APS5_STORE_AT_LABEL=1` stores every pending result before each label the GPU writes (`RELEASE_MEM`, `WRITE_DATA`, `DMA_DATA`), at the cost of a write-back of every pending image per label. Any other value stops the title at its first label.
 
+### Guest-memory coherence checks
+
+Three switches take `0` (the default), `1` or `verify`; any other value stops the title when the GPU device is created.
+
+`APS5_COHERENCE_AUDIT=1` keeps a version for every GPU writer the driver records (address-based shaders that may store through pointers, and written buffer elements) and checks every store of an older GPU result into guest memory (a pending storage image, a unit shadow) against it. The first stale store prints a `[coherence] stale publication` line with the writers and stores that touched those bytes; later ones are counted on a `[coherence]` line every 10 s. An address-based shader that reads host memory under a pending image or an unpublished unit shadow prints `[coherence] stale read`. `verify` stops the title at the first stale store instead. Rendering is unchanged; the checks cost CPU time.
+
+`APS5_COHERENCE_ORDERING=1` changes what the driver stores before GPU work:
+- An address-based shader that only reads also stores the pending images over its heaps.
+- A shader that may store through pointers:
+  - its heaps are noted as pending writes, so driver CPU reads of them wait for it;
+  - only its color target and the storage images it writes are left pending.
+- Every pending result is stored before each label, as with `APS5_STORE_AT_LABEL=1`.
+
+`verify` also runs the audit and stops the title at the first stale store, stale read, or label written while results are still pending.
+
+`APS5_COHERENCE_DIRECTORY=1` makes those checks compare guest bytes by the memory backing them, so a write through one mapping and a store through another mapping of the same memory are compared. `verify` also stops the title when a writer completes after its range was mapped to other memory. This switch is Windows only; on other systems it stops the title at start.
+
 ### Tracing system library calls
 
 Windows only. An executable converted with `--trace-imports` records the calls it makes to the libraries named in `APS5_TRACE_CALLS`, a comma-separated list such as `libkernel,libSceSaveData`, or `all`. Without the variable nothing is recorded. The crash and abort reports then end with the last 64 calls: sequence number, thread, library, import name as the executable imports it (a NID) and the caller's address. They are followed by the 32 most called imports since start-up, with their number of calls.

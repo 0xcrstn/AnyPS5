@@ -77,6 +77,7 @@ struct UnitShadow {
     // whether a slab -> import copy was recorded at that generation.
     std::vector<std::uint64_t> generation;
     std::vector<std::uint8_t> published;
+    std::vector<Coherence::Version> versions;
     // Slab k covers units [k * SlabUnits(), (k + 1) * SlabUnits()), made on demand; a failed
     // allocation is not retried before the noted present.
     std::vector<std::shared_ptr<ShadowSlab>> slabs;
@@ -171,6 +172,7 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     const auto units = (import.base + import.bytes - shadow->base + UnitBytes - 1) / UnitBytes;
     shadow->generation.assign(static_cast<std::size_t>(units), 0);
     shadow->published.assign(static_cast<std::size_t>(units), 0);
+    shadow->versions.assign(static_cast<std::size_t>(units), 0);
     const auto slabs = (units + SlabUnits() - 1) / SlabUnits();
     shadow->slabs.assign(static_cast<std::size_t>(slabs), nullptr);
     shadow->slabFailedUntil.assign(static_cast<std::size_t>(slabs), 0);
@@ -344,6 +346,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             }
             const auto [begin, end] = shadow->UnitRange(unit);
             if (end <= begin) continue;
+            static_cast<void>(Coherence::CheckPublication(Coherence::Source::ShadowUnit, shadow->versions[unit], {begin, end}, ReasonNames[static_cast<std::size_t>(reason)]));
             const VkBufferCopy region{(unit - slab->firstUnit) * UnitBytes + (begin - shadow->UnitBegin(unit)), begin - shadow->importBase, end - begin};
             if (!copies.empty() && copies.back().slab == slab && copies.back().regions.back().dstOffset + copies.back().regions.back().size == region.dstOffset) {
                 copies.back().regions.back().size += region.size;
@@ -748,7 +751,7 @@ std::vector<ShadowRun> ShadowSources(const Context& context, const HostImport& i
     return result;
 }
 
-void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation) {
+void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation, Coherence::Version version) {
     if (!UnitShadowEnabled() || ranges.empty() || generation == 0) return;
     auto& registry = Registry();
     std::uint64_t bytes = 0;
@@ -771,6 +774,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                 }
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;
+                shadow->versions[unit] = version != 0 ? version : Coherence::CurrentVersion();
                 current->lastUse = present;
             }
         }

@@ -351,6 +351,42 @@ public:
         }
     }
 
+    std::size_t BackingRuns(std::uintptr_t address, std::size_t bytes, std::uintptr_t* begins, std::uintptr_t* ends, std::uint64_t* canonicals, std::size_t capacity) {
+        constexpr std::uint64_t canonicalSpace = std::uint64_t{1} << 63;
+        if (bytes == 0) return 0;
+        if (bytes > std::numeric_limits<std::uintptr_t>::max() - address) throw std::runtime_error("guest backing range wraps its address");
+        std::lock_guard lock(mutex);
+        std::size_t count = 0;
+        std::uintptr_t lastBegin = 0, lastEnd = 0;
+        std::uint64_t lastCanonical = 0;
+        const auto emit = [&](std::uintptr_t begin, std::uintptr_t end, std::uint64_t canonical) {
+            if (count != 0 && lastEnd == begin && lastCanonical + (lastEnd - lastBegin) == canonical) {
+                lastEnd = end;
+                if (count <= capacity) ends[count - 1] = end;
+                return;
+            }
+            lastBegin = begin;
+            lastEnd = end;
+            lastCanonical = canonical;
+            if (count < capacity) {
+                begins[count] = begin;
+                ends[count] = end;
+                canonicals[count] = canonical;
+            }
+            ++count;
+        };
+        const auto stop = address + bytes;
+        for (auto cursor = address; cursor < stop;) {
+            const auto base = cursor & ~(pageBytes - 1);
+            const auto end = std::min<std::uintptr_t>(stop, base + pageBytes);
+            const auto found = views.find(base);
+            if (found == views.end() || found->second.page == nullptr) emit(cursor, end, cursor);
+            else emit(cursor, end, canonicalSpace | (found->second.page->serial * pageBytes + (cursor - base)));
+            cursor = end;
+        }
+        return count;
+    }
+
     bool ResidentSpan(std::uintptr_t address, std::size_t bytes, std::uintptr_t* start, std::uintptr_t* end) {
         std::lock_guard lock(mutex);
         auto run = residentRuns.upper_bound(address);
@@ -640,7 +676,12 @@ private:
     static constexpr std::size_t subpages = pageBytes / subpageBytes;
     static constexpr std::uint8_t allSubpages = (1u << subpages) - 1;
     static constexpr std::size_t chunkBytes = 0x200000;
+    static std::uint64_t nextSharedPageSerial() {
+        static std::atomic<std::uint64_t> serials{0};
+        return serials.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
     struct SharedPage {
+        std::uint64_t serial = nextSharedPageSerial();
         std::array<std::uint64_t, subpages> generation = [] {
             std::array<std::uint64_t, subpages> initial{};
             initial.fill(1);
