@@ -147,6 +147,54 @@ void testNoReentrantRun() {
     Expect(!RecordQueue::Running(), "the run ends with the drain");
 }
 
+class GatedExclusion {
+public:
+    explicit GatedExclusion(RecordQueue& queue) : queue(queue) {}
+    void lock() {
+        if (queue.Pending() && !RecordQueue::OnWorker()) queue.WaitIdle();
+        mutex.lock();
+    }
+    void unlock() { mutex.unlock(); }
+
+private:
+    RecordQueue& queue;
+    std::recursive_mutex mutex;
+};
+
+void testHoldersWaitForTheWorker() {
+    RecordQueue queue;
+    GatedExclusion exclusion(queue);
+    queue.Start([&] {
+        std::lock_guard lock(exclusion);
+        queue.RunPending();
+    });
+    std::atomic<std::uint64_t> late{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> holders;
+    for (int i = 0; i < 3; ++i) {
+        holders.emplace_back([&] {
+            while (!stop.load()) {
+                const auto before = queue.Posted();
+                std::lock_guard lock(exclusion);
+                if (queue.Finished() < before) ++late;
+            }
+        });
+    }
+    std::vector<int> order;
+    constexpr int Jobs = 500;
+    for (int i = 0; i < Jobs; ++i) queue.Post([&order, i] { order.push_back(i); });
+    queue.WaitIdle();
+    stop = true;
+    for (auto& holder : holders) holder.join();
+    queue.Stop();
+    bool ordered = order.size() == Jobs;
+    for (int i = 0; ordered && i < Jobs; ++i) ordered = order[static_cast<std::size_t>(i)] == i;
+    Expect(ordered, "the worker runs every job in posting order");
+    Expect(late.load() == 0, "a holder finds every job posted before its acquisition finished");
+    Expect(queue.Counts().byOthers == 0, "only the worker runs jobs when holders wait for it");
+    Expect(!RecordQueue::OnWorker(), "the producer is not the worker");
+}
+
 void testStalePreparation() {
     const std::vector<PreparedRead> reads{{0x1000, 0x100}, {0x8000, 0x40}};
     const auto noPending = [](std::uint64_t, std::size_t) { return false; };
@@ -187,6 +235,7 @@ int main() {
     testWaitFinished();
     testFailureKept();
     testNoReentrantRun();
+    testHoldersWaitForTheWorker();
     testStalePreparation();
     testOverlappingPackets();
     if (failures != 0) {

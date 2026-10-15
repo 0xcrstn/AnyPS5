@@ -50,6 +50,10 @@ bool RecordQueue::Running() {
     return runningJobs;
 }
 
+bool RecordQueue::OnWorker() {
+    return workerThread;
+}
+
 void RecordQueue::RunPending() {
     if (runningJobs) return;
     runningJobs = true;

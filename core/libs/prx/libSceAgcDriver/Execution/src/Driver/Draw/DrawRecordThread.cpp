@@ -64,7 +64,13 @@ bool Driver::recordThread() {
             std::fprintf(stderr, "[record-thread] off: APS5_LOCKED_DRAW_PREPARE prepares draws under the GPU mutex\n");
             return false;
         }
-        GuestMemory::SetGpuLockHook(&Driver::runDrawRecords);
+        GuestMemory::SetGpuLockGate([] {
+            auto& records = drawRecords();
+            if (records.Pending() && !RecordQueue::OnWorker()) records.WaitIdle();
+        }, [] {
+            const auto& records = drawRecords();
+            return records.Pending() && !RecordQueue::OnWorker();
+        });
         std::fprintf(stderr, "[record-thread] on: queue 0 records draws on a record thread\n");
         return true;
     }();
@@ -95,12 +101,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             ~Reset() { state = DrawRecordState{}; }
         } reset{state};
         if (state.overlapped != 0) ++counters.overlapped;
+        const bool locked = GuestMemory::GpuMutex().HeldByThisThread();
         std::string attempt;
         const auto verdict = drawNow(queue, packet, submission, attempt);
         if (!state.settled) {
             state.settled = true;
             if (state.overlapped != 0) {
-                records.WaitFinished(state.overlapped);
+                if (locked || GuestMemory::GpuMutex().HeldByThisThread()) runDrawRecords();
+                else records.WaitFinished(state.overlapped);
                 finishDrawRecords();
                 if (drawRecordResult != nullptr) {
                     const auto& effects = drawRecordResult->effects;
@@ -181,18 +189,22 @@ void Driver::postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, st
             (void)tagged;
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
             std::lock_guard lock(GuestMemory::GpuMutex());
+            std::lock_guard nested(GuestMemory::GpuMutex());
+            drawRecords().RunPending();
         });
     }
     auto result = std::make_shared<DrawRecordResult>();
     drawRecordResult = result;
-    result->ticket = records.Post([result, record = std::move(record), queue, device = localDevice] {
+    result->ticket = records.Post([result, record = std::move(record), queue, epoch = GuestMemory::CollectEpoch(), device = localDevice] {
         struct Restore {
             std::uint32_t tag;
+            std::uint64_t epoch;
             ~Restore() {
                 GuestMemory::LogDriverStores(nullptr);
+                GuestMemory::ExchangeCollectEpoch(epoch);
                 GuestMemory::TagGpuLockThread(tag);
             }
-        } restore{GuestMemory::GpuLockThreadTag()};
+        } restore{GuestMemory::GpuLockThreadTag(), GuestMemory::ExchangeCollectEpoch(epoch)};
         GuestMemory::TagGpuLockThread(queue);
         result->effects.writeGenerationBefore = Graphics::Recorder::WriteGeneration();
         result->effects.writeGenerationAfter = result->effects.writeGenerationBefore + 1;
@@ -223,7 +235,7 @@ void Driver::reportDrawRecords() {
     const auto jobs = counts.finished - lastCounts.finished;
     const auto jobMs = static_cast<double>(counts.jobNs - lastCounts.jobNs) / 1e6;
     const auto waitedMs = static_cast<double>(counts.waitedNs - lastCounts.waitedNs) / 1e6;
-    ProfilePrint_nid_no_patch("[record-thread] %.3f s: %llu draws (%llu overlapped a record), %llu jobs run (%llu on the record thread, %llu by other GPU mutex holders, %llu failed) %.1f ms, %.1f us per job; producer waits %llu (%llu blocked, %.1f ms); %llu packet waits; stale preparations: %llu pending write, %llu stored, %llu unchecked, %llu redone\n", seconds, static_cast<unsigned long long>(delta[0]), static_cast<unsigned long long>(delta[1]), static_cast<unsigned long long>(jobs), static_cast<unsigned long long>(counts.byWorker - lastCounts.byWorker), static_cast<unsigned long long>(counts.byOthers - lastCounts.byOthers), static_cast<unsigned long long>(counts.failed - lastCounts.failed), jobMs, jobs != 0 ? jobMs * 1000 / static_cast<double>(jobs) : 0.0, static_cast<unsigned long long>(counts.waits - lastCounts.waits), static_cast<unsigned long long>(counts.blockedWaits - lastCounts.blockedWaits), waitedMs, static_cast<unsigned long long>(delta[6]), static_cast<unsigned long long>(delta[2]), static_cast<unsigned long long>(delta[3]), static_cast<unsigned long long>(delta[4]), static_cast<unsigned long long>(delta[5]));
+    ProfilePrint_nid_no_patch("[record-thread] %.3f s: %llu draws (%llu overlapped a record), %llu jobs run (%llu on the record thread, %llu inline on queue 0, %llu failed) %.1f ms, %.1f us per job; producer waits %llu (%llu blocked, %.1f ms); %llu packet waits; stale preparations: %llu pending write, %llu stored, %llu unchecked, %llu redone\n", seconds, static_cast<unsigned long long>(delta[0]), static_cast<unsigned long long>(delta[1]), static_cast<unsigned long long>(jobs), static_cast<unsigned long long>(counts.byWorker - lastCounts.byWorker), static_cast<unsigned long long>(counts.byOthers - lastCounts.byOthers), static_cast<unsigned long long>(counts.failed - lastCounts.failed), jobMs, jobs != 0 ? jobMs * 1000 / static_cast<double>(jobs) : 0.0, static_cast<unsigned long long>(counts.waits - lastCounts.waits), static_cast<unsigned long long>(counts.blockedWaits - lastCounts.blockedWaits), waitedMs, static_cast<unsigned long long>(delta[6]), static_cast<unsigned long long>(delta[2]), static_cast<unsigned long long>(delta[3]), static_cast<unsigned long long>(delta[4]), static_cast<unsigned long long>(delta[5]));
     lastCounts = counts;
 }
 

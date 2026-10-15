@@ -89,6 +89,7 @@ struct MarkedWrites {
 };
 MarkedWrites MarkWrittenUnlessStored(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t since);
 void LogDriverStores(std::vector<std::pair<std::uint64_t, std::uint64_t>>* log);
+std::uint64_t ExchangeCollectEpoch(std::uint64_t epoch);
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
 // returns the current generation instead. A guest write landing between two collects of the same
 // epoch is seen by the next epoch, which is the ordering real hardware gives a CPU write made while a
@@ -156,7 +157,8 @@ private:
     void acquired();
     void lockMutex();
     bool tryLockMutex();
-    void runLockHook();
+    void gateWait();
+    bool gateBusy() const;
     std::recursive_mutex mutex;
     // The holder's thread token and recursion depth, written by the holder only; another thread
     // reads the owner just to see that it is not itself.
@@ -168,7 +170,7 @@ GpuMutexType& GpuMutex();
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
-void SetGpuLockHook(void (*hook)());
+void SetGpuLockGate(void (*wait)(), bool (*busy)());
 std::uint64_t GpuHoldSerial();
 // Debug aid (APS5_ASSERT_GPU_LOCK=1): aborts with a [lock] line naming `where` when the calling
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must
