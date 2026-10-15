@@ -293,7 +293,7 @@ std::uint32_t SpirvValueEmitContext::Label(const IrBlock* block) const {
 }
 
 void PrepareRewriteVerification(IrProgram& program) {
-    if (BufferSelectsSetting() == RewriteMode::Verify) program.Info().usesFaultBuffer = true;
+    if (BufferSelectsSetting() == RewriteMode::Verify && !program.Info().buffers.empty()) program.Info().usesFaultBuffer = true;
     if (BallotReuseSetting() == RewriteMode::Verify) program.Info().usesFaultBuffer = true;
     const bool log2 = LazyLog2RepairSetting() == RewriteMode::Verify;
     const bool trig = LazyTrigSeriesSetting() == RewriteMode::Verify;
