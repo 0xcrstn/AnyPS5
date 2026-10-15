@@ -281,20 +281,24 @@ void NoteDeviceResident(VkDevice device, std::uint64_t begin, std::uint64_t end,
     if (end <= begin || shadow == nullptr) return;
     Require(generation != 0, "device-resident buffer results need a watched generation");
     const auto version = Coherence::Tracking() ? Coherence::NextVersion() : Coherence::CurrentVersion();
-    std::shared_ptr<Guarded> guard;
-    if (Coherence::Residency()) {
-        if (const auto protection = Coherence::ProtectResident({begin, end}, version); protection != 0) guard = std::make_shared<Guarded>(protection);
-    }
     auto& registry = Resident();
     bool overBudget = false;
     {
         std::lock_guard lock(registry.mutex);
         cutLocked(registry, begin, end, nullptr);
-        const auto inserted = registry.entries.emplace(begin, Entry{end, std::move(shadow), shadowBase, import, importBase, generation, device, version, std::move(guard)}).first;
+        const auto inserted = registry.entries.emplace(begin, Entry{end, std::move(shadow), shadowBase, import, importBase, generation, device, version, nullptr}).first;
         noteShadow(registry, inserted->second);
         registry.bytes += end - begin;
         registry.count.store(registry.entries.size(), std::memory_order_release);
         overBudget = registry.bufferBytes > residentBudget();
+    }
+    if (Coherence::Residency()) {
+        if (const auto protection = Coherence::ProtectResident({begin, end}, version); protection != 0) {
+            auto guard = std::make_shared<Guarded>(protection);
+            std::lock_guard lock(registry.mutex);
+            const auto found = registry.entries.find(begin);
+            if (found != registry.entries.end() && found->second.end == end && found->second.version == version) found->second.guard = std::move(guard);
+        }
     }
     Stats().noted.fetch_add(1, std::memory_order_relaxed);
     Stats().notedBytes.fetch_add(end - begin, std::memory_order_relaxed);

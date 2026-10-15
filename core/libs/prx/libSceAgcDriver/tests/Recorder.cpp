@@ -11191,8 +11191,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--coherence-lazy-release-only") {
             if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
-                std::cout << "skipped, unit shadows or host imports are unavailable
-";
+                std::cout << "skipped, unit shadows or host imports are unavailable\n";
                 return 77;
             }
             gpu.unlock();
@@ -11202,8 +11201,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--coherence-faults-only") {
             if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
-                std::cout << "skipped, unit shadows or host imports are unavailable
-";
+                std::cout << "skipped, unit shadows or host imports are unavailable\n";
                 return 77;
             }
             gpu.unlock();

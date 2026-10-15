@@ -206,6 +206,7 @@ Three switches take `0` (the default), `1` or `verify`; any other value stops th
 - **Refused ranges:** ranges the protection refuses (pinned or resident pages) keep the default behaviour.
 - **`verify`:** stops the title at a refused or partly covered range, and at a driver access to such memory made while it holds the GPU lock.
 - **Limits:** unmapping or reprotecting such memory before the driver stored it stops the title. Windows only. Each pending image costs a protection change, so expect a slowdown.
+- **Deadlock risk:** a driver thread that holds the GPU lock and touches protected memory directly, while a title thread is resolving the same pages, deadlocks. The driver does not yet resolve such ranges before taking the lock, and `verify` does not catch it. The same applies to `APS5_COHERENCE_INPUT_LEASES` and `APS5_COHERENCE_RESIDENCY`.
 
 `APS5_COHERENCE_INPUT_LEASES=1` protects the guest memory that a recorded dispatch reads in place through host imports, from recording until its batch completes. A native store into that memory waits until the recorded work has run, so the dispatch reads the bytes it was given rather than a later write. The protection covers every 4 KiB page the reads touch, so reads beside the stored bytes wait as well. Address-based heaps are not leased, because their reach is the whole heap. `verify` stops the title when a lease is refused. Windows only. Each dispatch costs a protection change, and the title's stores into memory the GPU still reads wait for the GPU.
 
