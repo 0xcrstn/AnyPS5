@@ -332,7 +332,7 @@ std::optional<std::span<std::byte>> DrawSnapshotArena::reserve(std::size_t bytes
         return std::nullopt;
     }
     auto& chunk = *chunks[placement->chunk];
-    chunk.containsPartial = true;
+    if (chunk.twin != nullptr && !chunk.containsPartial) chunk.pending.push_back({placement->offset, placement->offset, bytes});
     *placed = Placed{identity, placement->chunk, chunk.serial, placement->offset, bytes};
     ++counters.placed;
     counters.placedBytes += bytes;
