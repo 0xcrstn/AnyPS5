@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/EmitUnit.hpp"
 #include <mutex>
 #include <set>
 
@@ -53,6 +54,7 @@ public:
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
     void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const;
     void BeginPass(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, bool secondary) const;
+    EmitPassBegin DescribePass(const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const;
     void BeginInside(const CommandSink& commands, const State& state) const;
     ChunkInheritance Inheritance(const Framebuffer& framebuffer) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by

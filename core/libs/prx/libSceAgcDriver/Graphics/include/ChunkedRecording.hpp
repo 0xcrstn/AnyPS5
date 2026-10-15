@@ -33,7 +33,7 @@ struct ChunkStatistics {
 
 class ChunkPool {
 public:
-    ChunkPool(const Context& context, VkCommandPool pool);
+    ChunkPool(const Context& context, VkCommandPool pool, VkCommandBufferLevel level = VK_COMMAND_BUFFER_LEVEL_SECONDARY);
     ~ChunkPool();
     ChunkPool(const ChunkPool&) = delete;
     ChunkPool& operator=(const ChunkPool&) = delete;
@@ -43,6 +43,7 @@ public:
 private:
     Context context;
     VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBufferLevel level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
     std::vector<VkCommandBuffer> buffers;
     std::size_t used = 0;
 };
