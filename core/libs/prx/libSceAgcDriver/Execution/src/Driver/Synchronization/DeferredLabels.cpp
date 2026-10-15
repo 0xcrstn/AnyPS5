@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace AgcDriver::DriverDetail {
 
@@ -29,6 +30,19 @@ bool QueuedLabelTable() {
 
 bool LabelBatchSubmit() {
     static const bool enabled = std::getenv("APS5_NO_LABEL_BATCH_SUBMIT") == nullptr && std::getenv("APS5_NO_LABEL_BATCHING") == nullptr;
+    return enabled;
+}
+
+bool ParseLabelRecordJobs(const char* text) {
+    if (text == nullptr) return false;
+    const std::string_view value(text);
+    if (value == "0" || value == "off") return false;
+    if (value == "1" || value == "on") return true;
+    throw std::invalid_argument("APS5_LABEL_RECORD_JOBS must be 0, 1, off or on, not \"" + std::string(value) + "\"");
+}
+
+bool LabelRecordJobs() {
+    static const bool enabled = ParseLabelRecordJobs(std::getenv("APS5_LABEL_RECORD_JOBS"));
     return enabled;
 }
 
@@ -139,6 +153,10 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
     auto& labels = ShaderRecompiler::ThreadOwned(recording);
     labels.clear();
     labels.swap(deferred.labels);
+    recordLabels(localDevice, queue, labels);
+}
+
+void Driver::recordLabels(VulkanDevice* localDevice, std::uint32_t queue, std::vector<DeferredLabel>& labels) {
     struct Clear {
         std::vector<DeferredLabel>& labels;
         std::uint32_t queue;

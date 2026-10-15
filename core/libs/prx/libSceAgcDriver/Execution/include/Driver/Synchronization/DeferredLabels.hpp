@@ -32,6 +32,10 @@ bool QueuedLabelTable();
 
 bool LabelBatchSubmit();
 
+bool ParseLabelRecordJobs(const char* text);
+
+bool LabelRecordJobs();
+
 std::size_t& queuedLabelsNoted();
 
 bool NeedsRecordedLabels(std::uint32_t header);

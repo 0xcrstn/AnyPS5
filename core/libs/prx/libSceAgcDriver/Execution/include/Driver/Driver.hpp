@@ -54,6 +54,8 @@ struct SnapshotWordCounts;
 
 namespace AgcDriver::DriverDetail {
 
+struct DeferredLabel;
+
 class Driver {
 public:
     static Driver& Get();
@@ -428,6 +430,10 @@ private:
     static bool reapEachPacket();
     static std::uint64_t batchCap();
     void recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue);
+    void recordLabels(VulkanDevice* localDevice, std::uint32_t queue, std::vector<DeferredLabel>& labels);
+    bool freezeLabels(std::uint32_t queue, bool force);
+    void emitFrozenLabels(const std::shared_ptr<FrozenDraw>& frozen);
+    bool deferredLabelPacket(std::span<const std::uint32_t> packet) const;
     bool recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queue);
     void recordQueuedLabelsBeforeRead(std::uint32_t queue);
     bool recordQueuedLabelsAfterCapture(std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> regions);

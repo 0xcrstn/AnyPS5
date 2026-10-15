@@ -57,7 +57,7 @@ FrozenFallback Driver::dispatchFrozenFallback(const QueueState& queue, std::span
     if (debug || verifyDataHits() || traceCapSync() || ShaderRecompiler::DebugProbeActive()) return FrozenFallback::Debug;
     if (device.Load() == nullptr) return FrozenFallback::NoDevice;
     if (GuestMemory::GpuMutex().HeldByThisThread()) return FrozenFallback::GpuMutexHeld;
-    if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value()) return FrozenFallback::Labels;
+    if (!deferredLabels().labels.empty() || ((!LabelRecordJobs() || !LabelBatchSubmit()) && Graphics::Recorder::PendingLabelSince().has_value())) return FrozenFallback::Labels;
     if (resolvedAhead().contains(currentPacketOffset())) return FrozenFallback::ResolvedAhead;
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (address == SkippedShader() && address != 0) return FrozenFallback::None;
