@@ -138,6 +138,16 @@ struct StagingShadow {
 
 namespace {
 
+bool PointerStorePretest() {
+    static const bool enabled = std::getenv("APS5_POINTER_STORE_PRETEST") != nullptr;
+    return enabled;
+}
+
+bool VerifyPointerStorePretest() {
+    static const bool enabled = std::getenv("APS5_VERIFY_POINTER_STORE_PRETEST") != nullptr;
+    return enabled;
+}
+
 struct StagingShadowCache {
     std::mutex mutex;
     std::map<std::tuple<VkDevice, std::uint64_t, std::uint64_t>, std::shared_ptr<StagingShadow>> entries;
@@ -3951,7 +3961,16 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         }
         for (const auto& region : regions) heap(region);
     }
-    for (const auto& [begin, end] : pointerHeaps) static_cast<void>(StorageTexture::StoreForPointerAccess(begin, static_cast<std::size_t>(end - begin), pointerExempt));
+    const auto storeForPointers = [&] {
+        bool stored = false;
+        for (const auto& [begin, end] : pointerHeaps) stored = StorageTexture::StoreForPointerAccess(begin, static_cast<std::size_t>(end - begin), pointerExempt) || stored;
+        return stored;
+    };
+    if (!PointerStorePretest() || StorageTexture::AnyPendingOverlaps(pointerHeaps) || AnyShadowedOverlaps(pointerHeaps)) {
+        static_cast<void>(storeForPointers());
+    } else if (VerifyPointerStorePretest()) {
+        Require(!storeForPointers(), "APS5_VERIFY_POINTER_STORE_PRETEST: an address-based build skipped by the pointer-heap pretest stored or published storage results");
+    }
     if (Coherence::Tracking() && !pointerHeaps.empty()) {
         for (const auto& [begin, end] : pointerHeaps) StorageTexture::AuditPointerReads(begin, static_cast<std::size_t>(end - begin), pointerExempt);
         if (pointerWrites) {
