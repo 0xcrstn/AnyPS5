@@ -168,6 +168,16 @@ bool PriorityCompileScheduler() {
     return priority;
 }
 
+bool PipelineContentDedup() {
+    static const bool dedup = [] {
+        const char* text = std::getenv("APS5_PIPELINE_CONTENT_DEDUP");
+        if (text == nullptr || *text == '\0' || std::string_view(text) == "0") return false;
+        require(std::string_view(text) == "1", "APS5_PIPELINE_CONTENT_DEDUP accepts only 0 or 1");
+        return true;
+    }();
+    return dedup;
+}
+
 bool VerifyCompileJobs() {
     static const bool verify = std::getenv("APS5_VERIFY_COMPILE_JOBS") != nullptr;
     return verify;
@@ -443,6 +453,7 @@ struct VulkanDevice::State {
     // dispatch's find-or-insert and the verify switch's lookups touch the map, recipes hold weak
     // references to its objects.
     PipelineSingleflight<PipelineCompileKey, ComputePipelineObjects> computePipelines;
+    PipelineContentIndex<ComputePipelineObjects> computeContents;
     std::shared_ptr<ComputePipelineObjects> BuildComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey = {});
     std::shared_ptr<ComputePipelineObjects> GetComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey = {}, bool ahead = false, bool* created = nullptr);
     std::shared_ptr<ComputePipelineObjects> FindComputePipeline(const PipelineCompileKey& key, bool demand = true);
@@ -4325,6 +4336,16 @@ std::uint64_t VulkanDevice::presync(std::span<const std::pair<std::uint64_t, std
 // The pipeline layout takes the resources' set layout: layouts built from the same bindings are
 // compatible, so the objects serve every dispatch of the variant.
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey) {
+    std::optional<PipelineContentKey> contentKey;
+    if (PipelineContentDedup() && !layoutKey.empty()) {
+        contentKey = ComputePipelineContentKey(shader, pushStages != 0, layoutKey);
+        if (auto shared = computeContents.Find(*contentKey)) {
+            ShaderCompileTrace::Event event("pipeline.compute_shared");
+            event.Hex("address", programAddress).Hex("variant", shader.PipelineVariantId()).Number("spirv_words", shader.spirv.size());
+            if (VerifyCompileJobs()) RequireSameComputeRecipe(shared->recipe, ComputePipelineRecipeHash(shader, pushStages != 0, layoutKey), programAddress);
+            return shared;
+        }
+    }
     auto objects = std::make_shared<ComputePipelineObjects>();
     objects->device = device;
     objects->destroyModule = DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
@@ -4384,6 +4405,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
     if (trace.Event().Active()) trace.Event().Hex("address", programAddress).Hex("variant", shader.PipelineVariantId()).Number("spirv_words", shader.spirv.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(shader.spirv.Words())).Hex("layout_key", ShaderCompileTrace::HashOf(layoutKey)).Number("specialization_constants", shader.specialization.size()).Flag("gpu_mutex_held", GuestMemory::GpuMutex().HeldByThisThread());
     CreateComputePipeline(device, DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization, &trace);
     if (VerifyCompileJobs()) objects->recipe = ComputePipelineRecipeHash(shader, pushStages != 0, layoutKey);
+    if (contentKey.has_value()) computeContents.Insert(*contentKey, objects);
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
     Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
