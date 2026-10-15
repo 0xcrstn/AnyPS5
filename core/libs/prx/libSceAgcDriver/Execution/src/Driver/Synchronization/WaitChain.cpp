@@ -111,12 +111,14 @@ void Driver::reportWaitChain(std::uint32_t queue) {
         std::snprintf(part, sizeof(part), "%s%s %.1f ms", segment == 0 ? "" : ", ", SegmentNames[segment], stats.segmentMs[segment]);
         segments += part;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[waitchain] queue 0x%x (10 s): waits by source entry %llu, held at submit %llu, history %llu, table %llu, table-late %llu, memory %llu; %llu history matches below the activation floor refused; %llu landings ended on settled writes; blocked %llu waits %.1f ms: %s; unknown producer %llu waits %.1f ms; longest %.1f ms on stamp %llu by queue 0x%x\n",
+    AgcDriver::ProfilePrint_nid_no_patch("[waitchain] queue 0x%x (10 s): waits by source entry %llu, held at submit %llu, history %llu, table %llu, table-late %llu, memory %llu; %llu history matches below the activation floor refused; %llu landings ended on settled writes; blocked %llu waits %.1f ms: %s; unknown producer %llu waits %.1f ms; longest %.1f ms on stamp %llu by queue 0x%x; lifts latched %llu, authoritative %llu, producer %llu, exact %llu, %llu unproven refused; broker wakes %llu, timeouts %llu\n",
                                          queue, static_cast<unsigned long long>(stats.bySource[1]), static_cast<unsigned long long>(stats.bySource[2]), static_cast<unsigned long long>(stats.bySource[3]), static_cast<unsigned long long>(stats.bySource[4]), static_cast<unsigned long long>(stats.bySource[5]), static_cast<unsigned long long>(stats.bySource[6]),
-                                         static_cast<unsigned long long>(outcomes.belowFloor), static_cast<unsigned long long>(outcomes.landedSettled), static_cast<unsigned long long>(stats.blocked), stats.blockedMs, segments.c_str(), static_cast<unsigned long long>(stats.unknown), stats.unknownMs, stats.longestMs, static_cast<unsigned long long>(stats.longestStamp), stats.longestProducer);
+                                         static_cast<unsigned long long>(outcomes.belowFloor), static_cast<unsigned long long>(outcomes.landedSettled), static_cast<unsigned long long>(stats.blocked), stats.blockedMs, segments.c_str(), static_cast<unsigned long long>(stats.unknown), stats.unknownMs, stats.longestMs, static_cast<unsigned long long>(stats.longestStamp), stats.longestProducer,
+                                         static_cast<unsigned long long>(outcomes.lifts[0]), static_cast<unsigned long long>(outcomes.lifts[1]), static_cast<unsigned long long>(outcomes.lifts[2]), static_cast<unsigned long long>(outcomes.lifts[3]), static_cast<unsigned long long>(outcomes.unprovenRefused), static_cast<unsigned long long>(outcomes.brokerWakes), static_cast<unsigned long long>(outcomes.brokerTimeouts));
     if (queue == 0) {
-        AgcDriver::ProfilePrint_nid_no_patch("[labels] (10 s) %s\n", Graphics::LabelVersions::TakeReport().c_str());
-        auto& scheduler = Get().Scheduler();
+        auto& driver = Get();
+        AgcDriver::ProfilePrint_nid_no_patch("[labels] (10 s) %s; batch-age submits %llu of %llu checks\n", Graphics::LabelVersions::TakeReport().c_str(), static_cast<unsigned long long>(driver.batchAgeSubmits.exchange(0)), static_cast<unsigned long long>(driver.batchAgeChecks.exchange(0)));
+        auto& scheduler = driver.Scheduler();
         if (scheduler.Active()) {
             const auto taken = scheduler.Take();
             constexpr const char* modes[] = {"off", "serial", "dag"};

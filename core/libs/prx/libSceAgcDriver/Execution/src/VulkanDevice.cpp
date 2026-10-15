@@ -10,6 +10,7 @@
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/QueueTopology.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DriverHeapTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -1104,12 +1105,41 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : VulkanDevice(wind
 
 VulkanDevice::VulkanDevice(CompileOnly) : VulkanDevice(nullptr, true) {}
 
-VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) : state(std::make_unique<State>()), serial([] { static std::atomic<std::uint64_t> serials{0}; return serials.fetch_add(1, std::memory_order_relaxed) + 1; }()) {
-    state->compileOnly = compileOnly;
+namespace {
+
+void MaterializeNativeAccess(Coherence::Interval range) {
+    Graphics::StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin));
+}
+
+void WaitForGuestReaders(Coherence::Interval range) {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) Coherence::NoteLockedFault(range);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    if (auto* recorder = Graphics::Recorder::Active()) recorder->Sync();
+}
+
+void InstallCoherence() {
+    if (Coherence::LazyRelease() && !Coherence::FaultOwnership()) throw std::runtime_error("APS5_COHERENCE_LAZY_RELEASE needs APS5_COHERENCE_FAULTS: a release that stores nothing must leave device-only guest memory protected");
+    if (Coherence::LazyRelease() && Graphics::LazyStagingOut() && !Coherence::Residency()) throw std::runtime_error("APS5_COHERENCE_LAZY_RELEASE with APS5_LAZY_STAGING_OUT needs APS5_COHERENCE_RESIDENCY");
     if (Coherence::Canonicalizing()) {
         Coherence::SetBackingTranslator(&GuestArena::GuestArenaBackingRuns_nid_postfix);
         static_cast<void>(Coherence::Translate({0x10000, 0x10001}));
     }
+    if (!Coherence::FaultOwnership() && !Coherence::InputLeases() && !Coherence::Residency()) return;
+#ifdef _WIN32
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetMaterializer(&MaterializeNativeAccess);
+    Coherence::SetLeaseWaiter(&WaitForGuestReaders);
+    GuestArena::GuestArenaSetResolveHostWrites_nid_postfix(true);
+#else
+    throw std::runtime_error("APS5_COHERENCE_FAULTS, APS5_COHERENCE_INPUT_LEASES and APS5_COHERENCE_RESIDENCY: guest access protection is not implemented on this platform");
+#endif
+}
+
+}
+
+VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) : state(std::make_unique<State>()), serial([] { static std::atomic<std::uint64_t> serials{0}; return serials.fetch_add(1, std::memory_order_relaxed) + 1; }()) {
+    state->compileOnly = compileOnly;
+    InstallCoherence();
     APS5_LOG_OUT("VulkanDevice constructor window=%p", static_cast<const void*>(window));
 #ifdef _WIN32
     state->library = SDL_LoadObject("vulkan-1.dll");
@@ -1661,6 +1691,29 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
         enabled.sparseBinding = state->sparseBinding ? VK_TRUE : VK_FALSE;
     }
+    {
+        std::uint32_t familyCount = 0;
+        auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
+        getFamilies(selected, &familyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> properties(familyCount);
+        getFamilies(selected, &familyCount, properties.data());
+        std::vector<QueueFamilyInfo> topologyFamilies(familyCount);
+        for (std::uint32_t i = 0; i < familyCount; ++i) {
+            topologyFamilies[i].flags = properties[i].queueFlags;
+            topologyFamilies[i].count = properties[i].queueCount;
+            if (window != nullptr) {
+                VkBool32 present = VK_FALSE;
+                check(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>("vkGetPhysicalDeviceSurfaceSupportKHR")(selected, i, state->surface, &present), "vkGetPhysicalDeviceSurfaceSupportKHR");
+                topologyFamilies[i].present = present == VK_TRUE;
+            }
+        }
+        APS5_LOG_OUT("Vulkan queue families: %s; graphics family %u, sparse family %d", DescribeQueueFamilies(topologyFamilies).c_str(), family, state->sparseFamily == VK_QUEUE_FAMILY_IGNORED ? -1 : static_cast<int>(state->sparseFamily));
+        const auto topology = ParseQueueTopology(std::getenv("APS5_QUEUE_TOPOLOGY"));
+        const auto plan = PlanQueueTopology(topology, topologyFamilies, family, state->sparseFamily);
+        if (plan.topology != QueueTopology::Serial) {
+            throw std::runtime_error(std::string("APS5_QUEUE_TOPOLOGY=") + QueueTopologyName(plan.topology) + ": compute queue family " + std::to_string(plan.computeFamily) + " index " + std::to_string(plan.computeIndex) + " is available, but running guest compute queues on it needs a recorder per physical queue, which is not implemented");
+        }
+    }
     deviceInfo.pQueueCreateInfos = queueInfos;
     // Indirect draw records with a non-zero first instance, and several records per call.
     enabled.drawIndirectFirstInstance = available.drawIndirectFirstInstance;
@@ -2177,8 +2230,16 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
-    if (storeAtLabel || Coherence::Ordering()) Graphics::StorageTexture::FlushAllPending("label");
-    const auto checkDrained = [&](bool writeBacksOrdered) { Coherence::CheckDrained(Graphics::StorageTexture::AnyPending(), Graphics::AnyShadowedOverlaps(0, std::numeric_limits<std::size_t>::max()), "label", writeBacksOrdered); };
+    const bool lazyRelease = Coherence::LazyRelease() && !storeAtLabel;
+    if (lazyRelease) {
+        static_cast<void>(Graphics::StorageTexture::FlushUnprotected("label"));
+        Coherence::CheckReleaseCovered(Graphics::StorageTexture::AnyUnprotectedPending(), Graphics::AnyUnprotectedShadow(), "label");
+    } else if (storeAtLabel || Coherence::Ordering()) {
+        Graphics::StorageTexture::FlushAllPending("label");
+    }
+    const auto checkDrained = [&](bool writeBacksOrdered) {
+        if (!lazyRelease) Coherence::CheckDrained(Graphics::StorageTexture::AnyPending(), Graphics::AnyShadowedOverlaps(0, std::numeric_limits<std::size_t>::max()), "label", writeBacksOrdered);
+    };
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) {
         checkDrained(true);
         return 4;
@@ -2201,11 +2262,14 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // A unit shadow's results in the label's unit reach the import before the store lands over
     // part of it (the store's stamp then makes the unit stale); the deferred label paths call no
     // FlushPending of their own.
-    if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    const auto publishShadow = [&] {
+        if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    };
     const std::array<Coherence::Interval, 1> labelRange{{{address, address + bytes.size()}}};
-    auto labelToken = Coherence::Reserve(Coherence::Producer::LabelStore, labelRange, false, queue);
     if (behindWriteBacks) {
         if (drain) return 2;
+        publishShadow();
+        auto labelToken = Coherence::Reserve(Coherence::Producer::LabelStore, labelRange, false, queue);
         GuestMemory::MarkWritten(address, bytes.size());
         recorder.AfterCompletions(address, bytes, stamp, queue, false);
         labelToken.Recorded();
@@ -2214,6 +2278,8 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     const auto context = graphicsContext();
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());
     if (import == nullptr) return 3;
+    publishShadow();
+    auto labelToken = Coherence::Reserve(Coherence::Producer::LabelStore, labelRange, false, queue);
     // The store on the GPU, into the open batch: everything recorded so far completes before it,
     // and it is visible to the host after. The barriers belong to the recorder's store run: one
     // pair for a whole group of labels recorded back to back (Recorder::RecordStore orders the
@@ -4735,6 +4801,21 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
 std::span<const double, 5> VulkanDevice::PreparePhaseMs(const PreparedDispatch& prepared) {
     static_assert(PreparedDispatch::PreparePhaseCount == 5);
     return std::span<const double, 5>(prepared.phaseMs);
+}
+
+std::span<const std::uint32_t> VulkanDevice::PreparedKey(const PreparedDispatch& prepared) {
+    return prepared.key;
+}
+
+std::vector<PreparedCpuCopy> VulkanDevice::PreparedCpuCopies(const PreparedDispatch& prepared, bool& unbounded) {
+    unbounded = false;
+    std::vector<PreparedCpuCopy> copies;
+    if (prepared.resources == nullptr) return copies;
+    unbounded = prepared.resources->PrepareCpuCopiesUnbounded();
+    const auto& made = prepared.resources->PrepareCpuCopies();
+    copies.reserve(made.size());
+    for (const auto& copy : made) copies.push_back({copy.begin, copy.end, copy.bytes});
+    return copies;
 }
 
 std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<const Recipe>& recipe, bool indirect) {

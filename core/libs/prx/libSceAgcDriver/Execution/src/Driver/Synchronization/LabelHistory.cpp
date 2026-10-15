@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitBroker.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LabelVersions.hpp"
 #include <algorithm>
 #include <array>
@@ -14,6 +15,7 @@ namespace AgcDriver::DriverDetail {
 void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
     Graphics::LabelVersions::Record(stamp, address, static_cast<std::uint32_t>(bytes.size()), queue);
     noteRelease(address, bytes, stamp, queue);
+    WaitBroker::Instance().Publish();
     if (!KeepsLabelStore(address, bytes.size())) return;
     std::lock_guard lock(labelStoresMutex);
     for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {

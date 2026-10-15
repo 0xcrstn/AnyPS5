@@ -403,8 +403,22 @@ public:
         physical.erase(physical.lower_bound(std::make_pair(key, std::uint64_t{0})), physical.lower_bound(std::make_pair(key + 1, std::uint64_t{0})));
     }
 
+    void SetResolveHostWrites(bool resolve) {
+        resolveHostWrites.store(resolve, std::memory_order_release);
+    }
+
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        std::unique_lock lock(mutex, std::defer_lock);
+        if (resolveHostWrites.load(std::memory_order_acquire)) {
+            for (;;) {
+                if (!ResolveAccess(address, bytes)) return false;
+                lock.lock();
+                if (!accessProtectedLocked(address, bytes)) break;
+                lock.unlock();
+            }
+        } else {
+            lock.lock();
+        }
         requireAccessResolved(address, bytes);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
@@ -727,6 +741,14 @@ private:
         const DWORD protection = view.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
         protectSubpages(base, watched, protection, "restore guest write tracking");
         protectSubpages(base, static_cast<std::uint8_t>(mask & ~guarded & ~watched), view.protection, "restore resolved guest access");
+    }
+
+    bool accessProtectedLocked(std::uintptr_t address, std::size_t bytes) const {
+        if (accessGuards.empty()) return false;
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
+            if ((protectedAccess(*it->second.page) & subpagesOf(it->first, address, address + bytes)) != 0) return true;
+        }
+        return false;
     }
 
     void requireAccessResolved(std::uintptr_t address, std::size_t bytes, bool wholePages = false) const {
@@ -1129,6 +1151,7 @@ private:
     std::map<std::uintptr_t, View> views;
     std::map<std::uint64_t, std::shared_ptr<AccessGuard>> accessGuards;
     std::atomic<std::size_t> accessGuardCount{0};
+    std::atomic<bool> resolveHostWrites{false};
     std::uint64_t nextAccessToken = 0;
     std::uint64_t viewIdentity = 0;
     struct ActiveAccessResolversTag {};

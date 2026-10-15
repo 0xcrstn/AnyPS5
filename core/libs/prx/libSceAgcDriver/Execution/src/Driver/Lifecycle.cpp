@@ -114,6 +114,11 @@ void Driver::stop() {
     for (auto& [queue, worker] : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
+    {
+        std::lock_guard lock(batchAgeMutex);
+    }
+    batchAgeChanged.notify_all();
+    if (batchAgeThread.joinable()) batchAgeThread.join();
     StopWorkerSampler();
     MemoryReport::Stop();
     CloseRegistrationPreparation();

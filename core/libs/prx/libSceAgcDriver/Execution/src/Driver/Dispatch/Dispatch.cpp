@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CompileService.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -12,15 +13,163 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
+
+struct Driver::DispatchInputs {
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    std::shared_ptr<const ShaderSnapshot> shader;
+    std::shared_ptr<DispatchVariant> keepVariant;
+    std::shared_ptr<DispatchVariant> attachVariant;
+    std::shared_ptr<ShaderMemory> shaderMemory;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    std::vector<ShaderRecompiler::MemoryRegion> captured;
+    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    std::shared_ptr<RecipeHit> recipeHit;
+    std::shared_ptr<PreparedDispatch> prepared;
+    std::array<std::uint32_t, 3> groups;
+    std::uint64_t indirectArguments;
+    std::uint64_t dispatchThreads;
+    std::uint64_t address;
+    bool dataHit;
+    DispatchVariant* attachTo;
+    std::vector<PreparedCpuCopy> stageCopies{};
+};
+
+FrozenFallback Driver::dispatchHleFallback(const Registers& shader, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::uint64_t indirectArguments) {
+    if (indirectArguments != 0 && matchesFillKernel(code, userData, compute)) return FrozenFallback::ArgumentRead;
+    if (Graphics::HtileDepthClearAddress(code, userData, compute.numThreads) != 0) return FrozenFallback::DepthNote;
+    if (indirectArguments == 0 && (packet[4] & 0x20u) == 0 && Graphics::MatchMemoryValueFill(code, userData, compute.numThreads, {packet[1], packet[2], packet[3]})) return FrozenFallback::DepthNote;
+    std::array<std::uint32_t, 3> partialGroups{};
+    if (indirectArguments == 0 && (packet[4] & 0x2u) != 0) partialGroups = Pm4::PartialGroupThreads({packet[1], packet[2], packet[3]}, {readRegister(shader, 0x207), readRegister(shader, 0x208), readRegister(shader, 0x209)});
+    if (partialGroups != std::array<std::uint32_t, 3>{}) return FrozenFallback::None;
+    if (MatchDwordPatternFill(packet, code, userData, compute) || MatchConstantDwordFill(packet, code, userData, compute) || MatchMemoryValueBufferFill(packet, code, userData, compute) || matchesFillKernel(code, userData, compute)) return FrozenFallback::FillHle;
+    if (indirectArguments == 0 && (matchesCopyKernel(code, userData, compute) || MatchStreamCopyKernel(code, userData, compute))) return FrozenFallback::CopyHle;
+    return FrozenFallback::None;
+}
+
+FrozenFallback Driver::dispatchFrozenFallback(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    static const bool debug = std::getenv("APS5_PROBE_DISPATCH") != nullptr || std::getenv("APS5_DUMP_SHADERS") != nullptr || std::getenv("APS5_TRACE_DISPATCH_CACHE") != nullptr || std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr || std::getenv("APS5_NO_UNLOCKED_DEVICE") != nullptr;
+    if (debug || verifyDataHits() || traceCapSync() || dispatchMissDiagnosisEnabled() || ShaderRecompiler::DebugProbeActive()) return FrozenFallback::Debug;
+    if (device.Load() == nullptr) return FrozenFallback::NoDevice;
+    if (GuestMemory::GpuMutex().HeldByThisThread()) return FrozenFallback::GpuMutexHeld;
+    if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value()) return FrozenFallback::Labels;
+    if (resolvedAhead().contains(currentPacketOffset())) return FrozenFallback::ResolvedAhead;
+    const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
+    if (address == SkippedShader() && address != 0) return FrozenFallback::None;
+    const auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
+    if (!registeredShader || registeredShader->type != 0 || address < registeredShader->codeAddress) return FrozenFallback::UnregisteredShader;
+    const auto& snapshot = *registeredShader;
+    const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
+    if (codeOffset > snapshot.code.size()) return FrozenFallback::UnregisteredShader;
+    const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
+    std::vector<std::uint32_t> userData;
+    userData.reserve(userCount);
+    for (std::uint32_t i = 0; i < userCount; ++i) userData.push_back(readUserData(queue.shader, 0x240 + i));
+    const auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
+    return dispatchHleFallback(queue.shader, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, indirectArguments);
+}
+
+void Driver::noteDispatchInputWriters(const DispatchInputs& inputs, std::uint32_t queue) {
+    if (writeEvidenceEnabled() || traceCapSync()) noteWrittenBuffers(inputs.address, queue, *inputs.compiled);
+}
+
+void Driver::recordDispatchInputs(DispatchInputs& inputs, const std::shared_ptr<VulkanDevice>& localDevice) {
+    const auto& compiled = *inputs.compiled;
+    const auto& groups = inputs.groups;
+    std::shared_ptr<const Recipe> builtRecipe;
+    for (;;) {
+        if (inputs.recipeHit != nullptr) {
+            VulkanDevice::IndirectOutcome outcome{0, 0};
+            const auto result = localDevice->DispatchRecipe(compiled, groups[0], groups[1], groups[2], inputs.indirectArguments, inputs.address, inputs.recipeHit, outcome, VulkanDevice::VerifyRecipes() ? inputs.prepared : nullptr, inputs.dataHit);
+            if (result == RecipeOutcome::Rebuild) {
+                inputs.recipeHit = nullptr;
+                VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, inputs.indirectArguments != 0);
+                inputs.prepared = localDevice->PrepareDispatch(compiled, inputs.snapshots, inputs.dispatchThreads, inputs.address);
+                continue;
+            }
+            if (inputs.indirectArguments != 0) countIndirect(outcome.cpuReason, outcome.argumentReadMs);
+        } else if (inputs.indirectArguments != 0) {
+            const auto outcome = localDevice->DispatchIndirect(compiled, inputs.indirectArguments, inputs.snapshots, inputs.address, std::move(inputs.prepared), inputs.attachTo != nullptr ? &builtRecipe : nullptr);
+            countIndirect(outcome.cpuReason, outcome.argumentReadMs);
+        } else {
+            localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], inputs.snapshots, inputs.address, std::move(inputs.prepared), inputs.attachTo != nullptr ? &builtRecipe : nullptr);
+        }
+        break;
+    }
+    if (builtRecipe == nullptr) return;
+    if (inputs.dataHit) {
+        auto own = std::make_shared<Recipe>(*builtRecipe);
+        own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, inputs.keepVariant->compiled.get(), 0});
+        builtRecipe = std::move(own);
+    }
+    inputs.attachTo->recipe.store(std::move(builtRecipe), std::memory_order_release);
+    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, inputs.indirectArguments != 0);
+}
+
+bool Driver::staleDispatchInputs(const DispatchInputs& adopted, const DispatchInputs& fresh, const std::function<bool(std::uint64_t, std::size_t)>& touchedEarlier) {
+    char text[320];
+    const auto fail = [&](const char* what) {
+        std::snprintf(text, sizeof(text), "APS5_VERIFY_PREPARE_DISPATCHES: the preparation on a worker differs from the in-order preparation in %s", what);
+        throw std::runtime_error(text);
+    };
+    if (adopted.address != fresh.address) fail("the program address");
+    if (adopted.indirectArguments != fresh.indirectArguments || adopted.groups != fresh.groups || adopted.dispatchThreads != fresh.dispatchThreads) fail("the indirect decision or the group counts");
+    if (adopted.snapshots.size() != fresh.snapshots.size()) fail("the number of bound ranges");
+    for (std::size_t index = 0; index < adopted.snapshots.size(); ++index) {
+        const auto& left = adopted.snapshots[index];
+        const auto& right = fresh.snapshots[index];
+        if (left.address != right.address || left.bytes.size() != right.bytes.size()) {
+            std::snprintf(text, sizeof(text), "APS5_VERIFY_PREPARE_DISPATCHES: bound range %zu is 0x%llx+0x%zx on a worker, 0x%llx+0x%zx in order", index, static_cast<unsigned long long>(left.address), left.bytes.size(), static_cast<unsigned long long>(right.address), right.bytes.size());
+            throw std::runtime_error(text);
+        }
+    }
+    for (std::size_t index = 0; index < adopted.snapshots.size(); ++index) {
+        const auto& left = adopted.snapshots[index];
+        const auto& right = fresh.snapshots[index];
+        if (left.bytes.empty() || std::memcmp(left.bytes.data(), right.bytes.data(), left.bytes.size()) == 0) continue;
+        std::vector<std::byte> live(left.bytes.size());
+        GuestMemory::Read(left.address, live);
+        if (std::memcmp(live.data(), right.bytes.data(), live.size()) == 0 && !touchedEarlier(left.address, left.bytes.size())) return true;
+        std::snprintf(text, sizeof(text), "APS5_VERIFY_PREPARE_DISPATCHES: bound range %zu at 0x%llx holds different bytes on a worker and in order, and no CPU store after the preparation explains it", index, static_cast<unsigned long long>(left.address));
+        throw std::runtime_error(text);
+    }
+    for (const auto& copy : adopted.stageCopies) {
+        const auto found = std::find_if(fresh.stageCopies.begin(), fresh.stageCopies.end(), [&](const PreparedCpuCopy& other) { return other.begin == copy.begin && other.end == copy.end; });
+        if (found == fresh.stageCopies.end() || copy.bytes.empty() || found->bytes.size() != copy.bytes.size()) continue;
+        if (std::memcmp(copy.bytes.data(), found->bytes.data(), copy.bytes.size()) == 0) continue;
+        std::vector<std::byte> live(copy.bytes.size());
+        GuestMemory::Read(copy.begin, live);
+        if (std::memcmp(live.data(), found->bytes.data(), live.size()) == 0 && !touchedEarlier(copy.begin, copy.bytes.size())) return true;
+        std::snprintf(text, sizeof(text), "APS5_VERIFY_PREPARE_DISPATCHES: stage A copied 0x%llx+0x%zx on the CPU with different bytes on a worker and in order, and no CPU store after the preparation explains it", static_cast<unsigned long long>(copy.begin), copy.bytes.size());
+        throw std::runtime_error(text);
+    }
+    const auto& left = *adopted.compiled;
+    const auto& right = *fresh.compiled;
+    if (left.PipelineVariantId() != right.PipelineVariantId() || left.spirv != right.spirv) fail("the shader variant");
+    if (!sameResourceBindings(left, right)) fail("the resource bindings or push constants");
+    if (Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, &left, 0}) != Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, &right, 0})) fail("the shader data words");
+    if (adopted.prepared != nullptr && fresh.prepared != nullptr && !std::ranges::equal(VulkanDevice::PreparedKey(*adopted.prepared), VulkanDevice::PreparedKey(*fresh.prepared))) fail("the resource template key");
+    return false;
+}
 
 void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (address == SkippedShader() && address != 0) return;
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
+    auto* const sink = frozenSink();
+    const auto refuse = [&](FrozenFallback reason) {
+        if (!sink->Refuse(reason)) throw std::logic_error(std::string("a frozen dispatch needs queue 0 in its in-order preparation: ") + FrozenFallbackNames[static_cast<std::size_t>(reason)]);
+    };
+    if (!registeredShader && sink != nullptr) {
+        refuse(FrozenFallback::UnregisteredShader);
+        return;
+    }
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
@@ -36,6 +185,13 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
 
     static const bool unlockedDevice = std::getenv("APS5_NO_UNLOCKED_DEVICE") == nullptr;
     std::shared_ptr<VulkanDevice> localDevice = unlockedDevice ? device.Load() : nullptr;
+    if (sink != nullptr) {
+        const auto reason = localDevice == nullptr ? FrozenFallback::NoDevice : dispatchHleFallback(queue.shader, packet, std::span(snapshot.code).subspan(static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t))), userData, compute, indirectArguments);
+        if (reason != FrozenFallback::None) {
+            refuse(reason);
+            return;
+        }
+    }
     if (localDevice == nullptr) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -403,7 +559,7 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 
-    if (VulkanDevice::CompileParkingEnabled() && onWorkerThread() && !GuestMemory::GpuMutex().HeldByThisThread()) {
+    if (VulkanDevice::CompileParkingEnabled() && sink == nullptr && onWorkerThread() && !GuestMemory::GpuMutex().HeldByThisThread()) {
         if (auto ticket = localDevice->TryComputePipeline(compiled, address)) {
             ParkedOp op;
             op.queue = submission.queue;
@@ -417,7 +573,7 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
             if (verify) require(localDevice->TryComputePipeline(compiled, address) == nullptr, "APS5_VERIFY_COMPILE_JOBS: a dispatch resumed after its pipeline build settled, but the pipeline is still not built");
         }
     }
-    const bool deferred = drawRecordState().active && !fromAhead;
+    const bool deferred = (drawRecordState().active || sink != nullptr) && !fromAhead;
     if (deferred) {
         std::shared_ptr<PreparedDispatch> prepared;
         if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {
@@ -427,65 +583,30 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
                 rethrow(error);
             }
         }
-        if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value()) {
+        if (sink == nullptr && (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value())) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             recordLabelsForPacket(localDevice.get(), submission.queue);
         }
         phaseTiming.Phase(PhaseLabels);
-        if (noteWrites && writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
+        if (sink == nullptr && noteWrites && writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
         phaseTiming.Phase(PhaseNoteWriters);
-        struct Inputs {
-            std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
-            decltype(registeredShader) shader;
-            std::shared_ptr<DispatchVariant> keepVariant;
-            std::shared_ptr<DispatchVariant> attachVariant;
-            std::shared_ptr<ShaderMemory> shaderMemory;
-            std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
-            std::vector<ShaderRecompiler::MemoryRegion> captured;
-            std::vector<Graphics::GuestMemorySnapshot> snapshots;
-            std::shared_ptr<RecipeHit> recipeHit;
-            std::shared_ptr<PreparedDispatch> prepared;
-            std::array<std::uint32_t, 3> groups;
-            std::uint64_t indirectArguments;
-            std::uint64_t dispatchThreads;
-            std::uint64_t address;
-            bool dataHit;
-            DispatchVariant* attachTo;
-        };
-        auto inputs = std::make_shared<Inputs>(Inputs{compiledResult, registeredShader, keepVariant, attachVariant, shaderMemory, capture, std::move(captured), std::move(snapshots), std::move(recipeHit), std::move(prepared), groups, indirectArguments, dispatchThreads, address, dataHit, attachTo});
-        postDrawRecord(localDevice, submission.queue, recordIdentity(submission, indirectArguments != 0 ? "indirect dispatch" : "dispatch", address), [inputs, localDevice](DrawRecordResult&) {
-            const auto& compiled = *inputs->compiled;
-            const auto& groups = inputs->groups;
-            std::shared_ptr<const Recipe> builtRecipe;
-            for (;;) {
-                if (inputs->recipeHit != nullptr) {
-                    VulkanDevice::IndirectOutcome outcome{0, 0};
-                    const auto result = localDevice->DispatchRecipe(compiled, groups[0], groups[1], groups[2], inputs->indirectArguments, inputs->address, inputs->recipeHit, outcome, VulkanDevice::VerifyRecipes() ? inputs->prepared : nullptr, inputs->dataHit);
-                    if (result == RecipeOutcome::Rebuild) {
-                        inputs->recipeHit = nullptr;
-                        VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, inputs->indirectArguments != 0);
-                        inputs->prepared = localDevice->PrepareDispatch(compiled, inputs->snapshots, inputs->dispatchThreads, inputs->address);
-                        continue;
-                    }
-                    if (inputs->indirectArguments != 0) countIndirect(outcome.cpuReason, outcome.argumentReadMs);
-                } else if (inputs->indirectArguments != 0) {
-                    const auto outcome = localDevice->DispatchIndirect(compiled, inputs->indirectArguments, inputs->snapshots, inputs->address, std::move(inputs->prepared), inputs->attachTo != nullptr ? &builtRecipe : nullptr);
-                    countIndirect(outcome.cpuReason, outcome.argumentReadMs);
-                } else {
-                    localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], inputs->snapshots, inputs->address, std::move(inputs->prepared), inputs->attachTo != nullptr ? &builtRecipe : nullptr);
-                }
-                break;
-            }
-            if (builtRecipe == nullptr) return;
-            if (inputs->dataHit) {
-                auto own = std::make_shared<Recipe>(*builtRecipe);
-                own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, inputs->keepVariant->compiled.get(), 0});
-                builtRecipe = std::move(own);
-            }
-            inputs->attachTo->recipe.store(std::move(builtRecipe), std::memory_order_release);
-            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, inputs->indirectArguments != 0);
-        });
+        std::vector<PreparedCpuCopy> stageCopies;
+        if (sink != nullptr && prepared != nullptr) {
+            bool unbounded = false;
+            stageCopies = VulkanDevice::PreparedCpuCopies(*prepared, unbounded);
+            if (unbounded && sink->Refuse(FrozenFallback::UnboundedCopies)) return;
+        }
+        auto inputs = std::make_shared<DispatchInputs>(DispatchInputs{compiledResult, registeredShader, keepVariant, attachVariant, shaderMemory, capture, std::move(captured), std::move(snapshots), std::move(recipeHit), std::move(prepared), groups, indirectArguments, dispatchThreads, address, dataHit, attachTo, std::move(stageCopies)});
+        if (sink != nullptr) {
+            sink->program = address;
+            sink->reads.reserve(inputs->snapshots.size() + inputs->stageCopies.size());
+            for (const auto& read : inputs->snapshots) sink->reads.push_back({read.address, read.bytes.size()});
+            for (const auto& copy : inputs->stageCopies) sink->reads.push_back({copy.begin, static_cast<std::size_t>(copy.end - copy.begin)});
+            sink->dispatchInputs = std::move(inputs);
+            return;
+        }
+        postDrawRecord(localDevice, submission.queue, recordIdentity(submission, indirectArguments != 0 ? "indirect dispatch" : "dispatch", address), [inputs, localDevice](DrawRecordResult&) { recordDispatchInputs(*inputs, localDevice); });
     }
     for (; !deferred;) {
 

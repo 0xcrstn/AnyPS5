@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include <algorithm>
 #include <type_traits>
@@ -5315,8 +5316,18 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     } else {
         recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
     }
+    if (Coherence::InputLeases() && kind == Recorder::ReadKind::DispatchElement) {
+        std::vector<std::uint64_t> leases;
+        for (const auto& [begin, end] : guestMemory.InPlaceReads()) {
+            if (const auto lease = Coherence::AcquireReadLease({begin, end}, Coherence::CurrentVersion()); lease != 0) leases.push_back(lease);
+        }
+        if (!leases.empty()) recorder.OnCompleteWithoutGuestAccess([leases] {
+            for (const auto lease : leases) Coherence::RetireReadLease(lease);
+        });
+    }
     if (usesBda && !bdaReadOnly) {
         guestMemory.ForgetPointerShadows();
+        for (const auto& [begin, end] : guestMemory.PointerHeaps()) NotePointerWrite(recorder, begin, end);
         guestMemory.PointerRecorded();
         if (Coherence::Ordering()) recorder.NotePendingWrites(guestMemory.PointerHeaps());
     }

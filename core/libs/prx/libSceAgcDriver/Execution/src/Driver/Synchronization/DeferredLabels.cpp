@@ -3,7 +3,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "ThreadOwned.hpp"
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -62,6 +66,45 @@ std::chrono::microseconds Driver::labelFlushDeadline() {
         return std::chrono::microseconds(text ? std::atoi(text) : (LabelBatchSubmit() ? 1000 : 250));
     }();
     return value;
+}
+
+std::chrono::microseconds Driver::batchAgeBound() {
+    static const std::chrono::microseconds bound = [] {
+        const char* value = std::getenv("APS5_BATCH_AGE_US");
+        if (value == nullptr) return std::chrono::microseconds(0);
+        char* end = nullptr;
+        const auto parsed = std::strtoll(value, &end, 10);
+        if (end == value || *end != '\0' || parsed < 0 || parsed > 1000000) throw std::runtime_error(std::string("APS5_BATCH_AGE_US: expected 0 to 1000000 microseconds, got ") + value);
+        return std::chrono::microseconds(parsed);
+    }();
+    return bound;
+}
+
+void Driver::runBatchAge(std::chrono::microseconds bound) noexcept {
+    try {
+        const auto period = std::max(bound / 2, std::chrono::microseconds(50));
+        std::unique_lock lock(batchAgeMutex);
+        while (!stopping.load(std::memory_order_acquire)) {
+            batchAgeChanged.wait_for(lock, period);
+            if (stopping.load(std::memory_order_acquire)) break;
+            batchAgeChecks.fetch_add(1, std::memory_order_relaxed);
+            const auto since = Graphics::Recorder::PendingLabelSince();
+            if (!since.has_value() || std::chrono::steady_clock::now() - *since < bound) continue;
+            lock.unlock();
+            {
+                std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+                if (gpuLock.owns_lock()) {
+                    if (const auto localDevice = device.Load(); localDevice != nullptr && Graphics::Recorder::PendingLabelSince().has_value()) {
+                        localDevice->SubmitRecorded(false);
+                        batchAgeSubmits.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+            lock.lock();
+        }
+    } catch (...) {
+        ReportFailure(std::current_exception());
+    }
 }
 
 bool Driver::labelFlushDue() {
