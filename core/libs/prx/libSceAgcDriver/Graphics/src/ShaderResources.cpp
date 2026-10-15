@@ -5281,9 +5281,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return result;
 }
 
-void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
-    if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
-    if (fragment.set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, 0, nullptr);
+void ShaderResources::Bind(const CommandSink& commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
+    if (_set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, bindPoint, layout, 0, _set);
+    if (fragment.set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, fragment.set);
 }
 
 namespace {

@@ -219,6 +219,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LabelVersions.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/CommandSink.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ChunkedRecording.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DrawSnapshotArena.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/IndexBounds.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
@@ -1368,6 +1370,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_parallel_revalidate_verify PROPERTIES ENVIRONMENT "APS5_PARALLEL_RESOLVE=1;APS5_PARALLEL_REVALIDATE=1;APS5_EPOCH_DIRTY_SET=1;APS5_VERIFY_PARALLEL_REVALIDATE=1")
     if(WIN32)
         set_tests_properties(agc_parallel_revalidate agc_parallel_revalidate_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_chunk_commands COMMAND agc_driver_recorder_tests --chunk-commands-only)
+    add_test(NAME agc_chunked_failure COMMAND agc_driver_recorder_tests --chunked-failure-only)
+    add_test(NAME agc_chunked_recording COMMAND agc_driver_recorder_tests --chunked-recording-only)
+    add_test(NAME agc_chunked_recording_verify COMMAND agc_driver_recorder_tests --chunked-recording-only)
+    set_tests_properties(agc_chunk_commands agc_chunked_failure agc_chunked_recording agc_chunked_recording_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_chunked_recording PROPERTIES ENVIRONMENT "APS5_RECORD_THREAD=1;APS5_CHUNKED_RECORDING=1")
+    set_tests_properties(agc_chunked_recording_verify PROPERTIES ENVIRONMENT "APS5_RECORD_THREAD=1;APS5_CHUNKED_RECORDING=1;APS5_VERIFY_CHUNKED_RECORDING=1")
+    if(WIN32)
+        set_tests_properties(agc_chunk_commands agc_chunked_failure agc_chunked_recording agc_chunked_recording_verify PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_space_pending_writes COMMAND agc_driver_recorder_tests --space-pending-writes-only)

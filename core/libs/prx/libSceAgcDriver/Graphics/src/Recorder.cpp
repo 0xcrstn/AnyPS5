@@ -4,6 +4,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LabelVersions.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ChunkedRecording.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
@@ -1122,6 +1123,10 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         cmdPushConstants = context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants");
         cmdDispatch = context.Function<PFN_vkCmdDispatch>("vkCmdDispatch");
     }
+    if (ChunkedRecording::Enabled() && context.deviceProc != nullptr) {
+        cmdExecuteCommands = context.Function<PFN_vkCmdExecuteCommands>("vkCmdExecuteCommands");
+        chunks = std::make_unique<ChunkedRecording>(context);
+    }
     if (!timelineSemaphores) return;
     // The timeline starts at 0 and every Submit signals its serial (1, 2, ...): a value that only
     // grows, so a thread waiting for it outside the mutex can never observe a reset or a reused
@@ -1247,6 +1252,7 @@ Recorder* Recorder::Active() {
 
 void Recorder::Activate() {
     activeRecorder = this;
+    if (chunks != nullptr) chunks->Activate();
     {
         std::lock_guard tableLock(labelTableMutex);
         labelTableOwner = this;
@@ -1464,7 +1470,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
         if (!barrier) CountMerged(CommandClass::Draw);
         return DrawPassStart{commands, false, barrier};
     };
-    if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+    if (!pass.open || forced || (countingSamples && ((segmentMode() && !segmentSlotReady(*open)) || pass.chunked))) {
         CountPassBreak(!pass.open ? PassBreak::Closed : forced ? PassBreak::Forced : PassBreak::SampleSlot);
         const auto start = coveredStart();
         open->passHazards.Clear();
@@ -1501,14 +1507,60 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     pass.key = key;
     pass.fenced = pass.fenced || fenced;
     open->passHazards.Add(access);
+    if (pass.chunked && chunks != nullptr) chunks->Post();
 }
 
 std::uint64_t Recorder::OpenPassSerial() const {
     return open != nullptr && open->renderPass.open ? open->renderPass.serial : 0;
 }
 
+bool Recorder::ChunkedRecordingEnabled() {
+    return ChunkedRecording::Enabled();
+}
+
+bool Recorder::ChunkPass() {
+    if (chunks == nullptr) return false;
+    if (GpuTimingEnabled()) {
+        ChunkedRecording::CountInline(ChunkInlineReason::GpuTiming);
+        return false;
+    }
+    if (countingSamples) {
+        ChunkedRecording::CountInline(ChunkInlineReason::OcclusionSamples);
+        return false;
+    }
+    return true;
+}
+
+CommandSink Recorder::OpenChunk(const Context& drawContext, const ChunkInheritance& inheritance, const ChunkDraw& draw) {
+    Require(chunks != nullptr && open != nullptr && !open->renderPass.open, "a chunk is opened outside a beginning render pass");
+    auto& pass = open->renderPass;
+    pass.chunked = true;
+    pass.inheritance = inheritance;
+    return chunks->Begin(drawContext, open->chunkPool, inheritance, draw);
+}
+
+CommandSink Recorder::PassSink(const Context& drawContext, const ChunkDraw& draw) {
+    Require(open != nullptr, "no batch is open for the render pass");
+    auto& pass = open->renderPass;
+    if (!pass.chunked || chunks == nullptr) return CommandSink(open->commands);
+    if (!chunks->IsOpen()) return chunks->Begin(drawContext, open->chunkPool, pass.inheritance, draw);
+    return chunks->Next(draw);
+}
+
+void Recorder::DrainChunks() {
+    ChunkedRecording::DrainActive();
+}
+
 void Recorder::endOpenRenderPass(bool barrier) {
     auto& pass = open->renderPass;
+    std::string chunkFailure;
+    bool chunkMismatch = false;
+    if (pass.chunked && chunks != nullptr) {
+        auto closed = chunks->Close();
+        if (closed.commands != VK_NULL_HANDLE) cmdExecuteCommands(open->commands, 1, &closed.commands);
+        chunkFailure = std::move(closed.failure);
+        chunkMismatch = closed.mismatch;
+    }
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
@@ -1524,6 +1576,10 @@ void Recorder::endOpenRenderPass(bool barrier) {
     open->coveredAccess = !barrier ? 0 : pass.afterPass ? storedAccess : passedAccess;
     open->hostReadOwed = true;
     pass = {};
+    if (chunkFailure.empty()) return;
+    open->chunkFailure = chunkFailure;
+    if (chunkMismatch) throw std::logic_error(chunkFailure);
+    throw std::runtime_error(chunkFailure);
 }
 
 void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end) {
@@ -3758,6 +3814,8 @@ void Recorder::Submit() {
     }
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
+    if (chunks != nullptr && chunks->IsOpen()) chunks->Discard();
+    if (!open->chunkFailure.empty()) throw std::runtime_error("the open batch is not submitted: its chunked recording failed: " + open->chunkFailure);
     if (open->guestCompletions && AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Completion);
     const bool segments = segmentMode();
     if (!segments) {
@@ -4368,6 +4426,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 }
 
 void Recorder::release(Batch& batch) noexcept {
+    if (batch.chunkPool != nullptr) {
+        if (chunks != nullptr) chunks->Recycle(std::move(batch.chunkPool));
+        batch.chunkPool.reset();
+    }
     if (batch.prologue != VK_NULL_HANDLE) {
         if (sparePrologues.size() < 64) {
             try {

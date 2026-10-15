@@ -1,4 +1,6 @@
 #include "ShaderDiskCache.hpp"
+#include "SpirvIntern.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <stdexcept>
 #include <vector>
@@ -44,6 +46,24 @@ void PlanEntries() {
     Require(Cache::DecodePlanEntry(truncated, key, ignored) == Cache::LoadStatus::Rejected, "a truncated plan entry was not rejected");
 }
 
+void Interning() {
+    const std::vector<std::uint32_t> words{0x07230203u, 0x00010300u, 0u, 9u, 0u, 7u, 8u};
+    const auto before = ShaderRecompiler::SpirvInternTotals();
+    const auto first = ShaderRecompiler::InternSpirv(words, true);
+    auto second = ShaderRecompiler::InternSpirv(words, true);
+    Require(first.Words().data() == second.Words().data(), "identical SPIR-V was not shared");
+    auto changed = words;
+    changed.back() = 9u;
+    const auto other = ShaderRecompiler::InternSpirv(changed, true);
+    Require(other.Words().data() != first.Words().data() && std::ranges::equal(other.Words(), changed), "different SPIR-V was shared");
+    const auto plain = ShaderRecompiler::InternSpirv(words, false);
+    Require(plain.Words().data() != first.Words().data() && std::ranges::equal(plain.Words(), words), "interning ran while disabled");
+    second[6] = 1u;
+    Require(first[6] == 8u && second[6] == 1u, "writing one interned module changed another");
+    const auto after = ShaderRecompiler::SpirvInternTotals();
+    Require(after.lookups - before.lookups == 3u && after.shared - before.shared == 1u && after.sharedBytes - before.sharedBytes == words.size() * sizeof(std::uint32_t), "intern counters are wrong");
+}
+
 }
 
 int main() {
@@ -51,6 +71,7 @@ int main() {
         Versions();
         PlanComparison();
         PlanEntries();
+        Interning();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "shader cache layer test failed: %s\n", error.what());
         return 1;
