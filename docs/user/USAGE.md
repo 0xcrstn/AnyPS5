@@ -207,6 +207,7 @@ These switches change how recompiled shaders reach guest memory through addresse
 
 - `APS5_BDA_ABI=legacy|radix|verify`: how a guest address is found in the table of mapped ranges (a binary search, or an indexed table).
 - `APS5_BDA_RELATIVE=off|on|verify`: whether a shader reuses the last range it found for later accesses inside it.
+- `APS5_BDA_INLINE_FAST_PATH=off|on`: with `APS5_BDA_RELATIVE=on`, asks the GPU driver to inline that reuse check at each access while the full lookup stays a separate function. The generated code is otherwise identical, so it has no verify mode.
 - `APS5_BDA_SPAN_HELPERS=off|on|verify`: whether wide reads use a reader specialized for the dwords they use.
 - `APS5_BDA_WRITE_NOTES=off|on|verify`: whether a shader skips recording a written page it already recorded.
 - `APS5_LAZY_LOG2_REPAIR=off|on|verify`, `APS5_LAZY_TRIG_SERIES=off|on|verify`: whether log2, sin and cos evaluate only the correction they select.

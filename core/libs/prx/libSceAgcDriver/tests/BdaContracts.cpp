@@ -4,6 +4,7 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvStatistics.hpp"
 #include <array>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -106,4 +107,32 @@ void RunSpirvStatisticsTests() {
     Require(calls("read_bda_span_stop") == 1u && calls("probe_bda_pointer") == 1u && calls("load_bda_span") >= 1u && calls("get_bda_pointer") >= 1u, "SPIR-V statistics miscounted the BDA helper calls");
     Require(statistics.functions >= 5u && statistics.physicalLoads >= 2u && statistics.loops >= 2u && statistics.float64Arithmetic == 0u && statistics.lines == 0u, "SPIR-V statistics miscounted the BDA test shader");
     Require(statistics.instructionsByFunction.contains("get_bda_pointer") && ShaderRecompiler::SpirvStatisticsJson(statistics).find("\"probe_bda_pointer\":1") != std::string::npos, "SPIR-V statistics JSON lost the helper counts");
+}
+
+void RunBdaInlineFastPathTests() {
+    using AgcDriver::Graphics::Require;
+    namespace Table = ShaderRecompiler::BdaTable;
+    const auto control = [](const std::vector<std::uint32_t>& words, const std::string& name) {
+        std::uint32_t target = 0;
+        for (std::size_t at = 5; at < words.size(); at += words[at] >> 16u) {
+            const auto opcode = words[at] & 0xffffu;
+            if (opcode == spv::OpName && std::string(reinterpret_cast<const char*>(&words[at + 2])) == name) target = words[at + 1];
+            if (opcode == spv::OpFunction && target != 0 && words[at + 2] == target) return words[at + 3];
+        }
+        throw std::runtime_error("no function " + name + " in the test shader");
+    };
+    const auto previousTranslation = BdaTestTranslation();
+    const auto previousRelative = BdaTestRelative();
+    SetBdaTestTranslation(Table::Translation::Radix);
+    for (const auto relative : {Table::Relative::Off, Table::Relative::On}) {
+        SetBdaTestRelative(relative);
+        for (const bool inlined : {false, true}) {
+            SetBdaTestInlineFastPath(inlined);
+            const auto expected = inlined && relative == Table::Relative::On ? static_cast<std::uint32_t>(spv::FunctionControlInlineMask) : static_cast<std::uint32_t>(spv::FunctionControlDontInlineMask);
+            Require(control(MakeBdaTestShader(0x7fff12340000ULL, 8u), "get_bda_pointer") == expected, "the BDA lookup has the wrong inline control");
+        }
+    }
+    SetBdaTestInlineFastPath(Table::InlineFastPathSetting());
+    SetBdaTestRelative(previousRelative);
+    SetBdaTestTranslation(previousTranslation);
 }

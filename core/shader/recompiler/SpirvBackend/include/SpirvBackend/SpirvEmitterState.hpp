@@ -138,6 +138,7 @@ struct SpirvEmitterState {
     BdaTable::Translation bdaTranslation = BdaTable::Translation::Legacy;
     std::uint32_t guestLineFile = 0;
     BdaTable::Relative bdaRelative = BdaTable::Relative::Off;
+    bool bdaInlineFastPath = false;
     std::map<std::array<std::uint32_t, 3>, std::uint32_t> bdaResolveFunctions;
     std::array<std::uint32_t, 4> bdaCapability {};
     RewriteMode lazyLog2Repair = RewriteMode::Off;

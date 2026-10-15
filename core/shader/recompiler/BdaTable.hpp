@@ -64,6 +64,16 @@ inline Relative RelativeSetting() {
     return relative;
 }
 
+inline bool InlineFastPathSetting() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_BDA_INLINE_FAST_PATH");
+        if (value == nullptr || std::string_view(value) == "off") return false;
+        if (std::string_view(value) == "on") return true;
+        throw std::runtime_error("APS5_BDA_INLINE_FAST_PATH must be off or on, not \"" + std::string(value) + "\"");
+    }();
+    return enabled;
+}
+
 inline std::uint32_t RangeBaseWord(Translation translation) {
     return translation == Translation::Legacy ? HeaderWords : RadixRangeWord;
 }

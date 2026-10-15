@@ -144,6 +144,7 @@ int main(int argc, char** argv) {
         RunBdaContractTests();
         RunBdaTableContractTests();
         RunSpirvStatisticsTests();
+        RunBdaInlineFastPathTests();
         if (argc == 2) {
             const auto shader = MakeBdaTestShader(0x7fff12340000ULL, 32);
             std::ofstream file(argv[1], std::ios::binary);
@@ -167,6 +168,7 @@ int main(int argc, char** argv) {
         SetBdaTestRelative(ShaderRecompiler::BdaTable::RelativeSetting());
         SetBdaTestSpanHelpers(ShaderRecompiler::BdaSpanHelpersSetting());
         SetBdaTestWriteNotes(ShaderRecompiler::BdaWriteNotesSetting());
+        SetBdaTestInlineFastPath(ShaderRecompiler::BdaTable::InlineFastPathSetting());
         if (device->RunsOnCpu()) {
             std::cout << "CPU Vulkan device: BDA read and multi-dword write execution not tested\n";
         } else {
