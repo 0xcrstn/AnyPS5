@@ -26,6 +26,7 @@ struct CacheEntryRequest {
     std::vector<std::string> extensionText;
     std::vector<std::string_view> extensions;
     std::vector<std::uint32_t> userData;
+    std::vector<std::uint32_t> linkedCallFallbacks;
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<std::uint64_t> key;
     ShaderRecompiler::RecompileRequest request{};
@@ -172,12 +173,14 @@ inline std::unique_ptr<CacheEntryRequest> ReadCacheEntry(std::span<const std::by
         for (std::uint32_t index = 0; index < info.interpolatorCount; ++index) info.interpolatorSettings[index] = key.Next32();
         info.wave32 = key.NextBool();
         info.inputAddr = key.Next32();
-        for (bool* flag : {&info.hasPerspectiveCenterVgpr, &info.perspectiveCentroid, &info.posX, &info.posY, &info.posZ, &info.posW, &info.frontFace, &info.ancillary, &info.sampleShading, &info.noPerspective, &info.linearCentroid, &info.pixelKillEnable, &info.depthExportEnable, &info.sampleMaskExportEnable, &info.earlyZ, &info.executeOnNoop}) *flag = key.NextBool();
+        for (bool* flag : {&info.hasPerspectiveCenterVgpr, &info.perspectiveCentroid, &info.posX, &info.posY, &info.posZ, &info.posW, &info.frontFace, &info.frontFaceAllBits, &info.ancillary, &info.sampleShading, &info.noPerspective, &info.linearCentroid, &info.pixelKillEnable, &info.depthExportEnable, &info.sampleMaskExportEnable, &info.earlyZ, &info.executeOnNoop}) *flag = key.NextBool();
         info.conservativeZExport = static_cast<ShaderRecompiler::ConservativeZExport>(key.Next());
         info.orderedPixelShader = key.NextBool();
         info.alphaToCoverage = key.NextBool();
         info.stencilRefExportEnable = key.NextBool();
         info.ditheredAlphaToCoverage = key.NextBool();
+        info.quadPixelMask = static_cast<std::uint8_t>(key.Next());
+        for (auto& mask : info.quadSampleMask) mask = static_cast<std::uint16_t>(key.Next());
         for (auto& mode : info.targetOutputMode) mode = static_cast<std::uint8_t>(key.Next());
         for (std::uint8_t target = 0; target < info.targetExportMapping.size(); ++target) info.targetExportMapping[target] = target;
         request.context.pixel = info;
@@ -191,6 +194,8 @@ inline std::unique_ptr<CacheEntryRequest> ReadCacheEntry(std::span<const std::by
         floatMode.fp16Overflow = key.NextBool();
         request.context.floatMode = floatMode;
     }
+    entry->linkedCallFallbacks.resize(key.Next());
+    for (auto& programCounter : entry->linkedCallFallbacks) programCounter = key.Next32();
     auto& target = request.target;
     target.vulkanVersion = key.Next32();
     target.spirvVersion = key.Next32();
@@ -249,6 +254,7 @@ inline std::unique_ptr<CacheEntryRequest> ReadCacheEntry(std::span<const std::by
     entry->memory.push_back({CacheEntryCodeAddress, std::as_bytes(std::span<const std::uint32_t>(entry->code))});
     request.shader = {stage, CacheEntryCodeAddress, entry->code, 0, {}};
     request.context.userData = entry->userData;
+    request.context.linkedCallFallbacks = entry->linkedCallFallbacks;
     request.context.memory = entry->memory;
     std::vector<std::uint64_t> rebuilt;
     ShaderRecompiler::RecompileCacheKey::Build(request, rebuilt);
