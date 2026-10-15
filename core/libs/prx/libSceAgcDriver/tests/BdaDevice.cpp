@@ -165,12 +165,18 @@ int main(int argc, char** argv) {
         Require(buffer.Bytes()[255] == std::byte{0x5a}, "real BDA buffer mapping failed");
         SetBdaTestTranslation(ShaderRecompiler::BdaTable::TranslationSetting());
         SetBdaTestRelative(ShaderRecompiler::BdaTable::RelativeSetting());
+        SetBdaTestSpanHelpers(ShaderRecompiler::BdaSpanHelpersSetting());
         if (device->RunsOnCpu()) {
             std::cout << "CPU Vulkan device: BDA read and multi-dword write execution not tested\n";
         } else {
             RunBdaExecutionTests(device->GetContext());
             RunBdaTranslationTests(device->GetContext());
-            std::cout << "BDA translation and relative fixtures passed\n";
+            RunBdaSpanHelperTests(device->GetContext());
+            std::cout << "BDA translation, relative and span helper fixtures passed\n";
+            if (std::getenv("APS5_TEST_FLOAT_REPAIRS") != nullptr) {
+                RunFloatRepairTests(device->GetContext());
+                std::cout << "lazy float repairs match the eager ones for every input\n";
+            }
         }
         RunBdaStoreExecutionTests(device->GetContext());
         std::cout << "BDA store boundary tests passed\n";

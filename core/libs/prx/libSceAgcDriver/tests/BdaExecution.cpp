@@ -526,3 +526,60 @@ void RunBdaTranslationTests(const Context& context) {
     }
     SetBdaTestRelative(previousRelative);
 }
+
+void RunBdaSpanHelperTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    Buffer wide(context, 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    for (std::uint32_t dword = 0; dword < 8u; ++dword) {
+        const std::uint32_t value = 0xa0b0c000u + dword;
+        std::memcpy(wide.Bytes().data() + dword * 4u, &value, sizeof(value));
+    }
+    constexpr std::uint64_t spanGuest = 0x7fff56780000ULL;
+    const std::array<Abi::Range, 1> ranges{{{spanGuest, spanGuest + 32, wide.DeviceAddress(), Abi::Read, 0}}};
+    const auto table = MakeTable(context, ranges, ranges.size());
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer words(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    for (const auto stops : {true, false}) {
+        SetBdaTestSpanHelpers(ShaderRecompiler::RewriteMode::Verify, 0x100u);
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        Pipeline pipeline(context, MakeBdaSpanReadTestShader(spanGuest, 4u, 0b0101u, false, stops), {table.get(), &fault, &words});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::SpanMismatch && report.address == spanGuest && report.bytes == 0b0101u && report.instruction == 0x1234, "APS5_BDA_SPAN_HELPERS=verify did not fail on an injected span mismatch");
+    }
+    SetBdaTestSpanHelpers(ShaderRecompiler::BdaSpanHelpersSetting());
+}
+
+void RunFloatRepairTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    using ShaderRecompiler::RewriteMode;
+    Buffer unused(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer io(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    constexpr std::uint32_t groups = 16384;
+    constexpr std::uint64_t perDispatch = std::uint64_t{groups} * 64u * 256u;
+    for (std::uint32_t function = 1; function <= 3u; ++function) {
+        Pipeline pipeline(context, MakeRepairTestShader(function, RewriteMode::Verify, 0u), {&unused, &fault, &io});
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        for (std::uint64_t base = 0; base < (std::uint64_t{1} << 32u); base += perDispatch) {
+            const auto first = static_cast<std::uint32_t>(base);
+            std::memcpy(io.Bytes().data(), &first, sizeof(first));
+            pipeline.Run(groups);
+            Abi::Fault report{};
+            std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+            if (report.state == Abi::FaultState::Empty) continue;
+            std::ostringstream message;
+            message << std::hex << "lazy and eager float repair " << function << " differ for input 0x" << static_cast<std::uint32_t>(report.address) << ": eager 0x" << static_cast<std::uint32_t>(report.address >> 32u) << ", lazy 0x" << report.bytes;
+            Require(false, message.str());
+        }
+        Pipeline injected(context, MakeRepairTestShader(function, RewriteMode::Verify, 1u), {&unused, &fault, &io});
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        const std::uint32_t first = 0x3f800000u;
+        std::memcpy(io.Bytes().data(), &first, sizeof(first));
+        injected.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::RepairMismatch && report.instruction == function && (static_cast<std::uint32_t>(report.address >> 32u) ^ report.bytes) == 1u, "float repair verify did not fail on an injected mismatch");
+    }
+}

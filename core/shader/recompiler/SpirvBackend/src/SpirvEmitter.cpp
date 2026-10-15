@@ -229,6 +229,21 @@ std::uint32_t SpirvValueEmitContext::Label(const IrBlock* block) const {
     throw std::runtime_error("SPIR-V emission failed: hash=0x" + std::to_string(state.program.Resources().shaderHash) + " stage=" + std::to_string(static_cast<unsigned>(state.program.Resources().stage)) + " opcode=" + std::string(IrOpcodeName(inst.Opcode())) + " reason=" + reason);
 }
 
+void PrepareRewriteVerification(IrProgram& program) {
+    const bool log2 = LazyLog2RepairSetting() == RewriteMode::Verify;
+    const bool trig = LazyTrigSeriesSetting() == RewriteMode::Verify;
+    if (!log2 && !trig) return;
+    for (const auto* block : program.BlockOrder()) {
+        for (const auto* instruction : block->Instructions()) {
+            const auto opcode = instruction->Opcode();
+            if ((log2 && opcode == IrOpcode::FPLog2) || (trig && (opcode == IrOpcode::FPSin || opcode == IrOpcode::FPCos))) {
+                program.Info().usesFaultBuffer = true;
+                return;
+            }
+        }
+    }
+}
+
 std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const CompiledBindingLayout& bindings, const SpirvTargetOptions& target) const {
     return Emit(program, ShaderStageInputInfo {}, bindings, target);
 }
@@ -256,6 +271,9 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.sharedFloatFunctions = std::getenv("APS5_NO_SHARED_FLOAT_FUNCTIONS") == nullptr;
     state.bdaTranslation = BdaTable::TranslationSetting();
     state.bdaRelative = BdaTable::RelativeSetting();
+    state.lazyLog2Repair = LazyLog2RepairSetting();
+    state.lazyTrigSeries = LazyTrigSeriesSetting();
+    state.bdaSpanHelpers = BdaSpanHelpersSetting();
     static const bool guestLines = std::getenv("APS5_SPIRV_GUEST_LINES") != nullptr;
     if (guestLines) state.guestLineFile = state.module.AddString("guest");
     state.hostSubgroupSize = target.subgroupSize;

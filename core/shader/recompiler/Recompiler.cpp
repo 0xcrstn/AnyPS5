@@ -668,6 +668,7 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
 
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program, bool consume = false) {
     InFlightIr inFlight(estimateProgramBytes(program));
+    PrepareRewriteVerification(program);
     const auto inputInfo = RequestInputInfo(request);
     constexpr BindingAllocator bindingAllocator;
     bool registration = request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment);

@@ -5,6 +5,7 @@
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "BdaTable.hpp"
+#include "RewriteSwitch.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -139,6 +140,11 @@ struct SpirvEmitterState {
     BdaTable::Relative bdaRelative = BdaTable::Relative::Off;
     std::map<std::array<std::uint32_t, 3>, std::uint32_t> bdaResolveFunctions;
     std::array<std::uint32_t, 4> bdaCapability {};
+    RewriteMode lazyLog2Repair = RewriteMode::Off;
+    RewriteMode lazyTrigSeries = RewriteMode::Off;
+    RewriteMode bdaSpanHelpers = RewriteMode::Off;
+    std::uint32_t rewriteMismatchInjection = 0;
+    std::map<std::array<std::uint32_t, 4>, std::uint32_t> bdaSpecializedSpanFunctions;
     bool nativeF16ModesEmitted = false;
     bool f16DenormPreserveEmitted = false;
     std::uint32_t dot2F32F16Function = 0;

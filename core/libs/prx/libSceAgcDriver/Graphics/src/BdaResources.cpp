@@ -295,6 +295,12 @@ void BdaResources::CheckFault() const {
     message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::TranslationMismatch) message << "; the legacy and radix BDA translations differ for this access (APS5_BDA_ABI=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RelativeMismatch) message << "; the cached BDA range capability differs from the table lookup for this access (APS5_BDA_RELATIVE=verify)";
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::SpanMismatch) message << "; the specialized BDA span helper differs from the generic one (APS5_BDA_SPAN_HELPERS=verify)";
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RepairMismatch) {
+        static constexpr const char* functions[] = {"", "log2 (APS5_LAZY_LOG2_REPAIR=verify)", "sin (APS5_LAZY_TRIG_SERIES=verify)", "cos (APS5_LAZY_TRIG_SERIES=verify)"};
+        message.str({});
+        message << "lazy and eager " << (report.instruction < 4u ? functions[report.instruction] : "float repair") << " differ: input 0x" << std::hex << static_cast<std::uint32_t>(report.address) << " eager 0x" << static_cast<std::uint32_t>(report.address >> 32u) << " lazy 0x" << report.bytes << std::dec << " stage=" << report.stage;
+    }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Permission && table != nullptr) {
         const auto bytes = table->Bytes();
         ShaderRecompiler::BdaAbi::Header header{};

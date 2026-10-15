@@ -2,6 +2,7 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
+#include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
 #include <functional>
 #include <stdexcept>
@@ -13,6 +14,8 @@ namespace {
 
 ShaderRecompiler::BdaTable::Translation testTranslation = ShaderRecompiler::BdaTable::Translation::Legacy;
 ShaderRecompiler::BdaTable::Relative testRelative = ShaderRecompiler::BdaTable::Relative::Off;
+ShaderRecompiler::RewriteMode testSpanHelpers = ShaderRecompiler::RewriteMode::Off;
+std::uint32_t testSpanInjection = 0;
 
 template<typename TEmit>
 std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, std::uint32_t extracted = 0, bool writes = false, const std::function<void(ShaderRecompiler::SpirvEmitterState&)>& prologue = {}) {
@@ -45,6 +48,8 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     state.bdaStopsInvocations = stops;
     state.bdaTranslation = testTranslation;
     state.bdaRelative = testRelative;
+    state.bdaSpanHelpers = testSpanHelpers;
+    state.rewriteMismatchInjection = testSpanInjection;
     DefineGetBdaPointer(state);
     const auto main = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), main, spv::FunctionControlMaskNone, TypeFunction(state));
@@ -85,6 +90,73 @@ void SetBdaTestTranslation(ShaderRecompiler::BdaTable::Translation translation) 
 
 ShaderRecompiler::BdaTable::Translation BdaTestTranslation() {
     return testTranslation;
+}
+
+void SetBdaTestSpanHelpers(ShaderRecompiler::RewriteMode mode, std::uint32_t injection) {
+    testSpanHelpers = mode;
+    testSpanInjection = injection;
+}
+
+std::vector<std::uint32_t> MakeRepairTestShader(std::uint32_t function, ShaderRecompiler::RewriteMode mode, std::uint32_t injection) {
+    using namespace ShaderRecompiler;
+    IrProgram program;
+    program.Resources().stage = IrShaderStage::Compute;
+    program.Info().usesFaultBuffer = true;
+    SpirvEmitterState state(program, {});
+    EmitBaseHeader(state.module, program);
+    const auto define = [&](std::uint32_t binding) {
+        const auto variable = state.module.DefineGlobalVariable(TypeStorageBufferPointer(state), spv::StorageClassStorageBuffer);
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0u);
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+        return variable;
+    };
+    static_cast<void>(define(0));
+    state.faultBufferVariable = define(1);
+    const auto io = define(2);
+    state.lazyLog2Repair = mode;
+    state.lazyTrigSeries = mode;
+    state.rewriteMismatchInjection = injection;
+    DefineBdaFaultFunction(state);
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto invocation = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassInput, TypeU32Vector(state, 3u)), spv::StorageClassInput);
+    state.module.AddAnnotation(spv::OpDecorate, invocation, spv::DecorationBuiltIn, spv::BuiltInGlobalInvocationId);
+    state.mainFunc = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
+    const auto entry = state.module.AllocateId();
+    EmitLabel(state, entry);
+    const auto id = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeU32Vector(state, 3u), id, invocation);
+    const auto x = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, u32, x, id, 0u);
+    const auto base = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, u32, base, BdaWord(state, io, ConstantU32(state, 0u)));
+    const auto first = Binary(state, spv::OpIAdd, u32, base, Binary(state, spv::OpIMul, u32, x, ConstantU32(state, 256u)));
+    const auto header = state.module.AllocateId();
+    const auto body = state.module.AllocateId();
+    const auto continuation = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    const auto step = state.module.AllocateId();
+    const auto next = state.module.AllocateId();
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, header);
+    state.module.AddFunction(spv::OpPhi, u32, step, ConstantU32(state, 0u), entry, next, continuation);
+    state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, Binary(state, spv::OpULessThan, boolean, step, ConstantU32(state, 256u)), body, merge);
+    EmitLabel(state, body);
+    const auto input = Unary(state, spv::OpBitcast, TypeF32(state), Binary(state, spv::OpIAdd, u32, first, step));
+    const auto result = function == 1u ? EmitFPLog2(state, input) : function == 2u ? EmitFPSin(state, input) : EmitFPCos(state, input);
+    static_cast<void>(result);
+    state.module.AddFunction(spv::OpBranch, continuation);
+    EmitLabel(state, continuation);
+    state.module.AddFunction(spv::OpIAdd, u32, next, step, ConstantU32(state, 1u));
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, merge);
+    state.module.AddFunction(spv::OpReturn);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeLocalSize, 64u, 1u, 1u);
+    state.module.EmitEntryPoint(spv::ExecutionModelGLCompute, state.mainFunc, "main", {invocation});
+    return state.module.Finalize();
 }
 
 void SetBdaTestRelative(ShaderRecompiler::BdaTable::Relative relative) {

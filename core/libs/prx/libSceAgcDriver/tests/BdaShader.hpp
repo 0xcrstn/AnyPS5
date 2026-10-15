@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_TESTS_BDASHADER_HPP
 
 #include "BdaTable.hpp"
+#include "RewriteSwitch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <cstdint>
 #include <vector>
@@ -11,6 +12,8 @@ ShaderRecompiler::BdaTable::Translation BdaTestTranslation();
 void SetBdaTestRelative(ShaderRecompiler::BdaTable::Relative relative);
 ShaderRecompiler::BdaTable::Relative BdaTestRelative();
 std::vector<std::uint32_t> MakeBdaCapabilityTestShader(std::uint64_t address, std::uint64_t capabilityBase);
+void SetBdaTestSpanHelpers(ShaderRecompiler::RewriteMode mode, std::uint32_t injection = 0);
+std::vector<std::uint32_t> MakeRepairTestShader(std::uint32_t function, ShaderRecompiler::RewriteMode mode, std::uint32_t injection);
 std::vector<std::uint32_t> MakeBdaResolveTestShader(std::uint32_t permission);
 std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset = 0);
 std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops);
@@ -24,5 +27,7 @@ void RunBdaContractTests();
 void RunBdaTableContractTests();
 void RunSpirvStatisticsTests();
 void RunBdaTranslationTests(const AgcDriver::Graphics::Context& context);
+void RunBdaSpanHelperTests(const AgcDriver::Graphics::Context& context);
+void RunFloatRepairTests(const AgcDriver::Graphics::Context& context);
 
 #endif
