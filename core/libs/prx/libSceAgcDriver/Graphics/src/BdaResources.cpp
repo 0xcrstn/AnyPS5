@@ -343,6 +343,11 @@ void BdaResources::CheckFault() const {
         message << "APS5_FLUSH_PROOFS=verify: shader stage " << report.stage << " saw the denormal 0x" << std::hex << static_cast<std::uint32_t>(report.address) << std::dec << " where a proof said a denormal flush was unneeded";
         throw std::runtime_error(message.str());
     }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::InterpolationFactMismatch) {
+        message.str({});
+        message << "APS5_INTERPOLATION_FACTS=verify: shader stage " << report.stage << " passed the denormal 0x" << std::hex << static_cast<std::uint32_t>(report.address) << std::dec << " to an interpolation or fma-mix input proven not denormal";
+        throw std::runtime_error(message.str());
+    }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::WriteNoteMismatch) message << "; a cached write note skipped a page the written-page record does not hold (APS5_BDA_WRITE_NOTES=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::SpanMismatch) message << "; the specialized BDA span helper differs from the generic one (APS5_BDA_SPAN_HELPERS=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RepairMismatch) {

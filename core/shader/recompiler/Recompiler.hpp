@@ -195,6 +195,8 @@ inline constexpr std::uint32_t InterpolationQuiet = 1u;
 inline constexpr std::uint32_t InterpolationFlush32 = 2u;
 inline constexpr std::uint32_t InterpolationFlush16 = 4u;
 inline constexpr std::uint32_t InterpolationRound16Shift = 3u;
+inline constexpr std::uint32_t InterpolationFlushedExact = 1u << 5u;
+inline constexpr std::uint32_t InterpolationNormalShift = 6u;
 
 struct GuestContext {
     std::uint32_t waveSize;

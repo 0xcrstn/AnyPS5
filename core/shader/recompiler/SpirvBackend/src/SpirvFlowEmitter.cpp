@@ -1122,15 +1122,17 @@ void EmitReferenceU32(SpirvValueEmitContext& context) {
     EmitVoid(context);
 }
 
-void EmitCheckDenormalFree(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t value) {
+void EmitCheckDenormalFree(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t value, const IrValue* reason) {
     auto& state = ctx.state;
-    if (state.faultBufferVariable == 0) ctx.Fail(inst, "checks a denormal-flush proof without a fault buffer");
+    if (state.faultBufferVariable == 0) ctx.Fail(inst, "checks a denormal-free proof without a fault buffer");
+    const auto faultReason = static_cast<BdaAbi::FaultReason>(reason->Resolve()->ImmediateU32());
+    if (faultReason != BdaAbi::FaultReason::FlushProofMismatch && faultReason != BdaAbi::FaultReason::InterpolationFactMismatch) ctx.Fail(inst, "checks a denormal-free proof with an unknown fault reason");
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
     const auto exponentZero = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, value, ConstantU32(state, 0x7f800000u)), ConstantU32(state, 0u));
     const auto nonZero = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, value, ConstantU32(state, 0x7fffffffu)), ConstantU32(state, 0u));
     EmitIfCondition(state, Binary(state, spv::OpLogicalAnd, boolean, exponentZero, nonZero), [&] {
-        RecordBdaFaultWords(state, value, ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, 0u), BdaAbi::FaultReason::FlushProofMismatch);
+        RecordBdaFaultWords(state, value, ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, 0u), faultReason);
     });
 }
 

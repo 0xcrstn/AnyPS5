@@ -112,7 +112,7 @@ void SetBdaTestSpanHelpers(ShaderRecompiler::RewriteMode mode, std::uint32_t inj
     testSpanInjection = injection;
 }
 
-std::vector<std::uint32_t> MakeFlushCheckTestShader(std::uint32_t value) {
+std::vector<std::uint32_t> MakeFlushCheckTestShader(std::uint32_t value, ShaderRecompiler::BdaAbi::FaultReason reason) {
     using namespace ShaderRecompiler;
     IrProgram program;
     program.Resources().stage = IrShaderStage::Compute;
@@ -133,8 +133,9 @@ std::vector<std::uint32_t> MakeFlushCheckTestShader(std::uint32_t value) {
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.module.AllocateId());
     SpirvValueEmitContext ctx(state);
+    auto& reasonValue = IrBuilder(program).Constant(static_cast<std::uint32_t>(reason));
     auto& check = program.CreateValue(IrOpcode::CheckDenormalFree, IrType::Void);
-    EmitCheckDenormalFree(ctx, check, ConstantU32(state, value));
+    EmitCheckDenormalFree(ctx, check, ConstantU32(state, value), &reasonValue);
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
     state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeLocalSize, 1u, 1u, 1u);

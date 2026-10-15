@@ -692,13 +692,15 @@ void RunFlushProofCheckTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
     Buffer unused(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    for (const auto [value, denormal] : {std::pair{0x00000001u, true}, std::pair{0x807fffffu, true}, std::pair{0x00400000u, true}, std::pair{0x00000000u, false}, std::pair{0x80000000u, false}, std::pair{0x00800000u, false}, std::pair{0x3f800000u, false}, std::pair{0x7fc00000u, false}}) {
-        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
-        Pipeline pipeline(context, MakeFlushCheckTestShader(value), {&unused, &fault, &unused});
-        pipeline.Run(1);
-        Abi::Fault report{};
-        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
-        if (denormal) Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::FlushProofMismatch && static_cast<std::uint32_t>(report.address) == value, "APS5_FLUSH_PROOFS=verify did not stop on a denormal reaching a proven flush");
-        else Require(report.state == Abi::FaultState::Empty, "APS5_FLUSH_PROOFS=verify stopped on a value that is not denormal");
+    for (const auto reason : {Abi::FaultReason::FlushProofMismatch, Abi::FaultReason::InterpolationFactMismatch}) {
+        for (const auto [value, denormal] : {std::pair{0x00000001u, true}, std::pair{0x807fffffu, true}, std::pair{0x00400000u, true}, std::pair{0x00000000u, false}, std::pair{0x80000000u, false}, std::pair{0x00800000u, false}, std::pair{0x3f800000u, false}, std::pair{0x7fc00000u, false}}) {
+            std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+            Pipeline pipeline(context, MakeFlushCheckTestShader(value, reason), {&unused, &fault, &unused});
+            pipeline.Run(1);
+            Abi::Fault report{};
+            std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+            if (denormal) Require(report.state == Abi::FaultState::Ready && report.reason == reason && static_cast<std::uint32_t>(report.address) == value, "a denormal-free proof check did not stop on a denormal");
+            else Require(report.state == Abi::FaultState::Empty, "a denormal-free proof check stopped on a value that is not denormal");
+        }
     }
 }

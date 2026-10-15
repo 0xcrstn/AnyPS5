@@ -40,6 +40,11 @@ inline RewriteMode FlushProofsSetting() {
     return mode;
 }
 
+inline RewriteMode InterpolationFactsSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_INTERPOLATION_FACTS", std::getenv("APS5_INTERPOLATION_FACTS"), RewriteMode::On);
+    return mode;
+}
+
 inline RewriteMode BdaSpanHelpersSetting() {
     static const RewriteMode mode = ParseRewriteMode("APS5_BDA_SPAN_HELPERS", std::getenv("APS5_BDA_SPAN_HELPERS"), RewriteMode::On);
     return mode;

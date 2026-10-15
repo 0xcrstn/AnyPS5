@@ -199,16 +199,22 @@ std::uint32_t AddRoundToOdd(SpirvEmitterState& state, std::uint32_t lhs, std::ui
     return ToF64(state, Join(state, SelectBits(state, inexact, odd, rounded)));
 }
 
-std::uint32_t FromF32Exact(SpirvEmitterState& state, std::uint32_t value) {
+std::uint32_t FromF32Exact(SpirvEmitterState& state, std::uint32_t value, bool notSubnormal) {
     const auto u32 = TypeU32(state);
     const auto bits = Unary(state, spv::OpBitcast, u32, value);
     const auto sign = Binary(state, spv::OpBitwiseAnd, u32, bits, ConstantU32(state, 0x80000000u));
     const auto magnitude = Binary(state, spv::OpBitwiseAnd, u32, bits, ConstantU32(state, 0x7fffffffu));
-    const auto subnormal = Binary(state, spv::OpULessThan, TypeBool(state), magnitude, ConstantU32(state, 0x00800000u));
-    const auto scaled = Exact(state, spv::OpFMul, Unary(state, spv::OpConvertUToF, TypeF64(state), magnitude), ConstantF64(state, 0x36a0000000000000ull));
     const F64Bits normal{Binary(state, spv::OpShiftLeftLogical, u32, magnitude, ConstantU32(state, 29u)), Binary(state, spv::OpIAdd, u32, Binary(state, spv::OpShiftRightLogical, u32, magnitude, ConstantU32(state, 3u)), ConstantU32(state, 896u << 20u))};
     const F64Bits special{normal.low, Binary(state, spv::OpBitwiseOr, u32, Binary(state, spv::OpShiftRightLogical, u32, Binary(state, spv::OpBitwiseAnd, u32, magnitude, ConstantU32(state, 0x007fffffu)), ConstantU32(state, 3u)), ConstantU32(state, 0x7ff00000u))};
     const auto nonFinite = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), magnitude, ConstantU32(state, 0x7f800000u));
+    if (notSubnormal) {
+        const auto zero = Binary(state, spv::OpIEqual, TypeBool(state), magnitude, ConstantU32(state, 0u));
+        const auto finite = SelectBits(state, zero, {ConstantU32(state, 0u), ConstantU32(state, 0u)}, normal);
+        const auto unsignedBits = SelectBits(state, nonFinite, special, finite);
+        return ToF64(state, Join(state, {unsignedBits.low, Binary(state, spv::OpBitwiseOr, u32, unsignedBits.high, sign)}));
+    }
+    const auto subnormal = Binary(state, spv::OpULessThan, TypeBool(state), magnitude, ConstantU32(state, 0x00800000u));
+    const auto scaled = Exact(state, spv::OpFMul, Unary(state, spv::OpConvertUToF, TypeF64(state), magnitude), ConstantF64(state, 0x36a0000000000000ull));
     const auto unsignedBits = SelectBits(state, nonFinite, special, Split(state, FromF64(state, Select(state, TypeF64(state), subnormal, scaled, ToF64(state, Join(state, normal))))));
     return ToF64(state, Join(state, {unsignedBits.low, Binary(state, spv::OpBitwiseOr, u32, unsignedBits.high, sign)}));
 }
@@ -279,11 +285,18 @@ std::uint32_t Interpolate(SpirvEmitterState& state, std::uint32_t delta, std::ui
     const bool quietNans = halfResult || (mode & InterpolationQuiet) != 0u;
     const bool flush32 = (mode & InterpolationFlush32) != 0u;
     const bool flush16 = (mode & InterpolationFlush16) != 0u;
+    const bool flushedExact = (mode & InterpolationFlushedExact) != 0u;
+    const auto proven = [&](std::uint32_t input) { return (mode & (1u << (InterpolationNormalShift + input))) != 0u; };
+    const bool baseFlush32 = halfResult && flush32;
+    const bool baseFlush16 = !halfResult && flush16;
     delta = FlushDenormal32(state, delta, flush16, 0x38800000u);
-    coordinate = FlushDenormal32(state, coordinate, flush32, 0x00800000u);
-    base = halfResult ? FlushDenormal32(state, base, flush32, 0x00800000u) : FlushDenormal32(state, base, flush16, 0x38800000u);
-    const auto product = Exact(state, spv::OpFMul, FromF32Exact(state, delta), FromF32Exact(state, coordinate));
-    const auto sum = AddRoundToOdd(state, product, FromF32Exact(state, base));
+    coordinate = FlushDenormal32(state, coordinate, flush32 && !proven(1u), 0x00800000u);
+    base = baseFlush32 ? FlushDenormal32(state, base, !proven(2u), 0x00800000u) : FlushDenormal32(state, base, baseFlush16, 0x38800000u);
+    const auto wideDelta = FromF32Exact(state, delta, proven(0u) || (flushedExact && flush16));
+    const auto wideCoordinate = FromF32Exact(state, coordinate, proven(1u) || (flushedExact && flush32));
+    const auto wideBase = FromF32Exact(state, base, proven(2u) || (flushedExact && (baseFlush32 || baseFlush16)));
+    const auto product = Exact(state, spv::OpFMul, wideDelta, wideCoordinate);
+    const auto sum = AddRoundToOdd(state, product, wideBase);
     const std::uint32_t rounding16 = halfResult ? (mode >> InterpolationRound16Shift) & 3u : 0u;
     auto rounded = halfResult ? (rounding16 == 0u ? RoundToPrecision(state, sum, 10u, 999u) : RoundToPrecisionDirected(state, sum, 10u, 999u, rounding16)) : RoundToPrecision(state, sum, 23u, 874u);
     if (halfResult) {
@@ -305,7 +318,7 @@ std::uint32_t Interpolate(SpirvEmitterState& state, std::uint32_t delta, std::ui
                 const auto zeroBits = [&](F64Bits value, std::uint32_t highMask) {
                     return Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, value.high, ConstantU32(state, highMask)), ConstantU32(state, 0u)), Binary(state, spv::OpIEqual, boolean, value.low, ConstantU32(state, 0u)));
                 };
-                const auto positiveZeros = Binary(state, spv::OpLogicalAnd, boolean, zeroBits(Split(state, FromF64(state, product)), 0xffffffffu), zeroBits(Split(state, FromF64(state, FromF32Exact(state, base))), 0xffffffffu));
+                const auto positiveZeros = Binary(state, spv::OpLogicalAnd, boolean, zeroBits(Split(state, FromF64(state, product)), 0xffffffffu), zeroBits(Split(state, FromF64(state, wideBase)), 0xffffffffu));
                 const auto negativeZero = Binary(state, spv::OpLogicalAnd, boolean, zeroBits(Split(state, FromF64(state, sum)), 0x7fffffffu), Unary(state, spv::OpLogicalNot, boolean, positiveZeros));
                 rounded = ToF64(state, Join(state, SelectBits(state, negativeZero, {ConstantU32(state, 0u), ConstantU32(state, 0x80000000u)}, Split(state, FromF64(state, rounded)))));
             }
@@ -313,7 +326,7 @@ std::uint32_t Interpolate(SpirvEmitterState& state, std::uint32_t delta, std::ui
     }
     const auto finite = F32BitsOfRounded(state, rounded);
     const auto inputs = std::array{Unary(state, spv::OpBitcast, u32, delta), Unary(state, spv::OpBitcast, u32, coordinate), Unary(state, spv::OpBitcast, u32, base)};
-    const auto unbounded = Split(state, FromF64(state, Exact(state, spv::OpFAdd, product, FromF32Exact(state, base))));
+    const auto unbounded = Split(state, FromF64(state, Exact(state, spv::OpFAdd, product, wideBase)));
     auto special = Select(state, u32, Classify(state, Join(state, unbounded)).nan, ConstantU32(state, 0xffc00000u), Binary(state, spv::OpBitwiseOr, u32, Binary(state, spv::OpBitwiseAnd, u32, unbounded.high, ConstantU32(state, 0x80000000u)), ConstantU32(state, 0x7f800000u)));
     auto nonFinite = NonFinite32(state, inputs[0]);
     for (const auto input : {inputs[1], inputs[2]}) nonFinite = Binary(state, spv::OpLogicalOr, TypeBool(state), nonFinite, NonFinite32(state, input));

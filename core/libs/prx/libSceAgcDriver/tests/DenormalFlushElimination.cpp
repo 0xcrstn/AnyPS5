@@ -1,5 +1,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/DenormalFlushEliminator.hpp"
+#include "Optimization/InterpolationFactsAnnotator.hpp"
+#include "Recompiler.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -375,6 +377,44 @@ int main() {
         bool checked = false;
         for (const auto* inst : b.block->Instructions()) checked |= inst->Opcode() == IrOpcode::CheckDenormalFree && inst->Argument(0)->Resolve() == &source;
         return stats.removedFlushes == 0u && stats.checkedFlushes == 1u && flushed.HasUses() && checked && b.program.Info().usesFaultBuffer;
+    });
+
+    const auto interpolation = [](Builder& b, std::uint32_t mode) -> IrValue& {
+        auto& half = b.emit(IrOpcode::ConvertF32F16, IrType::F32, {&b.unknown()});
+        auto& unknown = b.asFloat(b.unknown());
+        auto& one = b.program.CreateValue(IrOpcode::Void, IrType::F32);
+        one.SetImmediateU32(0x3f800000u);
+        auto& result = b.emit(IrOpcode::FPInterpolateF16, IrType::F32, {&half, &unknown, &one, &b.constant(mode)});
+        b.keep(b.asBits(result));
+        return result;
+    };
+
+    passed &= run("interpolation facts mark proven inputs and flushed inputs in the mode", [&] {
+        Builder b;
+        auto& result = interpolation(b, 2u << InterpolationRound16Shift);
+        const auto stats = InterpolationFactsAnnotator{}.Annotate(b.program, RewriteMode::On);
+        const auto mode = result.Argument(3)->Resolve()->ImmediateU32();
+        return stats.specializedOperations == 1u && stats.provenInputs == 2u && mode == ((2u << InterpolationRound16Shift) | InterpolationFlushedExact | (5u << InterpolationNormalShift));
+    });
+
+    passed &= run("interpolation facts off leave the mode unchanged", [&] {
+        Builder b;
+        auto& result = interpolation(b, InterpolationFlush32);
+        const auto stats = InterpolationFactsAnnotator{}.Annotate(b.program, RewriteMode::Off);
+        return stats.specializedOperations == 0u && result.Argument(3)->Resolve()->ImmediateU32() == InterpolationFlush32;
+    });
+
+    passed &= run("interpolation facts verify keeps the mode and checks each proven input that is not a constant", [&] {
+        Builder b;
+        auto& result = interpolation(b, InterpolationFlush32);
+        const auto stats = InterpolationFactsAnnotator{}.Annotate(b.program, RewriteMode::Verify);
+        std::uint32_t checks = 0;
+        for (const auto* inst : b.block->Instructions()) {
+            if (inst->Opcode() != IrOpcode::CheckDenormalFree) continue;
+            ++checks;
+            if (inst->Argument(0)->Resolve()->Argument(0)->Resolve() != result.Argument(0)->Resolve()) return false;
+        }
+        return stats.checkedInputs == 1u && checks == 1u && result.Argument(3)->Resolve()->ImmediateU32() == InterpolationFlush32 && b.program.Info().usesFaultBuffer;
     });
 
     return passed ? 0 : 1;
