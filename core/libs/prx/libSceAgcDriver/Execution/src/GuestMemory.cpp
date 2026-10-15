@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/OrderedMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "ThreadOwned.hpp"
@@ -2408,9 +2409,16 @@ const void* ThreadToken() {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
 }
 
+std::atomic<void (*)()> gpuAcquiredHook{nullptr};
+std::atomic<void (*)()> gpuReleasingHook{nullptr};
+
 void GpuMutexType::acquired() {
     owner.store(ThreadToken(), std::memory_order_relaxed);
-    if (++depth == 1) gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+    if (++depth == 1) {
+        gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+        NoteLockAcquired(this, LockLevel::Device, 0, "GpuMutex");
+        if (auto* hook = gpuAcquiredHook.load(std::memory_order_acquire); hook != nullptr) hook();
+    }
 }
 
 bool GpuMutexType::HeldByOtherThread() const {
@@ -2424,6 +2432,7 @@ bool GpuMutexType::try_lock() {
 }
 
 void GpuMutexType::lock() {
+    if (!HeldByThisThread()) CheckLockOrder(LockLevel::Device, 0, "GpuMutex");
     gateWait();
     lockMutex();
 }
@@ -2459,6 +2468,11 @@ std::atomic<void (*)()> gpuLockWait{nullptr};
 std::atomic<bool (*)()> gpuLockBusy{nullptr};
 }
 
+void SetGpuLockHooks(void (*acquired)(), void (*releasing)()) {
+    gpuAcquiredHook.store(acquired, std::memory_order_release);
+    gpuReleasingHook.store(releasing, std::memory_order_release);
+}
+
 void SetGpuUnlockHook(void (*hook)()) {
     gpuUnlockHook.store(hook, std::memory_order_release);
 }
@@ -2484,9 +2498,13 @@ std::uint64_t GpuHoldSerial() {
 }
 
 void GpuMutexType::unlock() {
+    if (depth == 1) {
+        if (auto* hook = gpuReleasingHook.load(std::memory_order_acquire); hook != nullptr) hook();
+    }
     const bool outermost = --depth == 0;
     if (outermost) {
         owner.store(nullptr, std::memory_order_relaxed);
+        NoteLockReleased(this);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
     }

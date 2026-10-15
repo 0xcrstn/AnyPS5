@@ -55,7 +55,7 @@ void Driver::execute(const Submission& submission) {
         if (suspendDrain || !deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {
             const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            QueueLock gpuLock(device, submission.queue);
             const auto localDevice = device.Load();
             recordDeferredLabels(localDevice.get(), submission.queue);
             if (localDevice != nullptr) {
@@ -229,7 +229,7 @@ void Driver::execute(const Submission& submission) {
             if (!drains) {
 
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                QueueLock gpuLock(device, submission.queue);
                 const auto localDevice = device.Load();
 
                 if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
@@ -359,7 +359,7 @@ void Driver::execute(const Submission& submission) {
         }
         ++costs.endSubmits;
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        QueueLock gpuLock(device, submission.queue);
         const auto localDevice = device.Load();
 
         recordDeferredLabels(localDevice.get(), submission.queue);

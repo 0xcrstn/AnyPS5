@@ -194,7 +194,7 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (localDevice == nullptr) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        QueueLock gpuLock(device, submission.queue);
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
         localDevice = device;
     }
@@ -585,7 +585,7 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
         }
         if (sink == nullptr && (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value())) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            QueueLock gpuLock(device, submission.queue);
             recordLabelsForPacket(localDevice.get(), submission.queue);
         }
         phaseTiming.Phase(PhaseLabels);
@@ -635,7 +635,7 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
             }
         }
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        QueueLock gpuLock(device, submission.queue);
         phaseTiming.Phase(PhaseLockWait);
 
         recordLabelsForPacket(localDevice.get(), submission.queue);

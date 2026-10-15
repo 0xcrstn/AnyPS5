@@ -228,6 +228,8 @@ In runs with `APS5_PROFILE_DRAW` (as `run.ps1 -Perf` and `-Debug` set it), `APS5
 - `off` runs the queues concurrently without the scheduler's bookkeeping, as before it existed.
 - `replay` runs one packet at a time like `serial`, but starts packets in the order of a capture: `APS5_QUEUE_SCHEDULER_REPLAY=<file>` names it. A queue whose next packet is not the captured next one waits; a packet the capture did not have next, or a wait of more than 10 s for the captured one, stops the title. Every discharged `WAIT_REG_MEM` is compared with the value the capture observed at the same packet; a difference is counted on the `[scheduler]` line, and with `APS5_QUEUE_SCHEDULER_VERIFY=1` it stops the title. The replay reorders only the packets: guest memory, the title's CPU threads and GPU timing are not replayed, so a difference can also come from the title's own timing.
 
+`APS5_LOCK_ORDER_VERIFY=1` checks the driver's lock order (device lock, then the physical queues' recorder locks in creation order, then owner and cache locks) and that recorder work runs with its recorder's lock; a violation stops the title, naming the locks held and the calling code address.
+
 `APS5_QUEUE_SCHEDULER_CAPTURE=<file>` writes, in any mode, the order in which packets started (a serial or replay run records the order it granted turns) and the value every discharged wait observed, for a later `replay`.
 
 `APS5_QUEUE_SCHEDULER_VERIFY=1` stops the title when a queue runs a packet out of order or while it is waiting for a compile. With `APS5_PROFILE_DRAW`, a `[scheduler]` line every 10 s counts turns, hand-overs and parked packets whenever the scheduler or its verify mode is on.

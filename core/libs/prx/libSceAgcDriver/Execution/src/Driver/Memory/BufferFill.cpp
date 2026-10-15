@@ -196,7 +196,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     std::uint64_t base;
     std::size_t bytes;
     std::array<std::uint32_t, 4> pattern;
-    std::unique_lock inputLock(GuestMemory::GpuMutex(), std::defer_lock);
+    QueueLock inputLock(device, queueId, std::defer_lock);
     if (dwordFill) {
         base = dwordFill->base;
         bytes = dwordFill->bytes;
@@ -274,7 +274,7 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
     filledBytes += bytes;
     if (bytes == 0) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
-    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    QueueLock gpuLock(device, queueId);
     const auto holdStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto phaseStart = holdStart;
     const auto phase = [&](FillPhase which) {

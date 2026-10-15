@@ -217,7 +217,7 @@ bool Driver::recordThread() {
 void Driver::runDrawRecords() {
     auto& records = drawRecords();
     if (!records.Pending() || RecordQueue::Running()) return;
-    std::lock_guard nested(GuestMemory::GpuMutex());
+    QueueLock nested(Get().device, 0);
     records.RunPending();
 }
 
@@ -931,8 +931,8 @@ void Driver::startDrawRecords() {
         thread_local const bool tagged = (GuestMemory::TagGpuLockThread(RecordWorkerTag), true);
         (void)tagged;
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-        std::lock_guard lock(GuestMemory::GpuMutex());
-        std::lock_guard nested(GuestMemory::GpuMutex());
+        QueueLock lock(Get().device, 0);
+        QueueLock nested(Get().device, 0);
         drawRecords().RunPending();
     });
 }

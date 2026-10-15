@@ -107,6 +107,8 @@ public:
     int WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst = true);
     bool AfterRecordedWork(std::function<void()> action, bool reapFirst);
     Graphics::Recorder& RecorderFor(std::uint32_t guestQueue) const;
+    std::array<Graphics::Recorder*, 2> RecordersFor(std::uint32_t guestQueue) const;
+    std::array<Graphics::Recorder::Hold, 2> HoldRecorders() const;
     void OrderAfter(std::uint32_t consumerQueue, std::uint32_t producerQueue);
     // Pending-label table lookup and open-batch overlap test for WAIT_REG_MEM (see Recorder).
     std::optional<Graphics::Recorder::LabelHit> PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, Graphics::Recorder::LabelRefusal* refusal = nullptr) const;

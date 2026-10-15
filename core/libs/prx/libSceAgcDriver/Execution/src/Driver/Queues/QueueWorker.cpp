@@ -64,7 +64,7 @@ void Driver::reapCompletionLabels() {
         ++reapsSkipped[TryIdle];
         return;
     }
-    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+    QueueLock gpuLock(device, QueueLock::AllQueues, std::try_to_lock);
     if (!gpuLock.owns_lock()) {
         ++triesFailed[TryIdle];
         return;

@@ -31,7 +31,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         if (label.has_value() || storesNothing) {
             bumpEpoch(&EpochBumps::drains);
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            QueueLock gpuLock(device, submission.queue);
             const auto localDevice = device.Load();
             recordDeferredLabels(localDevice.get(), submission.queue);
             const bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
@@ -83,7 +83,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 wroteOnGpu = true;
             } else {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                QueueLock gpuLock(device, submission.queue);
                 const auto localDevice = device.Load();
 
                 recordDeferredLabels(localDevice.get(), submission.queue);
@@ -117,7 +117,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         if (opcode == 0x50) {
             if (const auto copy = Pm4::DecodeMemoryCopy(packet); copy.has_value() && copy->bytes <= gpuStoreLimit) {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
-                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                QueueLock gpuLock(device, submission.queue);
                 if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->StoresPendingOver(copy->source, copy->bytes)) {
                     recordDeferredLabels(localDevice.get(), submission.queue);
                     const auto copied = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
@@ -142,7 +142,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             } else {
 
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                QueueLock gpuLock(device, submission.queue);
                 const auto localDevice = device.Load();
 
                 Graphics::StorageTexture::FlushPending(store->address, bytes.size(), nullptr, "packet store", Graphics::PublishScope::PartialUnits);
@@ -175,7 +175,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             const auto copy = Pm4::DecodeMemoryCopy(packet);
             if (copy.has_value() && copy->bytes > gpuStoreLimit && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
-                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                QueueLock gpuLock(device, submission.queue);
                 if (const auto localDevice = device.Load()) {
                     recordDeferredLabels(localDevice.get(), submission.queue);
                     const auto copied = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
@@ -219,7 +219,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     sampleDump = Pm4::SampleDump(packet);
     if (sampleDump && !drainAll) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        QueueLock gpuLock(device, submission.queue);
         if (const auto localDevice = device.Load()) {
             recordDeferredLabels(localDevice.get(), submission.queue);
             wroteOnGpu = localDevice->DumpSamplesOnGpu(Pm4::SampleDumpAddress(packet));
@@ -228,7 +228,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
     if (header == FlipPacketHeader) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        QueueLock gpuLock(device, submission.queue);
         static_cast<void>(Graphics::StorageTexture::StoreSmallPending("flip"));
     }
 
@@ -244,7 +244,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         std::uint64_t epoch = 0;
         {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            QueueLock gpuLock(device, submission.queue);
             if (profile) {
                 ++drainCounts[header == FlipPacketHeader ? 0xffffu : opcode];
                 ++drainTotal;
@@ -269,12 +269,12 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             } catch (...) {
 
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                QueueLock gpuLock(device, submission.queue);
                 draining.reset();
                 throw;
             }
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            QueueLock gpuLock(device, submission.queue);
             draining->ReapRecorded(epoch);
             draining.reset();
         }
@@ -286,7 +286,7 @@ void Driver::dumpSampleCounters(std::uint64_t address) {
     std::uint64_t samples = 0;
     {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        QueueLock gpuLock(device, 0);
         auto* recorder = Graphics::Recorder::ForPhysicalQueue(Graphics::Recorder::PhysicalQueueOf(GuestMemory::GpuLockThreadTag()));
         require(recorder != nullptr, "occlusion counters without the command recorder are not implemented");
         recorder->CountSamples();

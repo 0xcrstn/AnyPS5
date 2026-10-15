@@ -85,7 +85,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
     static const std::uint64_t dumpSlot1 = [] { const char* text = std::getenv("APS5_DUMP_DRAW_SLOT1"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
 
     static const bool lockedPrepare = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
-    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    QueueLock gpuLock(device, submission.queue, std::defer_lock);
     std::shared_ptr<VulkanDevice> localDevice;
     if (lockedPrepare) {
 
@@ -100,7 +100,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         phaseTiming.Phase(DrawRowLabels);
     } else if ((localDevice = device.Load()) == nullptr) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-        std::lock_guard createLock(GuestMemory::GpuMutex());
+        QueueLock createLock(device, submission.queue);
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
         localDevice = device;
     }

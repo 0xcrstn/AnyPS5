@@ -58,7 +58,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
             return;
         }
     }
-    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    QueueLock gpuLock(device, queue, std::defer_lock);
 
     if (record) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     else if (submit || capped) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);

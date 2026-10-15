@@ -80,7 +80,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         double waitedMs = 0;
         {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
-            std::lock_guard lock(GuestMemory::GpuMutex());
+            QueueLock lock(device, 0);
             timing.Mark("gpu_mutex_wait");
             require(device != nullptr && device->Window() == window.context, "presentation window is not attached to the device");
             presenting = device;
@@ -106,7 +106,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         }
         if (presentable) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
-            std::lock_guard lock(GuestMemory::GpuMutex());
+            QueueLock lock(device, 0);
             timing.Mark("gpu_mutex_wait");
             if (buffer != nullptr) {
                 if (syncFlip) {
@@ -140,7 +140,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             timing.Mark("render_fence_wait");
 
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
-            std::lock_guard lock(GuestMemory::GpuMutex());
+            QueueLock lock(device, 0);
             presenting->QueuePresent();
             timing.Mark("queue_present");
         }

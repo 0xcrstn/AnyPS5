@@ -199,6 +199,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WaitBroker.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/QueueTopology.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/QueueFamilyDispatch.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/OrderedMutex.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DriverHeapTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
@@ -416,6 +417,17 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
+    add_test_executable(agc_lock_order_tests tests/OrderedMutex.cpp Execution/src/OrderedMutex.cpp)
+    target_include_directories(agc_lock_order_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_lock_order_tests PRIVATE libc)
+    configure_windows_unwind(agc_lock_order_tests)
+    add_test(NAME agc_lock_order COMMAND agc_lock_order_tests)
+    set_tests_properties(agc_lock_order PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_lock_order PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
     add_test_executable(agc_wait_proof_tests tests/WaitProof.cpp Execution/src/WaitBroker.cpp)
     target_include_directories(agc_wait_proof_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_wait_proof_tests PRIVATE libc)
@@ -558,6 +570,7 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/OrderedMutex.cpp
 )
 target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
@@ -703,6 +716,7 @@ endif()
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/OrderedMutex.cpp
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_write_tracking_tests PRIVATE shader_recompiler_agc_driver libc)
@@ -2003,6 +2017,14 @@ if(BUILD_TESTING)
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_QUEUE_TOPOLOGY=dedicated;APS5_QUEUE_TOPOLOGY_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
         set_tests_properties(agc_driver_same_family_missing_order_dedicated_injected PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_lock_order_verify COMMAND agc_driver_tests)
+    add_test(NAME agc_driver_flip_lock_order_verify COMMAND agc_driver_flip_tests)
+    set_tests_properties(agc_driver_lock_order_verify agc_driver_flip_lock_order_verify PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_LOCK_ORDER_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_lock_order_verify agc_driver_flip_lock_order_verify PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set(agcScheduleCapture "${CMAKE_CURRENT_BINARY_DIR}/aps5-schedule-capture.txt")

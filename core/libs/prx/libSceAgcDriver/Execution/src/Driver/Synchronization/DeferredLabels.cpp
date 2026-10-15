@@ -95,7 +95,7 @@ void Driver::runBatchAge(std::chrono::microseconds bound) noexcept {
             if (!since.has_value() || std::chrono::steady_clock::now() - *since < bound) continue;
             lock.unlock();
             {
-                std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+                QueueLock gpuLock(device, QueueLock::AllQueues, std::try_to_lock);
                 if (gpuLock.owns_lock()) {
                     if (const auto localDevice = device.Load(); localDevice != nullptr && Graphics::Recorder::PendingLabelSince().has_value()) {
                         localDevice->SubmitRecorded(false);
@@ -129,7 +129,7 @@ void Driver::runCompletionWatcher() noexcept {
             std::vector<Graphics::Recorder::UnlockedWait> waits;
             bool timelines = true;
             {
-                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                QueueLock gpuLock(device, QueueLock::AllQueues);
                 held = device.Load();
                 if (held != nullptr) {
                     timelines = held->CompletionWaitsOnTimelines();
@@ -150,7 +150,7 @@ void Driver::runCompletionWatcher() noexcept {
             }
             waits.clear();
             {
-                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                QueueLock gpuLock(device, QueueLock::AllQueues);
                 if (reap && !stopping.load(std::memory_order_acquire)) {
                     if (const auto localDevice = device.Load()) {
                         bumpEpoch(&EpochBumps::reaps);
@@ -263,7 +263,7 @@ bool Driver::recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queu
 void Driver::recordQueuedLabelsBeforeRead(std::uint32_t queue) {
     if (deferredLabels().labels.empty()) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    QueueLock gpuLock(device, queue);
     const auto localDevice = device.Load();
     recordDeferredLabels(localDevice.get(), queue);
 }
@@ -281,7 +281,7 @@ bool Driver::recordQueuedLabelsAfterCapture(std::uint32_t queue, std::span<const
         }
     }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    QueueLock gpuLock(device, queue, std::defer_lock);
     if (!gpuLock.try_lock()) {
         ++triesFailed[TryCapture];
         return false;
@@ -304,7 +304,7 @@ void Driver::noteQueuedLabels(std::uint32_t queue) {
 
 void Driver::recordQueuedLabelsByTry(std::uint32_t queue, std::atomic<std::uint64_t>& counter) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    QueueLock gpuLock(device, queue, std::defer_lock);
     if (!gpuLock.try_lock()) {
         ++triesFailed[TryPollRecord];
         return;
@@ -318,7 +318,7 @@ void Driver::recordQueuedLabelsFromHook() {
     if (deferredLabels().labels.empty()) return;
     auto& driver = Get();
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    QueueLock gpuLock(Get().device, GuestMemory::GpuLockThreadTag());
     const auto localDevice = driver.device.Load();
     driver.recordDeferredLabels(localDevice.get(), GuestMemory::GpuLockThreadTag());
     ++hookLabelRecords;

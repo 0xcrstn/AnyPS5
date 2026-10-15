@@ -103,7 +103,7 @@ void Driver::dischargeWait(WaitObservation& observation, std::span<const std::ui
         if (Graphics::Recorder::PhysicalQueueOf(observation.producerQueue) != Graphics::Recorder::PhysicalQueueOf(observation.queue)) {
             if (const auto localDevice = device.Load()) {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
-                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                QueueLock gpuLock(device, QueueLock::AllQueues);
                 localDevice->OrderAfter(observation.queue, observation.producerQueue);
             }
         }
@@ -321,7 +321,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     bool entryTryFailed = false;
     if (lockedEntry) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
-        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        QueueLock gpuLock(device, QueueLock::AllQueues, std::defer_lock);
         if (blockingEntry || !unlocked) {
             gpuLock.lock();
         } else if (!gpuLock.try_lock()) {
@@ -378,7 +378,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             pollRefused(refusal);
         }
         if (pollProfile) ++poll.tries;
-        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+        QueueLock gpuLock(device, QueueLock::AllQueues, std::try_to_lock);
         if (!gpuLock.owns_lock()) {
             ++triesFailed[TryPoll];
             if (pollProfile) ++poll.triesFailed;
@@ -487,7 +487,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (pollService(!spinning)) return;
         noteAwaitingTitle(queue, awaited);
         if (requireMemory && (polls & 15u) == 0) {
-            std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
+            QueueLock settleLock(device, QueueLock::AllQueues, std::try_to_lock);
             if (settleLock.owns_lock()) {
                 if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
                     ++outcomes.landedSettled;

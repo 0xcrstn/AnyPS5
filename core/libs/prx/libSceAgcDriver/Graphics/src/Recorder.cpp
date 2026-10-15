@@ -1155,6 +1155,28 @@ bool Recorder::QueueOrderVerify() {
 
 namespace {
 
+ThreadList<const Recorder*, 16>& GpuHeldRecorders() {
+    thread_local ThreadList<const Recorder*, 16> held;
+    return held;
+}
+
+void LockActiveRecorders() {
+    for (std::uint32_t queue = 0; queue < Recorder::PhysicalQueues; ++queue) {
+        if (const auto* recorder = Recorder::Domain(queue).active) {
+            recorder->Lock().lock();
+            GpuHeldRecorders().push_back(recorder);
+        }
+    }
+}
+
+void UnlockActiveRecorders() {
+    auto& held = GpuHeldRecorders();
+    while (!held.empty()) {
+        held.back()->Lock().unlock();
+        held.pop_back();
+    }
+}
+
 std::mutex& CrossQueueSubmitMutex() {
     static auto* mutex = new std::mutex;
     return *mutex;
@@ -1191,6 +1213,11 @@ void Recorder::RequireOrderAfter(const Recorder& producer, std::uint64_t serial)
 }
 
 Recorder::Recorder(const Context& context, bool timelineSemaphores, std::uint32_t physicalQueue) : context(context), id(nextRecorderId.fetch_add(1)), physicalQueue(physicalQueue), domain(Domain(physicalQueue)) {
+    static const bool hooked = [] {
+        GuestMemory::SetGpuLockHooks(&LockActiveRecorders, &UnlockActiveRecorders);
+        return true;
+    }();
+    static_cast<void>(hooked);
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -1237,7 +1264,12 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores, std::uint32_
 }
 
 Recorder::~Recorder() {
+    for (auto& held = GpuHeldRecorders(); std::find(held.begin(), held.end(), this) != held.end();) {
+        held.erase(std::find(held.begin(), held.end(), this));
+        recordLock.unlock();
+    }
     try {
+        const Hold hold(this, true);
         if (AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Retire);
         Sync();
     } catch (const std::exception& error) {
@@ -1347,6 +1379,10 @@ Recorder* Recorder::Active() {
 
 void Recorder::Activate() {
     domain.active = this;
+    if (GuestMemory::GpuMutex().HeldByThisThread() && std::find(GpuHeldRecorders().begin(), GpuHeldRecorders().end(), this) == GpuHeldRecorders().end()) {
+        recordLock.LockUnderDeviceLock();
+        GpuHeldRecorders().push_back(this);
+    }
     if (chunks != nullptr) chunks->Activate();
     {
         std::lock_guard tableLock(domain.labelTableMutex);
@@ -1860,6 +1896,7 @@ void Recorder::noteForeignRecord() {
 }
 
 void Recorder::ensureOpen() {
+    recordLock.AssertHeld("Recorder::Commands", __builtin_return_address(0));
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
     if (peer != nullptr) noteForeignRecord();
     if (open == nullptr) {
@@ -4011,6 +4048,7 @@ bool Recorder::writtenBackSince(std::uint64_t sequence, std::uint64_t begin, std
 }
 
 void Recorder::Submit() {
+    recordLock.AssertHeld("Recorder::Submit", __builtin_return_address(0));
     PerformanceTimer frameTiming("Recorder.Submit");
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
@@ -4300,6 +4338,7 @@ void Recorder::WaitSerial(std::uint64_t serial) {
 }
 
 void Recorder::FinishUpTo(std::uint64_t serial) {
+    recordLock.AssertHeld("Recorder::FinishUpTo", __builtin_return_address(0));
     // A drain: the wait already happened (unlocked), the fences are signaled, so the source-0 wait
     // recorded here is the bookkeeping only (a caller that did not wait first, WaitForLeases, shows
     // up in the site table by its own address).
@@ -4317,6 +4356,7 @@ void Recorder::FinishUpTo(std::uint64_t serial) {
 }
 
 void Recorder::Sync() {
+    recordLock.AssertHeld("Recorder::Sync", __builtin_return_address(0));
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
@@ -4600,6 +4640,7 @@ bool Recorder::ReapMayRetire() const {
 }
 
 bool Recorder::Reap() {
+    recordLock.AssertHeld("Recorder::Reap", __builtin_return_address(0));
     PerformanceTimer frameTiming("Recorder.Reap");
     dropStaleHoldKept();
     const bool profile = DrawProfiled();

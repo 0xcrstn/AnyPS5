@@ -147,7 +147,7 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         return false;
     }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
-    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    QueueLock gpuLock(device, queueId);
     const auto locked = std::chrono::steady_clock::now();
 
     recordLabelsForPacket(localDevice.get(), queueId);

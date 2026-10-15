@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommandSink.hpp"
+#include "prx/libSceAgcDriver/Execution/include/OrderedMutex.hpp"
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
@@ -81,6 +82,26 @@ public:
     }
     std::uint32_t PhysicalQueue() const { return physicalQueue; }
     bool GraphicsCapable() const { return context.graphicsQueue; }
+    OrderedMutex& Lock() const { return recordLock; }
+    class Hold {
+    public:
+        Hold() = default;
+        explicit Hold(const Recorder* recorder, bool underDeviceLock = false) : recorder(recorder) {
+            if (recorder == nullptr) return;
+            if (underDeviceLock) recorder->Lock().LockUnderDeviceLock();
+            else recorder->Lock().lock();
+        }
+        Hold(Hold&& other) noexcept : recorder(std::exchange(other.recorder, nullptr)) {}
+        Hold(const Hold&) = delete;
+        Hold& operator=(const Hold&) = delete;
+        Hold& operator=(Hold&&) = delete;
+        ~Hold() {
+            if (recorder != nullptr) recorder->Lock().unlock();
+        }
+
+    private:
+        const Recorder* recorder = nullptr;
+    };
     static Recorder* GraphicsRecorder();
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
     explicit Recorder(const Context& context, bool timelineSemaphores = false, std::uint32_t physicalQueue = 0);
@@ -966,6 +987,7 @@ private:
     RecorderDomain& domain;
     Recorder* peer = nullptr;
     bool skipPeerOnce = false;
+    mutable OrderedMutex recordLock{LockLevel::Recorder, id, "recorder"};
     bool submittingNow = false;
     std::map<Recorder*, std::uint64_t> foreignProducers;
     void noteForeignRecord();

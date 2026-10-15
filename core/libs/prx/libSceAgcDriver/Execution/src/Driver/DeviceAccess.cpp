@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -19,6 +21,70 @@ VulkanDevice* DevicePointer::operator->() const { return Load().get(); }
 DevicePointer::operator bool() const { return Load() != nullptr; }
 
 bool DevicePointer::operator==(std::nullptr_t) const { return Load() == nullptr; }
+
+QueueLock::QueueLock(const DevicePointer& device, std::uint32_t queue) : device(device), queue(queue) {
+    lock();
+}
+
+QueueLock::QueueLock(const DevicePointer& device, std::uint32_t queue, std::defer_lock_t) : device(device), queue(queue) {}
+
+QueueLock::QueueLock(const DevicePointer& device, std::uint32_t queue, std::try_to_lock_t) : device(device), queue(queue) {
+    try_lock();
+}
+
+QueueLock::~QueueLock() {
+    if (owned) unlock();
+}
+
+bool QueueLock::attach(bool tryOnly) {
+    held = device.Load();
+    recorders = held != nullptr ? held->RecordersFor(queue) : std::array<Graphics::Recorder*, 2>{};
+    locked = 0;
+    for (auto* recorder : recorders) {
+        if (recorder == nullptr) break;
+        if (tryOnly) {
+            if (!recorder->Lock().try_lock()) {
+                while (locked != 0) recorders[--locked]->Lock().unlock();
+                held.reset();
+                return false;
+            }
+        } else {
+            recorder->Lock().lock();
+        }
+        ++locked;
+    }
+    return true;
+}
+
+void QueueLock::lock() {
+    GuestMemory::GpuMutex().lock();
+    try {
+        attach(false);
+    } catch (...) {
+        while (locked != 0) recorders[--locked]->Lock().unlock();
+        held.reset();
+        GuestMemory::GpuMutex().unlock();
+        throw;
+    }
+    owned = true;
+}
+
+bool QueueLock::try_lock() {
+    if (!GuestMemory::GpuMutex().try_lock()) return false;
+    if (!attach(true)) {
+        GuestMemory::GpuMutex().unlock();
+        return false;
+    }
+    owned = true;
+    return true;
+}
+
+void QueueLock::unlock() {
+    while (locked != 0) recorders[--locked]->Lock().unlock();
+    held.reset();
+    owned = false;
+    GuestMemory::GpuMutex().unlock();
+}
 
 void DeviceUseGate::lock_shared() {
     std::unique_lock lock(mutex);

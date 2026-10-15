@@ -887,6 +887,7 @@ struct VulkanDevice::State {
             // slabs (kept by the publishing batch) are freed by the recorder's teardown.
             if (recorder) {
                 try {
+                    const Graphics::Recorder::Hold hold(recorder.get(), true);
                     Graphics::PublishAllShadows(context, Graphics::PublishReason::Teardown);
                     recorder->Sync();
                 } catch (const std::exception& error) {
@@ -896,6 +897,7 @@ struct VulkanDevice::State {
             Graphics::DestroyShadows(device);
             if (computeRecorder) {
                 try {
+                    const Graphics::Recorder::Hold hold(computeRecorder.get(), true);
                     computeRecorder->Sync();
                 } catch (const std::exception& error) {
                     std::fprintf(stderr, "[gpu] compute recorder teardown: %s\n", error.what());
@@ -2218,6 +2220,7 @@ void VulkanDevice::PrepareForReplacement() {
 }
 
 void VulkanDevice::WaitIdle() {
+    const auto holds = HoldRecorders();
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle begin");
     RetirePresents(0);
     if (state->recorder) {
@@ -2244,11 +2247,13 @@ void VulkanDevice::StoreIdleResults(bool reapFirst) {
     if (!Graphics::StorageTexture::AnyPending()) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    const auto holds = HoldRecorders();
     Graphics::StorageTexture::FlushAllPending("idle");
     SubmitRecorded(reapFirst);
 }
 
 void VulkanDevice::SubmitRecorded(bool reapFirst) {
+    const auto holds = HoldRecorders();
     if (!state->recorder) return;
     // Finished batches are retired first (a non-blocking fence status check on the front of the
     // in-flight list), so PendingWriteOverlaps/HasCompletions scans stay short and a label recorded
@@ -2268,6 +2273,7 @@ bool VulkanDevice::CanWaitUnlocked() const {
 }
 
 std::uint64_t VulkanDevice::SubmitAndEpoch() {
+    const auto holds = HoldRecorders();
     if (!state->recorder) return 0;
     if (OpportunisticReap()) state->recorder->Reap();
     return state->recorder->SubmitAndEpoch();
@@ -2278,6 +2284,7 @@ void VulkanDevice::WaitRecorded(std::uint64_t serial) {
 }
 
 void VulkanDevice::ReapRecorded(std::uint64_t serial) {
+    const auto holds = HoldRecorders();
     if (!state->recorder) return;
     // The drain's site in the [recorder] table is this call's caller (Driver::execute's drain,
     // PrepareDispatch's presync), not this wrapper; FinishUpTo consumes the announcement.
@@ -2286,11 +2293,13 @@ void VulkanDevice::ReapRecorded(std::uint64_t serial) {
 }
 
 void VulkanDevice::ReapRecorded() {
+    const auto holds = HoldRecorders();
     if (state->recorder) state->recorder->Reap();
     if (state->computeRecorder) state->computeRecorder->Reap();
 }
 
 std::vector<Graphics::Recorder::UnlockedWait> VulkanDevice::CompletionWaits() const {
+    const auto holds = HoldRecorders();
     std::vector<Graphics::Recorder::UnlockedWait> waits;
     for (const auto* recorder : {state->recorder.get(), state->computeRecorder.get()}) {
         if (recorder == nullptr) continue;
@@ -2304,6 +2313,7 @@ bool VulkanDevice::CompletionWaitsOnTimelines() const {
 }
 
 bool VulkanDevice::ReapMayRetire() const {
+    const auto holds = HoldRecorders();
     if (state->computeRecorder && state->computeRecorder->ReapMayRetire()) return true;
     return state->recorder == nullptr || state->recorder->ReapMayRetire();
 }
@@ -2315,11 +2325,13 @@ std::optional<Graphics::Recorder::LabelHit> VulkanDevice::PendingLabel(std::uint
 }
 
 bool VulkanDevice::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
+    const auto holds = HoldRecorders();
     if (state->computeRecorder && state->computeRecorder->OpenWriteOverlaps(address, bytes)) return true;
     return state->recorder && state->recorder->OpenWriteOverlaps(address, bytes);
 }
 
 bool VulkanDevice::RecordedWritesSettled(std::uint64_t address, std::size_t bytes) const {
+    const auto holds = HoldRecorders();
     if (!state->recorder) return true;
     const auto settled = [&](const Graphics::Recorder& recorder) {
         if (!recorder.PendingWriteSettled(address, bytes)) return false;
@@ -2330,6 +2342,7 @@ bool VulkanDevice::RecordedWritesSettled(std::uint64_t address, std::size_t byte
 }
 
 bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) const {
+    const auto holds = HoldRecorders();
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
     if (Graphics::StorageTexture::AnyPendingOverlaps(range) || Graphics::AnyShadowedOverlaps(range) || state->CopiedWriterOverlaps(address, bytes)) return true;
     if (state->computeRecorder && (state->computeRecorder->PendingWriteOverlaps(address, bytes) || state->computeRecorder->PendingLabelIn(address, bytes))) return true;
@@ -2439,6 +2452,16 @@ bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirs
     return recorder.AfterRecordedWork(std::move(action));
 }
 
+std::array<Graphics::Recorder::Hold, 2> VulkanDevice::HoldRecorders() const {
+    return {Graphics::Recorder::Hold(state->recorder.get()), Graphics::Recorder::Hold(state->computeRecorder.get())};
+}
+
+std::array<Graphics::Recorder*, 2> VulkanDevice::RecordersFor(std::uint32_t guestQueue) const {
+    if (!state->recorder) return {};
+    if (guestQueue == 0xffffffffu) return {state->recorder.get(), state->computeRecorder.get()};
+    return {&RecorderFor(guestQueue), nullptr};
+}
+
 Graphics::Recorder& VulkanDevice::RecorderFor(std::uint32_t guestQueue) const {
     require(state->recorder != nullptr, "no command recorder exists");
     const auto physical = Graphics::Recorder::PhysicalQueueOf(guestQueue);
@@ -2457,6 +2480,7 @@ void VulkanDevice::OrderAfter(std::uint32_t consumerQueue, std::uint32_t produce
     auto& producer = RecorderFor(producerQueue);
     if (&consumer == &producer) return;
     GuestMemory::AssertGpuLockHeld("VulkanDevice::OrderAfter");
+    const auto holds = HoldRecorders();
     producer.Submit();
     consumer.RequireOrderAfter(producer, producer.Submissions());
 }
