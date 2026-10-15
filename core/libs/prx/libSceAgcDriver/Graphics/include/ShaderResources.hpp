@@ -508,6 +508,7 @@ private:
     std::vector<std::shared_ptr<ResidentMirror>> bufferMirrors;
     bool usesBda = false;
     bool mirrorReads = false;
+    bool bdaReadOnly = false;
     bool usesFaultBuffer = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
     // Whether the layout is this object's own (no cache) and destroyed with it.

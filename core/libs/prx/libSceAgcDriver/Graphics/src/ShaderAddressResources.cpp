@@ -26,7 +26,8 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         usesBda = usesBda || tables != 0;
         usesFaultBuffer = usesFaultBuffer || faults != 0;
     }
-    mirrorReads = usesBda && context.recorder != nullptr && ResidentMirrorsEnabled() && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.program->bdaWrites; });
+    bdaReadOnly = usesBda && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.program->bdaWrites; });
+    mirrorReads = bdaReadOnly && context.recorder != nullptr && ResidentMirrorsEnabled();
     if (usesBda) {
         Require(context.bufferDeviceAddress, "buffer device address is not enabled");
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
