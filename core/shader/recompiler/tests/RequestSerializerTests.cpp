@@ -406,13 +406,14 @@ int main() {
     ShaderRecompiler::RecompileRequest request{};
     for (const bool preserve : {false, true}) {
         request.target.float16DenormPreserve = preserve;
+        request.target.robustBufferAccess2 = !preserve;
         const auto encoded = serializer.Serialize(request);
         const auto replay = serializer.Deserialize(encoded);
-        Require(replay.request.target.float16DenormPreserve == preserve);
+        Require(replay.request.target.float16DenormPreserve == preserve && replay.request.target.robustBufferAccess2 == !preserve);
         auto bytes = DecodeBase64(encoded);
-        Require(bytes.size() >= 8u && bytes[4] == 30u && bytes[5] == 0u && bytes[6] == 0u && bytes[7] == 0u);
+        Require(bytes.size() >= 8u && bytes[4] == 31u && bytes[5] == 0u && bytes[6] == 0u && bytes[7] == 0u);
         auto future = bytes;
-        future[4] = 31u;
+        future[4] = 32u;
         bool futureRejected = false;
         try {
             static_cast<void>(serializer.Deserialize(EncodeBase64(future)));
