@@ -83,7 +83,10 @@ public:
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
     explicit Recorder(const Context& context, bool timelineSemaphores = false, std::uint32_t physicalQueue = 0);
     VkSemaphore Timeline() const { return timeline; }
-    void SetPeer(Recorder* peer) { this->peer = peer; }
+    void SetPeer(Recorder* peer) {
+        this->peer = peer;
+        foreignProducers.clear();
+    }
     void RequireOrderAfter(const Recorder& producer, std::uint64_t serial);
     void DropOrderWaitsForTest() {
         orderWaits.clear();
@@ -95,6 +98,8 @@ public:
         std::uint64_t requiredWaits = 0;
         std::uint64_t peerWaits = 0;
         std::uint64_t waitedSubmits = 0;
+        std::uint64_t foreignRecords = 0;
+        std::uint64_t foreignWaits = 0;
     };
     QueueOrderStatistics QueueOrderCounts() const { return queueOrder; }
     ~Recorder();
@@ -954,6 +959,9 @@ private:
     RecorderDomain& domain;
     Recorder* peer = nullptr;
     bool skipPeerOnce = false;
+    bool submittingNow = false;
+    std::map<Recorder*, std::uint64_t> foreignProducers;
+    void noteForeignRecord();
     std::map<VkSemaphore, std::uint64_t> orderWaits;
     std::map<VkSemaphore, std::uint64_t> requiredOrder;
     QueueOrderStatistics queueOrder;

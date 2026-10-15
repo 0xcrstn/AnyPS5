@@ -1817,8 +1817,19 @@ void Recorder::recordKeyStores(bool forWriter) {
     if (forWriter) keyStoreRunsForWriter.fetch_add(1, std::memory_order_relaxed);
 }
 
+void Recorder::noteForeignRecord() {
+    auto* current = Current();
+    if (current == nullptr || current == this || current->peer != this) return;
+    current->Submit();
+    auto& serial = current->foreignProducers[this];
+    if (serial > submissions) return;
+    serial = submissions + 1;
+    ++current->queueOrder.foreignRecords;
+}
+
 void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
+    if (peer != nullptr) noteForeignRecord();
     if (open == nullptr) {
         auto batch = std::make_unique<Batch>();
         try {
@@ -4047,6 +4058,23 @@ void Recorder::Submit() {
         submission.pNext = &timelineInfo;
         submission.signalSemaphoreCount = 1;
         submission.pSignalSemaphores = &timeline;
+    }
+    if (!foreignProducers.empty()) {
+        Require(!submittingNow, "a physical queue's submit re-entered through a cross-queue record");
+        submittingNow = true;
+        struct Clear {
+            bool& flag;
+            ~Clear() { flag = false; }
+        } clear{submittingNow};
+        auto producers = std::move(foreignProducers);
+        foreignProducers.clear();
+        for (const auto& [producer, serial] : producers) {
+            Require(!producer->submittingNow, "two physical queues recorded into each other's open batches");
+            if (producer->submissions < serial) producer->Submit();
+            Require(producer->submissions >= serial, "a cross-queue record was not submitted on its physical queue");
+            RequireOrderAfter(*producer, serial);
+            ++queueOrder.foreignWaits;
+        }
     }
     std::unique_lock crossQueueLock(CrossQueueSubmitMutex(), std::defer_lock);
     if (peer != nullptr) crossQueueLock.lock();
