@@ -23,7 +23,7 @@ struct Pending {
     bool skipped = false;
 };
 
-thread_local std::unique_ptr<Pending> pending;
+thread_local Pending* pending = nullptr;
 
 std::uint64_t LimitBytes() {
     static const std::uint64_t limit = [] {
@@ -75,7 +75,8 @@ std::vector<Range> Merge(std::span<const Reach> reachable) {
 }
 
 void Arm(std::filesystem::path path, std::string request) {
-    pending = std::make_unique<Pending>();
+    delete pending;
+    pending = new Pending();
     pending->path = std::move(path);
     pending->capture.request = std::move(request);
 }
@@ -85,7 +86,8 @@ bool Armed() {
 }
 
 void Disarm() {
-    pending.reset();
+    delete pending;
+    pending = nullptr;
 }
 
 void NoteDispatch(std::array<std::uint32_t, 3> groups, std::uint64_t arguments, std::uint64_t program, std::span<const Reach> reachable) {
@@ -114,7 +116,8 @@ void NoteDispatch(std::array<std::uint32_t, 3> groups, std::uint64_t arguments, 
 
 void Finish() {
     if (pending == nullptr) return;
-    const auto armed = std::move(pending);
+    const std::unique_ptr<Pending> armed(pending);
+    pending = nullptr;
     if (!armed->noted || armed->skipped) {
         if (!armed->noted) std::fprintf(stderr, "[freeze] %s: the dispatch did not reach the record step; not captured\n", armed->path.string().c_str());
         return;
