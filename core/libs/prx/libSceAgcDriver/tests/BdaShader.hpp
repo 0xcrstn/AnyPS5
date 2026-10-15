@@ -13,7 +13,7 @@ void SetBdaTestRelative(ShaderRecompiler::BdaTable::Relative relative);
 ShaderRecompiler::BdaTable::Relative BdaTestRelative();
 std::vector<std::uint32_t> MakeBdaCapabilityTestShader(std::uint64_t address, std::uint64_t capabilityBase);
 void SetBdaTestSpanHelpers(ShaderRecompiler::RewriteMode mode, std::uint32_t injection = 0);
-void SetBdaTestWriteNotes(ShaderRecompiler::RewriteMode mode, std::uint32_t injection = 0);
+void SetBdaTestWriteNotes(ShaderRecompiler::RewriteMode mode, std::uint64_t injection = 0);
 void SetBdaTestInlineFastPath(bool enabled);
 std::vector<std::uint32_t> MakeRepairTestShader(std::uint32_t function, ShaderRecompiler::RewriteMode mode, std::uint32_t injection);
 std::vector<std::uint32_t> MakeBdaResolveTestShader(std::uint32_t permission);
