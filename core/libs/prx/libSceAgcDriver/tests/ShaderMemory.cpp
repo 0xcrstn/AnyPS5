@@ -1546,7 +1546,7 @@ void verifyCaptureValues() {
         };
         const auto same = [&](const char* what) {
             const auto kept = run(true);
-            require(sameSnapshot(kept->snapshot, run(false)->snapshot), std::string("incremental instance: ") + what + ": the snapshot differs from a plain run");
+            require(sameSnapshot(kept->snapshot, run(false)->snapshot), (std::string("incremental instance: ") + what + ": the snapshot differs from a plain run").c_str());
             return kept;
         };
         userData[0] = static_cast<std::uint32_t>(pointerTo(tables.first));
@@ -1558,7 +1558,7 @@ void verifyCaptureValues() {
         const auto firstReads = instance.freshReads;
         require(instance.runs == 1 && instance.keptReads == 0 && instance.keptValues == 0 && firstReads != 0, "incremental instance: the first run kept values it never computed");
         same("unchanged run");
-        require(instance.keptReads == firstReads && instance.freshReads == 0, "incremental instance: an unchanged run read " + std::to_string(instance.freshReads) + " guest words and kept " + std::to_string(instance.keptReads) + ", expected all " + std::to_string(firstReads) + " kept");
+        require(instance.keptReads == firstReads && instance.freshReads == 0, ("incremental instance: an unchanged run read " + std::to_string(instance.freshReads) + " guest words and kept " + std::to_string(instance.keptReads) + ", expected all " + std::to_string(firstReads) + " kept").c_str());
         tables.first[0] = second[0];
         dirty = pointerTo(tables.first);
         const auto reread = same("changed word not proven stable");

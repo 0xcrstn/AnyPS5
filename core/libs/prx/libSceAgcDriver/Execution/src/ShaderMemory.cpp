@@ -6,6 +6,7 @@
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/SrtWalker.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1285,7 +1286,8 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureVa
     stableAllocation = allocation;
     stablePages.clear();
     keptWords.clear();
-    tapeInstance = &state.instance;
+    if (state.instance == nullptr) state.instance = std::make_shared<ShaderRecompiler::SrtTapeInstance>();
+    tapeInstance = state.instance.get();
     struct Reset {
         ShaderMemory& memory;
         ~Reset() {

@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/SrtWalker.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -101,13 +102,13 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
                         return now != word.second;
                     });
                     if (!stale) {
-                        noteIncrementalStage(incremental->instance, true, false);
+                        noteIncrementalStage(*incremental->instance, true, false);
                         ThrowIncrementalMismatch(submission.queue, submission.serial, currentPacketOffset(), i, program.binary.codeAddress);
                     }
                 }
                 phaseTiming.Phase(DrawRowStageVerify);
             }
-            noteIncrementalStage(incremental->instance, verified, stale);
+            noteIncrementalStage(*incremental->instance, verified, stale);
         }
         bool mismatch = false;
         auto part = SnapshotPart::None;

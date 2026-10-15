@@ -202,9 +202,9 @@ void DrawIndices() {
     Require(modulo.ranges.front().indexSource == BufferIndexSource::Expression && !EvaluateBufferIndex(modulo.ranges.front().indexExpression, inputs), "vertex - (vertex / 3) * 3, which interval arithmetic cannot bound below, was given a range");
     failure = BufferIndexFailure::None;
     Require(!EvaluateBufferIndex(modulo.ranges.front().indexExpression, inputs, &failure) && failure == BufferIndexFailure::Underflow, "vertex - (vertex / 3) * 3 was not reported as possibly going below 0");
-    const std::vector<BufferIndexNode> scaled{{BufferIndexOp::VertexIndex, 0u, 0u, 0u, 0u}, {BufferIndexOp::Range, 0u, 0u, 0x10000u, 0x10000u}, {BufferIndexOp::Mul, 0u, 1u, 0u, 0u}};
+    const std::vector<BufferIndexNode> overflowing{{BufferIndexOp::VertexIndex, 0u, 0u, 0u, 0u}, {BufferIndexOp::Range, 0u, 0u, 0x10000u, 0x10000u}, {BufferIndexOp::Mul, 0u, 1u, 0u, 0u}};
     failure = BufferIndexFailure::None;
-    Require(!EvaluateBufferIndex(scaled, BufferIndexInputs{0u, 0x20000u, 0u, 0u}, &failure) && failure == BufferIndexFailure::Overflow, "vertex * 65536 over vertices 0 to 131072 was not reported as passing 32 bits");
+    Require(!EvaluateBufferIndex(overflowing, BufferIndexInputs{0u, 0x20000u, 0u, 0u}, &failure) && failure == BufferIndexFailure::Overflow, "vertex * 65536 over vertices 0 to 131072 was not reported as passing 32 bits");
     const std::vector<BufferIndexNode> forward{{BufferIndexOp::Add, 1u, 1u, 0u, 0u}};
     failure = BufferIndexFailure::None;
     Require(!EvaluateBufferIndex(forward, inputs, &failure) && failure == BufferIndexFailure::Malformed, "an expression referring forward was not reported as malformed");

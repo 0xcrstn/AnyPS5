@@ -2,7 +2,6 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_SHADERMEMORY_HPP
 
 #include "Recompiler.hpp"
-#include "Optimization/SrtWalker.hpp"
 #include <array>
 #include <bitset>
 #include <cstddef>
@@ -17,6 +16,7 @@ namespace ShaderRecompiler {
 struct SourceHandle;
 class PreparedShaderInvocation;
 struct IrResourcePlan;
+struct SrtTapeInstance;
 }
 
 namespace AgcDriver {
@@ -77,7 +77,7 @@ public:
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> Capture(const ShaderRecompiler::PreparedShaderInvocation& invocation);
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation);
     struct IncrementalState {
-        ShaderRecompiler::SrtTapeInstance instance;
+        std::shared_ptr<ShaderRecompiler::SrtTapeInstance> instance;
         std::shared_ptr<const void> plan;
         std::uint64_t generation = 0;
         std::uint64_t allocation = 0;

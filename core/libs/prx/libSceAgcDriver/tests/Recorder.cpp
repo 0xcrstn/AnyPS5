@@ -3703,8 +3703,7 @@ void lowestIndexTests() {
     constexpr std::size_t bytes = 65536;
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
-        std::cout << "write watching unavailable: lowest index cache not tested
-";
+        std::cout << "write watching unavailable: lowest index cache not tested\n";
         return;
     }
     struct Release {
@@ -3718,8 +3717,7 @@ void lowestIndexTests() {
     AgcDriver::GuestMemory::BumpCollectEpoch();
     auto generation = AgcDriver::GuestMemory::CollectWrites(address, view.size());
     if (generation == 0) {
-        std::cout << "write tracking returned no generation: lowest index cache not tested
-";
+        std::cout << "write tracking returned no generation: lowest index cache not tested\n";
         return;
     }
     AgcDriver::Graphics::TakeLowestIndexCounters();
