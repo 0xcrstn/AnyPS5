@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdio>
 #include <exception>
+#include <set>
 #include <span>
 #include <spirv/unified1/spirv.hpp>
 #include <stdexcept>
@@ -32,16 +33,31 @@ SpirvTarget Target() {
 struct Counts {
     std::size_t words = 0;
     std::size_t functions = 0;
+    std::size_t mixFunctions = 0;
 };
 
 Counts Count(std::span<const std::uint32_t> words) {
     Check(words.size() >= 5 && words[0] == spv::MagicNumber, "fma mix once: missing SPIR-V module");
     Counts counts{words.size()};
+    std::set<std::uint32_t> mixNames;
+    std::vector<std::uint32_t> functionIds;
     for (std::size_t offset = 5; offset < words.size();) {
         const auto count = words[offset] >> spv::WordCountShift;
         Check(count != 0 && count <= words.size() - offset, "fma mix once: malformed SPIR-V instruction");
-        if ((words[offset] & spv::OpCodeMask) == spv::OpFunction) ++counts.functions;
+        const auto opcode = words[offset] & spv::OpCodeMask;
+        if (opcode == spv::OpName && count > 2u) {
+            const std::string_view name(reinterpret_cast<const char*>(&words[offset + 2]), (count - 2u) * sizeof(std::uint32_t));
+            if (name.starts_with("interpolate_")) mixNames.insert(words[offset + 1]);
+        }
+        if (opcode == spv::OpFunction) {
+            Check(count > 2u, "fma mix once: malformed OpFunction");
+            ++counts.functions;
+            functionIds.push_back(words[offset + 2]);
+        }
         offset += count;
+    }
+    for (const auto id : functionIds) {
+        if (mixNames.contains(id)) ++counts.mixFunctions;
     }
     return counts;
 }
@@ -82,7 +98,9 @@ int main() {
         const auto one = Compile(1);
         const auto three = Compile(3);
         Check(three.words - one.words < one.words - none.words, "fma mix once: 2 more v_fma_mixlo/mixhi_f16 added " + std::to_string(three.words - one.words) + " SPIR-V words, as many as the first one with its shared emulation (" + std::to_string(one.words - none.words) + ")");
-        Check(one.functions == none.functions + 1u, "fma mix once: one v_fma_mixlo_f16 emitted " + std::to_string(one.functions - none.functions) + " functions more than none, expected one shared emulation function");
+        Check(none.mixFunctions == 0u, "fma mix once: a module without v_fma_mix has " + std::to_string(none.mixFunctions) + " interpolation emulation functions");
+        Check(one.mixFunctions == 1u, "fma mix once: one v_fma_mixlo_f16 emitted " + std::to_string(one.mixFunctions) + " interpolation emulation functions, expected one shared function");
+        Check(three.mixFunctions == 1u, "fma mix once: three v_fma_mixlo/mixhi_f16 in the same float mode emitted " + std::to_string(three.mixFunctions) + " interpolation emulation functions, expected one shared function");
         Check(three.functions == one.functions, "fma mix once: two more v_fma_mixlo/mixhi_f16 in the same float mode emitted " + std::to_string(three.functions - one.functions) + " more functions, expected calls to the shared one");
         std::printf("fma mix once tests passed (%zu words without v_fma_mix, %zu for 1, %zu for 3)\n", none.words, one.words, three.words);
         return 0;
