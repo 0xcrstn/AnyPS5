@@ -1,31 +1,14 @@
 #include "Optimization/DenormalFlushEliminator.hpp"
+#include "Optimization/DenormalFreeProof.hpp"
+#include "BdaAbi.hpp"
+#include "IntermediateRepresentation/IrBuilder.hpp"
 #include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 namespace ShaderRecompiler {
 
 namespace {
-
-bool isImmediate(const IrValue* value, std::uint32_t bits) {
-    return value->HasImmediate() && value->ImmediateU32() == bits;
-}
-
-const IrValue* maskedOperand(const IrValue* value, IrOpcode opcode, std::uint32_t bits) {
-    if (value->Opcode() != opcode || value->ArgumentCount() != 2u) return nullptr;
-    const IrValue* lhs = value->Argument(0)->Resolve();
-    const IrValue* rhs = value->Argument(1)->Resolve();
-    if (isImmediate(rhs, bits)) return lhs;
-    if (isImmediate(lhs, bits)) return rhs;
-    return nullptr;
-}
-
-IrValue* flushedSource(const IrValue& value) {
-    if (value.Opcode() != IrOpcode::SelectU32 || value.ArgumentCount() != 3u) return nullptr;
-    IrValue* source = value.Argument(2)->Resolve();
-    const IrValue* exponent = maskedOperand(value.Argument(0)->Resolve(), IrOpcode::IEqual32, 0u);
-    if (exponent == nullptr || maskedOperand(exponent, IrOpcode::BitwiseAnd32, 0x7f800000u) != source) return nullptr;
-    return maskedOperand(value.Argument(1)->Resolve(), IrOpcode::BitwiseAnd32, 0x80000000u) == source ? source : nullptr;
-}
 
 class DenormalFreeValues {
 public:
@@ -40,11 +23,8 @@ public:
 
 private:
     bool compute(const IrValue& value) {
-        if (value.HasImmediate()) {
-            const std::uint32_t bits = value.ImmediateU32();
-            return (bits & 0x7f800000u) != 0u || (bits & 0x7fffffffu) == 0u;
-        }
-        if (flushedSource(value) != nullptr) return true;
+        if (value.HasImmediate()) return DenormalFreeConstant(value.ImmediateU32());
+        if (DenormalFlushSource(value) != nullptr) return true;
         switch (value.Opcode()) {
             case IrOpcode::ConvertIToF32:
             case IrOpcode::ConvertUToF32:
@@ -61,10 +41,10 @@ private:
             case IrOpcode::FPSaturate32:
                 return Contains(value.Argument(0));
             case IrOpcode::BitwiseXor32:
-                if (const IrValue* operand = maskedOperand(&value, IrOpcode::BitwiseXor32, 0x80000000u)) return Contains(operand);
+                if (const IrValue* operand = MaskedOperand(&value, IrOpcode::BitwiseXor32, 0x80000000u)) return Contains(operand);
                 return false;
             case IrOpcode::BitwiseAnd32:
-                if (const IrValue* operand = maskedOperand(&value, IrOpcode::BitwiseAnd32, 0x7fffffffu)) return Contains(operand);
+                if (const IrValue* operand = MaskedOperand(&value, IrOpcode::BitwiseAnd32, 0x7fffffffu)) return Contains(operand);
                 return false;
             case IrOpcode::SelectU32:
             case IrOpcode::SelectF32:
@@ -90,17 +70,48 @@ private:
 }
 
 DenormalFlushEliminationStats DenormalFlushEliminator::Eliminate(IrProgram& program) const {
+    return Eliminate(program, FlushProofsSetting());
+}
+
+DenormalFlushEliminationStats DenormalFlushEliminator::Eliminate(IrProgram& program, RewriteMode proofs) const {
     DenormalFlushEliminationStats stats;
-    DenormalFreeValues denormalFree;
+    if (proofs == RewriteMode::Off) {
+        DenormalFreeValues denormalFree;
+        for (auto* block : program.BlockOrder()) {
+            for (auto* inst : block->Instructions()) {
+                if (!inst->HasUses()) continue;
+                IrValue* source = DenormalFlushSource(*inst);
+                if (source == nullptr || !denormalFree.Contains(source)) continue;
+                inst->ReplaceAllUsesWith(source);
+                ++stats.removedFlushes;
+            }
+        }
+        return stats;
+    }
+    const DenormalFreeProof proven(program);
+    std::vector<std::pair<IrBlock*, IrValue*>> checks;
     for (auto* block : program.BlockOrder()) {
         for (auto* inst : block->Instructions()) {
             if (!inst->HasUses()) continue;
-            IrValue* source = flushedSource(*inst);
-            if (source == nullptr || !denormalFree.Contains(source)) continue;
+            IrValue* source = DenormalFlushSource(*inst);
+            if (source == nullptr || !proven.Contains(source)) continue;
+            if (proofs == RewriteMode::Verify) {
+                checks.emplace_back(block, inst);
+                continue;
+            }
             inst->ReplaceAllUsesWith(source);
             ++stats.removedFlushes;
         }
     }
+    IrBuilder builder(program);
+    for (const auto& [block, inst] : checks) {
+        auto& check = program.CreateValue(IrOpcode::CheckDenormalFree, IrType::Void);
+        check.AddArgument(DenormalFlushSource(*inst));
+        check.AddArgument(&builder.Constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::FlushProofMismatch)));
+        block->InsertInstructionBefore(inst, &check);
+        ++stats.checkedFlushes;
+    }
+    if (stats.checkedFlushes != 0u) program.Info().usesFaultBuffer = true;
     return stats;
 }
 

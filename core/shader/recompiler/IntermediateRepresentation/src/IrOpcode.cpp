@@ -521,6 +521,8 @@ constexpr std::array<OpcodeMeta, static_cast<std::size_t>(IrOpcode::Count)> Meta
     makeMeta("InstPrefetch", Void),
     makeMeta("SelectU32", U32, U1, U32, U32),
     makeMeta("ImageBvhIntersectRay", U32x4, U32x4, ImageAddress, U1),
+    makeMeta("CheckDenormalFree", Void, U32, U32),
+    makeMeta("CheckEqualU32", Void, U32, U32, U32),
 }};
 
 const OpcodeMeta& metaOf(IrOpcode opcode) {
@@ -892,6 +894,8 @@ bool IrOpcodeHasSideEffects(IrOpcode opcode) {
         case IrOpcode::Reference:
         case IrOpcode::ReferenceU32:
         case IrOpcode::UnlinkedCall:
+        case IrOpcode::CheckDenormalFree:
+        case IrOpcode::CheckEqualU32:
         case IrOpcode::SetTessellationAttribute:
         case IrOpcode::InterpolateHostP2:
         case IrOpcode::SetThreadBitScalarRegister:

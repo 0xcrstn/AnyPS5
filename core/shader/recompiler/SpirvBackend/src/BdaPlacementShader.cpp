@@ -41,12 +41,14 @@ void CloseLoop(SpirvEmitterState& state, const Loop& loop) {
 
 }
 
-std::vector<std::uint32_t> BuildCopyBackShader() {
+std::vector<std::uint32_t> BuildCopyBackShader(bool int64Atomics) {
+    const std::uint32_t unitBytes = int64Atomics ? 8u : 4u;
     IrProgram program;
     program.Resources().stage = IrShaderStage::Compute;
     program.Info().usesDma = true;
     SpirvEmitterState state(program, {});
     EmitBaseHeader(state.module, program);
+    if (int64Atomics) state.module.EmitCapability(spv::CapabilityInt64Atomics);
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);
@@ -136,38 +138,82 @@ std::vector<std::uint32_t> BuildCopyBackShader() {
             const auto host = field(32u);
             const auto low = Select(state, u64, binary(spv::OpUGreaterThan, boolean, begin, pageBegin), begin, pageBegin);
             const auto high = Select(state, u64, binary(spv::OpULessThan, boolean, end, pageEnd), end, pageEnd);
-            const auto start = binary(spv::OpIAdd, u64, low, Unary(state, spv::OpUConvert, u64, thread));
-            const auto inner = BeginLoop(state);
-            const auto address = state.module.AllocateId();
-            const auto nextAddress = state.module.AllocateId();
-            state.module.AddFunction(spv::OpPhi, u64, address, start, inner.entry, nextAddress, inner.continuation);
-            LoopTest(state, inner, binary(spv::OpULessThan, boolean, address, high));
-            const auto offset = binary(spv::OpISub, u64, address, begin);
-            const auto current = loadByte(binary(spv::OpIAdd, u64, work, offset));
             const auto copying = binary(spv::OpIEqual, boolean, pass, constant(static_cast<std::uint32_t>(Pass::CopyBack)));
             EmitIfCondition(state, copying, [&] {
-                const auto original = loadByte(binary(spv::OpIAdd, u64, pristine, offset));
-                EmitIfCondition(state, binary(spv::OpINotEqual, boolean, current, original), [&] {
-                    storeByte(binary(spv::OpIAdd, u64, host, offset), current);
-                    storeByte(binary(spv::OpIAdd, u64, pristine, offset), current);
-                });
-            });
-            EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, copying), [&] {
-                const auto stored = loadByte(binary(spv::OpIAdd, u64, host, offset));
-                EmitIfCondition(state, binary(spv::OpINotEqual, boolean, current, stored), [&] {
+                const auto unitType = unitBytes == 8u ? u64 : u32;
+                const auto unitPointer = unitBytes == 8u ? addressPointer : wordPointer;
+                const auto unitConstant = [&](std::uint64_t value) { return unitBytes == 8u ? BdaConstant(state, value) : constant(static_cast<std::uint32_t>(value)); };
+                const auto first = binary(spv::OpIAdd, u64, binary(spv::OpBitwiseAnd, u64, low, BdaConstant(state, ~std::uint64_t{unitBytes - 1u})), binary(spv::OpIMul, u64, Unary(state, spv::OpUConvert, u64, thread), BdaConstant(state, unitBytes)));
+                const auto units = BeginLoop(state);
+                const auto unit = state.module.AllocateId();
+                const auto nextUnit = state.module.AllocateId();
+                state.module.AddFunction(spv::OpPhi, u64, unit, first, units.entry, nextUnit, units.continuation);
+                LoopTest(state, units, binary(spv::OpULessThan, boolean, unit, high));
+                auto word = unitConstant(0u);
+                auto mask = unitConstant(0u);
+                for (std::uint32_t lane = 0; lane < unitBytes; ++lane) {
+                    const auto guest = binary(spv::OpIAdd, u64, unit, BdaConstant(state, lane));
+                    const auto inside = binary(spv::OpLogicalAnd, boolean, binary(spv::OpUGreaterThanEqual, boolean, guest, low), binary(spv::OpULessThan, boolean, guest, high));
+                    const auto offset = binary(spv::OpISub, u64, Select(state, u64, inside, guest, low), begin);
+                    const auto current = loadByte(binary(spv::OpIAdd, u64, work, offset));
+                    const auto original = loadByte(binary(spv::OpIAdd, u64, pristine, offset));
+                    const auto changed = binary(spv::OpLogicalAnd, boolean, inside, binary(spv::OpINotEqual, boolean, current, original));
+                    const auto shifted = binary(spv::OpShiftLeftLogical, unitType, unitBytes == 8u ? Unary(state, spv::OpUConvert, u64, current) : current, unitConstant(lane * 8u));
+                    word = binary(spv::OpBitwiseOr, unitType, word, Select(state, unitType, changed, shifted, unitConstant(0u)));
+                    mask = binary(spv::OpBitwiseOr, unitType, mask, Select(state, unitType, changed, unitConstant(std::uint64_t{0xffu} << (lane * 8u)), unitConstant(0u)));
+                    EmitIfCondition(state, changed, [&] { storeByte(binary(spv::OpIAdd, u64, pristine, offset), current); });
+                }
+                EmitIfCondition(state, binary(spv::OpINotEqual, boolean, mask, unitConstant(0u)), [&] {
+                    const auto target = at(unitPointer, binary(spv::OpIAdd, u64, host, binary(spv::OpISub, u64, unit, begin)));
                     const auto scope = constant(spv::ScopeDevice);
                     const auto relaxed = constant(spv::MemorySemanticsMaskNone);
-                    state.module.AddFunction(spv::OpAtomicIAdd, u32, state.module.AllocateId(), at(wordPointer, offsetBy(table, constant(4u))), scope, relaxed, constant(1u));
+                    const auto initial = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpAtomicLoad, unitType, initial, target, scope, relaxed);
+                    const auto exchange = BeginLoop(state);
+                    const auto expected = state.module.AllocateId();
                     const auto previous = state.module.AllocateId();
-                    state.module.AddFunction(spv::OpAtomicCompareExchange, u32, previous, at(wordPointer, offsetBy(table, constant(8u))), scope, relaxed, relaxed, constant(1u), constant(0u));
-                    EmitIfCondition(state, binary(spv::OpIEqual, boolean, previous, constant(0u)), [&] {
-                        state.module.AddFunction(spv::OpStore, at(addressPointer, offsetBy(table, constant(16u))), address, spv::MemoryAccessAlignedMask, 8u);
-                    });
+                    const auto pending = state.module.AllocateId();
+                    const auto retry = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpPhi, unitType, expected, initial, exchange.entry, previous, exchange.continuation);
+                    state.module.AddFunction(spv::OpPhi, boolean, pending, ConstantBool(state, true), exchange.entry, retry, exchange.continuation);
+                    LoopTest(state, exchange, pending);
+                    const auto kept = binary(spv::OpBitwiseAnd, unitType, expected, Unary(state, spv::OpNot, unitType, mask));
+                    const auto desired = binary(spv::OpBitwiseOr, unitType, kept, word);
+                    state.module.AddFunction(spv::OpAtomicCompareExchange, unitType, previous, target, scope, relaxed, relaxed, desired, expected);
+                    state.module.AddFunction(spv::OpINotEqual, boolean, retry, previous, expected);
+                    EndLoop(state, exchange);
+                    CloseLoop(state, exchange);
                 });
+                EndLoop(state, units);
+                state.module.AddFunction(spv::OpIAdd, u64, nextUnit, unit, BdaConstant(state, std::uint64_t{unitBytes} * WorkgroupSize));
+                CloseLoop(state, units);
             });
-            EndLoop(state, inner);
-            state.module.AddFunction(spv::OpIAdd, u64, nextAddress, address, BdaConstant(state, WorkgroupSize));
-            CloseLoop(state, inner);
+            EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, copying), [&] {
+                const auto start = binary(spv::OpIAdd, u64, low, Unary(state, spv::OpUConvert, u64, thread));
+                const auto inner = BeginLoop(state);
+                const auto address = state.module.AllocateId();
+                const auto nextAddress = state.module.AllocateId();
+                state.module.AddFunction(spv::OpPhi, u64, address, start, inner.entry, nextAddress, inner.continuation);
+                LoopTest(state, inner, binary(spv::OpULessThan, boolean, address, high));
+                const auto offset = binary(spv::OpISub, u64, address, begin);
+                const auto current = loadByte(binary(spv::OpIAdd, u64, work, offset));
+                {
+                    const auto stored = loadByte(binary(spv::OpIAdd, u64, host, offset));
+                    EmitIfCondition(state, binary(spv::OpINotEqual, boolean, current, stored), [&] {
+                        const auto scope = constant(spv::ScopeDevice);
+                        const auto relaxed = constant(spv::MemorySemanticsMaskNone);
+                        state.module.AddFunction(spv::OpAtomicIAdd, u32, state.module.AllocateId(), at(wordPointer, offsetBy(table, constant(4u))), scope, relaxed, constant(1u));
+                        const auto previous = state.module.AllocateId();
+                        state.module.AddFunction(spv::OpAtomicCompareExchange, u32, previous, at(wordPointer, offsetBy(table, constant(8u))), scope, relaxed, relaxed, constant(1u), constant(0u));
+                        EmitIfCondition(state, binary(spv::OpIEqual, boolean, previous, constant(0u)), [&] {
+                            state.module.AddFunction(spv::OpStore, at(addressPointer, offsetBy(table, constant(16u))), address, spv::MemoryAccessAlignedMask, 8u);
+                        });
+                    });
+                }
+                EndLoop(state, inner);
+                state.module.AddFunction(spv::OpIAdd, u64, nextAddress, address, BdaConstant(state, WorkgroupSize));
+                CloseLoop(state, inner);
+            });
             EndLoop(state, outer);
             state.module.AddFunction(spv::OpIAdd, u32, nextIndex, index, constant(1u));
             CloseLoop(state, outer);

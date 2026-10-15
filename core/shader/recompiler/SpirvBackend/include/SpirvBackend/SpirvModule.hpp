@@ -260,6 +260,8 @@ private:
     std::vector<std::uint32_t> globalVariables;
     std::vector<std::uint32_t> functionInstructions;
     std::vector<std::uint32_t> helperFunctionInstructions;
+    std::vector<std::vector<std::uint32_t>> nestedHelperInstructions;
+    std::size_t helperDepth = 0;
     bool inHelperFunction = false;
 };
 

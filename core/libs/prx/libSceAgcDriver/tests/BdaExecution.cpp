@@ -1,4 +1,5 @@
 #include "BdaShader.hpp"
+#include <spirv/unified1/spirv.hpp>
 #include "BdaTranslationFixtures.hpp"
 #include "BdaAbi.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <tuple>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -526,6 +528,22 @@ void RunBdaTranslationTests(const Context& context) {
             Require(report.state == Abi::FaultState::Ready && report.reason == Table::RelativeMismatchReason() && report.address == guest && report.instruction == 0x1234, "APS5_BDA_RELATIVE=verify did not fail on an injected capability mismatch");
         }
     }
+    SetBdaTestRelative(Table::Relative::On);
+    for (const auto provenance : {ShaderRecompiler::RewriteMode::On, ShaderRecompiler::RewriteMode::Verify}) {
+        SetBdaTestProvenance(provenance);
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        const std::uint32_t sentinel = 0xdeadbeef;
+        std::memcpy(output.Bytes().data(), &sentinel, sizeof(sentinel));
+        Pipeline pipeline(context, MakeBdaCapabilityTestShader(guest, second.DeviceAddress()), {&validTable, &fault, &output});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        std::uint32_t result = 0;
+        std::memcpy(&result, output.Bytes().data(), sizeof(result));
+        if (provenance == ShaderRecompiler::RewriteMode::On) Require(report.state == Abi::FaultState::Empty && result == 0x44u, "APS5_BDA_PROVENANCE=on did not translate through the installed capability");
+        else Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::ProvenanceMismatch && report.address == guest && report.instruction == 0x1234, "APS5_BDA_PROVENANCE=verify did not fail on an installed capability that disagrees with the table");
+    }
+    SetBdaTestProvenance(ShaderRecompiler::BdaProvenanceSetting());
     SetBdaTestRelative(previousRelative);
 }
 
@@ -645,8 +663,13 @@ void RunBdaPlacementTests(const Context& context) {
     }
     work.Bytes()[10] = std::byte{0x5a};
     host.Bytes()[20] = std::byte{0xa5};
+    work.Bytes()[32] = std::byte{0x3c};
+    host.Bytes()[33] = std::byte{0xc3};
+    pristine.Bytes()[33] = std::byte{0xc3};
+    work.Bytes()[33] = std::byte{0xc3};
     writePages(0b001u);
     const auto checked = run(0, bytes, true);
+    Require(std::to_integer<std::uint8_t>(host.Bytes()[32]) == 0x3c && std::to_integer<std::uint8_t>(host.Bytes()[33]) == 0xc3 && std::to_integer<std::uint8_t>(host.Bytes()[34]) == original(34), "BDA placement copy-back did not merge a changed byte into a unit whose neighbouring byte the host holds");
     Require(std::to_integer<std::uint8_t>(host.Bytes()[10]) == 0x5a, "BDA placement copy-back missed a byte the shader changed");
     Require(std::to_integer<std::uint8_t>(host.Bytes()[20]) == 0xa5, "BDA placement copy-back overwrote a byte written after the copy-in");
     Require(checked.mismatches == 1 && checked.firstMismatch == guest + 20, "APS5_BDA_PLACEMENT=verify did not report the injected difference between the placement and the import");
@@ -686,4 +709,61 @@ void RunBdaWriteNoteTests(const Context& context) {
     const auto [report, noted] = store(RewriteMode::Verify, page);
     Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::WriteNoteMismatch && report.address == guest + 4 && noted == 1u, "APS5_BDA_WRITE_NOTES=verify did not fail on an injected cache entry");
     SetBdaTestWriteNotes(ShaderRecompiler::BdaWriteNotesSetting());
+}
+
+void RunEqualCheckTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    Buffer unused(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    for (const auto [expected, actual] : {std::pair{7u, 7u}, std::pair{7u, 8u}, std::pair{0u, 0x80000000u}}) {
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        Pipeline pipeline(context, MakeEqualCheckTestShader(expected, actual), {&unused, &fault, &unused});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        if (expected != actual) Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::RegisterWindowMismatch && report.address == expected && report.bytes == actual, "APS5_WINDOW_REGISTERS=verify did not stop on differing window and register values");
+        else Require(report.state == Abi::FaultState::Empty, "an equality check stopped on equal values");
+    }
+}
+
+void RunBallotReuseTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    using ShaderRecompiler::RewriteMode;
+    const auto ballots = [](const std::vector<std::uint32_t>& words) {
+        std::uint32_t count = 0;
+        for (std::size_t index = 5; index < words.size() && (words[index] >> 16u) != 0u; index += words[index] >> 16u) count += (words[index] & 0xffffu) == spv::OpGroupNonUniformBallot;
+        return count;
+    };
+    Require(ballots(MakeBallotReuseTestShader(RewriteMode::Off, false)) == 2u, "APS5_BALLOT_REUSE=off did not emit both ballots");
+    Require(ballots(MakeBallotReuseTestShader(RewriteMode::On, false)) == 1u, "APS5_BALLOT_REUSE=on did not reuse a ballot of the same value in the same block");
+    Require(ballots(MakeBallotReuseTestShader(RewriteMode::On, true)) == 0u, "APS5_BALLOT_REUSE=on did not reuse the injected ballot");
+    Require(ballots(MakeBallotReuseTestShader(RewriteMode::Verify, false)) == 2u, "APS5_BALLOT_REUSE=verify did not emit both ballots");
+    Buffer unused(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    for (const auto [mode, inject, faults] : {std::tuple{RewriteMode::Verify, false, false}, std::tuple{RewriteMode::Verify, true, true}, std::tuple{RewriteMode::On, true, false}}) {
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        Pipeline pipeline(context, MakeBallotReuseTestShader(mode, inject), {&unused, &fault, &unused});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        if (faults) Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::BallotReuseMismatch && report.address == 1u && report.bytes == 0u, "APS5_BALLOT_REUSE=verify did not stop on an injected ballot");
+        else Require(report.state == Abi::FaultState::Empty, "a ballot reuse test faulted without a mismatch");
+    }
+}
+
+void RunFlushProofCheckTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    Buffer unused(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    for (const auto reason : {Abi::FaultReason::FlushProofMismatch, Abi::FaultReason::InterpolationFactMismatch}) {
+        for (const auto [value, denormal] : {std::pair{0x00000001u, true}, std::pair{0x807fffffu, true}, std::pair{0x00400000u, true}, std::pair{0x00000000u, false}, std::pair{0x80000000u, false}, std::pair{0x00800000u, false}, std::pair{0x3f800000u, false}, std::pair{0x7fc00000u, false}}) {
+            std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+            Pipeline pipeline(context, MakeFlushCheckTestShader(value, reason), {&unused, &fault, &unused});
+            pipeline.Run(1);
+            Abi::Fault report{};
+            std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+            if (denormal) Require(report.state == Abi::FaultState::Ready && report.reason == reason && static_cast<std::uint32_t>(report.address) == value, "a denormal-free proof check did not stop on a denormal");
+            else Require(report.state == Abi::FaultState::Empty, "a denormal-free proof check stopped on a value that is not denormal");
+        }
+    }
 }

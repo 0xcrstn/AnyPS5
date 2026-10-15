@@ -11,8 +11,8 @@ namespace ShaderRecompiler {
 
 enum class RewriteMode : std::uint32_t { Off, On, Verify };
 
-inline RewriteMode ParseRewriteMode(std::string_view name, const char* value) {
-    if (value == nullptr) return RewriteMode::Off;
+inline RewriteMode ParseRewriteMode(std::string_view name, const char* value, RewriteMode fallback = RewriteMode::Off) {
+    if (value == nullptr) return fallback;
     const std::string_view text(value);
     if (text == "off") return RewriteMode::Off;
     if (text == "on") return RewriteMode::On;
@@ -31,12 +31,37 @@ inline RewriteMode LazyTrigSeriesSetting() {
 }
 
 inline RewriteMode BdaWriteNotesSetting() {
-    static const RewriteMode mode = ParseRewriteMode("APS5_BDA_WRITE_NOTES", std::getenv("APS5_BDA_WRITE_NOTES"));
+    static const RewriteMode mode = ParseRewriteMode("APS5_BDA_WRITE_NOTES", std::getenv("APS5_BDA_WRITE_NOTES"), RewriteMode::On);
+    return mode;
+}
+
+inline RewriteMode FlushProofsSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_FLUSH_PROOFS", std::getenv("APS5_FLUSH_PROOFS"), RewriteMode::On);
+    return mode;
+}
+
+inline RewriteMode BdaProvenanceSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_BDA_PROVENANCE", std::getenv("APS5_BDA_PROVENANCE"), RewriteMode::On);
+    return mode;
+}
+
+inline RewriteMode WindowRegistersSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_WINDOW_REGISTERS", std::getenv("APS5_WINDOW_REGISTERS"), RewriteMode::On);
+    return mode;
+}
+
+inline RewriteMode BallotReuseSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_BALLOT_REUSE", std::getenv("APS5_BALLOT_REUSE"), RewriteMode::On);
+    return mode;
+}
+
+inline RewriteMode InterpolationFactsSetting() {
+    static const RewriteMode mode = ParseRewriteMode("APS5_INTERPOLATION_FACTS", std::getenv("APS5_INTERPOLATION_FACTS"), RewriteMode::On);
     return mode;
 }
 
 inline RewriteMode BdaSpanHelpersSetting() {
-    static const RewriteMode mode = ParseRewriteMode("APS5_BDA_SPAN_HELPERS", std::getenv("APS5_BDA_SPAN_HELPERS"));
+    static const RewriteMode mode = ParseRewriteMode("APS5_BDA_SPAN_HELPERS", std::getenv("APS5_BDA_SPAN_HELPERS"), RewriteMode::On);
     return mode;
 }
 

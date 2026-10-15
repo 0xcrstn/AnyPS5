@@ -19,6 +19,8 @@ std::shared_ptr<ResidentMirror> MirrorOfImport(const Context& context, const Hos
 VkDeviceAddress MirrorDeviceAddress(const ResidentMirror& mirror);
 ShaderRecompiler::BdaPlacement::Mode PlacementSetting();
 std::shared_ptr<ResidentMirror> PlacementOfImport(const Context& context, const HostImport& import);
+void CountPlacedBuild();
+std::uint64_t PlacedBuilds();
 VkDeviceAddress MirrorPristineAddress(const ResidentMirror& mirror);
 void RecordPlacementCopyBack(const Context& context, VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress table, bool verify);
 VkBuffer MirrorBuffer(const ResidentMirror& mirror);

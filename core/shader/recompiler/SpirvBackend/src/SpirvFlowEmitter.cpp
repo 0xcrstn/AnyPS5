@@ -387,6 +387,8 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::Reference: return Invoke(EmitReference, ctx, inst);
         case IrOpcode::ReferenceU32: return Invoke(EmitReferenceU32, ctx, inst);
         case IrOpcode::UnlinkedCall: return Invoke(EmitUnlinkedCall, ctx, inst);
+        case IrOpcode::CheckDenormalFree: return Invoke(EmitCheckDenormalFree, ctx, inst);
+        case IrOpcode::CheckEqualU32: return Invoke(EmitCheckEqualU32, ctx, inst);
         case IrOpcode::GetUserData: return Invoke(EmitGetUserData, ctx, inst);
         case IrOpcode::GetShaderBase: return Invoke(EmitGetShaderBase, ctx, inst);
         case IrOpcode::ShaderClock: return Invoke(EmitShaderClock, ctx, inst);
@@ -888,6 +890,7 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
     // and a read from the next write. The block may be entered right after a write.
     bool ldsWritten = true;
     bool ldsRead = false;
+    bool firstNonPhi = true;
     for (const IrValue* inst : block->Instructions()) {
         if (inst->Opcode() == IrOpcode::Phi) {
             if (emittedNonPhi) {
@@ -930,10 +933,13 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             SpirvValueEmitContext& lane = half == 0 ? ctx : *ctx.otherHalf;
             state.laneHalf = half;
             if (half == 0 || (inst->Opcode() != IrOpcode::Barrier && inst->Opcode() != IrOpcode::MeshAllocate)) {
+                if (inst->Opcode() != IrOpcode::Phi) EmitBdaRootBefore(lane, *inst, firstNonPhi);
                 EmitStructuredInstruction(lane, functionState, *inst);
+                if (inst->Opcode() != IrOpcode::Phi) EmitBdaRootAfter(lane, *inst);
             }
         }
         state.laneHalf = 0;
+        if (inst->Opcode() != IrOpcode::Phi) firstNonPhi = false;
     }
 }
 
@@ -1119,6 +1125,30 @@ void EmitReference(SpirvValueEmitContext& context) {
 
 void EmitReferenceU32(SpirvValueEmitContext& context) {
     EmitVoid(context);
+}
+
+void EmitCheckDenormalFree(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t value, const IrValue* reason) {
+    auto& state = ctx.state;
+    if (state.faultBufferVariable == 0) ctx.Fail(inst, "checks a denormal-free proof without a fault buffer");
+    const auto faultReason = static_cast<BdaAbi::FaultReason>(reason->Resolve()->ImmediateU32());
+    if (faultReason != BdaAbi::FaultReason::FlushProofMismatch && faultReason != BdaAbi::FaultReason::InterpolationFactMismatch) ctx.Fail(inst, "checks a denormal-free proof with an unknown fault reason");
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto exponentZero = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, value, ConstantU32(state, 0x7f800000u)), ConstantU32(state, 0u));
+    const auto nonZero = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, value, ConstantU32(state, 0x7fffffffu)), ConstantU32(state, 0u));
+    EmitIfCondition(state, Binary(state, spv::OpLogicalAnd, boolean, exponentZero, nonZero), [&] {
+        RecordBdaFaultWords(state, value, ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, 0u), faultReason);
+    });
+}
+
+void EmitCheckEqualU32(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t expected, std::uint32_t actual, const IrValue* reason) {
+    auto& state = ctx.state;
+    if (state.faultBufferVariable == 0) ctx.Fail(inst, "checks an equality without a fault buffer");
+    const auto faultReason = static_cast<BdaAbi::FaultReason>(reason->Resolve()->ImmediateU32());
+    if (faultReason != BdaAbi::FaultReason::RegisterWindowMismatch) ctx.Fail(inst, "checks an equality with an unknown fault reason");
+    EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), expected, actual), [&] {
+        RecordBdaFaultWords(state, expected, ConstantU32(state, 0u), actual, ConstantU32(state, 0u), faultReason);
+    });
 }
 
 void EmitUnlinkedCall(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t low, std::uint32_t high, std::uint32_t programCounter) {

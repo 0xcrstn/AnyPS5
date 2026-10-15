@@ -480,6 +480,8 @@ enum class IrOpcode : std::uint16_t {
     InstPrefetch,
     SelectU32,
     ImageBvhIntersectRay,
+    CheckDenormalFree,
+    CheckEqualU32,
     Count
 };
 

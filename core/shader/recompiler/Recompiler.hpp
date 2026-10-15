@@ -195,6 +195,8 @@ inline constexpr std::uint32_t InterpolationQuiet = 1u;
 inline constexpr std::uint32_t InterpolationFlush32 = 2u;
 inline constexpr std::uint32_t InterpolationFlush16 = 4u;
 inline constexpr std::uint32_t InterpolationRound16Shift = 3u;
+inline constexpr std::uint32_t InterpolationFlushedExact = 1u << 5u;
+inline constexpr std::uint32_t InterpolationNormalShift = 6u;
 
 struct GuestContext {
     std::uint32_t waveSize;
@@ -580,6 +582,7 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     bool bdaWrites = true;
     bool bdaAtomics = true;
     bool bdaCoherent = true;
+    bool bdaSpinWait = true;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;
     std::vector<std::array<std::uint32_t, 3>> bufferBaseSlots;

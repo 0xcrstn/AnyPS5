@@ -11,6 +11,8 @@
 #include <vector>
 #include <iterator>
 #include <initializer_list>
+#include <map>
+#include <unordered_map>
 
 namespace ShaderRecompiler {
 
@@ -399,9 +401,10 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         return function;
     }
     const auto boolean = TypeBool(state);
+    const bool provenanceVerified = state.bdaProvenance == RewriteMode::Verify && relative == BdaTable::Relative::On;
     BdaCapabilityHit cached;
     if (capability) cached = EmitBdaCapabilityProbe(state, address, bytes, permission);
-    if (relative == BdaTable::Relative::On) {
+    if (relative == BdaTable::Relative::On && !provenanceVerified) {
         const auto hitLabel = state.module.AllocateId();
         const auto next = state.module.AllocateId();
         state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
@@ -428,9 +431,9 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         ReturnBdaFailureIf(state, differs, address, bytes, instruction, BdaAbi::FaultReason::TranslationMismatch);
     }
     const auto failed = Binary(state, spv::OpINotEqual, boolean, reason, BdaConstant(state, 0u));
-    if (relative == BdaTable::Relative::Verify) {
+    if (relative == BdaTable::Relative::Verify || provenanceVerified) {
         const auto mismatch = Binary(state, spv::OpLogicalAnd, boolean, cached.hit, Binary(state, spv::OpLogicalOr, boolean, failed, Binary(state, spv::OpINotEqual, boolean, result, cached.result)));
-        ReturnBdaFailureIf(state, mismatch, address, bytes, instruction, BdaTable::RelativeMismatchReason());
+        ReturnBdaFailureIf(state, mismatch, address, bytes, instruction, provenanceVerified ? BdaAbi::FaultReason::ProvenanceMismatch : BdaTable::RelativeMismatchReason());
     }
     if (recordFaults) {
         const auto failedLabel = state.module.AllocateId();
@@ -564,6 +567,158 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;
+}
+
+namespace {
+
+using BdaRoot = std::pair<const IrValue*, const IrValue*>;
+
+const IrValue* BdaRootHandle(const SpirvEmitterState& state, const IrValue& inst) {
+    if (AddressOpcodeInfoOf(inst.Opcode()).access == AddressAccess::None || inst.ArgumentCount() == 0u) return nullptr;
+    const auto& memory = state.program.Resources().memoryInfo.at(inst.Flags<MemoryFlags>().index);
+    if (memory.addressIsFull) return nullptr;
+    const IrValue* handle = inst.Argument(0) != nullptr ? inst.Argument(0)->Resolve() : nullptr;
+    if (handle == nullptr || handle->Opcode() != IrOpcode::GetAddressResource || handle->ArgumentCount() != 2u) return nullptr;
+    return handle;
+}
+
+BdaRoot BdaRootOf(const IrValue& handle) {
+    return {handle.Argument(0)->Resolve(), handle.Argument(1)->Resolve()};
+}
+
+bool BdaProvenanceActive(const SpirvEmitterState& state) {
+    return state.bdaProvenance != RewriteMode::Off && state.bdaRelative != BdaTable::Relative::Off && state.bdaCapability[0] != 0u;
+}
+
+void ResolveBdaRoot(SpirvValueEmitContext& ctx, const BdaRoot& root) {
+    auto& state = ctx.state;
+    const std::tuple<const IrValue*, const IrValue*, std::uint32_t> key{root.first, root.second, ctx.half};
+    if (state.bdaRootCapabilities.contains(key)) return;
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto kind = state.bdaTranslation == BdaTable::Translation::Verify ? BdaResolveKind::LegacyRadixLayout : state.bdaTranslation == BdaTable::Translation::Radix ? BdaResolveKind::Radix : BdaResolveKind::Legacy;
+    const auto resolve = DefineBdaResolve(state, kind, BdaAbi::Read, true);
+    const auto low = Unary(state, spv::OpUConvert, u64, ctx.Def(root.first));
+    const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, ctx.Def(root.second)), BdaConstant(state, 32u));
+    const auto base = Binary(state, spv::OpBitwiseOr, u64, low, high);
+    const auto pair = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, BdaResolvedType(state), pair, resolve, base, ConstantU32(state, 1u));
+    const auto reason = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, u64, reason, pair, 1u);
+    const auto resolved = Binary(state, spv::OpIEqual, boolean, reason, BdaConstant(state, 0u));
+    std::array<std::uint32_t, 4> capability{};
+    for (std::size_t index = 0; index < capability.size(); ++index) {
+        capability[index] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, index == 3u ? u32 : u64, capability[index], state.bdaCapability[index]);
+    }
+    capability[0] = Select(state, u64, resolved, capability[0], BdaConstant(state, 1u));
+    capability[1] = Select(state, u64, resolved, capability[1], BdaConstant(state, 0u));
+    state.bdaRootCapabilities.emplace(key, capability);
+}
+
+}
+
+void PrepareBdaProvenance(SpirvEmitterState& state) {
+    state.bdaRootsBefore.clear();
+    state.bdaRootsAfter.clear();
+    state.bdaRootsAtStart.clear();
+    state.bdaRootCapabilities.clear();
+    if (!BdaProvenanceActive(state) || state.program.BlockOrder().empty()) return;
+    std::unordered_map<const IrBlock*, std::size_t> index;
+    std::vector<std::pair<IrBlock*, std::size_t>> stack{{state.program.BlockOrder().front(), 0u}};
+    index.emplace(state.program.BlockOrder().front(), 0u);
+    std::vector<IrBlock*> postorder;
+    while (!stack.empty()) {
+        auto& [block, next] = stack.back();
+        if (next < block->Successors().size()) {
+            IrBlock* successor = block->Successors()[next++];
+            if (index.emplace(successor, 0u).second) stack.emplace_back(successor, 0u);
+            continue;
+        }
+        postorder.push_back(block);
+        stack.pop_back();
+    }
+    const std::vector<IrBlock*> order(postorder.rbegin(), postorder.rend());
+    for (std::size_t position = 0; position < order.size(); ++position) index[order[position]] = position;
+    constexpr std::size_t none = static_cast<std::size_t>(-1);
+    std::vector<std::size_t> dominator(order.size(), none);
+    dominator[0] = 0;
+    const auto intersect = [&](std::size_t left, std::size_t right) {
+        while (left != right) {
+            while (left > right) left = dominator[left];
+            while (right > left) right = dominator[right];
+        }
+        return left;
+    };
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::size_t position = 1; position < order.size(); ++position) {
+            std::size_t candidate = none;
+            for (const IrBlock* predecessor : order[position]->Predecessors()) {
+                const auto found = index.find(predecessor);
+                if (found == index.end() || dominator[found->second] == none) continue;
+                candidate = candidate == none ? found->second : intersect(candidate, found->second);
+            }
+            if (candidate != dominator[position]) {
+                dominator[position] = candidate;
+                changed = true;
+            }
+        }
+    }
+    std::map<BdaRoot, std::size_t> common;
+    for (const IrBlock* block : order) {
+        const auto position = index.at(block);
+        for (const IrValue* inst : block->Instructions()) {
+            const IrValue* handle = BdaRootHandle(state, *inst);
+            if (handle == nullptr) continue;
+            const auto [found, inserted] = common.emplace(BdaRootOf(*handle), position);
+            if (!inserted) found->second = intersect(found->second, position);
+        }
+    }
+    for (const auto& [root, position] : common) {
+        const IrBlock* block = order[position];
+        const IrValue* firstAccess = nullptr;
+        const IrValue* lastArgument = nullptr;
+        for (const IrValue* inst : block->Instructions()) {
+            if (inst == root.first || inst == root.second) lastArgument = inst;
+            const IrValue* handle = BdaRootHandle(state, *inst);
+            if (handle != nullptr && BdaRootOf(*handle) == root) {
+                firstAccess = inst;
+                break;
+            }
+        }
+        if (firstAccess != nullptr) state.bdaRootsBefore[firstAccess].push_back(root);
+        else if (lastArgument != nullptr) state.bdaRootsAfter[lastArgument].push_back(root);
+        else state.bdaRootsAtStart[block].push_back(root);
+    }
+}
+
+void EmitBdaRootBefore(SpirvValueEmitContext& ctx, const IrValue& inst, bool firstInBlock) {
+    auto& state = ctx.state;
+    if (!BdaProvenanceActive(state)) return;
+    if (firstInBlock) {
+        if (const auto found = state.bdaRootsAtStart.find(inst.Parent()); found != state.bdaRootsAtStart.end()) {
+            for (const auto& root : found->second) ResolveBdaRoot(ctx, root);
+        }
+    }
+    if (const auto found = state.bdaRootsBefore.find(&inst); found != state.bdaRootsBefore.end()) {
+        for (const auto& root : found->second) ResolveBdaRoot(ctx, root);
+    }
+    const IrValue* handle = BdaRootHandle(state, inst);
+    if (handle == nullptr) return;
+    const auto root = BdaRootOf(*handle);
+    const auto found = state.bdaRootCapabilities.find({root.first, root.second, ctx.half});
+    if (found == state.bdaRootCapabilities.end()) return;
+    for (std::size_t index = 0; index < found->second.size(); ++index) state.module.AddFunction(spv::OpStore, state.bdaCapability[index], found->second[index]);
+}
+
+void EmitBdaRootAfter(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    auto& state = ctx.state;
+    if (!BdaProvenanceActive(state)) return;
+    if (const auto found = state.bdaRootsAfter.find(&inst); found != state.bdaRootsAfter.end()) {
+        for (const auto& root : found->second) ResolveBdaRoot(ctx, root);
+    }
 }
 
 std::uint32_t DefineBdaResolveFunction(SpirvEmitterState& state, bool radix, std::uint32_t permission) {

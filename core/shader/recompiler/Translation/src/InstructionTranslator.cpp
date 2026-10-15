@@ -2,6 +2,7 @@
 #include "Recompiler.hpp"
 #include "Translation/DispatchInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
+#include "RewriteSwitch.hpp"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -449,10 +450,14 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         }
     }
     const bool ancillaryWindow = options.stage == ShaderStageKind::Pixel && options.inputInfo.pixel != nullptr && options.inputInfo.pixel->psAncillary && options.inputInfo.pixel->psInputVgpr[static_cast<std::uint32_t>(PixelInput::Ancillary)] >= windowBase;
-    if (windowBase < vectorLimit && !ancillaryWindow) {
+    const auto windowRegisters = WindowRegistersSetting();
+    const bool registerWindow = windowBase < vectorLimit && !ancillaryWindow && windowRegisters == RewriteMode::On;
+    if (windowBase < vectorLimit && !ancillaryWindow && !registerWindow) {
         program.Metadata().vectorWindowBase = windowBase;
         program.Metadata().vectorWindowSize = vectorLimit - windowBase;
-        program.Metadata().vectorWindowIndexedWrites = indexedWrites;
+        program.Metadata().vectorWindowIndexedWrites = indexedWrites && windowRegisters == RewriteMode::Off;
+        program.Metadata().vectorWindowVerify = windowRegisters == RewriteMode::Verify;
+        if (program.Metadata().vectorWindowVerify) program.Info().usesFaultBuffer = true;
     }
     program.Resources().stage = toIrShaderStage(options.stage);
     program.Resources().shaderHash = options.shaderHash;
@@ -516,7 +521,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     if (program.Metadata().vectorWindowSize != 0u) {
         vectorLimit = program.Metadata().vectorWindowBase + program.Metadata().vectorWindowSize;
     }
-    if (ancillaryWindow) {
+    if (ancillaryWindow || registerWindow) {
         for (const IrValue* instruction : blocks.front()->Instructions()) {
             if (instruction->Opcode() == IrOpcode::SetVectorRegister) {
                 vectorLimit = std::max(vectorLimit, instruction->Argument(0)->Register().index + 1u);

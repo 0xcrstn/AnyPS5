@@ -156,6 +156,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             std::memcpy(placement->Bytes().data() + sizeof(header), entries.data(), entries.size() * sizeof(Placement::Entry));
             for (const auto& entry : entries) placed.emplace_back(entry.begin, entry.end);
             std::sort(placed.begin(), placed.end());
+            CountPlacedBuild();
         }
     }
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
@@ -337,7 +338,28 @@ void BdaResources::CheckFault() const {
     }
     message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::TranslationMismatch) message << "; the legacy and radix BDA translations differ for this access (APS5_BDA_ABI=verify)";
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::ProvenanceMismatch) message << "; the capability installed from this access's base resource differs from the table lookup (APS5_BDA_PROVENANCE=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RelativeMismatch) message << "; the cached BDA range capability differs from the table lookup for this access (APS5_BDA_RELATIVE=verify)";
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::FlushProofMismatch) {
+        message.str({});
+        message << "APS5_FLUSH_PROOFS=verify: shader stage " << report.stage << " saw the denormal 0x" << std::hex << static_cast<std::uint32_t>(report.address) << std::dec << " where a proof said a denormal flush was unneeded";
+        throw std::runtime_error(message.str());
+    }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RegisterWindowMismatch) {
+        message.str({});
+        message << "APS5_WINDOW_REGISTERS=verify: shader stage " << report.stage << " read 0x" << std::hex << static_cast<std::uint32_t>(report.address) << " from the relative-addressing window where the register selection gave 0x" << report.bytes << std::dec;
+        throw std::runtime_error(message.str());
+    }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::BallotReuseMismatch) {
+        message.str({});
+        message << "APS5_BALLOT_REUSE=verify: shader stage " << report.stage << " balloted 0x" << std::hex << static_cast<std::uint32_t>(report.address >> 32u) << "'" << static_cast<std::uint32_t>(report.address) << " where an earlier ballot of the same value in the same block gave 0x" << report.instruction << "'" << report.bytes << std::dec;
+        throw std::runtime_error(message.str());
+    }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::InterpolationFactMismatch) {
+        message.str({});
+        message << "APS5_INTERPOLATION_FACTS=verify: shader stage " << report.stage << " passed the denormal 0x" << std::hex << static_cast<std::uint32_t>(report.address) << std::dec << " to an interpolation or fma-mix input proven not denormal";
+        throw std::runtime_error(message.str());
+    }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::WriteNoteMismatch) message << "; a cached write note skipped a page the written-page record does not hold (APS5_BDA_WRITE_NOTES=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::SpanMismatch) message << "; the specialized BDA span helper differs from the generic one (APS5_BDA_SPAN_HELPERS=verify)";
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::RepairMismatch) {
