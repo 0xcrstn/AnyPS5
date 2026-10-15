@@ -117,8 +117,7 @@ bool Enabled() noexcept {
     try {
         return configured();
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "[compile-trace] %s
-", error.what());
+        std::fprintf(stderr, "[compile-trace] %s\n", error.what());
         std::terminate();
     }
 }
