@@ -1755,6 +1755,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             if (valid && recorder != nullptr) moved = found != nullptr ? cached->CheckMovedReadOnlyBuffers(*found->plan, *recorder) : cached->MovedReadOnlyBuffers(shaders, *recorder);
             if (moved.has_value()) {
                 if (trimKey && found == nullptr) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                static const bool verifyAddress = std::getenv("APS5_VERIFY_ADDRESS_TEMPLATES") != nullptr;
+                if (verifyAddress && cached->AddressTemplate()) cached->VerifyAddressTemplate(ShaderResources(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots));
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
@@ -2318,6 +2320,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     parts.lap(RecordStores);
     std::optional<ShaderResources::DrawIndexRanges> drawRanges;
     if (args == nullptr) drawRanges = drawIndexRanges(state, draw, shaders, inputs);
+    resources.RefreshAddressUse();
     resources.PublishResidentReads(*recorder);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.profile ? &outcome.bindings : nullptr, drawRanges ? &*drawRanges : nullptr, record.prefills);
     parts.lap(RecordBindings);

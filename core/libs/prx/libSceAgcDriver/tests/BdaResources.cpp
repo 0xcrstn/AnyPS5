@@ -837,6 +837,65 @@ ShaderRecompiler::DescriptorBinding binding(Role role, std::uint32_t slot) {
     return {ShaderRecompiler::DescriptorKind::StorageBuffer, role, 0, slot, 1, {}, false};
 }
 
+void addressTemplateTests(const Context& context) {
+    if (!AddressSpaceCounters().enabled) return;
+    constexpr std::size_t piece = 65536;
+    void* block = ::operator new(2 * piece, std::align_val_t{piece});
+    std::memset(block, 0x3a, 2 * piece);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, true, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(guest, true);
+    ShaderRecompiler::RecompileResult pixel;
+    pixel.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    pixel.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    const std::array<CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}}};
+    const bool previous = ShaderResources::AddressTemplatesEnabled();
+    ShaderResources::SetAddressTemplates(true);
+    Require(!ShaderResources::NeverReusable(stages), "a read-only address-based draw is refused the resource cache");
+    {
+        auto resources = std::make_shared<ShaderResources>(importing, stages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>{});
+        Require(resources->Reusable() && resources->AddressTemplate() && resources->HoldsLease(), "a read-only address-based draw build is not a reusable address template");
+        Require(resources->Revalidate(stages), "an address template over an unchanged registry did not prove current");
+        resources->RefreshAddressUse();
+        resources->RefreshAddressUse();
+        resources->CheckFaults();
+        ResourceCache cache;
+        const ResourceCache::Key key{0x41u, 0x54u};
+        cache.Insert(key, resources);
+        std::vector<std::shared_ptr<ShaderResources>> evicted;
+        cache.RemoveAddressTemplates(evicted);
+        Require(evicted.size() == 1 && evicted[0] == resources && cache.Find(key) == nullptr, "the pin waiter's eviction left an address template in the resource cache");
+        change(guest + piece, true);
+        Require(!resources->Revalidate(stages), "an address template proved current after the registry changed");
+        change(guest + piece, false);
+    }
+    pixel.bdaWrites = true;
+    Require(ShaderResources::NeverReusable(stages), "an address-based draw that writes through pointers is offered the resource cache");
+    {
+        ShaderResources writer(importing, stages, ColorTarget{}, 0, 0, 0, {});
+        Require(!writer.Reusable() && !writer.AddressTemplate(), "an address-based draw that writes through pointers became a template");
+        writer.WriteBack();
+    }
+    pixel.bdaWrites = false;
+    ShaderResources::SetAddressTemplates(false);
+    Require(ShaderResources::NeverReusable(stages), "APS5_ADDRESS_TEMPLATES=0 still offers address-based draws the resource cache");
+    {
+        ShaderResources off(importing, stages, ColorTarget{}, 0, 0, 0, {});
+        Require(!off.Reusable() && !off.AddressTemplate(), "APS5_ADDRESS_TEMPLATES=0 still made an address template");
+        off.WriteBack();
+    }
+    ShaderResources::SetAddressTemplates(previous);
+    change(guest, false);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
 void importedHeapMirrorTests(const Context& context, const BdaTestAccess& access) {
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
         std::cout << "guest arena unavailable or not write-watched: heap mirrors of imported ranges not tested\n";
@@ -1843,6 +1902,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     spaceImportRunTests(context);
     spaceWritableWritesTests(context);
     spaceReadListTests(context);
+    addressTemplateTests(context);
     importWindowTests(context);
     importSpanningTests(context);
     spaceReadAcrossImportsTests(context, access);

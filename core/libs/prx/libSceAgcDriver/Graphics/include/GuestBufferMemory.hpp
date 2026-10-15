@@ -276,6 +276,10 @@ public:
     bool PointerWrites() const { return pointerWrites; }
     void PointerRecorded();
     void CompletePointerWrites(std::span<const Coherence::Interval> written) const;
+    bool ReusableAddressSpace() const;
+    bool AddressSpaceCurrent() const;
+    std::uint64_t AddressSpaceSerial() const;
+    void RefreshAddressUse() const;
     struct CpuCopy {
         std::uint64_t begin = 0;
         std::uint64_t end = 0;
@@ -322,6 +326,7 @@ public:
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
+    bool HoldsAddressSpace() const { return space != nullptr; }
     std::size_t CopiedBytes() const {
         std::size_t bytes = 0;
         for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
@@ -419,6 +424,7 @@ private:
     // imports changed under the space (`resolve`: the direct regions are re-resolved by UploadFinish).
     void dissolveSpace(bool resolve);
     void completeSpaceWrites() const;
+    void storePointerHeaps() const;
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address) const;
