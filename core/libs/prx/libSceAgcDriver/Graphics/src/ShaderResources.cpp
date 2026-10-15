@@ -4843,7 +4843,7 @@ namespace {
 bool SnapshotReadRangesOnly() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_SNAPSHOT_READ_RANGES");
-        if (text == nullptr) return false;
+        if (text == nullptr) return true;
         const std::string_view value(text);
         if (value == "0" || value == "off") return false;
         if (value == "1" || value == "on") return true;
@@ -4858,7 +4858,7 @@ bool PartialSnapshotsDisabled() {
 }
 
 std::atomic<bool>& MovedWordRingFlag() {
-    static std::atomic<bool> flag{std::getenv("APS5_MOVED_WORD_RING") != nullptr && std::strcmp(std::getenv("APS5_MOVED_WORD_RING"), "0") != 0};
+    static std::atomic<bool> flag{std::getenv("APS5_MOVED_WORD_RING") == nullptr || std::strcmp(std::getenv("APS5_MOVED_WORD_RING"), "0") != 0};
     return flag;
 }
 

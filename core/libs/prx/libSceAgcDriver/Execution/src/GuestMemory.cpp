@@ -133,7 +133,7 @@ DirtySetCounters& dirtySetCounters() {
 }
 
 std::atomic<bool>& epochDirtySetFlag() {
-    static std::atomic<bool> flag{std::getenv("APS5_EPOCH_DIRTY_SET") != nullptr && std::strcmp(std::getenv("APS5_EPOCH_DIRTY_SET"), "0") != 0};
+    static std::atomic<bool> flag{std::getenv("APS5_EPOCH_DIRTY_SET") == nullptr || std::strcmp(std::getenv("APS5_EPOCH_DIRTY_SET"), "0") != 0};
     return flag;
 }
 
@@ -1309,7 +1309,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 }
 
 bool collectCoverageEnabled() {
-    static const bool enabled = std::getenv("APS5_COLLECT_COVERAGE") != nullptr;
+    static const bool enabled = std::getenv("APS5_COLLECT_COVERAGE") == nullptr || std::strcmp(std::getenv("APS5_COLLECT_COVERAGE"), "0") != 0;
     return enabled;
 }
 

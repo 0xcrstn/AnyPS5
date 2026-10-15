@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DefaultSwitch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareWorkers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -23,6 +24,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <cstring>
+#include <thread>
 #include <string_view>
 #include <tuple>
 #include <vector>
@@ -193,7 +196,7 @@ Driver::DrawRecordState& Driver::drawRecordState() {
 
 bool Driver::recordThread() {
     static const bool enabled = [] {
-        if (std::getenv("APS5_RECORD_THREAD") == nullptr) return false;
+        if (!DefaultOnSwitch("APS5_RECORD_THREAD")) return false;
         if (std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr) {
             std::fprintf(stderr, "[record-thread] off: APS5_LOCKED_DRAW_PREPARE prepares draws under the GPU mutex\n");
             return false;
@@ -228,12 +231,15 @@ bool Driver::deferDrawRecords(std::uint32_t queue) const {
 std::uint32_t Driver::prepareAhead() {
     static const std::uint32_t depth = [] {
         const char* text = std::getenv("APS5_PREPARE_AHEAD");
-        if (text == nullptr) return std::uint32_t{0};
-        char* end = nullptr;
-        const auto value = std::strtoul(text, &end, 10);
-        if (end == text || *end != '\0' || value < 1 || value > 64) throw std::runtime_error(std::string("APS5_PREPARE_AHEAD=") + text + ": expected a record depth from 1 to 64");
+        unsigned long value = 4;
+        if (text != nullptr) {
+            if (std::strcmp(text, "0") == 0) return std::uint32_t{0};
+            char* end = nullptr;
+            value = std::strtoul(text, &end, 10);
+            if (end == text || *end != '\0' || value < 1 || value > 64) throw std::runtime_error(std::string("APS5_PREPARE_AHEAD=") + text + ": expected 0 (off) or a record depth from 1 to 64");
+        }
         if (!recordThread()) {
-            std::fprintf(stderr, "[record-thread] APS5_PREPARE_AHEAD ignored: it needs APS5_RECORD_THREAD\n");
+            if (text != nullptr) std::fprintf(stderr, "[record-thread] APS5_PREPARE_AHEAD ignored: it needs APS5_RECORD_THREAD\n");
             return std::uint32_t{0};
         }
         if (value == 1) return std::uint32_t{0};
@@ -248,16 +254,19 @@ std::uint32_t Driver::prepareAhead() {
 std::uint32_t Driver::prepareWorkers() {
     static const std::uint32_t workers = [] {
         const char* text = std::getenv("APS5_PREPARE_WORKERS");
-        if (text == nullptr) return std::uint32_t{0};
-        char* end = nullptr;
-        const auto value = std::strtoul(text, &end, 10);
-        if (end == text || *end != '\0' || value < 1 || value > 16) throw std::runtime_error(std::string("APS5_PREPARE_WORKERS=") + text + ": expected a preparation worker count from 1 to 16");
+        unsigned long value = std::clamp<unsigned long>(std::thread::hardware_concurrency() / 8u, 1ul, 8ul);
+        if (text != nullptr) {
+            if (std::strcmp(text, "0") == 0) return std::uint32_t{0};
+            char* end = nullptr;
+            value = std::strtoul(text, &end, 10);
+            if (end == text || *end != '\0' || value < 1 || value > 16) throw std::runtime_error(std::string("APS5_PREPARE_WORKERS=") + text + ": expected 0 (off) or a preparation worker count from 1 to 16");
+        }
         if (!recordThread()) {
-            std::fprintf(stderr, "[record-thread] APS5_PREPARE_WORKERS ignored: it needs APS5_RECORD_THREAD\n");
+            if (text != nullptr) std::fprintf(stderr, "[record-thread] APS5_PREPARE_WORKERS ignored: it needs APS5_RECORD_THREAD\n");
             return std::uint32_t{0};
         }
-        if (std::getenv("APS5_PREPARE_AHEAD") == nullptr) {
-            std::fprintf(stderr, "[record-thread] APS5_PREPARE_WORKERS ignored: it needs APS5_PREPARE_AHEAD\n");
+        if (prepareAhead() == 0) {
+            if (text != nullptr) std::fprintf(stderr, "[record-thread] APS5_PREPARE_WORKERS ignored: it needs APS5_PREPARE_AHEAD\n");
             return std::uint32_t{0};
         }
         const auto depth = std::max<std::uint32_t>(prepareAhead(), 1u);
@@ -271,7 +280,7 @@ std::uint32_t Driver::prepareWorkers() {
 
 bool Driver::prepareDispatches() {
     static const bool enabled = [] {
-        if (std::getenv("APS5_PREPARE_DISPATCHES") == nullptr) return false;
+        if (!DefaultOnSwitch("APS5_PREPARE_DISPATCHES")) return false;
         if (prepareWorkers() == 0) {
             std::fprintf(stderr, "[record-thread] APS5_PREPARE_DISPATCHES ignored: it needs APS5_PREPARE_WORKERS\n");
             return false;
@@ -590,7 +599,7 @@ void Driver::mergeFrozenRecords() {
 }
 
 bool Driver::recordDispatches() {
-    static const bool enabled = recordThread() && std::getenv("APS5_RECORD_THREAD_DISPATCH") != nullptr;
+    static const bool enabled = recordThread() && DefaultOnSwitch("APS5_RECORD_THREAD_DISPATCH");
     return enabled;
 }
 

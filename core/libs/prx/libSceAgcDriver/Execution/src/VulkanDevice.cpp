@@ -4042,7 +4042,7 @@ bool TemplateDataRefresh() {
 bool MovedTemplatesSwitch() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_DISPATCH_MOVED_TEMPLATES");
-        return text != nullptr && std::strcmp(text, "0") != 0 && TemplateDataRefresh();
+        return (text == nullptr || std::strcmp(text, "0") != 0) && TemplateDataRefresh();
     }();
     return enabled;
 }

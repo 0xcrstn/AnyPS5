@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DefaultSwitch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSnapshotArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/IndexBounds.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
@@ -535,7 +536,7 @@ struct DrawProfile {
 constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown"};
 
 bool DirtyRecord() {
-    static const bool enabled = std::getenv("APS5_DIRTY_RECORD") != nullptr;
+    static const bool enabled = DefaultOnSwitch("APS5_DIRTY_RECORD");
     return enabled;
 }
 
@@ -2569,9 +2570,9 @@ const char* ResolveRedoName(ResolveRedo redo) {
 bool ParallelTargetsRequested() {
     static const bool requested = [] {
         const char* text = std::getenv("APS5_PARALLEL_TARGETS");
-        if (text == nullptr || std::strcmp(text, "0") == 0) return false;
+        if (text != nullptr && std::strcmp(text, "0") == 0) return false;
         if (ParallelResolveRequested()) return true;
-        std::fprintf(stderr, "[record-thread] APS5_PARALLEL_TARGETS ignored: it needs APS5_PARALLEL_RESOLVE\n");
+        if (text != nullptr) std::fprintf(stderr, "[record-thread] APS5_PARALLEL_TARGETS ignored: it needs APS5_PARALLEL_RESOLVE\n");
         return false;
     }();
     return requested;
@@ -2609,7 +2610,7 @@ ResolveStamp ResolveStamp::Now() {
 bool ParallelResolveRequested() {
     static const bool requested = [] {
         const char* text = std::getenv("APS5_PARALLEL_RESOLVE");
-        return text != nullptr && std::strcmp(text, "0") != 0;
+        return text == nullptr || std::strcmp(text, "0") != 0;
     }();
     return requested;
 }
@@ -2625,9 +2626,9 @@ bool VerifyParallelResolve() {
 bool ParallelRevalidateRequested() {
     static const bool requested = [] {
         const char* text = std::getenv("APS5_PARALLEL_REVALIDATE");
-        if (text == nullptr || std::strcmp(text, "0") == 0) return false;
+        if (text != nullptr && std::strcmp(text, "0") == 0) return false;
         if (ParallelResolveRequested()) return true;
-        std::fprintf(stderr, "[record-thread] APS5_PARALLEL_REVALIDATE ignored: it needs APS5_PARALLEL_RESOLVE\n");
+        if (text != nullptr) std::fprintf(stderr, "[record-thread] APS5_PARALLEL_REVALIDATE ignored: it needs APS5_PARALLEL_RESOLVE\n");
         return false;
     }();
     return requested;
@@ -3679,7 +3680,7 @@ namespace {
 
 bool PrecollectOnWorkers() {
     static const bool enabled = [] {
-        if (std::getenv("APS5_PRECOLLECT_ON_WORKERS") == nullptr) return false;
+        if (!DefaultOnSwitch("APS5_PRECOLLECT_ON_WORKERS")) return false;
         if (!GuestMemory::CollectCoverageEnabled()) {
             std::fprintf(stderr, "[parallel-resolve] APS5_PRECOLLECT_ON_WORKERS ignored: it needs APS5_COLLECT_COVERAGE\n");
             return false;

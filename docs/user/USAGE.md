@@ -241,6 +241,23 @@ In runs with `APS5_PROFILE_DRAW` (as `run.ps1 -Perf` and `-Debug` set it), `APS5
 
 `APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. `0` (the default) turns it off. The `[labels]` line counts these submits.
 
+### Draw and dispatch recording
+
+Queue 0's draws and dispatches are prepared on worker threads and recorded on a record thread by default. Each switch below is on unless it is set to `0`; switches that depend on another one are off when that one is off. The `APS5_VERIFY_*` switches stay off unless set, and stop the title on the first difference they find.
+
+- `APS5_RECORD_THREAD`: a record thread records queue 0's draws while queue 0 decodes the next packets. `APS5_RECORD_THREAD_DISPATCH` records queue 0's dispatches there too.
+- `APS5_PREPARE_AHEAD=<1-64>`: how many records queue 0 may post ahead of the record thread (4 by default).
+- `APS5_PREPARE_WORKERS=<1-16>`: threads that prepare frozen draws (one per 8 logical processors, 1 to 8, by default). `APS5_PREPARE_DISPATCHES` prepares queue 0's dispatches on them too.
+- `APS5_PARALLEL_RESOLVE`, `APS5_PARALLEL_REVALIDATE`, `APS5_PARALLEL_TARGETS`: the preparation workers also resolve a draw's inputs, template, pipeline, template proof and render targets; the record thread re-checks them. Verify: `APS5_VERIFY_PARALLEL_RESOLVE`, `APS5_VERIFY_PARALLEL_REVALIDATE`, `APS5_VERIFY_PARALLEL_TARGETS`.
+- `APS5_WORKER_SNAPSHOT_COPIES`: the preparation workers copy a draw's input snapshots; the record thread adopts a copy when its memory is unchanged. Verify: `APS5_VERIFY_WORKER_SNAPSHOT_COPIES`.
+- `APS5_BINDING_PLAN`, `APS5_INCREMENTAL_BINDINGS`, `APS5_INCREMENTAL_PLANS`: draws read their resource descriptors through a planned walk, and reuse the parts of it whose inputs did not change.
+- `APS5_DISPATCH_MOVED_TEMPLATES`: a dispatch whose read-only buffers moved reuses its resource template.
+- `APS5_DRAW_SNAPSHOT_ARENA` (with `APS5_DRAW_SNAPSHOT_ARENA_EXTEND_KIB`, 1024), `APS5_SNAPSHOT_READ_RANGES`, `APS5_MOVED_WORD_RING`: draw input snapshots are shared between draws, and only the ranges a shader reads are copied.
+- `APS5_EPOCH_DIRTY_SET` (with `APS5_EPOCH_DIRTY_SET_WIDEN_KIB`, 256), `APS5_COLLECT_COVERAGE`, `APS5_PRECOLLECT_ON_WORKERS`: write-tracking collects are widened, shared between the threads of a collect epoch and made early on the preparation workers.
+- `APS5_DIRTY_RECORD`: a draw that continues a render pass skips the binds that did not change.
+
+Off by default: `APS5_CHUNKED_RECORDING=1` records a render pass's draws into secondary command buffers on a recording thread (it costs more than it saves at a few draws per pass), and `APS5_IN_PLACE_DRAW_INPUTS=1` binds read-only draw inputs in place instead of snapshotting them (a title's CPU store before the GPU reads them is seen by the draw).
+
 ### Address-based shader experiments
 
 These switches change how recompiled shaders reach guest memory through addresses. Each accepts the values shown; any other value stops the title at start. `verify` runs the old and the new form side by side and stops the title with a description of the first difference.

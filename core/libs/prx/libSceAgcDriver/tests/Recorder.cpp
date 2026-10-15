@@ -10748,7 +10748,7 @@ struct ResolveScene {
 };
 
 bool withResolveScene(const Device& device, Recorder& recorder, const std::function<bool(ResolveScene&)>& body) {
-    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0 || device.GetContext().descriptorCache == nullptr) return false;
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return false;
     constexpr std::size_t unit = 65536;
     constexpr std::size_t bytes = unit * 3;
     void* watched = AllocateWatched(bytes, unit);
@@ -10762,6 +10762,11 @@ bool withResolveScene(const Device& device, Recorder& recorder, const std::funct
     const auto address = reinterpret_cast<std::uint64_t>(block);
     auto context = device.GetContext();
     context.recorder = &recorder;
+    std::optional<DescriptorCache> descriptors;
+    if (context.descriptorCache == nullptr) {
+        descriptors.emplace(context);
+        context.descriptorCache = &*descriptors;
+    }
     TextureDetiler detiler(context);
     context.detiler = &detiler;
     {
@@ -10906,7 +10911,7 @@ bool parallelRevalidateTests(const Device& device, Recorder& recorder) {
 }
 
 bool parallelResolveTests(const Device& device, Recorder& recorder) {
-    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0 || device.GetContext().descriptorCache == nullptr) return false;
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return false;
     constexpr std::size_t unit = 65536;
     constexpr std::size_t bytes = unit * 3;
     void* watched = AllocateWatched(bytes, unit);
@@ -10920,6 +10925,11 @@ bool parallelResolveTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     auto context = device.GetContext();
     context.recorder = &recorder;
+    std::optional<DescriptorCache> descriptors;
+    if (context.descriptorCache == nullptr) {
+        descriptors.emplace(context);
+        context.descriptorCache = &*descriptors;
+    }
     TextureDetiler detiler(context);
     context.detiler = &detiler;
     {
