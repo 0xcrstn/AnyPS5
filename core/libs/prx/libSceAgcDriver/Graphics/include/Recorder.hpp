@@ -81,7 +81,21 @@ public:
     }
     std::uint32_t PhysicalQueue() const { return physicalQueue; }
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
-    explicit Recorder(const Context& context, bool timelineSemaphores = false);
+    explicit Recorder(const Context& context, bool timelineSemaphores = false, std::uint32_t physicalQueue = 0);
+    VkSemaphore Timeline() const { return timeline; }
+    void SetPeer(Recorder* peer) { this->peer = peer; }
+    void RequireOrderAfter(const Recorder& producer, std::uint64_t serial);
+    void DropOrderWaitsForTest() {
+        orderWaits.clear();
+        skipPeerOnce = true;
+    }
+    static bool QueueOrderVerify();
+    struct QueueOrderStatistics {
+        std::uint64_t requiredWaits = 0;
+        std::uint64_t peerWaits = 0;
+        std::uint64_t waitedSubmits = 0;
+    };
+    QueueOrderStatistics QueueOrderCounts() const { return queueOrder; }
     ~Recorder();
     Recorder(const Recorder&) = delete;
     Recorder& operator=(const Recorder&) = delete;
@@ -906,6 +920,11 @@ private:
     std::uint64_t id = 0;
     std::uint32_t physicalQueue = 0;
     RecorderDomain& domain;
+    Recorder* peer = nullptr;
+    bool skipPeerOnce = false;
+    std::map<VkSemaphore, std::uint64_t> orderWaits;
+    std::map<VkSemaphore, std::uint64_t> requiredOrder;
+    QueueOrderStatistics queueOrder;
     // Every access holds the table mutex (Recorder.cpp): the recorded entries are mutated under
     // GuestMemory::GpuMutex as well, the queued ones (NoteQueuedLabel) under the table mutex alone.
     // Ordered, so a range (a noted write, PendingLabelIn) finds its dwords by lower_bound.

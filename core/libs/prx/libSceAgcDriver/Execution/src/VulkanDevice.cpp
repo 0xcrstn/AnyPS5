@@ -459,6 +459,11 @@ struct VulkanDevice::State {
     bool contextReady = false;
     std::unique_ptr<Graphics::TextureDetiler> detiler;
     std::unique_ptr<Graphics::Recorder> recorder;
+    QueueTopology topology = QueueTopology::Serial;
+    VkQueue computeQueue = VK_NULL_HANDLE;
+    VkCommandPool computePool = VK_NULL_HANDLE;
+    std::unique_ptr<Graphics::Recorder> computeRecorder;
+    Graphics::Context computeContext{};
     // Device-local buffers of a repeated 16-byte fill pattern (FillBuffer), most recently used
     // last; each is filled once by a doubling chain in device memory.
     std::vector<std::pair<std::array<std::uint32_t, 4>, std::shared_ptr<Graphics::DeviceBuffer>>> patternBuffers;
@@ -884,6 +889,16 @@ struct VulkanDevice::State {
                 }
             }
             Graphics::DestroyShadows(device);
+            if (computeRecorder) {
+                try {
+                    computeRecorder->Sync();
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "[gpu] compute recorder teardown: %s\n", error.what());
+                }
+                if (recorder) recorder->SetPeer(nullptr);
+                computeRecorder.reset();
+            }
+            computeContext = Graphics::Context{};
             recorder.reset();
             // Cached graphics pipelines (with their framebuffers, modules, render passes and layouts)
             // belong to this device and must be destroyed while it lives.
@@ -937,6 +952,7 @@ struct VulkanDevice::State {
             if (pool != VK_NULL_HANDLE) {
                 destroyPool(device, pool, nullptr);
             }
+            if (computePool != VK_NULL_HANDLE) destroyPool(device, computePool, nullptr);
             destroyDevice(device, nullptr);
         }
         if (instance != VK_NULL_HANDLE) {
@@ -1714,8 +1730,14 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         const auto topology = ParseQueueTopology(std::getenv("APS5_QUEUE_TOPOLOGY"));
         const auto plan = PlanQueueTopology(topology, topologyFamilies, family, state->sparseFamily);
         for (std::uint32_t guest = 0; guest < Graphics::Recorder::GuestQueues; ++guest) Graphics::Recorder::MapGuestQueue(guest, 0);
-        if (plan.topology != QueueTopology::Serial) {
-            throw std::runtime_error(std::string("APS5_QUEUE_TOPOLOGY=") + QueueTopologyName(plan.topology) + ": compute queue family " + std::to_string(plan.computeFamily) + " index " + std::to_string(plan.computeIndex) + " is available, but running guest compute queues on it needs a recorder per physical queue, which is not implemented");
+        if (plan.topology == QueueTopology::Dedicated) {
+            throw std::runtime_error(std::string("APS5_QUEUE_TOPOLOGY=dedicated: compute queue family ") + std::to_string(plan.computeFamily) + " is available, but queue family ownership transfers for a dedicated compute family are not implemented");
+        }
+        state->topology = plan.topology;
+        if (plan.topology == QueueTopology::SameFamily) {
+            static const float priorities[2] = {1.0f, 1.0f};
+            queueInfos[0].queueCount = plan.queuesFromGraphicsFamily;
+            queueInfos[0].pQueuePriorities = priorities;
         }
     }
     deviceInfo.pQueueCreateInfos = queueInfos;
@@ -2008,6 +2030,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
+    if (state->topology == QueueTopology::SameFamily) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 1, &state->computeQueue);
     state->queueFamily = family;
     if (state->sparseFamily != VK_QUEUE_FAMILY_IGNORED) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->sparseFamily, 0, &state->sparseQueue);
     if (checkpoints) state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
@@ -2026,6 +2049,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = family;
     check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &poolInfo, nullptr, &state->pool), "vkCreateCommandPool");
+    if (state->topology == QueueTopology::SameFamily) check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &poolInfo, nullptr, &state->computePool), "vkCreateCommandPool compute");
     static const bool procTable = std::getenv("APS5_NO_PROC_TABLE") == nullptr;
     if (procTable) {
         Graphics::FillDeviceFunctions(graphicsContext(), state->deviceFunctions);
@@ -2051,6 +2075,21 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->recorder->Activate();
     state->context = buildContext();
     state->contextReady = true;
+    if (state->topology == QueueTopology::SameFamily) {
+        require(state->timelineSemaphores && state->recorder->HasTimeline(), "APS5_QUEUE_TOPOLOGY=same-family needs timeline semaphores to order the two queues");
+        auto compute = state->context;
+        compute.queue = state->computeQueue;
+        compute.pool = state->computePool;
+        state->computeRecorder = std::make_unique<Graphics::Recorder>(compute, state->timelineSemaphores, 1);
+        require(state->computeRecorder->HasTimeline(), "the compute recorder has no timeline semaphore");
+        state->computeRecorder->Activate();
+        compute.recorder = state->computeRecorder.get();
+        state->computeContext = compute;
+        state->recorder->SetPeer(state->computeRecorder.get());
+        state->computeRecorder->SetPeer(state->recorder.get());
+        for (std::uint32_t guest = 1; guest < Graphics::Recorder::GuestQueues; ++guest) Graphics::Recorder::MapGuestQueue(guest, 1);
+        APS5_LOG_OUT("Vulkan queue topology same-family: guest queue 0 on queue %p, the other guest queues on queue %p", reinterpret_cast<void*>(state->queue), reinterpret_cast<void*>(state->computeQueue));
+    }
     if (window != nullptr) {
         require(window->getDrawableSize != nullptr, "missing window drawable size query");
         std::uint32_t drawableWidth = 0;
@@ -2148,6 +2187,7 @@ void VulkanDevice::WaitIdle() {
         if (!state->recorder->Idle()) Graphics::Recorder::CountSync(0, __builtin_return_address(0));
         state->recorder->Sync();
     }
+    if (state->computeRecorder) state->computeRecorder->Sync();
     check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
 }
@@ -2178,10 +2218,14 @@ void VulkanDevice::SubmitRecorded(bool reapFirst) {
     // mutex (see the header), which a poller or compute worker must never do for queue 0.
     if (reapFirst && OpportunisticReap()) state->recorder->Reap();
     state->recorder->Submit();
+    if (state->computeRecorder) {
+        if (reapFirst && OpportunisticReap()) state->computeRecorder->Reap();
+        state->computeRecorder->Submit();
+    }
 }
 
 bool VulkanDevice::CanWaitUnlocked() const {
-    return state->recorder && state->recorder->HasTimeline();
+    return state->recorder && state->recorder->HasTimeline() && !state->computeRecorder;
 }
 
 std::uint64_t VulkanDevice::SubmitAndEpoch() {
@@ -2204,31 +2248,39 @@ void VulkanDevice::ReapRecorded(std::uint64_t serial) {
 
 void VulkanDevice::ReapRecorded() {
     if (state->recorder) state->recorder->Reap();
+    if (state->computeRecorder) state->computeRecorder->Reap();
 }
 
 bool VulkanDevice::ReapMayRetire() const {
+    if (state->computeRecorder && state->computeRecorder->ReapMayRetire()) return true;
     return state->recorder == nullptr || state->recorder->ReapMayRetire();
 }
 
 std::optional<Graphics::Recorder::LabelHit> VulkanDevice::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, Graphics::Recorder::LabelRefusal* refusal) const {
     if (!state->recorder) return std::nullopt;
+    if (state->computeRecorder) return Graphics::Recorder::LookupLabel(address, bytes, afterStamp, refusal);
     return state->recorder->PendingLabel(address, bytes, afterStamp, refusal);
 }
 
 bool VulkanDevice::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
+    if (state->computeRecorder && state->computeRecorder->OpenWriteOverlaps(address, bytes)) return true;
     return state->recorder && state->recorder->OpenWriteOverlaps(address, bytes);
 }
 
 bool VulkanDevice::RecordedWritesSettled(std::uint64_t address, std::size_t bytes) const {
     if (!state->recorder) return true;
-    const auto& recorder = *state->recorder;
-    if (!recorder.PendingWriteSettled(address, bytes)) return false;
-    return Graphics::Recorder::PendingCompletionLabels() == 0 || !recorder.CompletionLabelIn(address, bytes);
+    const auto settled = [&](const Graphics::Recorder& recorder) {
+        if (!recorder.PendingWriteSettled(address, bytes)) return false;
+        return Graphics::Recorder::PendingCompletionLabels() == 0 || !recorder.CompletionLabelIn(address, bytes);
+    };
+    if (state->computeRecorder && !settled(*state->computeRecorder)) return false;
+    return settled(*state->recorder);
 }
 
 bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) const {
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
     if (Graphics::StorageTexture::AnyPendingOverlaps(range) || Graphics::AnyShadowedOverlaps(range) || state->CopiedWriterOverlaps(address, bytes)) return true;
+    if (state->computeRecorder && (state->computeRecorder->PendingWriteOverlaps(address, bytes) || state->computeRecorder->PendingLabelIn(address, bytes))) return true;
     return state->recorder && (state->recorder->PendingWriteOverlaps(address, bytes) || state->recorder->PendingLabelIn(address, bytes));
 }
 
@@ -2338,8 +2390,23 @@ bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirs
 Graphics::Recorder& VulkanDevice::RecorderFor(std::uint32_t guestQueue) const {
     require(state->recorder != nullptr, "no command recorder exists");
     const auto physical = Graphics::Recorder::PhysicalQueueOf(guestQueue);
-    if (physical != 0) throw std::runtime_error("guest queue " + std::to_string(guestQueue) + " maps to physical queue " + std::to_string(physical) + ", which has no recorder: recorders per physical queue are not implemented");
-    return *state->recorder;
+    if (physical == 0) return *state->recorder;
+    if (physical == 1 && state->computeRecorder) return *state->computeRecorder;
+    throw std::runtime_error("guest queue " + std::to_string(guestQueue) + " maps to physical queue " + std::to_string(physical) + ", which has no recorder");
+}
+
+Graphics::Context VulkanDevice::contextFor(std::uint32_t guestQueue) const {
+    if (Graphics::Recorder::PhysicalQueueOf(guestQueue) == 1 && state->computeRecorder) return state->computeContext;
+    return graphicsContext();
+}
+
+void VulkanDevice::OrderAfter(std::uint32_t consumerQueue, std::uint32_t producerQueue) {
+    auto& consumer = RecorderFor(consumerQueue);
+    auto& producer = RecorderFor(producerQueue);
+    if (&consumer == &producer) return;
+    GuestMemory::AssertGpuLockHeld("VulkanDevice::OrderAfter");
+    producer.Submit();
+    consumer.RequireOrderAfter(producer, producer.Submissions());
 }
 
 bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
@@ -4492,6 +4559,10 @@ std::uint64_t VulkanDevice::presync(std::span<const std::pair<std::uint64_t, std
             }
             if (open) serial = state->recorder->SubmitAndEpoch();
         }
+        if (state->computeRecorder) {
+            const bool pending = std::any_of(surfaces.begin(), surfaces.end(), [&](const auto& surface) { return state->computeRecorder->DescribePendingWrite(surface.first, static_cast<std::size_t>(surface.second)).has_value(); });
+            if (pending) state->computeRecorder->Sync();
+        }
     }
     if (serial != 0) {
         const auto waitStart = std::chrono::steady_clock::now();
@@ -5133,7 +5204,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         throw std::runtime_error("Vulkan dispatch: compute push constant range exceeds device limit");
     }
     auto pushBytes = Graphics::AssemblePushConstants(shaders);
-    const auto context = graphicsContext();
+    const auto context = contextFor(GuestMemory::GpuLockThreadTag());
     // Pipelines are shared by dispatches of one compiled variant; descriptor set layouts built from the
     // same bindings are compatible, so the pipeline layout of the first dispatch serves them all.
     const auto pipelineKey = ComputePipelineKey(shader, pushStages);
@@ -5412,7 +5483,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     auto& counters = Recipes().kinds[hit->indirect ? 1 : 0];
     auto& d = Dispatches();
     const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
-    const auto context = graphicsContext();
+    const auto context = contextFor(GuestMemory::GpuLockThreadTag());
     if (recipe.needsCompletion || recipe.holdsLease || !hit->resources->Reusable()) throw std::runtime_error("Vulkan dispatch: recipe over a non-reusable template");
     // Without the refresh the template holds the words it was keyed with: a data-only hit takes
     // the ordinary path, whose word-keyed lookup serves or builds the object for the live words.

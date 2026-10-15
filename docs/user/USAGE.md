@@ -235,7 +235,9 @@ In runs with `APS5_PROFILE_DRAW` (as `run.ps1 -Perf` and `-Debug` set it), `APS5
 
 `APS5_QUEUE_TOPOLOGY` chooses the Vulkan queues the driver runs on. The log lists every queue family when the device is created.
 - `serial` (the default) runs everything on one queue.
-- `same-family` and `dedicated` check that a second queue is available, in the graphics family or in a compute-only family respectively. They then stop the title, since running the compute queues on a second queue is not implemented yet. An unavailable topology also stops the title, naming the families that exist.
+- `same-family` takes a second queue from the graphics family and records every guest queue other than 0 on it, with its own command recorder. A wait on a label the other queue recorded submits the producer first and makes the waiting queue's next batch wait for it on the GPU. Every batch also waits for the batches the other queue had already submitted. Experimental. `APS5_QUEUE_TOPOLOGY_VERIFY=1` stops the title when a batch is submitted without waiting for a producer it depends on.
+- `dedicated` checks that a compute-only family has a free queue, then stops the title: ownership transfers between queue families are not implemented.
+- An unavailable topology stops the title, naming the families that exist.
 
 `APS5_BATCH_AGE_US=<microseconds>` submits a recorded batch that holds a label once the label is that old, even if no queue packet or wait asks for it. This keeps a label that only the title's CPU code waits for from staying unsubmitted. `0` (the default) turns it off. The `[labels]` line counts these submits.
 

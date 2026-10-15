@@ -639,7 +639,7 @@ using WriteRanges = Recorder::WriteRanges;
 // work. A range leaves the snapshot only after its batch's completions (CPU write-backs) ran, so a
 // reader that sees no overlap either precedes the note (the queues are unordered then, as on the
 // GPU) or follows the write-back.
-AtomicSharedPtr<const WriteRanges> pendingWrites;
+AtomicSharedPtr<const WriteRanges> pendingWritesByQueue[Recorder::PhysicalQueues];
 
 bool HookSnapshotEnabled() {
     // Debug aid: APS5_NO_HOOK_SNAPSHOT=1 takes the GpuMutex on every access as before.
@@ -656,13 +656,16 @@ bool SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::s
 
 bool SnapshotOverlaps(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0) return false;
-    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
-    return SnapshotOverlaps(snapshot.get(), address, bytes);
+    for (auto& published : pendingWritesByQueue) {
+        const auto snapshot = published.load(std::memory_order_acquire);
+        if (SnapshotOverlaps(snapshot.get(), address, bytes)) return true;
+    }
+    return false;
 }
 
 // Whether one merged range of the snapshot contains [address, end) entirely.
-bool SnapshotCovers(std::uint64_t address, std::uint64_t end) {
-    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
+bool SnapshotCovers(std::uint32_t physicalQueue, std::uint64_t address, std::uint64_t end) {
+    const auto snapshot = pendingWritesByQueue[physicalQueue].load(std::memory_order_acquire);
     if (snapshot == nullptr || snapshot->empty()) return false;
     const auto it = std::partition_point(snapshot->begin(), snapshot->end(), [&](const auto& range) { return range.second <= address; });
     return it != snapshot->end() && it->first <= address && end <= it->second;
@@ -1134,7 +1137,26 @@ Recorder* Recorder::ForPhysicalQueue(std::uint32_t physicalQueue) {
     return Domain(physicalQueue).active;
 }
 
-Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)), domain(Domain(0)) {
+bool Recorder::QueueOrderVerify() {
+    static const bool verify = [] {
+        const char* value = std::getenv("APS5_QUEUE_TOPOLOGY_VERIFY");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return verify;
+}
+
+void Recorder::RequireOrderAfter(const Recorder& producer, std::uint64_t serial) {
+    Require(&producer != this, "a recorder cannot be ordered after itself");
+    Require(producer.timeline != VK_NULL_HANDLE, "ordering after another physical queue needs its timeline semaphore");
+    if (serial == 0) return;
+    auto& wait = orderWaits[producer.timeline];
+    wait = std::max(wait, serial);
+    auto& required = requiredOrder[producer.timeline];
+    required = std::max(required, serial);
+    ++queueOrder.requiredWaits;
+}
+
+Recorder::Recorder(const Context& context, bool timelineSemaphores, std::uint32_t physicalQueue) : context(context), id(nextRecorderId.fetch_add(1)), physicalQueue(physicalQueue), domain(Domain(physicalQueue)) {
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -1190,7 +1212,7 @@ Recorder::~Recorder() {
     holdKept.clear();
     if (domain.active == this) {
         domain.active = nullptr;
-        if (physicalQueue == 0) pendingWrites.store(nullptr, std::memory_order_release);
+        pendingWritesByQueue[physicalQueue].store(nullptr, std::memory_order_release);
         domain.publishGeneration.fetch_add(1, std::memory_order_release);
         domain.pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
         domain.completionLabels.store(0, std::memory_order_release);
@@ -1426,7 +1448,23 @@ bool Recorder::SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes) {
 }
 
 std::shared_ptr<const Recorder::WriteRanges> Recorder::PendingWriteSnapshot() {
-    return pendingWrites.load(std::memory_order_acquire);
+    auto first = pendingWritesByQueue[0].load(std::memory_order_acquire);
+    std::vector<std::shared_ptr<const WriteRanges>> others;
+    for (std::uint32_t queue = 1; queue < PhysicalQueues; ++queue) {
+        if (auto snapshot = pendingWritesByQueue[queue].load(std::memory_order_acquire); snapshot != nullptr && !snapshot->empty()) others.push_back(std::move(snapshot));
+    }
+    if (others.empty()) return first;
+    auto merged = std::make_shared<WriteRanges>();
+    if (first != nullptr) merged->insert(merged->end(), first->begin(), first->end());
+    for (const auto& snapshot : others) merged->insert(merged->end(), snapshot->begin(), snapshot->end());
+    std::sort(merged->begin(), merged->end());
+    WriteRanges coalesced;
+    for (const auto& range : *merged) {
+        if (!coalesced.empty() && range.first <= coalesced.back().second) coalesced.back().second = std::max(coalesced.back().second, range.second);
+        else coalesced.push_back(range);
+    }
+    *merged = std::move(coalesced);
+    return merged;
 }
 
 bool Recorder::SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::size_t bytes) {
@@ -3214,7 +3252,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     if (domain.active == this) domain.writeGeneration.fetch_add(1, std::memory_order_release);
     // Consecutive dispatches write the same output buffers: a range the snapshot already contains
     // leaves the published union unchanged, so the O(N log N) rebuild is skipped.
-    if (SnapshotCovers(address, end)) {
+    if (SnapshotCovers(physicalQueue, address, end)) {
         ++snapshotCovered;
         return false;
     }
@@ -3240,7 +3278,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writeValues.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
     if (domain.active == this) domain.writeGeneration.fetch_add(1, std::memory_order_release);
-    if (!SnapshotCovers(address, address + bytes)) {
+    if (!SnapshotCovers(physicalQueue, address, address + bytes)) {
         const std::array ranges{std::pair{address, address + bytes}};
         publishPendingWrites(ranges);
     }
@@ -3281,11 +3319,12 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
 }
 
 void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
-    if (physicalQueue != 0 || domain.active != this) {
+    if (domain.active != this) {
         publishedWriteRangesValid = false;
         return;
     }
     const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto& pendingWrites = pendingWritesByQueue[physicalQueue];
     const auto previous = pendingWrites.load(std::memory_order_acquire);
     const auto owned = publishedWriteRanges.lock();
     const auto resident = DeviceResidentRanges(context.device);
@@ -3923,8 +3962,39 @@ void Recorder::Submit() {
         submission.signalSemaphoreCount = 1;
         submission.pSignalSemaphores = &timeline;
     }
+    if (peer != nullptr && peer->timeline != VK_NULL_HANDLE && peer->submissions != 0 && !skipPeerOnce) {
+        auto& wait = orderWaits[peer->timeline];
+        wait = std::max(wait, peer->submissions);
+        ++queueOrder.peerWaits;
+    }
+    if (QueueOrderVerify()) {
+        for (const auto& [semaphore, value] : requiredOrder) {
+            const auto found = orderWaits.find(semaphore);
+            if (found == orderWaits.end() || found->second < value) throw std::runtime_error("APS5_QUEUE_TOPOLOGY_VERIFY: a batch on physical queue " + std::to_string(physicalQueue) + " is submitted without waiting for producer serial " + std::to_string(value) + " of another physical queue");
+        }
+    }
+    std::vector<VkSemaphore> waitSemaphores;
+    std::vector<std::uint64_t> waitValues;
+    std::vector<VkPipelineStageFlags> waitStages;
+    for (const auto& [semaphore, value] : orderWaits) {
+        waitSemaphores.push_back(semaphore);
+        waitValues.push_back(value);
+        waitStages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    }
+    if (!waitSemaphores.empty()) {
+        Require(timeline != VK_NULL_HANDLE, "a batch that waits for another physical queue needs a timeline semaphore");
+        timelineInfo.waitSemaphoreValueCount = static_cast<std::uint32_t>(waitValues.size());
+        timelineInfo.pWaitSemaphoreValues = waitValues.data();
+        submission.waitSemaphoreCount = static_cast<std::uint32_t>(waitSemaphores.size());
+        submission.pWaitSemaphores = waitSemaphores.data();
+        submission.pWaitDstStageMask = waitStages.data();
+        ++queueOrder.waitedSubmits;
+    }
     const auto submitStart = std::chrono::steady_clock::now();
     Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    orderWaits.clear();
+    requiredOrder.clear();
+    skipPeerOnce = false;
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();

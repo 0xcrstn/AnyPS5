@@ -98,7 +98,16 @@ void Driver::dischargeWait(WaitObservation& observation, std::span<const std::ui
     auto& floor = waitFloor();
     if (verifyWaitObservations() && !ObservationProven(observation, floor)) throw std::runtime_error("APS5_VERIFY_WAIT_OBSERVATIONS: unproven wait observation: " + DescribeObservation(observation) + ", queue floor " + std::to_string(floor));
     floor = std::max(floor, observation.discharged);
-    if (observation.FromRecordedStore() && observation.CrossQueue()) notePendingWait(packet, observation);
+    if (observation.FromRecordedStore() && observation.CrossQueue()) {
+        notePendingWait(packet, observation);
+        if (Graphics::Recorder::PhysicalQueueOf(observation.producerQueue) != Graphics::Recorder::PhysicalQueueOf(observation.queue)) {
+            if (const auto localDevice = device.Load()) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                localDevice->OrderAfter(observation.queue, observation.producerQueue);
+            }
+        }
+    }
     importRelease(observation);
     noteWaitChain(observation, packet);
 }
