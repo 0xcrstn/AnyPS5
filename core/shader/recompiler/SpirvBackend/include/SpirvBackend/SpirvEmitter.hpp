@@ -26,6 +26,7 @@ struct SpirvTargetOptions {
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
     std::optional<bool> sharedFloatFunctions;
+    std::optional<bool> outlineImageModes;
 };
 
 void PrepareRewriteVerification(IrProgram& program);

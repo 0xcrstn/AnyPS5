@@ -19,6 +19,13 @@ namespace ShaderRecompiler {
 
 namespace {
 
+bool OutlineImageModes() {
+    const char* value = std::getenv("APS5_OUTLINE_IMAGE_MODES");
+    if (value == nullptr || *value == '\0' || std::string_view(value) == "0") return false;
+    if (std::string_view(value) == "1") return true;
+    throw std::invalid_argument("APS5_OUTLINE_IMAGE_MODES accepts only 0 or 1");
+}
+
 bool SharedFloatFunctions() {
     const char* value = std::getenv("APS5_NO_SHARED_FLOAT_FUNCTIONS");
     if (value == nullptr || *value == '\0' || std::string_view(value) == "0") return true;
@@ -282,6 +289,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.fragmentDescriptorSet = target.fragmentDescriptorSet;
     state.float16DenormPreserve = target.float16DenormPreserve;
     state.sharedFloatFunctions = target.sharedFloatFunctions.value_or(SharedFloatFunctions());
+    state.outlineImageModes = target.outlineImageModes.value_or(OutlineImageModes());
     state.bdaTranslation = BdaTable::TranslationSetting();
     state.bdaRelative = BdaTable::RelativeSetting();
     state.bdaInlineFastPath = BdaTable::InlineFastPathSetting();

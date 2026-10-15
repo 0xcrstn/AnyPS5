@@ -108,6 +108,13 @@ struct SpirvEmitterState {
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
     bool sharedFloatFunctions = true;
+    bool outlineImageModes = false;
+    struct OutlinedImageModes {
+        MemoryInfo memory;
+        std::vector<std::uint64_t> shape;
+        std::uint32_t function = 0;
+    };
+    std::vector<OutlinedImageModes> outlinedImageModes;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     std::uint32_t spirvVersion = 0x00010300u;

@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1779,6 +1780,120 @@ void EmitImageMode(SpirvValueEmitContext& ctx, const IrValue& inst, const ImageR
     }
 }
 
+namespace {
+
+template<typename TEmitMode>
+void EmitOutlinedImageModes(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& memory, std::span<const ImageResource> modes, TEmitMode&& emitMode) {
+    auto& state = ctx.state;
+    const auto imageInfo = ImageOpcodeInfoOf(inst.Opcode());
+    std::vector<std::uint64_t> shape{static_cast<std::uint64_t>(inst.Opcode()), static_cast<std::uint64_t>(inst.Type()), inst.ArgumentCount()};
+    std::vector<const IrValue*> inputs;
+    std::vector<std::uint32_t> inputTypes;
+    const auto describe = [&](const IrValue* argument) {
+        const IrValue* resolved = argument != nullptr ? argument->Resolve() : nullptr;
+        if (resolved == nullptr) ctx.Fail(inst, "has an image operand that is not a value");
+        if (resolved->HasImmediate()) {
+            shape.insert(shape.end(), {1u, static_cast<std::uint64_t>(resolved->Type()), resolved->ImmediateU64()});
+            return;
+        }
+        const auto opcode = resolved->Opcode();
+        if (opcode == IrOpcode::GetImageResource || opcode == IrOpcode::GetSamplerResource || opcode == IrOpcode::MakeImageAddress) {
+            shape.insert(shape.end(), {2u, static_cast<std::uint64_t>(opcode), resolved->ArgumentCount()});
+            return;
+        }
+        const auto type = TypeId(state, resolved->Type());
+        if (type == 0u) ctx.Fail(inst, "has an image operand without a SPIR-V type");
+        auto position = static_cast<std::size_t>(std::find(inputs.begin(), inputs.end(), resolved) - inputs.begin());
+        if (position == inputs.size()) {
+            inputs.push_back(resolved);
+            inputTypes.push_back(type);
+        }
+        shape.insert(shape.end(), {3u, static_cast<std::uint64_t>(resolved->Type()), position});
+    };
+    for (std::size_t index = 0; index < inst.ArgumentCount(); ++index) describe(inst.Argument(index));
+    const auto* address = ctx.ImageAddress(inst.Argument(imageInfo.needsSampler ? 2 : 1));
+    shape.push_back(address->ArgumentCount());
+    for (std::size_t index = 0; index < address->ArgumentCount(); ++index) describe(address->Argument(index));
+    const bool returnsValue = inst.Opcode() != IrOpcode::ImageWrite;
+    const auto resultType = returnsValue ? TypeId(state, inst.Type()) : state.module.Type(spv::OpTypeVoid);
+    std::uint32_t function = 0u;
+    for (const auto& outlined : state.outlinedImageModes) {
+        if (outlined.memory == memory && outlined.shape == shape) {
+            function = outlined.function;
+            break;
+        }
+    }
+    if (function == 0u) {
+        const auto functionType = state.module.Type(spv::OpTypeFunction, resultType, std::span<const std::uint32_t>(inputTypes));
+        function = state.module.AllocateId();
+        struct Restore {
+            SpirvEmitterState& state;
+            std::uint32_t label;
+            const IrBlock* block;
+            ~Restore() {
+                state.runtimeImage = nullptr;
+                state.module.EndHelperFunction();
+                state.currentLabel = label;
+                state.currentBlock = block;
+            }
+        };
+        state.module.BeginHelperFunction();
+        const Restore restore{state, state.currentLabel, state.currentBlock};
+        state.module.AddName(function, "image_modes_" + std::to_string(memory.resource));
+        state.module.AddFunction(spv::OpFunction, resultType, function, spv::FunctionControlDontInlineMask, functionType);
+        SpirvValueEmitContext helper(state);
+        helper.half = ctx.half;
+        for (std::size_t index = 0; index < inputs.size(); ++index) {
+            const auto parameter = state.module.AllocateId();
+            state.module.AddFunction(spv::OpFunctionParameter, inputTypes[index], parameter);
+            helper.definitions.emplace(inputs[index], parameter);
+        }
+        EmitLabel(state, state.module.AllocateId());
+        const auto selector = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords, 0u);
+        const auto merge = state.module.AllocateId();
+        const auto invalid = state.module.AllocateId();
+        std::vector<std::uint32_t> labels(modes.size());
+        std::vector<std::uint32_t> words{spv::OpSwitch, selector, invalid};
+        for (std::uint32_t index = 0u; index < modes.size(); ++index) {
+            labels[index] = state.module.AllocateId();
+            words.insert(words.end(), {index, labels[index]});
+        }
+        state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+        state.module.AddFunction(words);
+        std::vector<std::uint32_t> incoming;
+        for (std::uint32_t index = 0u; index < modes.size(); ++index) {
+            EmitLabel(state, labels[index]);
+            emitMode(helper, modes[index]);
+            if (returnsValue) incoming.insert(incoming.end(), {helper.Def(&inst), state.currentLabel});
+            helper.definitions.erase(&inst);
+            state.module.AddFunction(spv::OpBranch, merge);
+        }
+        state.runtimeImage = nullptr;
+        EmitLabel(state, invalid);
+        state.module.AddFunction(spv::OpUnreachable);
+        EmitLabel(state, merge);
+        if (returnsValue) {
+            const auto result = state.module.AllocateId();
+            std::vector<std::uint32_t> phi{spv::OpPhi, resultType, result};
+            phi.insert(phi.end(), incoming.begin(), incoming.end());
+            state.module.AddFunction(phi);
+            state.module.AddFunction(spv::OpReturnValue, result);
+        } else {
+            state.module.AddFunction(spv::OpReturn);
+        }
+        state.module.AddFunction(spv::OpFunctionEnd);
+        state.outlinedImageModes.push_back({memory, shape, function});
+    }
+    std::vector<std::uint32_t> arguments;
+    arguments.reserve(inputs.size());
+    for (const auto* input : inputs) arguments.push_back(ctx.Def(input));
+    const auto call = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, resultType, call, function, std::span<const std::uint32_t>(arguments));
+    if (returnsValue) ctx.Define(inst, call);
+}
+
+}
+
 void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const auto& memory = ctx.Memory(inst);
@@ -1804,28 +1919,32 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
             samplerGuard = access.valid;
         }
     }
-    const auto emitMode = [&](const ImageResource& mode) {
+    const auto emitMode = [&](SpirvValueEmitContext& target, const ImageResource& mode) {
         state.runtimeImage = &mode;
         if (mode.packedFormat == IrBufferFormat::Fmask8_S2_F1) {
             if (inst.Opcode() == IrOpcode::ImageRead && memory.dataBits == 32u) {
                 const auto value = state.module.AllocateId();
                 state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), value, ConstantU32(state, 0x76543210u), ConstantU32(state, 0xfedcba98u), ConstantU32(state, 0u), ConstantU32(state, 0u));
-                const auto active = ctx.Arg(inst, 2u);
+                const auto active = target.Arg(inst, 2u);
                 const auto mapped = state.module.AllocateId();
                 state.module.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, 4u), mapped, active, active, active, active);
-                ctx.Define(inst, Select(state, TypeU32Vector(state, 4u), mapped, value, ConstantU32CompositeZero(state, 4u)));
+                target.Define(inst, Select(state, TypeU32Vector(state, 4u), mapped, value, ConstantU32CompositeZero(state, 4u)));
             } else {
-                ctx.Fail(inst, "FMASK requires a 32-bit image read");
+                target.Fail(inst, "FMASK requires a 32-bit image read");
             }
         } else if (mode.depthBits && memory.dataBits == 16u) {
-            ctx.Fail(inst, "depth bits require a 32-bit image result");
+            target.Fail(inst, "depth bits require a 32-bit image result");
         } else {
-            EmitImageMode(ctx, inst, mode);
+            EmitImageMode(target, inst, mode);
         }
     };
     if (modes.size() == 1u && !tables) {
-        emitMode(modes.front());
+        emitMode(ctx, modes.front());
         state.runtimeImage = nullptr;
+        return;
+    }
+    if (!tables && !state.registrationModules && state.outlineImageModes) {
+        EmitOutlinedImageModes(ctx, inst, memory, std::span<const ImageResource>(modes), emitMode);
         return;
     }
     const auto selector = tables ? tableSelector : !state.registrationModules ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords, 0u) : RuntimeImageMode(state, memory.resource);
@@ -1862,7 +1981,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         if (labels[index] == 0u) continue;
         EmitLabel(state, labels[index]);
-        emitMode(modes[index]);
+        emitMode(ctx, modes[index]);
         if (returnsValue) incoming.insert(incoming.end(), {ctx.Def(&inst), state.currentLabel});
         ctx.definitions.erase(&inst);
         state.module.AddFunction(spv::OpBranch, merge);
