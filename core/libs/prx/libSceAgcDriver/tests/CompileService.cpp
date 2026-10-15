@@ -277,6 +277,32 @@ void Parking() {
     holder->Wait();
 }
 
+ShaderRecompiler::RecompileResult Source(std::shared_ptr<std::vector<std::uint32_t>> words);
+
+void ContentIndex() {
+    PipelineContentIndex<int> index;
+    const auto words = std::make_shared<std::vector<std::uint32_t>>(std::initializer_list<std::uint32_t>{0x07230203u, 1, 2, 3, 4});
+    const auto source = Source(words);
+    const std::vector<std::uint32_t> layout{3, 7, 1, 32};
+    const auto key = ComputePipelineContentKey(source, true, layout);
+    auto sameWords = std::make_shared<std::vector<std::uint32_t>>(*words);
+    auto copy = Source(sameWords);
+    copy.variantId = 99;
+    Require(ComputePipelineContentKey(copy, true, layout) == key, "identical content under another variant has another content key");
+    auto changed = std::make_shared<std::vector<std::uint32_t>>(*words);
+    (*changed)[3] = 7;
+    Require(ComputePipelineContentKey(Source(changed), true, layout) != key, "different SPIR-V shares a content key");
+    Require(ComputePipelineContentKey(source, false, layout) != key, "different push-constant use shares a content key");
+    const std::vector<std::uint32_t> otherLayout{3, 7, 1, 33};
+    Require(ComputePipelineContentKey(source, true, otherLayout) != key, "a different layout shares a content key");
+    Require(index.Find(key) == nullptr, "an empty index found an entry");
+    auto value = std::make_shared<int>(5);
+    index.Insert(key, value);
+    Require(index.Find(key) == value && index.Hits() == 1, "an inserted entry was not found");
+    value.reset();
+    Require(index.Find(key) == nullptr && index.Size() == 0, "an expired entry was returned or kept");
+}
+
 std::atomic<bool> guardHeld{false};
 
 void WaitGuard() {
@@ -370,6 +396,7 @@ int main() {
         WaitGuard();
         Parking();
         RecipeVerification();
+        ContentIndex();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "compile service test failed: %s\n", error.what());
         return 1;

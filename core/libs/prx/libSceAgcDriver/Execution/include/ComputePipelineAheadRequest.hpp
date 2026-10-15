@@ -3,6 +3,7 @@
 
 #include "Recompiler.hpp"
 #include "CompileTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PipelineContentIndex.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +16,7 @@
 
 namespace AgcDriver {
 
-inline std::uint64_t ComputePipelineRecipeHash(const ShaderRecompiler::RecompileResult& shader, bool pushes, std::span<const std::uint32_t> layoutKey) {
+inline std::vector<std::uint64_t> ComputePipelineRecipeFields(const ShaderRecompiler::RecompileResult& shader, bool pushes, std::span<const std::uint32_t> layoutKey) {
     std::vector<std::uint64_t> fields;
     const auto words = shader.spirv.Words();
     fields.push_back(words.size());
@@ -36,7 +37,24 @@ inline std::uint64_t ComputePipelineRecipeHash(const ShaderRecompiler::Recompile
     fields.push_back(pushes ? 1u : 0u);
     fields.push_back(layoutKey.size());
     fields.push_back(ShaderCompileTrace::HashOf(layoutKey));
+    std::uint64_t mixed = 0x9e3779b97f4a7c15ull;
+    for (const auto word : words) {
+        mixed = (mixed ^ word) * 0xff51afd7ed558ccdull;
+        mixed ^= mixed >> 29u;
+    }
+    fields.push_back(mixed);
+    for (const auto word : layoutKey) fields.push_back(word);
+    return fields;
+}
+
+inline std::uint64_t ComputePipelineRecipeHash(const ShaderRecompiler::RecompileResult& shader, bool pushes, std::span<const std::uint32_t> layoutKey) {
+    const auto fields = ComputePipelineRecipeFields(shader, pushes, layoutKey);
     return ShaderCompileTrace::HashOf(std::span<const std::uint64_t>(fields));
+}
+
+inline PipelineContentKey ComputePipelineContentKey(const ShaderRecompiler::RecompileResult& shader, bool pushes, std::span<const std::uint32_t> layoutKey) {
+    const auto fields = ComputePipelineRecipeFields(shader, pushes, layoutKey);
+    return HashPipelineContent(fields);
 }
 
 inline void RequireSameComputeRecipe(std::uint64_t built, std::uint64_t demanded, std::uint64_t programAddress) {
