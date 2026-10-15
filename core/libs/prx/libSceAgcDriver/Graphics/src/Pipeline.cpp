@@ -1230,7 +1230,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         return pipeline;
     }
     std::promise<std::shared_ptr<Pipeline>> promise;
-    store.pending.emplace(hash, PipelineStore::Pending{context.device, key, promise.get_future().share()});
+    store.pending.emplace(hash, PipelineStore::Pending{context.device, key, promise.get_future().share(), nullptr});
     lock.unlock();
     std::shared_ptr<Pipeline> pipeline;
     try {
