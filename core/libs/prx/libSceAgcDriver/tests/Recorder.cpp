@@ -9341,6 +9341,7 @@ bool drawInputTwinTests(const Device& device, Recorder& recorder) {
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
             recorder.Sync();
+            recorder.WaitDeferredReleases();
             ClearCachedPipelines(context.device);
             GuestAllocations::Mutation mutation;
             mutation.Remove(block);
@@ -9446,6 +9447,7 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
             recorder.Sync();
+            recorder.WaitDeferredReleases();
             ClearCachedPipelines(context.device);
             {
                 GuestAllocations::Mutation mutation;
@@ -10798,6 +10800,7 @@ bool withResolveScene(const Device& device, Recorder& recorder, const std::funct
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
             recorder.Sync();
+            recorder.WaitDeferredReleases();
             ClearCachedPipelines(context.device);
             {
                 GuestAllocations::Mutation mutation;
@@ -10961,6 +10964,7 @@ bool parallelResolveTests(const Device& device, Recorder& recorder) {
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
             recorder.Sync();
+            recorder.WaitDeferredReleases();
             ClearCachedPipelines(context.device);
             {
                 GuestAllocations::Mutation mutation;
