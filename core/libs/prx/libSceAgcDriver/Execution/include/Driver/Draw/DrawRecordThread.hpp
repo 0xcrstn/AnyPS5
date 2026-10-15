@@ -104,6 +104,8 @@ private:
 
 enum class CommandProcessorReads : std::uint8_t { Drain, Overlap, Verify };
 
+bool ParseMemoryPacketJobs(const char* text);
+bool MemoryPacketJobs();
 bool ParseFrozenIndirectDraws(const char* text);
 bool FrozenIndirectDraws();
 std::uint64_t FrozenIndirectRedos();
@@ -129,6 +131,7 @@ struct LabelRecordJobCounters {
     std::uint64_t jobs = 0;
     std::uint64_t labels = 0;
     std::uint64_t endOfPipe = 0;
+    std::uint64_t memoryPackets = 0;
 };
 
 LabelRecordJobCounters LabelRecordJobTotals();

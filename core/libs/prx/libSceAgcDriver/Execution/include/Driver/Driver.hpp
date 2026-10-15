@@ -439,7 +439,11 @@ private:
     };
     EndOfPipeOutcome recordEndOfPipe(VulkanDevice* localDevice, std::uint32_t queue, std::span<const std::uint32_t> packet);
     bool freezeEndOfPipe(std::uint32_t queue, std::span<const std::uint32_t> packet);
+    bool storeMemoryPacket(std::uint32_t queueId, std::span<const std::uint32_t> packet, const std::function<std::optional<Pm4::StoreWrite>(std::size_t)>& resolveStore, bool& wroteOnGpu, bool& orderedAlready);
+    bool memoryPacketJob(std::uint32_t queue, std::span<const std::uint32_t> packet);
+    bool freezeMemoryPacket(std::uint32_t queue, QueueState& state, std::span<const std::uint32_t> packet);
     void emitFrozenLabels(const std::shared_ptr<FrozenDraw>& frozen);
+    void recordMemoryPacketJob(const FrozenDraw& frozen);
     bool deferredLabelPacket(std::span<const std::uint32_t> packet) const;
     bool recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queue);
     void recordQueuedLabelsBeforeRead(std::uint32_t queue);

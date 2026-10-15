@@ -55,9 +55,10 @@ alignas(16) std::array<std::uint32_t, 4> VertexTable{};
 alignas(16) std::array<std::uint32_t, 4> FullTable{};
 alignas(16) std::array<std::uint32_t, 4> ValueTable{};
 alignas(16) std::array<float, 4> Full{1.0f, 0.0f, 0.0f, 0.0f};
-alignas(16) std::array<float, 4> Values{};
+alignas(16) std::array<float, 12> Values{};
 alignas(16) volatile std::uint32_t Condition = 1;
 bool NopBeforeCondition = false;
+bool WideStore = false;
 alignas(64) volatile std::uint32_t EndOfPipe = 0;
 std::byte* ColorMemory = nullptr;
 
@@ -164,7 +165,13 @@ std::vector<std::uint32_t> Frame(bool writeData) {
     SetRegister(words, SetShReg, 0x08c, static_cast<std::uint32_t>(vertexTable));
     SetRegister(words, SetShReg, 0x08d, static_cast<std::uint32_t>(vertexTable >> 32u));
     words.insert(words.end(), {0xc0012d00u, 3u, 2u});
-    ReleaseMemory(words, Values.data(), std::bit_cast<std::uint32_t>(0.5f), 0u);
+    if (WideStore) {
+        const auto values = reinterpret_cast<std::uintptr_t>(Values.data());
+        words.insert(words.end(), {0xc00b3700u, 0x500u, static_cast<std::uint32_t>(values), static_cast<std::uint32_t>(static_cast<std::uint64_t>(values) >> 32u)});
+        for (std::size_t word = 0; word < 9; ++word) words.push_back(word == 0 ? std::bit_cast<std::uint32_t>(0.5f) : 0u);
+    } else {
+        ReleaseMemory(words, Values.data(), std::bit_cast<std::uint32_t>(0.5f), 0u);
+    }
     if (writeData) {
         const auto condition = reinterpret_cast<std::uintptr_t>(&Condition);
         words.insert(words.end(), {0xc0033700u, 0x500u, static_cast<std::uint32_t>(condition), static_cast<std::uint32_t>(static_cast<std::uint64_t>(condition) >> 32u), 0u});
@@ -180,7 +187,8 @@ std::vector<std::uint32_t> Frame(bool writeData) {
 std::uint32_t CentreRed(const std::string& what, bool writeData = false) {
     std::fill_n(ColorMemory, ColorBytes, std::byte{0});
     EndOfPipe = 0;
-    Values = {1.0f, 0.0f, 0.0f, 0.0f};
+    Values = {};
+    Values[0] = 1.0f;
     Condition = 1;
     auto words = Frame(writeData);
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
@@ -225,6 +233,20 @@ void DrawsSeeEarlierLabels(bool jobs) {
     Require(after.endOfPipe - before.endOfPipe <= Frames, std::to_string(after.endOfPipe - before.endOfPipe) + " end-of-pipe labels were recorded as jobs over " + std::to_string(Frames) + " frames, expected at most one per frame");
 }
 
+void DrawsSeeWideWriteData(bool jobs) {
+    const auto before = AgcDriver::DriverDetail::LabelRecordJobTotals();
+    WideStore = true;
+    for (std::uint64_t frame = 0; frame < 4; ++frame) {
+        const auto name = "a draw after a 36-byte WRITE_DATA of its value, frame " + std::to_string(frame);
+        const auto red = CentreRed(name);
+        Require(red + 1u >= 128u && red <= 129u, name + ": the draw wrote red " + std::to_string(red) + ", expected 128 from the value the WRITE_DATA stored");
+    }
+    WideStore = false;
+    const auto after = AgcDriver::DriverDetail::LabelRecordJobTotals();
+    if (!jobs) Require(after.memoryPackets == before.memoryPackets, "a WRITE_DATA was recorded as a memory job with the jobs off");
+    else Require(after.memoryPackets > before.memoryPackets, "no wide WRITE_DATA was recorded as an ordered memory job while draws were in flight");
+}
+
 void ConditionsSeeWriteData() {
     for (std::uint64_t frame = 0; frame < 4; ++frame) {
         NopBeforeCondition = frame % 2 == 1;
@@ -265,6 +287,7 @@ int main() {
         Register(BufferPixelHeader, BufferPixelCode.data(), sizeof(BufferPixelCode), 1);
         DrawsSeeEarlierLabels(jobs);
         ConditionsSeeWriteData();
+        DrawsSeeWideWriteData(AgcDriver::DriverDetail::ParseMemoryPacketJobs(std::getenv("APS5_MEMORY_PACKET_JOBS")));
         AgcDriverShutdown_nid_postfix();
         std::cout << "Draws on the preparation workers see the values earlier RELEASE_MEM labels stored " << (jobs ? "with labels recorded as ordered jobs" : "with labels recorded by queue 0") << " (" << AgcDriver::DriverDetail::LabelRecordJobTotals().endOfPipe << " end-of-pipe labels recorded as jobs)" << std::endl;
         return 0;
