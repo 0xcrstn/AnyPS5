@@ -181,6 +181,17 @@ bool PipelineContentDedup() {
     return dedup;
 }
 
+bool CompileParking() {
+    static const bool parking = [] {
+        const char* text = std::getenv("APS5_COMPILE_PARK");
+        if (text == nullptr || *text == '\0' || std::string_view(text) == "0") return false;
+        require(std::string_view(text) == "1", "APS5_COMPILE_PARK accepts only 0 or 1");
+        require(PriorityCompileScheduler(), "APS5_COMPILE_PARK=1 needs APS5_COMPILE_SCHEDULER=priority");
+        return true;
+    }();
+    return parking;
+}
+
 bool VerifyCompileJobs() {
     static const bool verify = std::getenv("APS5_VERIFY_COMPILE_JOBS") != nullptr;
     return verify;
@@ -498,6 +509,14 @@ struct VulkanDevice::State {
         const auto key = "graphics:" + std::to_string(++sequence);
         service->RunAndWait(key, reservedBytes, [&](const CompileTicket&) { build(); });
         service->Forget(key);
+    }
+    static std::shared_ptr<CompileTicket> SubmitPipelineBuild(void* owner, std::size_t reservedBytes, std::function<void()> build) {
+        auto& compileState = *static_cast<State*>(owner);
+        auto* service = compileState.Service();
+        if (service == nullptr) return nullptr;
+        static std::atomic<std::uint64_t> sequence{0};
+        const auto key = "graphics-parked:" + std::to_string(++sequence);
+        return service->Submit(key, CompilePriority::Demand, reservedBytes, [build = std::move(build)](const CompileTicket&) { build(); });
     }
     std::shared_ptr<ComputePipelineObjects> DemandComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress, bool* created);
     void closeCompileQueue() {
@@ -3777,6 +3796,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     if (PriorityCompileScheduler()) {
         context.pipelineBuildOwner = state.get();
         context.pipelineBuildRunner = &State::RunPipelineBuild;
+        if (CompileParking()) context.pipelineBuildSubmitter = &State::SubmitPipelineBuild;
     }
     context.srgbDecodeFormats = state->srgbDecodeFormats;
     context.sampleLocationSampleCounts = state->sampleLocationSampleCounts;
@@ -3834,6 +3854,58 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
     }
     const auto layouts = Graphics::DescribeSetLayouts(context, group);
     return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
+}
+
+bool VulkanDevice::CompileParkingEnabled() {
+    return CompileParking();
+}
+
+std::shared_ptr<CompileTicket> VulkanDevice::TryDrawPipeline(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) {
+    if (!CompileParking()) return nullptr;
+    require(!GuestMemory::GpuMutex().HeldByThisThread(), "a draw pipeline was looked up for parking under the GPU mutex");
+    ShaderCompileTrace::Event event("demand.graphics_try");
+    auto ticket = Graphics::TryPrewarmPipeline(graphicsContext(), graphics, shaders);
+    event.Flag("parks", ticket != nullptr);
+    return ticket;
+}
+
+std::shared_ptr<CompileTicket> VulkanDevice::TryComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress) {
+    if (!CompileParking() || !state->contextReady || shader.PipelineVariantId() == 0) return nullptr;
+    require(!GuestMemory::GpuMutex().HeldByThisThread(), "a compute pipeline was looked up for parking under the GPU mutex");
+    ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
+    const VkShaderStageFlags pushStages = shader.pushConstants.empty() ? 0u : VK_SHADER_STAGE_COMPUTE_BIT;
+    const auto key = ComputePipelineKey(shader, pushStages);
+    if (state->computePipelines.Find(key) != nullptr) return nullptr;
+    const auto context = graphicsContext();
+    if (pushStages != 0 && context.limits.maxPushConstantsSize < Graphics::ComputePushConstantBytes) return nullptr;
+    auto* service = state->Service();
+    if (service == nullptr) return nullptr;
+    ShaderCompileTrace::Event event("demand.compute_try");
+    event.Hex("address", programAddress).Hex("variant", key.first);
+    const auto jobKey = ComputeJobKey(key);
+    if (auto existing = service->Find(jobKey); existing != nullptr && existing->State() != CompileState::Cancelled) {
+        if (existing->State() != CompileState::Ready) {
+            service->Promote(*existing, CompilePriority::Demand);
+            event.Flag("joined", true);
+            return existing;
+        }
+        service->Forget(jobKey);
+    }
+    const auto bytes = ComputePipelineAheadRequest::EstimateBytes(shader);
+    const auto request = ComputePipelineAheadRequest::Capture(shader, bytes);
+    require(request != nullptr, "compute pipeline park exceeds the request capture bound");
+    return service->Submit(jobKey, CompilePriority::Demand, ComputeJobReservation(bytes, shader), [compileState = state.get(), request, context, programAddress](const CompileTicket&) {
+        const VkShaderStageFlags stages = request->pushes ? VK_SHADER_STAGE_COMPUTE_BIT : 0u;
+        const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &request->shader, 0}}};
+        const auto described = Graphics::DescribeSetLayouts(context, shaders);
+        static_cast<void>(compileState->GetComputePipeline(ComputePipelineKey(request->shader, stages), context, request->shader, described.layouts.main, stages, programAddress, described.mainKey, true, nullptr));
+    });
+}
+
+bool VulkanDevice::ArmCompileWait(const std::shared_ptr<CompileTicket>& ticket, std::function<void()> wake) {
+    auto* service = state->Service();
+    if (service == nullptr) return false;
+    return service->Park(ticket, std::move(wake));
 }
 
 void VulkanDevice::PrewarmDrawPipeline(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) {

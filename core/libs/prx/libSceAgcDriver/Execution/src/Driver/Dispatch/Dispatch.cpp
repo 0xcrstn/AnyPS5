@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CompileService.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
@@ -558,6 +559,20 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 
+    if (VulkanDevice::CompileParkingEnabled() && sink == nullptr && onWorkerThread() && !GuestMemory::GpuMutex().HeldByThisThread()) {
+        if (auto ticket = localDevice->TryComputePipeline(compiled, address)) {
+            ParkedOp op;
+            op.queue = submission.queue;
+            op.submission = submission.serial;
+            op.cursor = currentPacketOffset();
+            op.what = "dispatch waiting for its compute pipeline";
+            op.arm = [device = localDevice, ticket](std::function<void()> wake) { return device->ArmCompileWait(ticket, std::move(wake)); };
+            op.resume = [ticket] { ticket->Wait(); };
+            ParkPacket(std::move(op));
+            static const bool verify = std::getenv("APS5_VERIFY_COMPILE_JOBS") != nullptr;
+            if (verify) require(localDevice->TryComputePipeline(compiled, address) == nullptr, "APS5_VERIFY_COMPILE_JOBS: a dispatch resumed after its pipeline build settled, but the pipeline is still not built");
+        }
+    }
     const bool deferred = (drawRecordState().active || sink != nullptr) && !fromAhead;
     if (deferred) {
         std::shared_ptr<PreparedDispatch> prepared;
