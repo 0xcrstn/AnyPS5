@@ -60,6 +60,8 @@ public:
         std::uint64_t prefillsServed = 0;
         std::uint64_t adopted = 0;
         std::uint64_t adoptRefused = 0;
+        std::uint64_t workerHits = 0;
+        std::uint64_t workerHitsVerified = 0;
     };
     struct Prefill {
         std::shared_ptr<const void> pin;
@@ -76,6 +78,8 @@ public:
         std::uint64_t dirtySerial = 0;
         std::optional<CopyRanges> ranges;
         std::size_t copiedBytes = 0;
+        bool hit = false;
+        bool limited = false;
     };
     struct Placed {
         std::uint64_t arena = 0;
@@ -102,6 +106,9 @@ public:
     std::optional<View> TakePrefilled(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, RangeProvider&& ranges, const Prefill& prefill) {
         std::lock_guard lock(mutex);
         if (!beginTake(bytes)) return std::nullopt;
+        if (prefill.hit) {
+            if (auto hit = adoptHit(recorder, prefill, address, bytes, registryGeneration)) return hit;
+        }
         if (auto hit = lookup(recorder, address, bytes, registryGeneration)) return hit;
         auto wanted = ranges();
         if (prefill.address == address && prefill.bytes == bytes && wanted == prefill.ranges) {
@@ -140,6 +147,10 @@ public:
     static void SetBudgetBytes(std::size_t bytes);
     static std::size_t ExtendBytes();
     static void SetExtendBytes(std::size_t bytes);
+    static bool ParseWorkerHits(const char* text);
+    static bool WorkerHits();
+    static bool VerifyWorkerHits();
+    static void SetWorkerHits(bool enabled);
     static bool Verify();
     static void SetVerify(bool verify);
     static bool DeviceTwins();
@@ -184,6 +195,14 @@ private:
     void settleTwin(Recorder& recorder, Chunk& chunk);
     std::optional<std::size_t> reusableChunk() const;
     View view(Recorder& recorder, std::size_t chunk, VkDeviceSize offset, std::size_t bytes, bool copied, std::size_t chargedBytes, std::size_t copiedBytes = 0, bool limited = false);
+    struct Served {
+        std::size_t chunk = 0;
+        std::uint64_t serial = 0;
+        VkDeviceSize offset = 0;
+        bool limited = false;
+    };
+    std::optional<Served> servedEntry(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges* ranges) const;
+    std::optional<View> adoptHit(Recorder& recorder, const Prefill& prefill, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration);
     std::optional<View> lookup(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges* ranges = nullptr);
     std::optional<View> extend(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges& ranges);
     std::optional<View> adopt(Recorder& recorder, const Prefill& prefill, std::uint64_t registryGeneration);

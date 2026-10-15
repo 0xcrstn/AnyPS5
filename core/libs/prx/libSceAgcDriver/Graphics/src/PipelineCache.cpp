@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "ShaderCacheDirectory.hpp"
+#include "ShaderDiskCache.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -75,12 +76,8 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
 }
 
 void PipelineCache::adoptEarlierDriverFile(const std::filesystem::path& directory, const std::string& uuid) {
-    static const bool layered = [] {
-        const char* value = std::getenv("APS5_SHADER_CACHE_V2");
-        return value != nullptr && std::string_view(value) == "1";
-    }();
     std::error_code error;
-    if (!layered || std::filesystem::exists(path, error)) return;
+    if (!ShaderRecompiler::ShaderDiskCache::LayeredCache() || std::filesystem::exists(path, error)) return;
     char prefix[64];
     std::snprintf(prefix, sizeof(prefix), "vk-pipelines-%04x-%04x-", properties.vendorID, properties.deviceID);
     const auto suffix = "-" + uuid + ".bin";

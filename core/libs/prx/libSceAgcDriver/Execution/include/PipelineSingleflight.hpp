@@ -30,6 +30,11 @@ public:
         return found != entries.end() ? found->second : nullptr;
     }
 
+    std::shared_ptr<TValue> Adopt(const TKey& key, std::shared_ptr<TValue> value) {
+        std::lock_guard lock(mutex);
+        return entries.emplace(key, std::move(value)).first->second;
+    }
+
     template<typename TBuild>
     Result GetOrBuild(const TKey& key, TBuild&& build) {
         std::shared_future<std::shared_ptr<TValue>> waiting;

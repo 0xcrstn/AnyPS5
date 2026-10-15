@@ -1208,7 +1208,34 @@ ShaderResources::ShaderResources(const Context& context, std::span<const Compile
 
 ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots) : ShaderResources(context, compute, snapshots, false) {}
 
+ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, StagedDraw) : context(context), guestMemory(context), stagedTarget(target), stagedColorAttachments(colorAttachments), stagedIndexAddress(indexAddress), stagedIndexBytes(indexBytes) {
+    drawBuild = true;
+    if (!prepareAddressBindings(shaders, snapshots, true)) {
+        lockedBuild = true;
+        return;
+    }
+    unlockedPrepare = true;
+    buildPrepare(shaders, &stagedTarget, colorAttachments, indexAddress, indexBytes);
+}
+
+void ShaderResources::CompleteDraw(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
+    Require(drawBuild && !completed && (unlockedPrepare || lockedBuild), "a staged draw build was completed twice or never staged");
+    if (lockedBuild) {
+        prepareAddressBindings(shaders, snapshots);
+        buildPrepare(shaders, &stagedTarget, stagedColorAttachments, stagedIndexAddress, stagedIndexBytes);
+    }
+    buildComplete();
+}
+
 namespace {
+
+bool UnlockedAddressBuilds() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_UNLOCKED_ADDRESS_BUILDS");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
 
 // Whether a compute stage maps registered guest memory through BDA tables (see prepareAddressBindings).
 bool UsesAddressTables(const CompiledShader& compute) {
@@ -1234,11 +1261,27 @@ ShaderResources::ShaderResources(const Context& context, const CompiledShader& c
     // imports retires buffers to the recorder, refreshing mirrors waits for recorded work): that is
     // device-lock work, so their whole build waits for Complete(). Without tables the call only
     // checks the bindings.
-    lockedBuild = UsesAddressTables(compute);
-    if (lockedBuild) return;
+    if (UsesAddressTables(compute)) {
+        lockedBuild = !UnlockedAddressBuilds() || !prepareAddressBindings(shaders, snapshots, true);
+        if (lockedBuild) return;
+    } else {
+        prepareAddressBindings(shaders, snapshots);
+    }
     unlockedPrepare = true;
-    prepareAddressBindings(shaders, snapshots);
     buildPrepare(shaders, nullptr, 0, 0, 0);
+}
+
+bool ShaderResources::VerifyUnlockedAddressBuilds() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_UNLOCKED_ADDRESS_BUILDS");
+        return UnlockedAddressBuilds() && text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+bool ShaderResources::SameBuildAs(const ShaderResources& other) const {
+    if (GuestBufferViews() != other.GuestBufferViews() || textures != other.textures || StorageImages() != other.StorageImages()) return false;
+    return layoutKey == other.layoutKey && fragmentLayoutKey == other.fragmentLayoutKey && usesBda == other.usesBda && bdaReadOnly == other.bdaReadOnly && Reusable() == other.Reusable();
 }
 
 void ShaderResources::Complete() {
@@ -2097,8 +2140,10 @@ void ShaderResources::noteReusable() {
     // Taken whether or not the object turns out reusable: the lookups' records are this build's.
     captureValidation();
     reusable = false;
+    addressTemplate = false;
     directRegions.clear();
-    if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
+    const bool address = usesBda && drawBuild && bdaReadOnly && !placeWrites && AddressTemplatesEnabled() && !LoopGuardEnabled() && bda != nullptr && !bda->HasPlacements() && guestMemory.ReusableAddressSpace();
+    if (guestMemory.HasCopiedWrites() || (HoldsLease() && !address) || (usesBda && !address) || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
     if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
     const auto regions = guestMemory.DirectRegions();
@@ -2120,14 +2165,33 @@ void ShaderResources::noteReusable() {
             region.committedEnd = cut.committedEnd;
         }
     }
+    addressTemplate = address;
     reusable = true;
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
     const bool loopGuard = LoopGuardEnabled();
-    return std::any_of(shaders.begin(), shaders.end(), [loopGuard](const CompiledShader& shader) {
-        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
+    const bool addressTemplates = AddressTemplatesEnabled() && !loopGuard && std::none_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr || shader.program->bdaWrites || shader.stage == ShaderRecompiler::ShaderStage::Compute; });
+    return std::any_of(shaders.begin(), shaders.end(), [loopGuard, addressTemplates](const CompiledShader& shader) {
+        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard, addressTemplates](const ShaderRecompiler::DescriptorBinding& binding) { return (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable && !addressTemplates) || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
     });
+}
+
+void ShaderResources::VerifyAddressTemplate(const ShaderResources& fresh) const {
+    Require(addressTemplate, "APS5_VERIFY_ADDRESS_TEMPLATES: the reused template is not an address template");
+    Require(fresh.usesBda && fresh.bdaReadOnly && fresh.guestMemory.HoldsAddressSpace(), "APS5_VERIFY_ADDRESS_TEMPLATES: a fresh build of a reused address template does not map the cached address space");
+    Require(fresh.guestMemory.AddressSpaceSerial() == guestMemory.AddressSpaceSerial(), "APS5_VERIFY_ADDRESS_TEMPLATES: a fresh build maps another address space than the reused template");
+    const auto heaps = guestMemory.PointerHeaps();
+    const auto freshHeaps = fresh.guestMemory.PointerHeaps();
+    Require(std::equal(heaps.begin(), heaps.end(), freshHeaps.begin(), freshHeaps.end()), "APS5_VERIFY_ADDRESS_TEMPLATES: a fresh build stores other pointer heaps than the reused template");
+    const auto reads = guestMemory.InPlaceReads();
+    const auto freshReads = fresh.guestMemory.InPlaceReads();
+    Require(reads == freshReads, "APS5_VERIFY_ADDRESS_TEMPLATES: a fresh build reads other ranges in place than the reused template");
+}
+
+void ShaderResources::RefreshAddressUse() const {
+    if (!addressTemplate || !addressUsed.exchange(true, std::memory_order_acq_rel)) return;
+    guestMemory.RefreshAddressUse();
 }
 
 // APS5_PROFILE_DRAW: the per-device descriptor caches' counters, every 10 s.
@@ -2507,7 +2571,7 @@ const char* ShaderResources::EpochProofVerdictName(EpochProofVerdict verdict) {
 
 ShaderResources::EpochProofResult ShaderResources::ResolveEpochProof() const {
     EpochProofResult result;
-    if (!reusable || !ParallelRevalidateRequested() || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return result;
+    if (!reusable || !EpochProofsOffThread() || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return result;
     struct RangesTag {};
     auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, RangesTag>();
     std::uint64_t serial = 0;
@@ -2539,6 +2603,7 @@ ShaderResources::EpochProofVerdict ShaderResources::AdoptEpochProof(const EpochP
     if (result.verdict != EpochProofVerdict::Held) return result.verdict;
     const auto start = std::chrono::steady_clock::now();
     if (!reusable || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return EpochProofVerdict::Disabled;
+    if (addressTemplate && !guestMemory.AddressSpaceCurrent()) return EpochProofVerdict::Stamps;
     std::lock_guard lock(proofMutex);
     if (proofBasis != result.basis) return EpochProofVerdict::Basis;
     if (!epochProofScalarsHold()) return EpochProofVerdict::Stamps;
@@ -2931,8 +2996,9 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    if (addressTemplate && !guestMemory.AddressSpaceCurrent()) return false;
     std::unique_lock<std::recursive_mutex> proofLock(proofMutex, std::defer_lock);
-    if (ParallelRevalidateRequested()) proofLock.lock();
+    if (EpochProofsOffThread()) proofLock.lock();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto dirtySerialBefore = GuestMemory::DirtySerial();
@@ -3480,6 +3546,21 @@ void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::sh
         }
         serial.fetch_add(1, std::memory_order_acq_rel);
         if (evicted != nullptr) evicted->push_back(std::move(it->resources));
+        bytes -= it->bytes;
+        index.erase(it->key);
+        it = entries.erase(it);
+    }
+}
+
+void ResourceCache::RemoveAddressTemplates(std::vector<std::shared_ptr<ShaderResources>>& evicted) {
+    std::lock_guard lock(mutex);
+    for (auto it = entries.begin(); it != entries.end();) {
+        if (!it->resources->AddressTemplate()) {
+            ++it;
+            continue;
+        }
+        serial.fetch_add(1, std::memory_order_acq_rel);
+        evicted.push_back(std::move(it->resources));
         bytes -= it->bytes;
         index.erase(it->key);
         it = entries.erase(it);
@@ -4740,11 +4821,10 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::CheckM
     return plan.moved;
 }
 
-std::optional<std::vector<ShaderResources::MovedDispatchBuffer>> ShaderResources::MovedDispatchBuffers(const CompiledShader& shader, Recorder& recorder) const {
-    std::vector<MovedDispatchBuffer> moved;
+std::optional<std::vector<ShaderResources::MovedDispatchCandidate>> ShaderResources::planMovedDispatch(const CompiledShader& shader) const {
+    std::vector<MovedDispatchCandidate> moved;
     if (shader.program == nullptr || usesBda || fragment.set != VK_NULL_HANDLE || splitSets) return std::nullopt;
     if (_set == VK_NULL_HANDLE) return moved;
-    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     for (const auto& binding : shader.program->bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
         const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
@@ -4769,18 +4849,69 @@ std::optional<std::vector<ShaderResources::MovedDispatchBuffer>> ShaderResources
             const auto begin = address - item.adjustment;
             const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
             if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
-            if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || recorder.PendingLabelIn(begin, bytes) || recorder.QueuedStoreOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes) || AnyDeviceResidentOverlaps(begin, bytes)) return std::nullopt;
-            if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), [&](const std::shared_ptr<ShaderResources>& writer) { return writer != nullptr && writer->WritesOverlap(begin, bytes); })) return std::nullopt;
-            GuestMemory::FlushGpuWrites(begin, bytes);
-            const auto* import = HostImportFor(context, begin, bytes);
-            if (import == nullptr || begin < import->base || (address - import->base) % alignment != item.adjustment || bytes > import->bytes - (begin - import->base) || bytes > context.limits.maxStorageBufferRange) return std::nullopt;
-            moved.push_back({index, address, size, {import->buffer, begin - import->base, bytes}, begin});
+            moved.push_back({index, address, size, begin, bytes, item.adjustment});
         }
     }
     return moved;
 }
 
+std::optional<VkDescriptorBufferInfo> ShaderResources::movedDispatchView(const MovedDispatchCandidate& candidate, Recorder& recorder) const {
+    const auto begin = candidate.begin;
+    const auto bytes = candidate.bytes;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
+    if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || recorder.PendingLabelIn(begin, bytes) || recorder.QueuedStoreOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes) || AnyDeviceResidentOverlaps(begin, bytes)) return std::nullopt;
+    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), [&](const std::shared_ptr<ShaderResources>& writer) { return writer != nullptr && writer->WritesOverlap(begin, bytes); })) return std::nullopt;
+    GuestMemory::FlushGpuWrites(begin, bytes);
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+    const auto* import = HostImportFor(context, begin, bytes);
+    if (import == nullptr || begin < import->base || (candidate.address - import->base) % alignment != candidate.adjustment || bytes > import->bytes - (begin - import->base) || bytes > context.limits.maxStorageBufferRange) return std::nullopt;
+    return VkDescriptorBufferInfo{import->buffer, begin - import->base, bytes};
+}
+
+std::optional<std::vector<ShaderResources::MovedDispatchBuffer>> ShaderResources::MovedDispatchBuffers(const CompiledShader& shader, Recorder& recorder) const {
+    const auto plan = planMovedDispatch(shader);
+    if (!plan.has_value()) return std::nullopt;
+    std::vector<MovedDispatchBuffer> moved;
+    moved.reserve(plan->size());
+    for (const auto& candidate : *plan) {
+        const auto view = movedDispatchView(candidate, recorder);
+        if (!view.has_value()) return std::nullopt;
+        moved.push_back({candidate.allocation, candidate.address, candidate.size, *view, candidate.begin});
+    }
+    return moved;
+}
+
+std::optional<ShaderResources::PreparedMovedDispatch> ShaderResources::PrepareMovedDispatchBuffers(const CompiledShader& shader) const {
+    const auto plan = planMovedDispatch(shader);
+    if (!plan.has_value()) return std::nullopt;
+    PreparedMovedDispatch prepared;
+    prepared.moved.reserve(plan->size());
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+    for (const auto& candidate : *plan) {
+        const auto import = ImportedHostRange(context, candidate.begin, candidate.bytes);
+        if (!import.has_value() || candidate.begin < import->base || (candidate.address - import->base) % alignment != candidate.adjustment || candidate.bytes > context.limits.maxStorageBufferRange) return std::nullopt;
+        prepared.moved.push_back({candidate.allocation, candidate.address, candidate.size, {import->buffer, candidate.begin - import->base, candidate.bytes}, candidate.begin});
+    }
+    if (!prepared.moved.empty()) prepared.set = writeMovedDispatchSet(prepared.moved);
+    return prepared;
+}
+
+std::optional<std::vector<ShaderResources::MovedDispatchBuffer>> ShaderResources::CheckMovedDispatchBuffers(const PreparedMovedDispatch& prepared, Recorder& recorder) const {
+    for (const auto& entry : prepared.moved) {
+        const MovedDispatchCandidate candidate{entry.allocation, entry.address, entry.size, entry.begin, static_cast<std::size_t>(entry.view.range), allocations[entry.allocation].adjustment};
+        const auto view = movedDispatchView(candidate, recorder);
+        if (!view.has_value() || view->buffer != entry.view.buffer || view->offset != entry.view.offset || view->range != entry.view.range) return std::nullopt;
+    }
+    return prepared.moved;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::BindMovedDispatchBuffers(Recorder& recorder, std::span<const MovedDispatchBuffer> moved) const {
+    auto result = writeMovedDispatchSet(moved);
+    recorder.Keep(result);
+    return result;
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::writeMovedDispatchSet(std::span<const MovedDispatchBuffer> moved) const {
     Require(context.descriptorCache != nullptr, "moved dispatch buffers require a descriptor cache");
     Require(_set != VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE && !splitSets, "moved dispatch buffers need the template's single descriptor set");
     std::map<VkDescriptorType, std::uint32_t> counts;
@@ -4812,7 +4943,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::BindMovedDispatc
     }
     Require(nextWrite == writes.end(), "moved dispatch buffer writes disagree with their descriptor bindings");
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    recorder.Keep(result);
     return result;
 }
 
@@ -4866,6 +4996,11 @@ bool MovedWordRing() {
     return MovedWordRingFlag().load(std::memory_order_relaxed);
 }
 
+std::atomic<bool>& AddressTemplatesFlag() {
+    static std::atomic<bool> flag{std::getenv("APS5_ADDRESS_TEMPLATES") == nullptr || std::strcmp(std::getenv("APS5_ADDRESS_TEMPLATES"), "0") != 0};
+    return flag;
+}
+
 std::atomic<bool>& InPlaceDrawInputsFlag() {
     static std::atomic<bool> flag{std::getenv("APS5_IN_PLACE_DRAW_INPUTS") == nullptr ? Coherence::InputLeases() : std::strcmp(std::getenv("APS5_IN_PLACE_DRAW_INPUTS"), "0") != 0};
     return flag;
@@ -4882,6 +5017,14 @@ bool AddressBasedDrawSnapshots() {
     }();
     return enabled;
 }
+}
+
+bool ShaderResources::AddressTemplatesEnabled() {
+    return AddressTemplatesFlag().load(std::memory_order_relaxed);
+}
+
+void ShaderResources::SetAddressTemplates(bool enabled) {
+    AddressTemplatesFlag().store(enabled, std::memory_order_relaxed);
 }
 
 void ShaderResources::SetInPlaceDrawInputs(bool enabled) {
@@ -5287,6 +5430,34 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     lap(&DrawBindingsStatistics::checkUs);
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    const bool persistent = RecordBindingsMode() == RecordBindings::Persistent;
+    std::vector<std::array<std::uint64_t, 4>> persistentKey;
+    if (persistent) {
+        persistentKey.reserve(selected.size() + 1);
+        persistentKey.push_back({recorder.SnapshotArena().Identity(), selected.size(), 0, 0});
+        for (std::size_t index = 0; index < selected.size(); ++index) {
+            const auto& snapshot = result->snapshots[index];
+            persistentKey.push_back({selected[index], reinterpret_cast<std::uint64_t>(snapshot.handle), snapshot.offset, snapshot.bytes.size()});
+        }
+        std::shared_ptr<const DrawBindings> reused;
+        {
+            std::lock_guard lock(persistentDrawSetMutex);
+            const auto found = std::find_if(persistentDrawSets.begin(), persistentDrawSets.end(), [&](const PersistentDrawSet& entry) { return entry.key == persistentKey; });
+            if (found != persistentDrawSets.end()) reused = found->bindings;
+        }
+        if (reused != nullptr) {
+            result->allocation = reused->allocation;
+            result->fragmentAllocation = reused->fragmentAllocation;
+            result->persistent = std::move(reused);
+            recorder.Keep(result);
+            for (const auto& snapshot : result->snapshots) {
+                if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+            }
+            if (statistics != nullptr) ++statistics->persistentSets;
+            lap(&DrawBindingsStatistics::allocateUs);
+            return result;
+        }
+    }
     std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
     std::array<std::map<VkDescriptorType, std::uint32_t>, 2> counts;
     for (const auto& binding : bindings) {
@@ -5339,8 +5510,41 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     }
     if (statistics != nullptr) statistics->descriptorWrites += writes.size();
+    if (persistent) {
+        std::lock_guard lock(persistentDrawSetMutex);
+        PersistentDrawSet entry{std::move(persistentKey), result};
+        if (persistentDrawSets.size() < PersistentDrawSetSlots) persistentDrawSets.push_back(std::move(entry));
+        else persistentDrawSets[persistentDrawSetNext++ % PersistentDrawSetSlots] = std::move(entry);
+    }
     lap(&DrawBindingsStatistics::updateUs);
     return result;
+}
+
+ShaderResources::RecordBindings ShaderResources::ParseRecordBindings(const char* text) {
+    if (text == nullptr) return RecordBindings::Persistent;
+    const std::string_view value(text);
+    if (value == "persistent" || value == "1" || value == "on") return RecordBindings::Persistent;
+    if (value == "legacy" || value == "0" || value == "off") return RecordBindings::Legacy;
+    throw std::invalid_argument("APS5_RECORD_BINDINGS must be persistent, legacy, 1, 0, on or off, not \"" + std::string(value) + "\"");
+}
+
+namespace {
+
+std::atomic<int>& recordBindingsOverride() {
+    static std::atomic<int> mode{-1};
+    return mode;
+}
+
+}
+
+ShaderResources::RecordBindings ShaderResources::RecordBindingsMode() {
+    static const auto parsed = ParseRecordBindings(std::getenv("APS5_RECORD_BINDINGS"));
+    const auto forced = recordBindingsOverride().load(std::memory_order_relaxed);
+    return forced >= 0 ? static_cast<RecordBindings>(forced) : parsed;
+}
+
+void ShaderResources::SetRecordBindingsMode(RecordBindings mode) {
+    recordBindingsOverride().store(static_cast<int>(mode), std::memory_order_relaxed);
 }
 
 void ShaderResources::Bind(const CommandSink& commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {

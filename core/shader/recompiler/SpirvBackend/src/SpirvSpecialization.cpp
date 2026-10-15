@@ -1001,10 +1001,301 @@ private:
     IdSet removed;
 };
 
+constexpr std::size_t MaxCallRounds = 4;
+
+bool AnnotationInstruction(spv::Op op) {
+    return op == spv::OpDecorate || op == spv::OpMemberDecorate || op == spv::OpDecorateId || op == spv::OpDecorateString || op == spv::OpMemberDecorateString || op == spv::OpDecorationGroup || op == spv::OpGroupDecorate || op == spv::OpGroupMemberDecorate;
+}
+
+bool TargetedDebugOrAnnotation(spv::Op op) {
+    return op == spv::OpName || op == spv::OpDecorate || op == spv::OpDecorateId || op == spv::OpDecorateString;
+}
+
+class CallSpecialization {
+public:
+    explicit CallSpecialization(std::span<const std::uint32_t> words) {
+        if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid specialized SPIR-V header");
+        header.assign(words.begin(), words.begin() + 5);
+        bound = header[3];
+        for (std::size_t cursor = 5; cursor < words.size();) {
+            const auto count = words[cursor] >> 16u;
+            if (count == 0u || count > words.size() - cursor) throw std::runtime_error("truncated specialized SPIR-V instruction");
+            instructions.emplace_back(words.begin() + cursor, words.begin() + cursor + count);
+            cursor += count;
+        }
+    }
+
+    std::optional<std::vector<std::uint32_t>> Run() {
+        scan();
+        analyze();
+        const bool cloned = redirect();
+        const bool removedFunctions = removeUncalledFunctions();
+        if (!cloned && !removedFunctions) return std::nullopt;
+        header[3] = bound;
+        std::vector<std::uint32_t> words = header;
+        for (const auto& instruction : instructions) words.insert(words.end(), instruction.begin(), instruction.end());
+        return words;
+    }
+
+private:
+    struct Function {
+        std::size_t begin = 0;
+        std::size_t end = 0;
+        std::vector<std::uint32_t> parameters;
+        std::uint64_t required = 0;
+        std::uint64_t foldable = 0;
+    };
+    using Key = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+
+    std::uint32_t switchLiteralWords(const Instruction& instruction) const {
+        if (Opcode(instruction) != spv::OpSwitch || instruction.size() < 2u) return 1u;
+        const auto type = instruction[1] < resultTypes.size() ? resultTypes[instruction[1]] : 0u;
+        return type < intWidths.size() && intWidths[type] == 64u ? 2u : 1u;
+    }
+
+    void scan() {
+        resultTypes.assign(bound, 0u);
+        intWidths.assign(bound, 0u);
+        canonical.assign(bound, 0u);
+        globals.assign(bound, 0u);
+        std::map<Instruction, std::uint32_t> constantIds;
+        std::uint32_t current = 0;
+        for (std::size_t index = 0; index < instructions.size(); ++index) {
+            const auto& instruction = instructions[index];
+            const auto op = Opcode(instruction);
+            bool hasResult = false;
+            bool hasType = false;
+            spv::HasResultAndType(op, &hasResult, &hasType);
+            if (hasResult && hasType && instruction.at(2) < bound) resultTypes[instruction[2]] = instruction[1];
+            if (op == spv::OpTypeInt) intWidths.at(instruction.at(1)) = instruction.at(2);
+            if (op == spv::OpEntryPoint) entryPoints.insert(instruction.at(2));
+            if (AnnotationInstruction(op) && lastAnnotation <= index) lastAnnotation = index + 1u;
+            if (op == spv::OpFunction) {
+                current = instruction.at(2);
+                functions[current].begin = index;
+                order.push_back(current);
+                continue;
+            }
+            if (op == spv::OpFunctionEnd) {
+                functions.at(current).end = index;
+                current = 0;
+                continue;
+            }
+            if (current != 0u) {
+                if (op == spv::OpFunctionParameter) functions.at(current).parameters.push_back(instruction.at(2));
+                continue;
+            }
+            if (op == spv::OpVariable) globals.at(instruction.at(2)) = 1u;
+            if (op == spv::OpConstant || op == spv::OpConstantTrue || op == spv::OpConstantFalse || op == spv::OpConstantNull || op == spv::OpConstantComposite) {
+                Instruction key = instruction;
+                key.erase(key.begin() + 2);
+                canonical.at(instruction[2]) = constantIds.emplace(std::move(key), instruction[2]).first->second;
+            }
+        }
+    }
+
+    void analyze() {
+        std::vector<std::uint64_t> taint(bound, 0u);
+        const auto of = [&](std::uint32_t id) { return id < taint.size() ? taint[id] : 0u; };
+        for (const auto id : order) {
+            auto& function = functions.at(id);
+            if (function.parameters.empty() || function.parameters.size() > 64u || entryPoints.contains(id)) continue;
+            for (std::size_t index = 0; index < function.parameters.size(); ++index) taint.at(function.parameters[index]) = std::uint64_t{1} << index;
+            for (int pass = 0; pass < 2; ++pass) {
+                for (auto index = function.begin; index <= function.end; ++index) {
+                    const auto& instruction = instructions[index];
+                    const auto op = Opcode(instruction);
+                    if (op == spv::OpPhi) {
+                        std::uint64_t mask = 0;
+                        for (std::size_t operand = 3; operand < instruction.size(); operand += 2u) mask |= of(instruction[operand]);
+                        taint.at(instruction.at(2)) |= mask;
+                        continue;
+                    }
+                    if (op == spv::OpSwitch) function.required |= of(instruction.at(1));
+                    if ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain) && instruction.size() > 4u && instruction[3] < globals.size() && globals[instruction[3]] != 0u) function.required |= of(instruction[4]);
+                    if (op == spv::OpBranchConditional) function.foldable |= of(instruction.at(1));
+                    if (op == spv::OpSelect && instruction.size() == 6u) function.foldable |= of(instruction[3]);
+                    if (!PureInstruction(instruction)) continue;
+                    std::uint64_t mask = 0;
+                    VisitInputs(instruction, [&](std::size_t operand) { mask |= of(instruction[operand]); });
+                    const auto result = Result(instruction);
+                    if (mask != 0u && result < taint.size()) taint[result] |= mask;
+                }
+            }
+            function.foldable |= function.required;
+        }
+    }
+
+    template<typename TVisitor>
+    void forEachCall(const TVisitor& visit) {
+        bool inside = false;
+        for (auto& instruction : instructions) {
+            const auto op = Opcode(instruction);
+            if (op == spv::OpFunction) inside = true;
+            if (op == spv::OpFunctionEnd) inside = false;
+            if (!inside || op != spv::OpFunctionCall || instruction.size() < 4u) continue;
+            const auto found = functions.find(instruction[3]);
+            if (found == functions.end() || found->second.required == 0u) continue;
+            visit(instruction, found->second);
+        }
+    }
+
+    Key keyOf(const Instruction& call, const Function& function, std::uint64_t mask) const {
+        Key key;
+        for (std::size_t index = 0; index < function.parameters.size() && 4u + index < call.size(); ++index) {
+            if ((mask >> index & 1u) == 0u) continue;
+            const auto argument = call[4u + index];
+            if (argument < canonical.size() && canonical[argument] != 0u) key.emplace_back(static_cast<std::uint32_t>(index), canonical[argument]);
+        }
+        return key;
+    }
+
+    bool redirect() {
+        constexpr std::uint32_t Varying = 0u;
+        std::map<std::pair<std::uint32_t, Key>, std::map<std::uint32_t, std::uint32_t>> groups;
+        forEachCall([&](const Instruction& call, const Function& function) {
+            auto key = keyOf(call, function, function.required);
+            if (key.empty()) return;
+            auto [group, inserted] = groups.try_emplace(std::pair{call[3], std::move(key)});
+            const auto conditions = function.foldable & ~function.required;
+            for (std::size_t index = 0; index < function.parameters.size() && 4u + index < call.size(); ++index) {
+                if ((conditions >> index & 1u) == 0u) continue;
+                const auto argument = call[4u + index];
+                const auto value = argument < canonical.size() ? canonical[argument] : 0u;
+                const auto [entry, first] = group->second.try_emplace(static_cast<std::uint32_t>(index), inserted ? value : Varying);
+                if (!first && entry->second != value) entry->second = Varying;
+                if (first && !inserted) entry->second = Varying;
+            }
+        });
+        std::map<std::pair<std::uint32_t, Key>, std::uint32_t> clones;
+        std::vector<std::pair<std::uint32_t, Key>> created;
+        forEachCall([&](Instruction& call, const Function& function) {
+            auto key = keyOf(call, function, function.required);
+            if (key.empty()) return;
+            for (const auto& [index, value] : groups.at(std::pair{call[3], key})) {
+                if (value != Varying) key.emplace_back(index, value);
+            }
+            std::ranges::sort(key);
+            auto request = std::pair{call[3], std::move(key)};
+            auto found = clones.find(request);
+            if (found == clones.end()) {
+                found = clones.emplace(request, bound++).first;
+                created.push_back(request);
+            }
+            call[3] = found->second;
+        });
+        if (created.empty()) return false;
+        std::vector<Instruction> annotations;
+        std::vector<Instruction> bodies;
+        std::map<std::uint32_t, std::vector<std::size_t>> targeted;
+        for (std::size_t index = 0; index < lastAnnotation; ++index) {
+            const auto op = Opcode(instructions[index]);
+            if ((op == spv::OpDecorate || op == spv::OpDecorateId || op == spv::OpDecorateString) && instructions[index].size() > 1u) targeted[instructions[index][1]].push_back(index);
+        }
+        for (const auto& request : created) {
+            const auto& function = functions.at(request.first);
+            std::map<std::uint32_t, std::uint32_t> definitions;
+            for (auto index = function.begin; index <= function.end; ++index) {
+                const auto result = Result(instructions[index]);
+                if (result != 0u) definitions.emplace(result, result == request.first ? clones.at(request) : bound++);
+            }
+            auto uses = definitions;
+            for (const auto& [parameter, constant] : request.second) uses[function.parameters.at(parameter)] = constant;
+            for (auto index = function.begin; index <= function.end; ++index) {
+                const auto& original = instructions[index];
+                auto copy = original;
+                bool hasResult = false;
+                bool hasType = false;
+                spv::HasResultAndType(Opcode(original), &hasResult, &hasType);
+                const std::size_t resultIndex = hasResult ? (hasType ? 2u : 1u) : 0u;
+                VisitIdOperands(original, switchLiteralWords(original), [&](std::size_t operand) {
+                    if (operand == resultIndex) return;
+                    const auto found = uses.find(original[operand]);
+                    if (found != uses.end()) copy[operand] = found->second;
+                });
+                if (resultIndex != 0u) copy[resultIndex] = definitions.at(original[resultIndex]);
+                bodies.push_back(std::move(copy));
+            }
+            for (const auto& [original, replacement] : definitions) {
+                const auto found = targeted.find(original);
+                if (found == targeted.end()) continue;
+                for (const auto index : found->second) {
+                    auto copy = instructions[index];
+                    copy[1] = replacement;
+                    annotations.push_back(std::move(copy));
+                }
+            }
+        }
+        instructions.insert(instructions.end(), std::make_move_iterator(bodies.begin()), std::make_move_iterator(bodies.end()));
+        instructions.insert(instructions.begin() + static_cast<std::ptrdiff_t>(lastAnnotation), std::make_move_iterator(annotations.begin()), std::make_move_iterator(annotations.end()));
+        return true;
+    }
+
+    bool removeUncalledFunctions() {
+        std::map<std::uint32_t, std::pair<std::size_t, std::size_t>> ranges;
+        std::uint32_t current = 0;
+        for (std::size_t index = 0; index < instructions.size(); ++index) {
+            const auto op = Opcode(instructions[index]);
+            if (op == spv::OpFunction) {
+                current = instructions[index].at(2);
+                ranges[current].first = index;
+            }
+            if (op == spv::OpFunctionEnd) ranges.at(current).second = index;
+        }
+        std::set<std::uint32_t> live(entryPoints.begin(), entryPoints.end());
+        std::vector<std::uint32_t> pending(entryPoints.begin(), entryPoints.end());
+        while (!pending.empty()) {
+            const auto id = pending.back();
+            pending.pop_back();
+            const auto found = ranges.find(id);
+            if (found == ranges.end()) continue;
+            for (auto index = found->second.first; index <= found->second.second; ++index) {
+                const auto& instruction = instructions[index];
+                if (Opcode(instruction) == spv::OpFunctionCall && instruction.size() > 3u && live.insert(instruction[3]).second) pending.push_back(instruction[3]);
+            }
+        }
+        std::vector<std::uint8_t> dead(std::max<std::size_t>(bound, header[3]), 0u);
+        bool removedAny = false;
+        for (const auto& [id, range] : ranges) {
+            if (live.contains(id)) continue;
+            removedAny = true;
+            for (auto index = range.first; index <= range.second; ++index) {
+                const auto result = Result(instructions[index]);
+                if (result != 0u && result < dead.size()) dead[result] = 1u;
+                instructions[index].clear();
+            }
+        }
+        if (!removedAny) return false;
+        std::erase_if(instructions, [&](const Instruction& instruction) {
+            if (instruction.empty()) return true;
+            return TargetedDebugOrAnnotation(Opcode(instruction)) && instruction.size() > 1u && instruction[1] < dead.size() && dead[instruction[1]] != 0u;
+        });
+        return true;
+    }
+
+    std::vector<std::uint32_t> header;
+    std::vector<Instruction> instructions;
+    std::uint32_t bound = 0;
+    std::vector<std::uint32_t> resultTypes;
+    std::vector<std::uint32_t> intWidths;
+    std::vector<std::uint32_t> canonical;
+    std::vector<std::uint8_t> globals;
+    std::set<std::uint32_t> entryPoints;
+    std::map<std::uint32_t, Function> functions;
+    std::vector<std::uint32_t> order;
+    std::size_t lastAnnotation = 0;
+};
+
 }
 
 std::vector<std::uint32_t> SpecializeSpirv(std::span<const std::uint32_t> words) {
-    return Specialization(words).Run();
+    auto specialized = Specialization(words).Run();
+    for (std::size_t round = 0; round < MaxCallRounds; ++round) {
+        auto cloned = CallSpecialization(specialized).Run();
+        if (!cloned) break;
+        specialized = Specialization(*cloned).Run();
+    }
+    return specialized;
 }
 
 }

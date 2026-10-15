@@ -181,6 +181,14 @@ public:
         return bindings->snapshots.front();
     }
 
+    std::shared_ptr<ShaderResources::DrawBindings> Bindings(std::uint64_t offset, std::size_t size, Statistics* statistics) {
+        ShaderResources::MovedBuffer moved{0, Address() + offset, size, {}};
+        auto bindings = resources->PrepareDrawBindings(*recorder, std::span(&moved, 1), statistics);
+        Require(bindings != nullptr && bindings->snapshots.size() == 1, "a moved read-only draw input was not snapshotted");
+        held.push_back(bindings);
+        return bindings;
+    }
+
     std::shared_ptr<ShaderResources::DrawBindings> TakeOwn() {
         auto bindings = resources->PrepareDrawBindings(*recorder);
         if (bindings != nullptr) held.push_back(bindings);
@@ -605,7 +613,16 @@ void WorkerCopyTests(Fixture& fixture) {
     Require(adopted.has_value() && adopted->copied && Holds(Snapshot{address, nullptr, {}, adopted->buffer, adopted->offset, adopted->bytes}, std::byte{0x71}), "the encode did not adopt a worker's copy");
     const auto again = arena.Take(recorder, address, 4096, registry);
     Require(again.has_value() && !again->copied && again->buffer == adopted->buffer && again->offset == adopted->offset, "an adopted copy was not indexed for later draws");
+    DrawSnapshotArena::SetWorkerHits(false);
     Require(!arena.PrepareCopy(address, 4096, registry, std::nullopt).has_value(), "a worker copied a range the arena already serves");
+    DrawSnapshotArena::SetWorkerHits(true);
+    static_cast<void>(arena.TakeCounters());
+    const auto hit = arena.PrepareCopy(address + 256, 1024, registry, std::nullopt);
+    Require(hit.has_value() && hit->hit && hit->copiedBytes == 0, "a worker did not hand over the arena hit for a range the arena already serves");
+    const auto adoptedHit = arena.TakePrefilled(recorder, address + 256, 1024, registry, whole, *hit);
+    const auto hitCounts = arena.TakeCounters();
+    Require(adoptedHit.has_value() && !adoptedHit->copied && adoptedHit->buffer == adopted->buffer && adoptedHit->offset == adopted->offset + 256 && hitCounts.workerHits == 1 && hitCounts.hits == 1, "the encode did not take a worker's arena hit without a lookup");
+    Require(!arena.TakePrefilled(recorder, address + 512, 1024, registry, whole, *hit).value().copied, "a worker's hit for another range was not looked up again");
     const auto stale = address + 16384;
     auto early = arena.PrepareCopy(stale, 4096, registry, std::nullopt);
     Require(early.has_value(), "a worker did not copy the second input");
@@ -925,6 +942,39 @@ double MeasurePattern(Fixture& fixture, const Pattern& pattern, bool arena, Stat
 
 }
 
+void PersistentSetTests(Fixture& fixture) {
+    DrawSnapshotArena::SetEnabled(true);
+    DrawSnapshotArena::SetExtendBytes(0);
+    ShaderResources::SetRecordBindingsMode(ShaderResources::RecordBindings::Persistent);
+    std::memset(fixture.Bytes(0), 0x55, 4096);
+    GuestMemory::BumpCollectEpoch();
+    Statistics first{};
+    const auto a = fixture.Bindings(0, 1024, &first);
+    Require(first.persistentSets == 0 && a->allocation.set != VK_NULL_HANDLE, "the first draw over an input found a persistent descriptor set");
+    GuestMemory::BumpCollectEpoch();
+    Statistics second{};
+    const auto b = fixture.Bindings(0, 1024, &second);
+    Require(second.arenaHits == 1 && second.persistentSets == 1 && b->allocation.set == a->allocation.set, "a draw over an unchanged arena snapshot did not reuse the descriptor set of the draw before (" + std::to_string(second.arenaHits) + " arena hits, " + std::to_string(second.persistentSets) + " sets reused)");
+    Statistics other{};
+    const auto c = fixture.Bindings(1024, 1024, &other);
+    Require(other.persistentSets == 0 && c->allocation.set != a->allocation.set, "a draw over another range reused a descriptor set bound to the first range");
+    std::memset(fixture.Bytes(0), 0x66, 1024);
+    GuestMemory::BumpCollectEpoch();
+    Statistics changed{};
+    const auto d = fixture.Bindings(0, 1024, &changed);
+    Require(changed.arenaCopies == 1 && changed.persistentSets == 0 && d->allocation.set != a->allocation.set && Holds(d->snapshots.front(), std::byte{0x66}), "a draw over a range a CPU store changed reused the old descriptor set");
+    Require(Holds(a->snapshots.front(), std::byte{0x55}), "a new snapshot overwrote the bytes behind a persistent descriptor set");
+    ShaderResources::SetRecordBindingsMode(ShaderResources::RecordBindings::Legacy);
+    GuestMemory::BumpCollectEpoch();
+    Statistics legacy{};
+    const auto e = fixture.Bindings(0, 1024, &legacy);
+    Require(legacy.arenaHits == 1 && legacy.persistentSets == 0 && e->allocation.set != d->allocation.set, "APS5_RECORD_BINDINGS=legacy reused a descriptor set");
+    ShaderResources::SetRecordBindingsMode(ShaderResources::RecordBindings::Persistent);
+    Require(ShaderResources::ParseRecordBindings(nullptr) == ShaderResources::RecordBindings::Persistent && ShaderResources::ParseRecordBindings("legacy") == ShaderResources::RecordBindings::Legacy && ShaderResources::ParseRecordBindings("0") == ShaderResources::RecordBindings::Legacy, "APS5_RECORD_BINDINGS parses to the wrong mode");
+    fixture.Release();
+    fixture.GetRecorder().Sync();
+}
+
 bool RunDrawSnapshotArenaTests(const Context& context) {
     const Settings settings;
     {
@@ -934,6 +984,7 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
             return false;
         }
         ContentTests(fixture);
+        PersistentSetTests(fixture);
         MovedWordTests(fixture, false);
         MovedWordTests(fixture, true);
         PendingWriteTests(fixture);

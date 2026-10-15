@@ -76,6 +76,11 @@ constexpr std::uint32_t RecordWorkerTag = 0x100;
 constexpr std::uint32_t PrepareWorkerTag = 0x200;
 constexpr std::size_t RecordHistoryEntries = 4096;
 
+std::chrono::steady_clock::time_point& drawEnteredAt() {
+    thread_local std::chrono::steady_clock::time_point entered{};
+    return entered;
+}
+
 RecordQueue& drawRecords() {
     static auto* queue = new RecordQueue;
     return *queue;
@@ -200,6 +205,7 @@ struct PacketWaitCounts {
     std::atomic<std::uint64_t> commandProcessorReads{0};
     std::atomic<std::uint64_t> commandProcessorReadsAhead{0};
     std::atomic<std::uint64_t> commandProcessorReadsVerified{0};
+    std::atomic<std::uint64_t> registerStatePackets{0};
     std::atomic<std::uint64_t> labelJobs{0};
     std::atomic<std::uint64_t> labelJobLabels{0};
     std::atomic<std::uint64_t> labelPackets{0};
@@ -427,7 +433,10 @@ DrawVerdict Driver::freezeDraw(QueueState& queue, std::span<const std::uint32_t>
         pending.phases = true;
         pending.captures = 0;
         pending.ms = {};
-        if (packetStartedAt() != std::chrono::steady_clock::time_point{}) pending.ms[DrawRowPrologue] = std::chrono::duration<double, std::milli>(begin - packetStartedAt()).count();
+        const auto entered = std::exchange(drawEnteredAt(), std::chrono::steady_clock::time_point{});
+        const auto split = entered != std::chrono::steady_clock::time_point{} && entered <= begin ? entered : begin;
+        if (packetStartedAt() != std::chrono::steady_clock::time_point{}) pending.ms[DrawRowPrologue] = std::chrono::duration<double, std::milli>(split - packetStartedAt()).count();
+        pending.ms[DrawRowFreezeCheck] = std::chrono::duration<double, std::milli>(begin - split).count();
         pending.ms[DrawRowVectors] = std::chrono::duration<double, std::milli>(frozenAt - begin).count();
         pending.ms[DrawRowLockWait] = std::chrono::duration<double, std::milli>(now - frozenAt).count();
         pending.tailAt = now;
@@ -775,6 +784,8 @@ std::string Driver::recordIdentity(const Submission& submission, const char* wha
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     if (drawRecordState().active || frozenSink() != nullptr || !deferDrawRecords(submission.queue)) return drawNow(queue, packet, submission, rejected);
     if (prepareWorkers() != 0) {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile) drawEnteredAt() = std::chrono::steady_clock::now();
         freezeLabels(submission.queue, true);
         const auto reason = frozenFallback(packet);
         if (reason == FrozenFallback::None) return freezeDraw(queue, packet, submission);
@@ -1028,12 +1039,16 @@ LabelRecordJobCounters LabelRecordJobTotals() {
 
 CommandProcessorReadCounters CommandProcessorReadTotals() {
     const auto& counts = packetWaitCounts();
-    return {counts.commandProcessorReads.load(std::memory_order_relaxed), counts.commandProcessorReadsAhead.load(std::memory_order_relaxed), counts.commandProcessorReadsVerified.load(std::memory_order_relaxed)};
+    return {counts.commandProcessorReads.load(std::memory_order_relaxed), counts.commandProcessorReadsAhead.load(std::memory_order_relaxed), counts.commandProcessorReadsVerified.load(std::memory_order_relaxed), counts.registerStatePackets.load(std::memory_order_relaxed)};
 }
 
 bool Driver::overlapCommandProcessorRead(std::span<const std::uint32_t> packet) {
     const auto mode = CommandProcessorReadsMode();
-    if (mode == CommandProcessorReads::Drain) return false;
+    if (mode == CommandProcessorReads::Drain || packet.empty()) return false;
+    if (RegisterStatePacket(packet[0])) {
+        packetWaitCounts().registerStatePackets.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
     const auto read = Pm4::CommandProcessorReadOf(packet);
     if (!read) return false;
     auto& counts = packetWaitCounts();
@@ -1179,7 +1194,7 @@ void Driver::reportDrawRecords() {
         }
         static CommandProcessorReadCounters lastReads{};
         const auto reads = CommandProcessorReadTotals();
-        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s; command processor reads without a drain: %llu, %llu of them ahead of pending records, %llu verified\n", text.empty() ? " none" : text.c_str(), static_cast<unsigned long long>(reads.reads - lastReads.reads), static_cast<unsigned long long>(reads.ahead - lastReads.ahead), static_cast<unsigned long long>(reads.verified - lastReads.verified));
+        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s; command processor reads without a drain: %llu, %llu of them ahead of pending records, %llu verified; register-state packets without a drain: %llu\n", text.empty() ? " none" : text.c_str(), static_cast<unsigned long long>(reads.reads - lastReads.reads), static_cast<unsigned long long>(reads.ahead - lastReads.ahead), static_cast<unsigned long long>(reads.verified - lastReads.verified), static_cast<unsigned long long>(reads.registerState - lastReads.registerState));
         lastReads = reads;
         static std::array<std::uint64_t, 4> lastLabels{};
         const std::array<std::uint64_t, 4> labelTotals{counts.labelPackets.load(std::memory_order_relaxed), counts.labelJobs.load(std::memory_order_relaxed), counts.labelJobLabels.load(std::memory_order_relaxed), counts.endOfPipeJobs.load(std::memory_order_relaxed)};

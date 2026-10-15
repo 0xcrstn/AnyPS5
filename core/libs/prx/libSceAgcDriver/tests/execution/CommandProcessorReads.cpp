@@ -156,6 +156,7 @@ std::vector<std::uint32_t> Frame() {
     SetRegister(words, SetShReg, 0x08c, static_cast<std::uint32_t>(vertexTable));
     SetRegister(words, SetShReg, 0x08d, static_cast<std::uint32_t>(vertexTable >> 32u));
     words.insert(words.end(), {0xc0012d00u, 3u, 2u});
+    words.insert(words.end(), {0xc0001000u, 0u});
     words.insert(words.end(), {0xc0036300u, static_cast<std::uint32_t>(pairs), static_cast<std::uint32_t>(static_cast<std::uint64_t>(pairs) >> 32u), 0x80000000u, 2u});
     words.insert(words.end(), {0xc0012d00u, 3u, 2u});
     const auto labelAddress = reinterpret_cast<std::uintptr_t>(&EndOfPipe);
@@ -223,10 +224,11 @@ void DrawsSeeTheIndirectRegisters(CommandProcessorReads mode, const std::string&
     Require(full >= 254u, name + ": the draw after SET_SH_REG_INDIRECT wrote red " + std::to_string(full) + ", expected 255 after the CPU changed the pairs");
     const auto after = AgcDriver::DriverDetail::CommandProcessorReadTotals();
     if (mode == CommandProcessorReads::Drain) {
-        Require(after.reads == before.reads, name + ": a drained SET_SH_REG_INDIRECT was counted as read without a drain");
+        Require(after.reads == before.reads && after.registerState == before.registerState, name + ": a drained SET_SH_REG_INDIRECT or NOP was counted as taken without a drain");
         return;
     }
     Require(after.reads == before.reads + 2u, name + ": " + std::to_string(after.reads - before.reads) + " SET_SH_REG_INDIRECT packets read without a drain, expected 2");
+    Require(after.registerState == before.registerState + 2u, name + ": " + std::to_string(after.registerState - before.registerState) + " NOP packets taken without a drain, expected 2");
     if (mode == CommandProcessorReads::Verify) Require(after.verified - before.verified == after.ahead - before.ahead, name + ": " + std::to_string(after.verified - before.verified) + " of " + std::to_string(after.ahead - before.ahead) + " reads ahead of pending records were verified");
     else Require(after.verified == before.verified, name + ": reads were verified with verification off");
 }

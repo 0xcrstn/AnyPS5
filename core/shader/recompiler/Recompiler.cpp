@@ -755,6 +755,17 @@ void VerifyEmission(const RecompileRequest& request, const IrProgram& program, c
 #endif
     if (event.Active()) event.Number("outlined_image_words", outlined.size()).Number("inline_image_words", inlineModes.size()).Number("outlined_image_functions", DescribeSpirvShape(outlined).functions);
     if (const auto difference = CompareSpirvInterfaces(inlineModes, outlined)) throw std::runtime_error("APS5_VERIFY_SHADER_EMISSION: outlined image modes change the interface of shader 0x" + std::to_string(request.shader.codeAddress) + ": " + *difference);
+    options.outlineImageModes.reset();
+    options.sharedBufferHelpers = true;
+    const auto sharedBuffers = spirvEmitter.Emit(program, inputInfo, bindings, options);
+    options.sharedBufferHelpers = false;
+    const auto resourceBuffers = spirvEmitter.Emit(program, inputInfo, bindings, options);
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    static_cast<void>(ValidateAndOptimizeSpirv(sharedBuffers, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, false));
+    static_cast<void>(ValidateAndOptimizeSpirv(resourceBuffers, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, false));
+#endif
+    if (event.Active()) event.Number("shared_buffer_words", sharedBuffers.size()).Number("resource_buffer_words", resourceBuffers.size()).Number("shared_buffer_functions", DescribeSpirvShape(sharedBuffers).functions);
+    if (const auto difference = CompareSpirvInterfaces(resourceBuffers, sharedBuffers)) throw std::runtime_error("APS5_VERIFY_SHADER_EMISSION: shared formatted buffer helpers change the interface of shader 0x" + std::to_string(request.shader.codeAddress) + ": " + *difference);
 }
 
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program, bool consume = false) {
