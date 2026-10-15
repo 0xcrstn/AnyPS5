@@ -4,6 +4,7 @@
 #include "IntermediateRepresentation/IrOpcode.hpp"
 #include "IntermediateRepresentation/IrType.hpp"
 #include "IntermediateRepresentation/GuestRegister.hpp"
+#include "IntermediateRepresentation/IrSmallVector.hpp"
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -34,8 +35,11 @@ public:
     [[nodiscard]] IrOpcode Opcode() const;
     [[nodiscard]] IrType Type() const;
     [[nodiscard]] std::uint32_t Id() const;
-    [[nodiscard]] const std::vector<IrValue*>& Arguments() const;
-    [[nodiscard]] const std::vector<IrValue*>& Uses() const;
+    using ValueList = IrSmallVector<IrValue*, 3>;
+    using UserList = IrSmallVector<IrValue*, 2>;
+    using UseList = IrSmallVector<IrUse, 2>;
+    [[nodiscard]] const ValueList& Arguments() const;
+    [[nodiscard]] const UserList& Uses() const;
     [[nodiscard]] IrBlock* Parent() const;
     [[nodiscard]] bool HasImmediate() const;
     [[nodiscard]] std::uint32_t ImmediateU32() const;
@@ -70,7 +74,7 @@ public:
     [[nodiscard]] std::size_t PhiBlockCount() const;
     [[nodiscard]] IrValue* Argument(std::size_t index) const;
     [[nodiscard]] IrBlock* PhiBlock(std::size_t index) const;
-    [[nodiscard]] const std::vector<IrUse>& OperandUses() const;
+    [[nodiscard]] const UseList& OperandUses() const;
     [[nodiscard]] std::uint64_t ImmediateU64() const;
     [[nodiscard]] std::uint16_t ImmediateF16Bits() const;
     [[nodiscard]] float ImmediateF32() const;
@@ -100,10 +104,10 @@ private:
     GuestRegister registerValue{};
     std::uint64_t flags = 0;
     std::vector<IrBlock*> phiBlocks;
-    std::vector<IrUse> operandUses;
+    UseList operandUses;
     bool hasImmediate;
-    std::vector<IrValue*> arguments;
-    std::vector<IrValue*> uses;
+    ValueList arguments;
+    UserList uses;
     IrBlock* parent;
 };
 
@@ -123,11 +127,11 @@ inline std::uint32_t IrValue::Id() const {
     return id;
 }
 
-inline const std::vector<IrValue*>& IrValue::Arguments() const {
+inline const IrValue::ValueList& IrValue::Arguments() const {
     return arguments;
 }
 
-inline const std::vector<IrValue*>& IrValue::Uses() const {
+inline const IrValue::UserList& IrValue::Uses() const {
     return uses;
 }
 
@@ -163,7 +167,7 @@ inline std::size_t IrValue::PhiBlockCount() const {
     return phiBlocks.size();
 }
 
-inline const std::vector<IrUse>& IrValue::OperandUses() const {
+inline const IrValue::UseList& IrValue::OperandUses() const {
     return operandUses;
 }
 

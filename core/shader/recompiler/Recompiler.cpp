@@ -278,38 +278,38 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     const auto simplify = [&] {
         ShaderCompileTrace::Event simplifyEvent("frontend.simplify");
         dumpIr("translate");
-        ssaBuilder.Rewrite(program);
+        { ShaderCompileTrace::Event passEvent("pass.ssa"); ssaBuilder.Rewrite(program); }
         dumpIr("ssa");
 
-        constantFolder.Fold(program);
-        ResolveControlFlowIdentities(program);
-        deadCodeEliminator.RemoveIdentities(program);
-        deadCodeEliminator.Eliminate(program);
+        { ShaderCompileTrace::Event passEvent("pass.fold"); constantFolder.Fold(program); }
+        { ShaderCompileTrace::Event passEvent("pass.control_flow_identities"); ResolveControlFlowIdentities(program); }
+        { ShaderCompileTrace::Event passEvent("pass.remove_identities"); deadCodeEliminator.RemoveIdentities(program); }
+        { ShaderCompileTrace::Event passEvent("pass.dce"); deadCodeEliminator.Eliminate(program); }
         dumpIr("fold");
 
-        const auto readLaneStats = readLaneEliminator.Eliminate(program, translateOptions.waveSize);
+        const auto readLaneStats = [&] { ShaderCompileTrace::Event passEvent("pass.read_lane"); return readLaneEliminator.Eliminate(program, translateOptions.waveSize); }();
         if (readLaneStats.rewrittenReads != 0u) {
-            constantFolder.Fold(program);
-            ResolveControlFlowIdentities(program);
-            deadCodeEliminator.RemoveIdentities(program);
-            deadCodeEliminator.Eliminate(program);
+            { ShaderCompileTrace::Event passEvent("pass.fold"); constantFolder.Fold(program); }
+            { ShaderCompileTrace::Event passEvent("pass.control_flow_identities"); ResolveControlFlowIdentities(program); }
+            { ShaderCompileTrace::Event passEvent("pass.remove_identities"); deadCodeEliminator.RemoveIdentities(program); }
+            { ShaderCompileTrace::Event passEvent("pass.dce"); deadCodeEliminator.Eliminate(program); }
         }
 
-        if (maskedSelectEliminator.Eliminate(program).removedSelects != 0u) {
+        if ([&] { ShaderCompileTrace::Event passEvent("pass.masked_select"); return maskedSelectEliminator.Eliminate(program).removedSelects; }() != 0u) {
             const bool liveAncillary = std::ranges::any_of(program.Blocks(), [](const auto& block) {
                 return std::ranges::any_of(block->Instructions(), [](const IrValue* value) {
                     return value->Opcode() == IrOpcode::GetBuiltin && value->HasUses() && value->Argument(0)->Resolve()->ImmediateU32() == static_cast<std::uint32_t>(StageInputKind::PackedAncillary);
                 });
             });
             if (liveAncillary) {
-                constantFolder.Fold(program);
-                ResolveControlFlowIdentities(program);
-                deadCodeEliminator.RemoveIdentities(program);
+                { ShaderCompileTrace::Event passEvent("pass.fold"); constantFolder.Fold(program); }
+                { ShaderCompileTrace::Event passEvent("pass.control_flow_identities"); ResolveControlFlowIdentities(program); }
+                { ShaderCompileTrace::Event passEvent("pass.remove_identities"); deadCodeEliminator.RemoveIdentities(program); }
             }
-            deadCodeEliminator.Eliminate(program);
+            { ShaderCompileTrace::Event passEvent("pass.dce"); deadCodeEliminator.Eliminate(program); }
         }
         if (constantFolder.ComposePackedAncillary(program)) {
-            deadCodeEliminator.Eliminate(program);
+            { ShaderCompileTrace::Event passEvent("pass.dce"); deadCodeEliminator.Eliminate(program); }
         }
     };
     simplify();
@@ -322,23 +322,23 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
 
     ShaderCompileTrace::Event lowerEvent("frontend.lower_resources");
     constexpr DenormalFlushEliminator denormalFlushEliminator;
-    if (denormalFlushEliminator.Eliminate(program).removedFlushes != 0u) {
-        deadCodeEliminator.Eliminate(program);
+    if ([&] { ShaderCompileTrace::Event passEvent("pass.denormal_flush"); return denormalFlushEliminator.Eliminate(program).removedFlushes; }() != 0u) {
+        { ShaderCompileTrace::Event passEvent("pass.dce"); deadCodeEliminator.Eliminate(program); }
     }
 
     if (inputInfo.vertex != nullptr) {
         constexpr TessellationLowering tessellationLowering;
-        tessellationLowering.Lower(program, inputInfo.vertex->tess);
+        { ShaderCompileTrace::Event passEvent("pass.tessellation"); tessellationLowering.Lower(program, inputInfo.vertex->tess); }
     }
 
     constexpr SrtWalker srtWalker;
-    srtWalker.BuildPlan(program);
-    deadCodeEliminator.Eliminate(program);
+    { ShaderCompileTrace::Event passEvent("pass.srt_walker"); srtWalker.BuildPlan(program); }
+    { ShaderCompileTrace::Event passEvent("pass.dce"); deadCodeEliminator.Eliminate(program); }
     dumpIr("srt");
 
     constexpr ResourceTracker resourceTracker;
-    resourceTracker.Track(program);
-    deadCodeEliminator.Eliminate(program);
+    { ShaderCompileTrace::Event passEvent("pass.resource_tracker"); resourceTracker.Track(program); }
+    { ShaderCompileTrace::Event passEvent("pass.dce"); deadCodeEliminator.Eliminate(program); }
     dumpIr("resources");
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
     if (traced.Active()) traced.Number("ir_bytes", estimateProgramBytes(program)).Flag("barycentric_retranslated", program.Metadata().barycentricEmulation);

@@ -432,41 +432,55 @@ void ValidateProgram(const IrProgram& program, bool requireSsa) {
         fail("value IR entry block has a predecessor");
     }
 
+    std::vector<const IrBlock*> predecessors;
+    std::vector<const IrBlock*> successors;
+    std::vector<const IrBlock*> expectedSuccessors;
+    std::vector<const IrBlock*> incomingBlocks;
+    const auto contains = [](const std::vector<const IrBlock*>& blocks, const IrBlock* block) {
+        return std::find(blocks.begin(), blocks.end(), block) != blocks.end();
+    };
+    const auto sameBlocks = [](std::vector<const IrBlock*>& left, std::vector<const IrBlock*>& right) {
+        std::sort(left.begin(), left.end());
+        std::sort(right.begin(), right.end());
+        return left == right;
+    };
     for (std::size_t blockIndex = 0; blockIndex < blockOrder.size(); blockIndex++) {
         const auto* block = blockOrder[blockIndex];
-        std::unordered_set<const IrBlock*> predecessors;
+        predecessors.clear();
         for (const auto* predecessor : block->Predecessors()) {
             if (predecessor == nullptr || !blockIndices.contains(predecessor)) {
                 fail("value IR block has a foreign predecessor");
             }
-            if (!predecessors.insert(predecessor).second) {
+            if (contains(predecessors, predecessor)) {
                 fail("value IR block predecessor is duplicated");
             }
+            predecessors.push_back(predecessor);
             if (std::find(predecessor->Successors().begin(), predecessor->Successors().end(), block) == predecessor->Successors().end()) {
                 fail("value IR predecessor edge is not reciprocal");
             }
         }
 
-        std::unordered_set<const IrBlock*> successors;
+        successors.clear();
         for (const auto* successor : block->Successors()) {
             if (successor == nullptr || !blockIndices.contains(successor)) {
                 fail("value IR block has a foreign successor");
             }
-            if (!successors.insert(successor).second) {
+            if (contains(successors, successor)) {
                 fail("value IR block successor is duplicated");
             }
+            successors.push_back(successor);
             if (std::find(successor->Predecessors().begin(), successor->Predecessors().end(), block) == successor->Predecessors().end()) {
                 fail("value IR successor edge is not reciprocal");
             }
         }
 
-        std::unordered_set<const IrBlock*> expectedSuccessors;
+        expectedSuccessors.clear();
         const auto addTarget = [&](std::uint32_t id) {
             const auto found = blocksById.find(id);
             if (found == blocksById.end()) {
                 return false;
             }
-            expectedSuccessors.insert(found->second);
+            if (!contains(expectedSuccessors, found->second)) expectedSuccessors.push_back(found->second);
             return true;
         };
         const auto& terminator = blockInfo[blockIndex].terminator;
@@ -508,7 +522,7 @@ void ValidateProgram(const IrProgram& program, bool requireSsa) {
                 }
                 for (const auto target : terminator.indirectSelectorTargets) {
                     const auto found = blocksById.find(target);
-                    if (found == blocksById.end() || !expectedSuccessors.contains(found->second)) {
+                    if (found == blocksById.end() || !contains(expectedSuccessors, found->second)) {
                         fail("value IR indirect selector target is not a CFG successor");
                     }
                 }
@@ -521,7 +535,7 @@ void ValidateProgram(const IrProgram& program, bool requireSsa) {
         if ((terminator.mergeBlock != InvalidControlFlowId && !blocksById.contains(terminator.mergeBlock)) || (terminator.continueBlock != InvalidControlFlowId && !blocksById.contains(terminator.continueBlock))) {
             fail("value IR structured control target is missing");
         }
-        if (successors != expectedSuccessors) {
+        if (!sameBlocks(successors, expectedSuccessors)) {
             fail("value IR terminator and successor graph disagree");
         }
 
@@ -540,15 +554,16 @@ void ValidateProgram(const IrProgram& program, bool requireSsa) {
                 if (inst->ArgumentCount() == 0) {
                     fail("value IR Phi has no incoming values");
                 }
-                std::unordered_set<const IrBlock*> incomingBlocks;
+                incomingBlocks.clear();
                 for (std::size_t argIndex = 0; argIndex < inst->ArgumentCount(); argIndex++) {
                     const auto* predecessor = inst->PhiBlock(argIndex);
-                    if (predecessor == nullptr || !blockIndices.contains(predecessor) || !predecessors.contains(predecessor)) {
+                    if (predecessor == nullptr || !blockIndices.contains(predecessor) || !contains(predecessors, predecessor)) {
                         fail("value IR Phi has a foreign or non-predecessor parent");
                     }
-                    if (!incomingBlocks.insert(predecessor).second) {
+                    if (contains(incomingBlocks, predecessor)) {
                         fail("value IR Phi parent is duplicated");
                     }
+                    incomingBlocks.push_back(predecessor);
                     const auto* argument = inst->Argument(argIndex);
                     if (argument == nullptr) {
                         fail("value IR Phi has an empty argument");
@@ -557,7 +572,7 @@ void ValidateProgram(const IrProgram& program, bool requireSsa) {
                         fail("value IR Phi incoming type does not match its result");
                     }
                 }
-                if (incomingBlocks != predecessors) {
+                if (incomingBlocks.size() != predecessors.size()) {
                     fail("value IR Phi does not cover every predecessor");
                 }
             } else {
