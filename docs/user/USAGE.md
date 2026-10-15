@@ -297,6 +297,7 @@ Queue 0's draws and dispatches are prepared on worker threads and recorded on a 
 `APS5_IN_PLACE_DRAW_INPUTS` binds read-only draw inputs through their host imports instead of snapshotting them. It is on by default whenever `APS5_COHERENCE_INPUT_LEASES` is: each input then holds a read lease until its batch completes, so a CPU store into it waits for the draw instead of reaching it, and an input whose lease is refused is snapshotted. Setting it to `1` without the leases binds the inputs unprotected (a CPU store before the GPU reads them is seen by the draw); `0` turns it off.
 
 Off by default: `APS5_CHUNKED_RECORDING=1` records a render pass's draws into secondary command buffers on a recording thread (it costs more than it saves at a few draws per pass).
+
 A completion watcher thread waits on the GPU for the oldest submitted batch with completion actions (end-of-pipe interrupts, labels stored behind write-backs, write-backs) and runs them as soon as the GPU finishes it, so a title's CPU code waiting on an event queue or on such a label is woken without the queue workers polling. `APS5_COMPLETION_WATCHER=0` turns it off; idle workers then poll for finished batches as before. The `[labels]` line counts the watcher's reaps and GPU waits.
 
 ### Address-based shader experiments
