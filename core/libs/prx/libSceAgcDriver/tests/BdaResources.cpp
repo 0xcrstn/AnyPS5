@@ -855,6 +855,9 @@ void addressTemplateTests(const Context& context) {
     ShaderRecompiler::RecompileResult pixel;
     pixel.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
     pixel.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    pixel.bdaWrites = false;
+    pixel.bdaAtomics = false;
+    pixel.bdaCoherent = false;
     const std::array<CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}}};
     const bool previous = ShaderResources::AddressTemplatesEnabled();
     ShaderResources::SetAddressTemplates(true);
