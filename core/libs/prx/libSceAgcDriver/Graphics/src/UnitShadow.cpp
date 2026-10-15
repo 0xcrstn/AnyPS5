@@ -582,6 +582,11 @@ void MarkShadowedReached(std::span<const std::pair<std::uint64_t, std::uint64_t>
     }
 }
 
+std::atomic<std::uint64_t>& UnprotectedShadowBytes() {
+    static std::atomic<std::uint64_t> bytes{0};
+    return bytes;
+}
+
 std::size_t PublishUnprotectedShadows(PublishReason reason, bool protectedToo) {
     if (!UnitShadowEnabled()) return 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -601,7 +606,11 @@ std::size_t PublishUnprotectedShadows(PublishReason reason, bool protectedToo) {
         });
     }
     std::size_t published = 0;
-    for (const auto& [begin, end] : ranges) published += PublishShadow(begin, static_cast<std::size_t>(end - begin), PublishScope::Whole, reason);
+    for (const auto& [begin, end] : ranges) {
+        const auto units = PublishShadow(begin, static_cast<std::size_t>(end - begin), PublishScope::Whole, reason);
+        if (units != 0) UnprotectedShadowBytes().fetch_add(end - begin, std::memory_order_relaxed);
+        published += units;
+    }
     return published;
 }
 
