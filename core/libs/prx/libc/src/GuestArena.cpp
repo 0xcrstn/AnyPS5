@@ -446,6 +446,10 @@ std::size_t GuestArenaBackingRuns_nid_postfix(std::uintptr_t address, std::size_
 void GuestArenaSetResolveHostWrites_nid_postfix(bool resolve) {
     WindowsMappings::Get().SetResolveHostWrites(resolve);
 }
+
+bool GuestArenaOpenAccessForRead_nid_postfix(std::uint64_t token) {
+    return WindowsMappings::Get().OpenAccessForRead(token);
+}
 #else
 std::size_t GuestArenaBackingRuns_nid_postfix(std::uintptr_t, std::size_t, std::uintptr_t*, std::uintptr_t*, std::uint64_t*, std::size_t) {
     throw std::runtime_error("canonical guest backing identities are not implemented on this platform");

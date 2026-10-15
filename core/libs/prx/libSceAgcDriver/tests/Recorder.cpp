@@ -4697,7 +4697,7 @@ int coherenceFaultTests(const Device& device, Recorder& recorder) {
     }
     CollectWritesUncached(address, bytes);
     Coherence::SetFaultsModeForTests(Coherence::Mode::New);
-    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix, &GuestArena::GuestArenaOpenAccessForRead_nid_postfix});
     Coherence::SetMaterializer([](Coherence::Interval range) { StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin)); });
     Coherence::ResetForTests();
     TextureDetiler detiler(base);
@@ -4868,7 +4868,7 @@ int coherenceLeaseTests(const Device& device, Recorder& recorder) {
         return 77;
     }
     Coherence::SetInputLeasesModeForTests(Coherence::Mode::Verify);
-    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix, &GuestArena::GuestArenaOpenAccessForRead_nid_postfix});
     Coherence::SetLeaseWaiter([](Coherence::Interval) {
         std::lock_guard lock(GpuMutex());
         if (auto* active = Recorder::Active()) active->Sync();
@@ -4973,7 +4973,7 @@ int coherenceResidencyTests(const Device& device, Recorder& recorder) {
     }
     Coherence::SetModesForTests(Coherence::Mode::Verify, Coherence::Mode::Reference, Coherence::Mode::Reference);
     Coherence::SetResidencyModeForTests(Coherence::Mode::Verify);
-    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix, &GuestArena::GuestArenaOpenAccessForRead_nid_postfix});
     Coherence::SetMaterializer([](Coherence::Interval range) { StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin)); });
     Coherence::ResetForTests();
     const auto resident = [&](std::uint8_t value) {
@@ -5066,7 +5066,7 @@ int coherenceLazyReleaseTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the release block refused or compared: not tested\n";
         return 77;
     }
-    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix, &GuestArena::GuestArenaOpenAccessForRead_nid_postfix});
     Coherence::SetMaterializer([](Coherence::Interval range) { StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin)); });
     Coherence::SetLazyReleaseModeForTests(Coherence::Mode::Verify);
     Coherence::ResetForTests();

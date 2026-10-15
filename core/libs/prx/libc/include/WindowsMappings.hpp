@@ -73,6 +73,24 @@ public:
         return token;
     }
 
+    bool OpenAccessForRead(std::uint64_t token) {
+        std::lock_guard lock(mutex);
+        const auto found = accessGuards.find(token);
+        if (found == accessGuards.end()) return false;
+        auto& guard = *found->second;
+        if (guard.opened) return true;
+        guard.opened = true;
+        for (const auto& held : guard.pages) {
+            for (std::size_t sub = 0; sub < subpages; ++sub) {
+                if ((held.mask & (1u << sub)) != 0) ++held.page->readableGuards[sub];
+            }
+        }
+        for (const auto& held : guard.pages) {
+            for (const auto alias : held.page->aliases) protectAccess(alias, views.at(alias), held.mask);
+        }
+        return true;
+    }
+
     void ReleaseAccess(std::uint64_t token) {
         std::shared_ptr<AccessGuard> released;
         {
@@ -704,6 +722,7 @@ private:
         std::vector<std::uintptr_t> aliases;
         std::uint32_t pins = 0;
         std::array<std::uint32_t, subpages> accessGuards{};
+        std::array<std::uint32_t, subpages> readableGuards{};
     };
     struct ProtectedPage {
         std::shared_ptr<SharedPage> page;
@@ -719,6 +738,7 @@ private:
         bool (*resolve)(std::uint64_t, void*) = nullptr;
         void* context = nullptr;
         void (*releaseContext)(void*) = nullptr;
+        bool opened = false;
         std::mutex resolverMutex;
         ~AccessGuard() {
             if (releaseContext != nullptr) releaseContext(context);
@@ -734,11 +754,21 @@ private:
         return mask;
     }
 
+    static std::uint8_t readableAccess(const SharedPage& page) {
+        std::uint8_t mask = 0;
+        for (std::size_t sub = 0; sub < subpages; ++sub) {
+            if (page.accessGuards[sub] != 0 && page.readableGuards[sub] == page.accessGuards[sub]) mask |= static_cast<std::uint8_t>(1u << sub);
+        }
+        return mask;
+    }
+
     static void protectAccess(std::uintptr_t base, const View& view, std::uint8_t mask) {
         const auto guarded = static_cast<std::uint8_t>(mask & protectedAccess(*view.page));
-        protectSubpages(base, guarded, PAGE_NOACCESS, "protect pending guest access");
-        const auto watched = static_cast<std::uint8_t>(mask & ~guarded & view.armed);
+        const auto readable = static_cast<std::uint8_t>(guarded & readableAccess(*view.page));
         const DWORD protection = view.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+        protectSubpages(base, static_cast<std::uint8_t>(guarded & ~readable), PAGE_NOACCESS, "protect pending guest access");
+        protectSubpages(base, readable, protection, "open pending guest access for reading");
+        const auto watched = static_cast<std::uint8_t>(mask & ~guarded & view.armed);
         protectSubpages(base, watched, protection, "restore guest write tracking");
         protectSubpages(base, static_cast<std::uint8_t>(mask & ~guarded & ~watched), view.protection, "restore resolved guest access");
     }
@@ -762,7 +792,9 @@ private:
     void releaseAccessLocked(std::uint64_t token, const AccessGuard& guard) {
         for (const auto& held : guard.pages) {
             for (std::size_t sub = 0; sub < subpages; ++sub) {
-                if ((held.mask & (1u << sub)) != 0) --held.page->accessGuards[sub];
+                if ((held.mask & (1u << sub)) == 0) continue;
+                --held.page->accessGuards[sub];
+                if (guard.opened) --held.page->readableGuards[sub];
             }
         }
         accessGuards.erase(token);
