@@ -546,6 +546,7 @@ private:
     bool usesBda = false;
     bool mirrorReads = false;
     std::vector<std::uint64_t> multisampleSources;
+    bool bdaReadOnly = false;
     bool usesFaultBuffer = false;
     bool faultChecks = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;

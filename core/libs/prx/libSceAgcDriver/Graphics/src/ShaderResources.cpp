@@ -4595,6 +4595,14 @@ bool PartialSnapshotsDisabled() {
     static const bool disabled = std::getenv("APS5_NO_PARTIAL_DRAW_SNAPSHOTS") != nullptr;
     return disabled;
 }
+
+bool AddressBasedDrawSnapshots() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_BDA_DRAW_SNAPSHOTS");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
 }
 
 const char* ShaderResources::WholeCopyName(WholeCopy reason) {
@@ -4703,7 +4711,7 @@ std::optional<ShaderResources::ByteRanges> ShaderResources::GuestReadRanges(std:
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindingsStatistics* statistics, const DrawIndexRanges* drawRanges) const {
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !(AddressBasedDrawSnapshots() && bdaReadOnly))) return {};
     auto lapStart = statistics != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto lap = [&](double DrawBindingsStatistics::*bucket) {
         if (statistics == nullptr) return;
