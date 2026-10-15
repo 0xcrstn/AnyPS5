@@ -157,6 +157,9 @@ bool ParallelResolveRequested();
 bool VerifyParallelResolve();
 bool ParallelRevalidateRequested();
 bool VerifyParallelRevalidate();
+bool ParallelDispatchRevalidate();
+bool VerifyParallelDispatchRevalidate();
+bool EpochProofsOffThread();
 std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
 void EncodeDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const ResolvedDraw& resolved, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
 

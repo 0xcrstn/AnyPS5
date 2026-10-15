@@ -2642,6 +2642,26 @@ bool VerifyParallelRevalidate() {
     return verify;
 }
 
+bool ParallelDispatchRevalidate() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_PARALLEL_DISPATCH_REVALIDATE");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool VerifyParallelDispatchRevalidate() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_PARALLEL_DISPATCH_REVALIDATE");
+        return ParallelDispatchRevalidate() && text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+bool EpochProofsOffThread() {
+    return ParallelRevalidateRequested() || ParallelDispatchRevalidate();
+}
+
 struct ResolvedDraw {
     VkDevice device = VK_NULL_HANDLE;
     ResolveStamp stamp;

@@ -196,6 +196,8 @@ public:
         std::uint64_t created, underGpuMutex;
     };
     static ComputePipelineCreation ComputePipelineCounts();
+    static std::vector<std::uint64_t> DispatchProofVerdicts();
+    static std::uint64_t DispatchProofsVerified();
     void ResolveMemory(std::uint64_t address, std::size_t bytes, bool writable);
     void* Window() const;
     void Resize(std::uint32_t width, std::uint32_t height);

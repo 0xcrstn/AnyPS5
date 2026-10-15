@@ -2507,7 +2507,7 @@ const char* ShaderResources::EpochProofVerdictName(EpochProofVerdict verdict) {
 
 ShaderResources::EpochProofResult ShaderResources::ResolveEpochProof() const {
     EpochProofResult result;
-    if (!reusable || !ParallelRevalidateRequested() || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return result;
+    if (!reusable || !EpochProofsOffThread() || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return result;
     struct RangesTag {};
     auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, RangesTag>();
     std::uint64_t serial = 0;
@@ -2932,7 +2932,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     std::unique_lock<std::recursive_mutex> proofLock(proofMutex, std::defer_lock);
-    if (ParallelRevalidateRequested()) proofLock.lock();
+    if (EpochProofsOffThread()) proofLock.lock();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto dirtySerialBefore = GuestMemory::DirtySerial();
