@@ -191,7 +191,6 @@ Three switches take `0` (the default), `1` or `verify`; any other value stops th
 `APS5_COHERENCE_AUDIT=1` keeps a version for every GPU writer the driver records (address-based shaders that may store through pointers, and written buffer elements) and checks every store of an older GPU result into guest memory (a pending storage image, a unit shadow) against it. The first stale store prints a `[coherence] stale publication` line with the writers and stores that touched those bytes; later ones are counted on a `[coherence]` line every 10 s. An address-based shader that reads host memory under a pending image or an unpublished unit shadow prints `[coherence] stale read`. `verify` stops the title at the first stale store instead. Rendering is unchanged; the checks cost CPU time.
 
 `APS5_COHERENCE_ORDERING=1` changes what the driver stores before GPU work:
-- An address-based shader that only reads also stores the pending images over its heaps.
 - A shader that may store through pointers:
   - its heaps are noted as pending writes, so driver CPU reads of them wait for it;
   - only its color target and the storage images it writes are left pending.
