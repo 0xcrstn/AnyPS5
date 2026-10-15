@@ -33,6 +33,8 @@ struct LinearSpaceCounters {
     std::uint64_t binds = 0;
     std::uint64_t unbinds = 0;
     std::uint64_t refused = 0;
+    std::uint64_t tables = 0;
+    std::uint64_t codedPages = 0;
 };
 
 bool ParseLinearSpace(const char* text);
@@ -43,6 +45,7 @@ void ReleaseLinearRange(VkDevice device, std::uint64_t begin, std::uint64_t end)
 void ClearLinearSpace(VkDevice device);
 LinearSpaceCounters LinearSpaceTotals();
 LinearPageCodes BuildLinearPageCodes(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, VkDeviceAddress deviceBase);
+void CountLinearTable(const LinearPageCodes& codes);
 LinearPageCode LinearPageCodeAt(const LinearPageCodes& codes, std::uint64_t address);
 
 }
