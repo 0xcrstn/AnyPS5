@@ -11316,6 +11316,11 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        SetBdaTestTranslation(ShaderRecompiler::BdaTable::TranslationSetting());
+        SetBdaTestRelative(ShaderRecompiler::BdaTable::RelativeSetting());
+        SetBdaTestSpanHelpers(ShaderRecompiler::BdaSpanHelpersSetting());
+        SetBdaTestWriteNotes(ShaderRecompiler::BdaWriteNotesSetting());
+        SetBdaTestInlineFastPath(ShaderRecompiler::BdaTable::InlineFastPathSetting());
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-retirement-only") {
             const auto alignment = device.GetContext().hostImportAlignment;
             if (alignment == 0 || alignment > 65536) {
