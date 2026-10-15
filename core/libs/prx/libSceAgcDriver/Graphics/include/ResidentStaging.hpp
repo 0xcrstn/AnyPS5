@@ -15,7 +15,7 @@ namespace AgcDriver::Graphics {
 class Buffer;
 class Recorder;
 
-enum class ResidentSite : std::uint8_t { Hook, Scanout, InPlace, CopyIn, AddressBased, Indirect, Copy, Label, Upload, Completion, Eviction, Retire, Count };
+enum class ResidentSite : std::uint8_t { Hook, Scanout, InPlace, CopyIn, AddressBased, Indirect, Copy, Label, Upload, Completion, Eviction, Retire, Native, Count };
 
 bool LazyStagingOut();
 bool LazyStagingVerify();

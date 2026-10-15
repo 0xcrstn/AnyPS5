@@ -1086,12 +1086,41 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : VulkanDevice(wind
 
 VulkanDevice::VulkanDevice(CompileOnly) : VulkanDevice(nullptr, true) {}
 
-VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) : state(std::make_unique<State>()), serial([] { static std::atomic<std::uint64_t> serials{0}; return serials.fetch_add(1, std::memory_order_relaxed) + 1; }()) {
-    state->compileOnly = compileOnly;
+namespace {
+
+void MaterializeNativeAccess(Coherence::Interval range) {
+    Graphics::StorageTexture::MaterializeForNativeAccess(range.begin, static_cast<std::size_t>(range.end - range.begin));
+}
+
+void WaitForGuestReaders(Coherence::Interval range) {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) Coherence::NoteLockedFault(range);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    if (auto* recorder = Graphics::Recorder::Active()) recorder->Sync();
+}
+
+void InstallCoherence() {
+    if (Coherence::LazyRelease() && !Coherence::FaultOwnership()) throw std::runtime_error("APS5_COHERENCE_LAZY_RELEASE needs APS5_COHERENCE_FAULTS: a release that stores nothing must leave device-only guest memory protected");
+    if (Coherence::LazyRelease() && Graphics::LazyStagingOut() && !Coherence::Residency()) throw std::runtime_error("APS5_COHERENCE_LAZY_RELEASE with APS5_LAZY_STAGING_OUT needs APS5_COHERENCE_RESIDENCY");
     if (Coherence::Canonicalizing()) {
         Coherence::SetBackingTranslator(&GuestArena::GuestArenaBackingRuns_nid_postfix);
         static_cast<void>(Coherence::Translate({0x10000, 0x10001}));
     }
+    if (!Coherence::FaultOwnership() && !Coherence::InputLeases() && !Coherence::Residency()) return;
+#ifdef _WIN32
+    Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix});
+    Coherence::SetMaterializer(&MaterializeNativeAccess);
+    Coherence::SetLeaseWaiter(&WaitForGuestReaders);
+    GuestArena::GuestArenaSetResolveHostWrites_nid_postfix(true);
+#else
+    throw std::runtime_error("APS5_COHERENCE_FAULTS, APS5_COHERENCE_INPUT_LEASES and APS5_COHERENCE_RESIDENCY: guest access protection is not implemented on this platform");
+#endif
+}
+
+}
+
+VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) : state(std::make_unique<State>()), serial([] { static std::atomic<std::uint64_t> serials{0}; return serials.fetch_add(1, std::memory_order_relaxed) + 1; }()) {
+    state->compileOnly = compileOnly;
+    InstallCoherence();
     APS5_LOG_OUT("VulkanDevice constructor window=%p", static_cast<const void*>(window));
 #ifdef _WIN32
     state->library = SDL_LoadObject("vulkan-1.dll");
@@ -2182,8 +2211,16 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
-    if (storeAtLabel || Coherence::Ordering()) Graphics::StorageTexture::FlushAllPending("label");
-    const auto checkDrained = [&](bool writeBacksOrdered) { Coherence::CheckDrained(Graphics::StorageTexture::AnyPending(), Graphics::AnyShadowedOverlaps(0, std::numeric_limits<std::size_t>::max()), "label", writeBacksOrdered); };
+    const bool lazyRelease = Coherence::LazyRelease() && !storeAtLabel;
+    if (lazyRelease) {
+        static_cast<void>(Graphics::StorageTexture::FlushUnprotected("label"));
+        Coherence::CheckReleaseCovered(Graphics::StorageTexture::AnyUnprotectedPending(), Graphics::AnyUnprotectedShadow(), "label");
+    } else if (storeAtLabel || Coherence::Ordering()) {
+        Graphics::StorageTexture::FlushAllPending("label");
+    }
+    const auto checkDrained = [&](bool writeBacksOrdered) {
+        if (!lazyRelease) Coherence::CheckDrained(Graphics::StorageTexture::AnyPending(), Graphics::AnyShadowedOverlaps(0, std::numeric_limits<std::size_t>::max()), "label", writeBacksOrdered);
+    };
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) {
         checkDrained(true);
         return 4;
