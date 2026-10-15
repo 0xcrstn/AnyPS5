@@ -150,15 +150,30 @@ bool ResolveProtection(std::uint64_t token, void* context) {
         }
     }
     if (live) {
+        std::vector<std::uint64_t> opened;
+        {
+            std::lock_guard lock(ledger.mutex);
+            for (auto it = ledger.live.begin(); it != ledger.live.end();) {
+                if (it->first == id || (it->second.token != 0 && it->second.range.begin < range.end && range.begin < it->second.range.end)) {
+                    if (it->second.token != 0 && it->second.token != token) opened.push_back(it->second.token);
+                    it = ledger.live.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            ++(lease ? ledger.leaseWaits : ledger.resolved);
+        }
+        if (backend.release != nullptr) {
+            backend.release(token);
+            for (const auto other : opened) backend.release(other);
+        }
         try {
             if (materializer == nullptr) throw std::runtime_error(lease ? "no lease waiter is installed" : "no materializer is installed");
             materializer(range);
         } catch (const std::exception& error) {
             AbortInFault(lease ? "a native access to guest memory under a read lease could not wait for its readers" : "native access to device-owned guest memory could not be materialized", range, error.what());
         }
-        std::lock_guard lock(ledger.mutex);
-        ledger.live.erase(id);
-        ++(lease ? ledger.leaseWaits : ledger.resolved);
+        return true;
     }
     if (backend.release != nullptr) backend.release(token);
     return true;
@@ -522,6 +537,13 @@ void ReleaseDeviceOwned(std::uint64_t protection) {
         ledger.live.erase(found);
     }
     if (token != 0 && backend.release != nullptr) backend.release(token);
+}
+
+bool ProtectionLive(std::uint64_t protection) {
+    if (protection == 0) return false;
+    auto& ledger = Protections();
+    std::lock_guard lock(ledger.mutex);
+    return ledger.live.contains(protection);
 }
 
 void NoteLockedFault(Interval range) {
