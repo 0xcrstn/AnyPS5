@@ -219,12 +219,13 @@ void CommandSink::SetStencilTestEnable(const Context& context, VkBool32 enable) 
     context.Resolved(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, enable);
 }
 
-void CommandSink::BindDescriptorSet(const Context& context, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t index, VkDescriptorSet set) const {
+void CommandSink::BindDescriptorSet(const Context& context, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t index, VkDescriptorSet set, std::span<const std::uint32_t> dynamicOffsets) const {
     if (list != nullptr) {
-        list->Append(ChunkCommand::BindDescriptorSet, {Value(bindPoint), Handle(layout), Value(index), Handle(set)});
+        std::vector<std::uint64_t> offsets(dynamicOffsets.begin(), dynamicOffsets.end());
+        list->Append(ChunkCommand::BindDescriptorSet, {Value(bindPoint), Handle(layout), Value(index), Handle(set), Value(static_cast<std::uint32_t>(offsets.size()))}, offsets);
         return;
     }
-    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, index, 1, &set, 0, nullptr);
+    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, index, 1, &set, static_cast<std::uint32_t>(dynamicOffsets.size()), dynamicOffsets.empty() ? nullptr : dynamicOffsets.data());
 }
 
 void CommandSink::PushConstants(const Context& context, VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::uint32_t size, const void* values) const {
@@ -411,10 +412,15 @@ std::size_t ReplayCommands(const Context& context, VkCommandBuffer commands, std
             expect(1);
             issue([&](const CommandSink& sink) { sink.SetStencilTestEnable(context, Low(args[0])); });
             break;
-        case ChunkCommand::BindDescriptorSet:
-            expect(4);
-            issue([&](const CommandSink& sink) { sink.BindDescriptorSet(context, Enum<VkPipelineBindPoint>(args[0]), FromHandle<VkPipelineLayout>(args[1]), Low(args[2]), FromHandle<VkDescriptorSet>(args[3])); });
+        case ChunkCommand::BindDescriptorSet: {
+            if (args.size() < 5) expect(5);
+            const auto count = static_cast<std::size_t>(Low(args[4]));
+            expect(5 + count);
+            std::vector<std::uint32_t> offsets(count);
+            for (std::size_t offset = 0; offset < count; ++offset) offsets[offset] = Low(args[5 + offset]);
+            issue([&](const CommandSink& sink) { sink.BindDescriptorSet(context, Enum<VkPipelineBindPoint>(args[0]), FromHandle<VkPipelineLayout>(args[1]), Low(args[2]), FromHandle<VkDescriptorSet>(args[3]), offsets); });
             break;
+        }
         case ChunkCommand::PushConstants: {
             if (args.size() < 4) expect(4);
             const auto size = Low(args[3]);
