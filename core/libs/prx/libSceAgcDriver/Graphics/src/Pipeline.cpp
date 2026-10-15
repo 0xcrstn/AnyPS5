@@ -1229,11 +1229,11 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled) return nullptr;
-    auto& store = Pipelines();
-    std::lock_guard lock(store.mutex);
-    auto& key = store.scratchKey;
+    std::vector<std::byte> key;
     pipelineKey(key, context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout);
     if (key.empty()) return nullptr;
+    auto& store = Pipelines();
+    std::lock_guard lock(store.mutex);
     const auto found = store.index.find(hashKey(key));
     if (found == store.index.end() || found->second->key != key || !alive(*found->second, context)) return nullptr;
     store.entries.splice(store.entries.end(), store.entries, found->second);
