@@ -129,7 +129,7 @@ SnapshotPart FirstSnapshotDifference(const ShaderRecompiler::ResourceCapture& fu
 bool Driver::bindingPlan() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_BINDING_PLAN");
-        return text != nullptr && std::strcmp(text, "0") != 0;
+        return text == nullptr || std::strcmp(text, "0") != 0;
     }();
     return enabled;
 }
@@ -145,7 +145,7 @@ bool Driver::verifyBindingPlan() {
 bool Driver::incrementalBindings() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_INCREMENTAL_BINDINGS");
-        return text != nullptr && std::strcmp(text, "0") != 0;
+        return text == nullptr || std::strcmp(text, "0") != 0;
     }();
     return enabled;
 }
@@ -220,7 +220,7 @@ void Driver::noteIncrementalStage(const ShaderRecompiler::SrtTapeInstance& insta
 bool Driver::incrementalPlans() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_INCREMENTAL_PLANS");
-        return text != nullptr && std::strcmp(text, "0") != 0;
+        return text == nullptr || std::strcmp(text, "0") != 0;
     }();
     return enabled;
 }

@@ -4858,7 +4858,7 @@ bool PartialSnapshotsDisabled() {
 }
 
 std::atomic<bool>& MovedWordRingFlag() {
-    static std::atomic<bool> flag{std::getenv("APS5_MOVED_WORD_RING") != nullptr && std::strcmp(std::getenv("APS5_MOVED_WORD_RING"), "0") != 0};
+    static std::atomic<bool> flag{std::getenv("APS5_MOVED_WORD_RING") == nullptr || std::strcmp(std::getenv("APS5_MOVED_WORD_RING"), "0") != 0};
     return flag;
 }
 
