@@ -69,11 +69,11 @@ std::uint32_t selectValue(SpirvEmitterState& state, std::uint32_t condition, std
 }
 
 template<typename TRead>
-std::uint32_t readOrDefault(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t condition, std::uint32_t type, std::uint32_t fallback, std::uint32_t components, TRead&& read) {
+std::uint32_t readOrDefault(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t condition, std::uint32_t type, std::uint32_t fallback, std::uint32_t components, TRead&& read, bool compared = true) {
     auto& state = context.state;
     if (!selectedReads(context, instruction)) return EmitValueOrDefaultIfCondition(state, condition, type, fallback, [&] { return read(false); });
     const auto selected = selectValue(state, condition, type, read(true), fallback, components);
-    if (state.bufferSelects == RewriteMode::On) return selected;
+    if (state.bufferSelects == RewriteMode::On || !compared) return selected;
     if (state.faultBufferVariable == 0u) context.Fail(instruction, "APS5_BUFFER_SELECTS=verify needs a fault buffer");
     const auto guarded = EmitValueOrDefaultIfCondition(state, condition, type, fallback, [&] { return read(false); });
     auto differs = ConstantBool(state, false);
@@ -796,7 +796,7 @@ std::uint32_t EmitRuntimeBufferLoad(SpirvValueEmitContext& context, const IrValu
     const auto zero = components == 1u ? ConstantU32(state, 0u) : ConstantU32CompositeZero(state, components);
     return readOrDefault(context, instruction, context.Arg(instruction, instruction.ArgumentCount() - 1u), type, zero, components, [&](bool) {
         const auto resource = descriptor(context, instruction);
-        if (memory.formatted) return readOrDefault(context, instruction, resource.valid, type, zero, components, [&](bool) { return formattedDispatch(context, instruction, resource, components, false, 0u); });
+        if (memory.formatted) return readOrDefault(context, instruction, resource.valid, type, zero, components, [&](bool) { return formattedDispatch(context, instruction, resource, components, false, 0u); }, false);
         const auto readComponents = [&] {
             std::array<std::uint32_t, 4> values{};
             for (std::uint32_t component = 0; component < components; ++component) {
@@ -819,7 +819,7 @@ std::uint32_t EmitRuntimeBufferLoad(SpirvValueEmitContext& context, const IrValu
             const auto high = Binary(state, spv::OpShiftRightLogical, TypeScalarU64(state), value, BdaConstant(state, 32u));
             return composite(state, 2u, {Unary(state, spv::OpUConvert, TypeU32(state), value), Unary(state, spv::OpUConvert, TypeU32(state), high), 0u, 0u});
         }, readComponents);
-    });
+    }, false);
 }
 
 void EmitRuntimeBufferStore(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t components) {
