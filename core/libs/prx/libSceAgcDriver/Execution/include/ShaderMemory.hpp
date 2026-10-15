@@ -81,6 +81,7 @@ public:
         std::shared_ptr<const void> plan;
         std::uint64_t generation = 0;
         std::uint64_t allocation = 0;
+        std::vector<std::uint64_t> pages;
     };
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation, IncrementalState& state);
     std::vector<std::pair<std::uint64_t, std::uint32_t>> TakeKeptWords();
@@ -129,6 +130,7 @@ private:
     static bool stable(void* context, std::uint64_t address, std::uint32_t word);
     bool stableDirect(std::uint64_t address, std::uint32_t word);
     bool pageUnchanged(std::uint64_t base);
+    void notePage(std::uint64_t base);
     void recordDirect(std::uint64_t address, std::uint32_t word);
     void enableDirect();
     Page& page(std::uint64_t base);
@@ -180,6 +182,7 @@ private:
     std::uint64_t stableSince = 0;
     std::uint64_t stableAllocation = 0;
     std::vector<std::pair<std::uint64_t, bool>> stablePages;
+    std::vector<std::uint64_t> runPages;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> keptWords;
 };
 

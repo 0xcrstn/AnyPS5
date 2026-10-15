@@ -673,6 +673,7 @@ bool ShaderMemory::readDirect(std::uint64_t address, std::uint32_t* value) {
                 *value = directReads[held - 1].word;
                 recentReads.push_back(held - 1);
                 if (recording != nullptr) recording->push_back({address, 0, *value});
+                if (tapeInstance != nullptr) notePage(address & ~static_cast<std::uint64_t>(PageBytes - 1));
                 return true;
             }
         }
@@ -696,6 +697,7 @@ bool ShaderMemory::readDirect(std::uint64_t address, std::uint32_t* value) {
         ++directHooked;
     }
     recordDirect(address, word);
+    if (tapeInstance != nullptr) notePage(address & ~static_cast<std::uint64_t>(PageBytes - 1));
     *value = word;
     return true;
 }
@@ -734,6 +736,7 @@ bool ShaderMemory::stableDirect(std::uint64_t address, std::uint32_t word) {
             if (directReads[held - 1].address != address) continue;
             if (directReads[held - 1].word != word) return false;
             recentReads.push_back(held - 1);
+            notePage(address & ~static_cast<std::uint64_t>(PageBytes - 1));
             return true;
         }
     }
@@ -745,7 +748,12 @@ bool ShaderMemory::stableDirect(std::uint64_t address, std::uint32_t word) {
     if (directPageKind(base, allocation, provider, pending) != PageWhole || !pageUnchanged(base)) return false;
     recordDirect(address, word);
     keptWords.emplace_back(address, word);
+    notePage(base);
     return true;
+}
+
+void ShaderMemory::notePage(std::uint64_t base) {
+    if (std::find(runPages.begin(), runPages.end(), base) == runPages.end()) runPages.push_back(base);
 }
 
 bool ShaderMemory::pageUnchanged(std::uint64_t base) {
@@ -1281,11 +1289,15 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureVa
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation, IncrementalState& state) {
     enableDirect();
     const auto allocation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const auto generation = GuestMemory::TrackerGeneration();
     stableSince = direct && state.allocation == allocation ? state.generation : 0;
     stableAllocation = allocation;
     stablePages.clear();
     keptWords.clear();
+    runPages.clear();
+    if (stableSince != 0) {
+        for (const auto base : state.pages) stablePages.emplace_back(base, GuestMemory::CollectWrites(base, PageBytes) != 0 && GuestMemory::UnchangedSince(base, PageBytes, stableSince));
+    }
+    const auto generation = GuestMemory::TrackerGeneration();
     if (state.instance == nullptr) state.instance = std::make_shared<ShaderRecompiler::SrtTapeInstance>();
     tapeInstance = state.instance.get();
     struct Reset {
@@ -1305,6 +1317,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureVa
     state.plan = result->plan;
     state.generation = generation;
     state.allocation = allocation;
+    state.pages = runPages;
     return result;
 }
 
