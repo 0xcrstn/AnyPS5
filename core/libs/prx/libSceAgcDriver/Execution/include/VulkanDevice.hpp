@@ -331,6 +331,7 @@ public:
     void PrewarmDrawPipeline(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders);
     std::shared_ptr<CompileTicket> TryDrawPipeline(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders);
     bool ArmCompileWait(const std::shared_ptr<CompileTicket>& ticket, std::function<void()> wake);
+    std::shared_ptr<CompileTicket> TryComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress);
 
 private:
     VulkanDevice(const PresentationWindow* window, bool compileOnly);

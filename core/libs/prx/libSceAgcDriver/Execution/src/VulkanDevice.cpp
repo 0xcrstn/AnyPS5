@@ -3803,6 +3803,39 @@ std::shared_ptr<CompileTicket> VulkanDevice::TryDrawPipeline(const Graphics::Sta
     return ticket;
 }
 
+std::shared_ptr<CompileTicket> VulkanDevice::TryComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress) {
+    if (!CompileParking() || !state->contextReady || shader.PipelineVariantId() == 0) return nullptr;
+    require(!GuestMemory::GpuMutex().HeldByThisThread(), "a compute pipeline was looked up for parking under the GPU mutex");
+    ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
+    const VkShaderStageFlags pushStages = shader.pushConstants.empty() ? 0u : VK_SHADER_STAGE_COMPUTE_BIT;
+    const auto key = ComputePipelineKey(shader, pushStages);
+    if (state->computePipelines.Find(key) != nullptr) return nullptr;
+    const auto context = graphicsContext();
+    if (pushStages != 0 && context.limits.maxPushConstantsSize < Graphics::ComputePushConstantBytes) return nullptr;
+    auto* service = state->Service();
+    if (service == nullptr) return nullptr;
+    ShaderCompileTrace::Event event("demand.compute_try");
+    event.Hex("address", programAddress).Hex("variant", key.first);
+    const auto jobKey = ComputeJobKey(key);
+    if (auto existing = service->Find(jobKey); existing != nullptr && existing->State() != CompileState::Cancelled) {
+        if (existing->State() != CompileState::Ready) {
+            service->Promote(*existing, CompilePriority::Demand);
+            event.Flag("joined", true);
+            return existing;
+        }
+        service->Forget(jobKey);
+    }
+    const auto bytes = ComputePipelineAheadRequest::EstimateBytes(shader);
+    const auto request = ComputePipelineAheadRequest::Capture(shader, bytes);
+    require(request != nullptr, "compute pipeline park exceeds the request capture bound");
+    return service->Submit(jobKey, CompilePriority::Demand, ComputeJobReservation(bytes, shader), [compileState = state.get(), request, context, programAddress](const CompileTicket&) {
+        const VkShaderStageFlags stages = request->pushes ? VK_SHADER_STAGE_COMPUTE_BIT : 0u;
+        const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &request->shader, 0}}};
+        const auto described = Graphics::DescribeSetLayouts(context, shaders);
+        static_cast<void>(compileState->GetComputePipeline(ComputePipelineKey(request->shader, stages), context, request->shader, described.layouts.main, stages, programAddress, described.mainKey, true, nullptr));
+    });
+}
+
 bool VulkanDevice::ArmCompileWait(const std::shared_ptr<CompileTicket>& ticket, std::function<void()> wake) {
     auto* service = state->Service();
     if (service == nullptr) return false;
