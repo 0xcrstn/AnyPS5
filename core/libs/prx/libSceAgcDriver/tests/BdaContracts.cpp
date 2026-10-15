@@ -99,14 +99,22 @@ void RunBdaTableContractTests() {
 
 void RunSpirvStatisticsTests() {
     using AgcDriver::Graphics::Require;
+    const auto translation = BdaTestTranslation();
+    const auto relative = BdaTestRelative();
+    SetBdaTestTranslation(ShaderRecompiler::BdaTable::Translation::Legacy);
+    SetBdaTestRelative(ShaderRecompiler::BdaTable::Relative::Off);
+    SetBdaTestSpanHelpers(ShaderRecompiler::RewriteMode::Off);
     const auto statistics = ShaderRecompiler::AnalyzeSpirv(MakeBdaSpanReadTestShader(0x7fff12340000ULL, 0u, 0b0101u, false, true));
+    SetBdaTestSpanHelpers(ShaderRecompiler::BdaSpanHelpersSetting());
+    SetBdaTestRelative(relative);
+    SetBdaTestTranslation(translation);
     const auto calls = [&](const char* name) {
         const auto found = statistics.callsByCallee.find(name);
         return found != statistics.callsByCallee.end() ? found->second : 0u;
     };
-    Require(calls("read_bda_span_stop") == 1u && calls("probe_bda_pointer") == 1u && calls("load_bda_span") >= 1u && calls("get_bda_pointer") >= 1u, "SPIR-V statistics miscounted the BDA helper calls");
+    Require(calls("read_bda_span_stop") == 1u && calls("read_bda_span") == 0u && calls("probe_bda_pointer") == 2u && calls("load_bda_span") == 2u && calls("read_bda_dword_bytes_stop") == 1u && calls("read_bda_dword_bytes") == 1u && calls("get_bda_pointer") == 2u, "SPIR-V statistics miscounted the BDA helper calls");
     Require(statistics.functions >= 5u && statistics.physicalLoads >= 2u && statistics.loops >= 2u && statistics.float64Arithmetic == 0u && statistics.lines == 0u, "SPIR-V statistics miscounted the BDA test shader");
-    Require(statistics.instructionsByFunction.contains("get_bda_pointer") && ShaderRecompiler::SpirvStatisticsJson(statistics).find("\"probe_bda_pointer\":1") != std::string::npos, "SPIR-V statistics JSON lost the helper counts");
+    Require(statistics.instructionsByFunction.contains("get_bda_pointer") && ShaderRecompiler::SpirvStatisticsJson(statistics).find("\"probe_bda_pointer\":2") != std::string::npos, "SPIR-V statistics JSON lost the helper counts");
 }
 
 void RunBdaInlineFastPathTests() {
