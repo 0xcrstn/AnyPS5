@@ -349,6 +349,43 @@ void testWideLabelStoredSinceSubmission() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
+void submitOverwrittenBeforeActivation(volatile std::uint32_t* first, volatile std::uint32_t* second, volatile std::uint32_t* done) {
+    alignas(64) static volatile std::uint32_t waiting = 0;
+    waiting = 0;
+    submit(0x20, commands(writeData(&waiting, 1), waitEqual(second, 1), waitEqual(first, 5), writeData(done, 1)));
+    waitFor(&waiting, 1, "consumer never reached its first wait");
+    submit(0, commands(writeData(first, 5), writeData(first, 6), writeData(second, 1)));
+    waitFor(second, 1, "producer never stored its last label");
+}
+
+void testWaitAfterWaitRejectsOverwrittenLabel() {
+    alignas(64) static volatile std::uint32_t first = 0, second = 0, done = 0;
+    submitOverwrittenBeforeActivation(&first, &second, &done);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    check(done == 0, "a label overwritten before its wait became active satisfied the wait");
+    first = 5;
+    waitFor(&done, 1, "consumer did not resume after the CPU stored the awaited value");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+void testWaitObservesValueStoredAfterActivation() {
+    alignas(64) static volatile std::uint32_t label = 0, done = 0, waiting = 0;
+    submit(0x20, commands(writeData(&waiting, 1), waitEqual(&label, 5), writeData(&done, 1)));
+    waitFor(&waiting, 1, "consumer never reached its wait");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    submit(0, commands(writeData(&label, 5), writeData(&label, 6)));
+    check(waitFor(&done, 1, "consumer never passed its wait") < std::chrono::milliseconds(500), "a label stored after its wait became active and overwritten later did not satisfy the wait");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+void testWaitFloorVerifyFails() {
+    alignas(64) static volatile std::uint32_t first = 0, second = 0, done = 0;
+    submitOverwrittenBeforeActivation(&first, &second, &done);
+    const auto failure = expectFailure([] { AgcDriverWaitIdle_nid_postfix(); });
+    check(failure.find("APS5_VERIFY_WAIT_OBSERVATIONS") != std::string::npos, "a wait observation below the activation floor did not fail the verify mode");
+    check(done == 0, "the consumer ran past an unproven wait observation");
+}
+
 void testLabelHeldAtSubmission() {
     alignas(64) static volatile std::uint32_t gate = 0, label = 1, done = 0, reset = 0, waiting = 0;
     submit(0x20, commands(waitEqual(&gate, 1), waitEqual(&label, 1), writeData(&done, 1)));
@@ -863,6 +900,12 @@ void testWorkerFailure() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--wait-floor-verify") {
+            testWaitFloorVerifyFails();
+            check(!expectFailure([] { LibcRunShutdown_nid_postfix(); }).empty(), "shutdown lost the verify failure");
+            std::puts("Wait floor verify failed as required");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--readonly-resummarize") {
             testReadOnlyResummarize();
             LibcRunShutdown_nid_postfix();
@@ -953,6 +996,8 @@ int main(int argc, char** argv) {
         testEndOfPipeLabelsWithoutWork();
         testLabelHeldAtSubmission();
         testWideLabelStoredSinceSubmission();
+        testWaitAfterWaitRejectsOverwrittenLabel();
+        testWaitObservesValueStoredAfterActivation();
         testWaitFreeSubmissionAfterEarlierQueue0Work();
         testWaitFreeSubmissionQueue0WaitsOn();
         testMultiAcbs();

@@ -2074,6 +2074,12 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // stores elsewhere. Debug aid: APS5_LABEL_GATE_ALL=1 gates on any completion, as before (a
     // completion label there registered its own completion, so every later label followed).
     static const bool gateAll = std::getenv("APS5_LABEL_GATE_ALL") != nullptr;
+    if (Graphics::Recorder::LabelPublicationOrdered() && recorder.GuestWriteBacksOwed()) {
+        if (drain) return 2;
+        GuestMemory::MarkWritten(address, bytes.size());
+        recorder.AfterCompletions(address, bytes, stamp, queue, false);
+        return 5;
+    }
     if (gateAll ? recorder.HasCompletions() : state->CopiedWriterOverlaps(address, bytes.size())) {
         // A copied buffer's write-back is still to run: the store must land after it. It is stored
         // by a completion action of the batch (a CPU memcpy when the batch is reaped) instead of

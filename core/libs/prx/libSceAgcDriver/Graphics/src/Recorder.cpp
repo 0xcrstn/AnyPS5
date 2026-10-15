@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LabelVersions.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
@@ -29,6 +30,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -3016,6 +3018,7 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
 void Recorder::OnComplete(std::function<void()> action) {
     OnCompleteWithoutGuestAccess(std::move(action));
     open->guestCompletions = true;
+    open->guestWriteBacks = true;
 }
 
 void Recorder::OnCompleteWithoutGuestAccess(std::function<void()> action) {
@@ -3404,6 +3407,39 @@ bool Recorder::HasGuestCompletions() const {
     return false;
 }
 
+bool Recorder::GuestWriteBacksOwed() const {
+    if (open != nullptr && open->guestWriteBacks) return true;
+    for (const auto& batch : inFlight) {
+        if (batch->guestWriteBacks) return true;
+    }
+    return false;
+}
+
+bool Recorder::LabelPublicationOrdered() {
+    static const bool ordered = [] {
+        const char* value = std::getenv("APS5_LABEL_PUBLICATION");
+        if (value == nullptr || std::strcmp(value, "early") == 0) return false;
+        if (std::strcmp(value, "ordered") == 0) return true;
+        throw std::runtime_error(std::string("APS5_LABEL_PUBLICATION: unknown mode ") + value + " (early or ordered)");
+    }();
+    return ordered;
+}
+
+bool Recorder::LabelPublicationVerify() {
+    static const bool verify = [] {
+        const char* value = std::getenv("APS5_LABEL_PUBLICATION_VERIFY");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return verify;
+}
+
+void Recorder::requireLabelAfterWriteBacks(std::uint64_t address, std::size_t bytes) const {
+    if (!LabelPublicationVerify() || !GuestWriteBacksOwed()) return;
+    char text[192];
+    std::snprintf(text, sizeof(text), "APS5_LABEL_PUBLICATION_VERIFY: label 0x%llx+%zu stored on the GPU while guest write-backs are still owed: native readers see it before its payload", static_cast<unsigned long long>(address), bytes);
+    throw std::runtime_error(text);
+}
+
 void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion) {
     // One entry per dword; a label overlapping older entries (a 4-byte store inside an 8-byte one or
     // the reverse) replaces exactly the dwords it stores, so a lookup composes what memory will hold.
@@ -3416,6 +3452,10 @@ void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const 
         batch.labelDwords.push_back(dword);
         LabelGroupDwords().emplace_back(dword, stamp);
     }
+    if (LabelVersions::Enabled()) {
+        LabelVersions::Record(stamp, address, static_cast<std::uint32_t>(bytes.size()), queue);
+        batch.labelStamps.push_back(stamp);
+    }
     recordedLabels.store(labels.size(), std::memory_order_relaxed);
 }
 
@@ -3427,6 +3467,7 @@ void Recorder::markBehindCompletion(const Batch& batch, std::uint64_t begin, std
 }
 
 void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+    requireLabelAfterWriteBacks(address, bytes.size());
     ensureOpen();
     NoteMirroredWrite(address, address + bytes.size());
     // The table entry before the write note: the note bumps the write generation a poller
@@ -3540,6 +3581,7 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
 }
 
 void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu) {
+    if (storedOnGpu) requireLabelAfterWriteBacks(address, bytes.size());
     if (AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Completion);
     Require(open != nullptr || !inFlight.empty(), "no batch to append a completion label to");
     Batch& batch = open != nullptr ? *open : *inFlight.back();
@@ -3710,6 +3752,7 @@ void Recorder::Submit() {
         newestSubmitted = batch->serial;
         newestSubmittedAt = batch->submittedAt;
     }
+    LabelVersions::MarkAll(batch->labelStamps, LabelVersions::Milestone::Submitted);
     inFlight.push_back(std::move(batch));
     inFlightKeptBytes += inFlight.back()->keptBytes;
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
@@ -4173,6 +4216,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     }
     readGpuTiming(*batch);
     readSamples(*batch);
+    LabelVersions::MarkAll(batch->labelStamps, LabelVersions::Milestone::DeviceReady);
     if (batch->serial != 0) {
         std::lock_guard ringLock(completedMutex);
         auto& entry = completed[batch->serial % completed.size()];
@@ -4205,6 +4249,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         }
     }
+    LabelVersions::MarkAll(batch->labelStamps, LabelVersions::Milestone::HostPublished);
     if (profile) holdCounters.completions += batch->completions.size();
     const auto keptStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Deferred only from inside a hold: the unlock that releases the list is this thread's own, and
@@ -4244,6 +4289,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     }
     batch->labelDwords.clear();
     batch->wideLabels.clear();
+    LabelVersions::MarkAll(batch->labelStamps, LabelVersions::Milestone::Retired);
+    batch->labelStamps.clear();
     release(*batch);
 }
 

@@ -184,6 +184,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/SynchronizationStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitStatistics.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitChain.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
@@ -215,6 +216,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LabelVersions.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DrawSnapshotArena.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/IndexBounds.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
@@ -1655,6 +1657,12 @@ if(BUILD_TESTING)
         endif()
         set_tests_properties(${prebuildPolicyTest} PROPERTIES ENVIRONMENT_MODIFICATION "${prebuildPolicyEnvironment}")
     endforeach()
+    add_test(NAME agc_driver_wait_floor_verify COMMAND agc_driver_tests --wait-floor-verify)
+    set_tests_properties(agc_driver_wait_floor_verify PROPERTIES TIMEOUT 20 ENVIRONMENT "APS5_WAIT_FLOOR=submission;APS5_VERIFY_WAIT_OBSERVATIONS=1")
+    if(WIN32)
+        set_tests_properties(agc_driver_wait_floor_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_readonly_resummarize COMMAND agc_driver_tests --readonly-resummarize)
     set_tests_properties(agc_driver_readonly_resummarize PROPERTIES TIMEOUT 10)
     if(WIN32)
@@ -1707,6 +1715,14 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    set_property(TEST agc_driver_label_publication_order APPEND PROPERTY ENVIRONMENT "APS5_LABEL_PUBLICATION=ordered;APS5_LABEL_PUBLICATION_VERIFY=1")
+    add_test(NAME agc_driver_label_publication_verify COMMAND agc_driver_label_publication_order_tests --verify)
+    set_tests_properties(agc_driver_label_publication_verify PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_LABEL_PUBLICATION_VERIFY=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_label_publication_verify PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_compute_pipeline_ahead_off COMMAND agc_driver_compute_pipeline_ahead_tests off)
     set_tests_properties(agc_driver_compute_pipeline_ahead agc_driver_compute_pipeline_ahead_off PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINE_COMPILE_THREADS=2" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")

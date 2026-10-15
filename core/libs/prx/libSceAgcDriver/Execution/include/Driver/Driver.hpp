@@ -237,9 +237,10 @@ private:
     static PendingDrawPhases& pendingDrawPhases();
     void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures);
     void noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
-    bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer = nullptr);
+    std::optional<StoredMatch> storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp);
     static void traceLabel(std::span<const std::uint32_t> packet, std::uint32_t queue);
     std::string describeWait(std::span<const std::uint32_t> packet);
+    static std::string describeObservedChain(std::uint64_t target);
     static std::array<WriteRecord, 16384>& writeHistory();
     static std::size_t& writeCursor();
     static void dumpPackets(std::span<const std::uint32_t> commands, const std::uint32_t* guest = nullptr);
@@ -312,9 +313,17 @@ private:
         std::array<std::uint32_t, 8> words;
         std::size_t count;
         std::uint64_t received;
+        WaitObservation observation;
     };
     static std::vector<PendingWait>& pendingWaits();
-    static void notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received);
+    static void notePendingWait(std::span<const std::uint32_t> packet, const WaitObservation& observation);
+    static std::uint64_t& waitFloor();
+    static WaitFloorMode waitFloorMode();
+    static bool verifyWaitObservations();
+    void dischargeWait(WaitObservation& observation, std::span<const std::uint32_t> packet);
+    void noteWaitChain(const WaitObservation& observation, std::span<const std::uint32_t> packet);
+    static WaitObservation& lastObservation();
+    static void reportWaitChain(std::uint32_t queue);
     void landPendingWaits(std::uint32_t queue);
     struct ResolvedDispatch {
         std::uint64_t address = 0, key = 0, indirectArguments = 0;
