@@ -105,6 +105,8 @@ public:
         m_info.sampledPairs.clear();
         m_info.usesDma = false;
         m_info.bdaWrites = false;
+        m_info.bdaAtomics = false;
+        m_info.bdaCoherent = false;
     }
 
     void Run() {
@@ -1520,6 +1522,8 @@ private:
         memory.gpuDescriptor = true;
         m_info.usesDma = true;
         m_info.bdaWrites = m_info.bdaWrites || access == BufferAccess::Write || access == BufferAccess::Atomic;
+        m_info.bdaAtomics = m_info.bdaAtomics || access == BufferAccess::Atomic;
+        m_info.bdaCoherent = m_info.bdaCoherent || memory.coherent;
         return true;
     }
 
@@ -1751,6 +1755,8 @@ private:
             }
             m_info.usesDma = true;
             m_info.bdaWrites = m_info.bdaWrites || addressInfo.access == AddressAccess::Write || addressInfo.access == AddressAccess::Atomic;
+            m_info.bdaAtomics = m_info.bdaAtomics || addressInfo.access == AddressAccess::Atomic;
+            m_info.bdaCoherent = m_info.bdaCoherent || memory.coherent;
             return;
         }
 

@@ -33,6 +33,8 @@ struct ShaderInfo {
     bool hasBitwiseXor = false;
     bool usesDma = false;
     bool bdaWrites = false;
+    bool bdaAtomics = false;
+    bool bdaCoherent = false;
     bool usesFaultBuffer = false;
     bool dispatchThreadLimit = false;
     bool rasterPrimitive = false;

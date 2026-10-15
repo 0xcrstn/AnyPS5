@@ -1923,7 +1923,7 @@ void ShaderResources::buildComplete() {
         }
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
-        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, mirrorReads);
+        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, mirrorReads, placeWrites);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         finishImageTables();
         phase(BuildPhase::Bda);
@@ -5048,7 +5048,16 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         guestMemory.ForgetPointerShadows();
         guestMemory.PointerRecorded();
         if (Coherence::Ordering()) recorder.NotePendingWrites(guestMemory.PointerHeaps());
-        for (const auto& [begin, end] : guestMemory.PointerHeaps()) NoteMirroredWrite(begin, end);
+        const auto placed = bda != nullptr ? bda->PlacedIntervals() : std::span<const std::pair<std::uint64_t, std::uint64_t>>{};
+        for (const auto& [begin, end] : guestMemory.PointerHeaps()) {
+            auto cursor = begin;
+            for (const auto& [placedBegin, placedEnd] : placed) {
+                if (placedEnd <= cursor || placedBegin >= end) continue;
+                if (placedBegin > cursor) NotePointerWrite(recorder, cursor, placedBegin);
+                cursor = std::max(cursor, placedEnd);
+            }
+            if (cursor < end) NotePointerWrite(recorder, cursor, end);
+        }
     }
     if (Coherence::Tracking() && !guestMemory.Writes().empty()) {
         std::vector<Coherence::Interval> written;

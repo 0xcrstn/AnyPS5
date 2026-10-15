@@ -127,11 +127,11 @@ std::uint64_t hashRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& ran
 BdaResources::BdaResources(const Context& context) {
     static_assert(std::endian::native == std::endian::little);
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
-    fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (context.bufferDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
 }
 
-BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool mirrorReads) : BdaResources(context) {
+BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool mirrorReads, bool placeWrites) : BdaResources(context) {
     auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
@@ -140,6 +140,22 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         if (!mirrors.empty()) {
             built = std::move(mirrored);
             cached.reset();
+        }
+    }
+    if (placeWrites) {
+        namespace Placement = ShaderRecompiler::BdaPlacement;
+        std::vector<Placement::Entry> entries;
+        auto moved = memory.PlacedRanges(cached.has_value() ? std::span<const ShaderRecompiler::BdaAbi::Range>(*cached->ranges) : std::span<const ShaderRecompiler::BdaAbi::Range>(built), mirrors, entries);
+        if (!entries.empty()) {
+            built = std::move(moved);
+            cached.reset();
+            placement = std::make_shared<Buffer>(context, sizeof(Placement::Header) + entries.size() * sizeof(Placement::Entry), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            Placement::Header header{};
+            header.count = static_cast<std::uint32_t>(entries.size());
+            std::memcpy(placement->Bytes().data(), &header, sizeof(header));
+            std::memcpy(placement->Bytes().data() + sizeof(header), entries.data(), entries.size() * sizeof(Placement::Entry));
+            for (const auto& entry : entries) placed.emplace_back(entry.begin, entry.end);
+            std::sort(placed.begin(), placed.end());
         }
     }
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
@@ -251,7 +267,30 @@ bool LoopGuardTripped() {
     return loopGuardTripped.load(std::memory_order_relaxed);
 }
 
+void BdaResources::RecordPlacementCopyBack(const Context& context, VkCommandBuffer commands) const {
+    Require(placement != nullptr && fault != nullptr, "a BDA build without placements recorded a copy-back");
+    Graphics::RecordPlacementCopyBack(context, commands, fault->DeviceAddress(), placement->DeviceAddress(), PlacementSetting() == ShaderRecompiler::BdaPlacement::Mode::Verify);
+}
+
+void BdaResources::checkPlacement() const {
+    if (placement == nullptr) return;
+    namespace Placement = ShaderRecompiler::BdaPlacement;
+    Placement::Header header{};
+    std::memcpy(&header, placement->Bytes().data(), sizeof(header));
+    if (header.mismatches == 0) return;
+    const auto mismatches = header.mismatches;
+    const auto first = header.firstMismatch;
+    header.mismatches = 0;
+    header.claimed = 0;
+    header.firstMismatch = 0;
+    std::memcpy(placement->Bytes().data(), &header, sizeof(header));
+    std::ostringstream message;
+    message << "APS5_BDA_PLACEMENT=verify: " << mismatches << " written bytes differ between the device-local placement and the host import after the copy-back, the first at 0x" << std::hex << first;
+    throw std::runtime_error(message.str());
+}
+
 void BdaResources::CheckFault() const {
+    checkPlacement();
     markWrittenPages();
     ShaderRecompiler::BdaAbi::Fault report{};
     std::memcpy(&report, fault->Bytes().data(), sizeof(report));

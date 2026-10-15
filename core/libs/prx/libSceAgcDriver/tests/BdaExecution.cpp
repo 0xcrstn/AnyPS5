@@ -3,6 +3,8 @@
 #include "BdaAbi.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentMirrors.hpp"
+#include "BdaPlacement.hpp"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -582,4 +584,75 @@ void RunFloatRepairTests(const Context& context) {
         std::memcpy(&report, fault.Bytes().data(), sizeof(report));
         Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::RepairMismatch && report.instruction == function && (static_cast<std::uint32_t>(report.address >> 32u) ^ report.bytes) == 1u, "float repair verify did not fail on an injected mismatch");
     }
+}
+
+void RunBdaPlacementTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    namespace Placement = ShaderRecompiler::BdaPlacement;
+    constexpr std::uint64_t guest = 0x7fff12340000ULL;
+    constexpr std::size_t pages = 3;
+    constexpr std::size_t bytes = pages * Placement::PageBytes;
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    Buffer host(context, bytes, usage);
+    Buffer work(context, bytes, usage);
+    Buffer pristine(context, bytes, usage);
+    Buffer record(context, Abi::FaultBufferBytes, usage);
+    Buffer table(context, sizeof(Placement::Header) + sizeof(Placement::Entry), usage);
+    const auto original = [](std::size_t offset) { return static_cast<std::uint8_t>(offset * 7u + 3u); };
+    const auto writePages = [&](std::uint32_t mask) {
+        std::memset(record.Bytes().data(), 0, record.Bytes().size());
+        auto* words = reinterpret_cast<std::uint32_t*>(record.Bytes().data());
+        words[Abi::WrittenCountWord] = 1;
+        words[Abi::WrittenListWord] = 9;
+        words[Abi::WrittenSlotsWord + 18] = Abi::WrittenChunkKey(guest);
+        words[Abi::WrittenSlotsWord + 19] = mask;
+    };
+    const auto run = [&](std::size_t begin, std::size_t end, bool verify) {
+        Placement::Header header{};
+        header.count = 1;
+        const Placement::Entry entry{guest + begin, guest + end, work.DeviceAddress() + begin, pristine.DeviceAddress() + begin, host.DeviceAddress() + begin};
+        std::memcpy(table.Bytes().data(), &header, sizeof(header));
+        std::memcpy(table.Bytes().data() + sizeof(header), &entry, sizeof(entry));
+        CommandBatch batch(context);
+        RecordPlacementCopyBack(context, batch.Handle(), record.DeviceAddress(), table.DeviceAddress(), verify);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        std::memcpy(&header, table.Bytes().data(), sizeof(header));
+        return header;
+    };
+    for (const auto begin : {std::size_t{0}, std::size_t{1}, std::size_t{5}, std::size_t{4095}, std::size_t{4096}, std::size_t{4097}, std::size_t{8191}}) {
+        for (const auto end : {begin + 1u, begin + 3u, std::size_t{4096}, std::size_t{8192}, std::size_t{8193}, bytes - 1u, bytes}) {
+            if (end <= begin || end > bytes) continue;
+            for (std::size_t offset = 0; offset < bytes; ++offset) {
+                host.Bytes()[offset] = std::byte{original(offset)};
+                pristine.Bytes()[offset] = std::byte{original(offset)};
+                work.Bytes()[offset] = std::byte{static_cast<std::uint8_t>(original(offset) ^ 0xffu)};
+            }
+            writePages(0b101u);
+            static_cast<void>(run(begin, end, false));
+            for (std::size_t offset = 0; offset < bytes; ++offset) {
+                const bool copied = offset >= begin && offset < end && (offset / Placement::PageBytes) != 1u;
+                const auto expected = copied ? static_cast<std::uint8_t>(original(offset) ^ 0xffu) : original(offset);
+                if (std::to_integer<std::uint8_t>(host.Bytes()[offset]) == expected && std::to_integer<std::uint8_t>(pristine.Bytes()[offset]) == expected) continue;
+                Require(false, "BDA placement copy-back of [" + std::to_string(begin) + ", " + std::to_string(end) + ") left byte " + std::to_string(offset) + " wrong");
+            }
+        }
+    }
+    for (std::size_t offset = 0; offset < bytes; ++offset) {
+        host.Bytes()[offset] = std::byte{original(offset)};
+        pristine.Bytes()[offset] = std::byte{original(offset)};
+        work.Bytes()[offset] = std::byte{original(offset)};
+    }
+    work.Bytes()[10] = std::byte{0x5a};
+    host.Bytes()[20] = std::byte{0xa5};
+    writePages(0b001u);
+    const auto checked = run(0, bytes, true);
+    Require(std::to_integer<std::uint8_t>(host.Bytes()[10]) == 0x5a, "BDA placement copy-back missed a byte the shader changed");
+    Require(std::to_integer<std::uint8_t>(host.Bytes()[20]) == 0xa5, "BDA placement copy-back overwrote a byte written after the copy-in");
+    Require(checked.mismatches == 1 && checked.firstMismatch == guest + 20, "APS5_BDA_PLACEMENT=verify did not report the injected difference between the placement and the import");
+    std::memset(table.Bytes().data(), 0, sizeof(Placement::Header));
+    work.Bytes()[20] = std::byte{0xa5};
+    pristine.Bytes()[20] = std::byte{0xa5};
+    Require(run(0, bytes, true).mismatches == 0, "APS5_BDA_PLACEMENT=verify reported a difference after a consistent copy-back");
+    ClearMirrors(context.device);
 }

@@ -29,5 +29,6 @@ void RunSpirvStatisticsTests();
 void RunBdaTranslationTests(const AgcDriver::Graphics::Context& context);
 void RunBdaSpanHelperTests(const AgcDriver::Graphics::Context& context);
 void RunFloatRepairTests(const AgcDriver::Graphics::Context& context);
+void RunBdaPlacementTests(const AgcDriver::Graphics::Context& context);
 
 #endif

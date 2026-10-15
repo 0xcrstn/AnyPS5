@@ -172,6 +172,7 @@ int main(int argc, char** argv) {
             RunBdaExecutionTests(device->GetContext());
             RunBdaTranslationTests(device->GetContext());
             RunBdaSpanHelperTests(device->GetContext());
+            RunBdaPlacementTests(device->GetContext());
             std::cout << "BDA translation, relative and span helper fixtures passed\n";
             if (std::getenv("APS5_TEST_FLOAT_REPAIRS") != nullptr) {
                 RunFloatRepairTests(device->GetContext());

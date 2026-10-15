@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "BdaAbi.hpp"
+#include "BdaPlacement.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <cstddef>
@@ -330,6 +331,7 @@ public:
     Recorder::BoundPlacement Placement() const;
     VkDescriptorBufferInfo MirroredDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment, std::vector<std::shared_ptr<ResidentMirror>>& mirrors) const;
     std::vector<ShaderRecompiler::BdaAbi::Range> MirroredRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::vector<std::shared_ptr<ResidentMirror>>& mirrors) const;
+    std::vector<ShaderRecompiler::BdaAbi::Range> PlacedRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::vector<std::shared_ptr<ResidentMirror>>& mirrors, std::vector<ShaderRecompiler::BdaPlacement::Entry>& entries) const;
     struct SplitReads {
         std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> space;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
