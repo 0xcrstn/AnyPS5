@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -35,6 +36,8 @@ struct BufferIndexInputs {
     std::uint32_t vertexFold = 0;
     std::int32_t instanceFoldSgpr = -1;
     std::uint32_t instanceFold = 0;
+    std::uint32_t firstUserSgpr = 0;
+    std::span<const std::uint32_t> userData{};
 };
 
 inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferIndex(const std::vector<BufferIndexNode>& nodes, const BufferIndexInputs& inputs) {
@@ -68,6 +71,7 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
         case BufferIndexOp::UserData:
             if (inputs.vertexFoldSgpr >= 0 && node.low == static_cast<std::uint32_t>(inputs.vertexFoldSgpr)) result = {inputs.vertexFold, inputs.vertexFold};
             else if (inputs.instanceFoldSgpr >= 0 && node.low == static_cast<std::uint32_t>(inputs.instanceFoldSgpr)) result = {inputs.instanceFold, inputs.instanceFold};
+            else if (node.low >= inputs.firstUserSgpr && node.low - inputs.firstUserSgpr < inputs.userData.size()) result = {inputs.userData[node.low - inputs.firstUserSgpr], inputs.userData[node.low - inputs.firstUserSgpr]};
             else return std::nullopt;
             break;
         case BufferIndexOp::Add:

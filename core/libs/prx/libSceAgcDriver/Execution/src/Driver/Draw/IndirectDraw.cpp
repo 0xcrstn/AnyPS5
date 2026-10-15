@@ -13,6 +13,8 @@ std::uint32_t Driver::drawUserWord(const DrawProgram& program, std::int32_t sgpr
 }
 
 void Driver::FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, const DrawProgram& program, Pm4::DrawParameters& parameters) {
+    parameters.firstUserSgpr = program.firstUserSgpr;
+    parameters.userData = program.userData;
     if (result.vertexOffsetSgpr >= 0) {
         const auto offset = drawUserWord(program, result.vertexOffsetSgpr);
         require(offset <= std::numeric_limits<std::uint32_t>::max() - parameters.firstVertex, "draw vertex offset overflow");
