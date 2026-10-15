@@ -613,7 +613,16 @@ void WorkerCopyTests(Fixture& fixture) {
     Require(adopted.has_value() && adopted->copied && Holds(Snapshot{address, nullptr, {}, adopted->buffer, adopted->offset, adopted->bytes}, std::byte{0x71}), "the encode did not adopt a worker's copy");
     const auto again = arena.Take(recorder, address, 4096, registry);
     Require(again.has_value() && !again->copied && again->buffer == adopted->buffer && again->offset == adopted->offset, "an adopted copy was not indexed for later draws");
+    DrawSnapshotArena::SetWorkerHits(false);
     Require(!arena.PrepareCopy(address, 4096, registry, std::nullopt).has_value(), "a worker copied a range the arena already serves");
+    DrawSnapshotArena::SetWorkerHits(true);
+    static_cast<void>(arena.TakeCounters());
+    const auto hit = arena.PrepareCopy(address + 256, 1024, registry, std::nullopt);
+    Require(hit.has_value() && hit->hit && hit->copiedBytes == 0, "a worker did not hand over the arena hit for a range the arena already serves");
+    const auto adoptedHit = arena.TakePrefilled(recorder, address + 256, 1024, registry, whole, *hit);
+    const auto hitCounts = arena.TakeCounters();
+    Require(adoptedHit.has_value() && !adoptedHit->copied && adoptedHit->buffer == adopted->buffer && adoptedHit->offset == adopted->offset + 256 && hitCounts.workerHits == 1 && hitCounts.hits == 1, "the encode did not take a worker's arena hit without a lookup");
+    Require(!arena.TakePrefilled(recorder, address + 512, 1024, registry, whole, *hit).value().copied, "a worker's hit for another range was not looked up again");
     const auto stale = address + 16384;
     auto early = arena.PrepareCopy(stale, 4096, registry, std::nullopt);
     Require(early.has_value(), "a worker did not copy the second input");
