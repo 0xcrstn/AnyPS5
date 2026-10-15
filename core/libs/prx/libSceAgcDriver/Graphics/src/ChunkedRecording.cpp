@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/ChunkedRecording.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DefaultSwitch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
@@ -102,7 +103,10 @@ ChunkedRecording::ChunkedRecording(const Context& context) : context(context) {
     poolInfo.queueFamilyIndex = context.queueFamily;
     beginCommandBuffer = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer");
     endCommandBuffer = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer");
-    worker = std::thread([this] { run(); });
+    worker = std::thread([this] {
+        const Coherence::DriverAccessScope driverAccess;
+        run();
+    });
 }
 
 ChunkedRecording::~ChunkedRecording() {

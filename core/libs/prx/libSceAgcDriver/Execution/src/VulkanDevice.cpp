@@ -1247,6 +1247,10 @@ bool HoldsGpuMutex() {
     return GuestMemory::GpuMutex().HeldByThisThread();
 }
 
+bool MustNotWaitForResolution() {
+    return Coherence::InDriverAccess() || GuestMemory::GpuMutex().HeldByThisThread();
+}
+
 void InstallCoherence() {
     using Coherence::Mode;
     if (Coherence::LazyReleaseMode() != Mode::Reference && Coherence::FaultsMode() == Mode::Reference) throw std::runtime_error("APS5_COHERENCE_LAZY_RELEASE needs APS5_COHERENCE_FAULTS: a release that stores nothing must leave device-only guest memory protected");
@@ -1260,7 +1264,7 @@ void InstallCoherence() {
     Coherence::SetMaterializer(&MaterializeNativeAccess);
     Coherence::SetLeaseWaiter(&WaitForGuestReaders);
     Coherence::SetFaultPriority(&HoldsGpuMutex);
-    GuestArena::GuestArenaSetResolverBypass_nid_postfix(&HoldsGpuMutex);
+    GuestArena::GuestArenaSetResolverBypass_nid_postfix(&MustNotWaitForResolution);
     GuestArena::GuestArenaSetResolveHostWrites_nid_postfix(true);
     Coherence::SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix, &GuestArena::GuestArenaOpenAccessForRead_nid_postfix});
 #else
@@ -4585,6 +4589,7 @@ struct RecordedDispatch {
     bool resourceKeyMatched = false;
     std::shared_ptr<Graphics::ShaderResources::DrawBindings> movedSet = {};
     std::vector<std::pair<std::uint64_t, std::uint64_t>> movedReads = {};
+    std::vector<std::size_t> movedAllocations = {};
 };
 
 VkDevice VulkanDevice::Device() const {
@@ -5206,7 +5211,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         const auto images = resources.StorageImages();
         recorder.NoteAccess(CommandClass::DispatchLeading, Graphics::Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, resources.HoldsLease()});
     }
-    resources.UseMirrors(recorder);
+    resources.UseMirrors(recorder, record.movedAllocations);
     if (argumentImport != nullptr && Graphics::AnyDeviceResident()) Graphics::PublishDeviceResident(recorder, arguments, 12, Graphics::ResidentSite::Indirect);
     if (argumentImport != nullptr) {
         // The group counts were stored by earlier recorded work (a dispatch in place, a fill) or the
@@ -5283,7 +5288,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     resources.RecordPlacementCopyBack(recorder, commands);
     recordStep(PhaseRecordBind);
     resources.MarkGpuWrites(recorder);
-    if (!record.movedReads.empty()) recorder.NotePendingReads(record.movedReads, Graphics::Recorder::ReadKind::DispatchElement);
+    if (!record.movedReads.empty()) {
+        recorder.NotePendingReads(record.movedReads, Graphics::Recorder::ReadKind::DispatchElement);
+        Graphics::ShaderResources::LeaseInPlaceReads(recorder, record.movedReads);
+    }
     recordStep(PhaseRecordMarks);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.
@@ -5352,6 +5360,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     double revalidateMs = 0;
     std::shared_ptr<Graphics::ShaderResources::DrawBindings> movedSet;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> movedReads;
+    std::vector<std::size_t> movedAllocations;
     // The batches the pre-sync (PrepareDispatch) waited for are reaped first: their completions
     // (CPU write-backs) land before stage B or a cached object's Revalidate reads, and the flush
     // hook then finds nothing pending over their surfaces.
@@ -5438,7 +5447,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                 } else {
                     if (moved.has_value() && !moved->empty()) {
                         movedSet = cached->BindMovedDispatchBuffers(RecorderFor(GuestMemory::GpuLockThreadTag()), *moved);
-                        for (const auto& entry : *moved) movedReads.emplace_back(entry.begin, entry.begin + entry.view.range);
+                        for (const auto& entry : *moved) {
+                            movedReads.emplace_back(entry.begin, entry.begin + entry.view.range);
+                            movedAllocations.push_back(entry.allocation);
+                        }
                         if (VerifyMovedTemplates()) {
                             auto fresh = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0);
                             const auto expected = fresh->GuestBufferViews();
@@ -5523,6 +5535,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     record.resourceKeyMatched = fromCache;
     record.movedSet = movedSet;
     record.movedReads = movedReads;
+    record.movedAllocations = movedAllocations;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;

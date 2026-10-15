@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/RecordQueue.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include <chrono>
 #include <utility>
 
@@ -23,7 +24,10 @@ void RecordQueue::Start(std::function<void()> serve) {
     std::lock_guard lock(mutex);
     if (worker.joinable()) return;
     stopping = false;
-    worker = std::thread([this, serve = std::move(serve)]() mutable { serveLoop(std::move(serve)); });
+    worker = std::thread([this, serve = std::move(serve)]() mutable {
+        const Coherence::DriverAccessScope driverAccess;
+        serveLoop(std::move(serve));
+    });
 }
 
 void RecordQueue::Stop() {

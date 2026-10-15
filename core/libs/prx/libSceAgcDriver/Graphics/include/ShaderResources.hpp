@@ -261,6 +261,8 @@ public:
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
     void UseMirrors(Recorder& recorder) const;
+    void UseMirrors(Recorder& recorder, std::span<const std::size_t> movedAllocations) const;
+    static void LeaseInPlaceReads(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads);
     void RecordPlacementCopyBack(Recorder& recorder, VkCommandBuffer commands) const;
     void PublishResidentReads(Recorder& recorder) const;
     void RefreshMirrorsForDirectUse(Recorder& recorder) const;
@@ -407,6 +409,7 @@ private:
         std::int64_t dataAllocation = -1;
         std::uint32_t dataByte = 0;
         std::optional<ReadAnalysis> readAnalysis;
+        std::shared_ptr<ResidentMirror> mirror;
     };
     struct DataPatch {
         std::size_t allocation;

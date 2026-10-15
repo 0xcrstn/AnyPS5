@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -414,6 +415,7 @@ void Driver::enqueue(Submission submission) {
     worker.queued.fetch_add(1, std::memory_order_acq_rel);
     if (const auto bound = batchAgeBound(); bound.count() != 0 && !batchAgeThread.joinable()) batchAgeThread = std::thread([this, bound] { runBatchAge(bound); });
     if (!worker.thread.joinable()) worker.thread = std::thread([this, queue] {
+        const Coherence::DriverAccessScope driverAccess;
         char role[32];
         std::snprintf(role, sizeof(role), "queue 0x%x worker", queue);
         try {

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_PREPAREWORKERS_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <array>
 #include <atomic>
@@ -160,7 +161,10 @@ public:
     OrderedPrepare(std::size_t workers, std::size_t bound, Prepare prepare, Emit emit, Enter enter = {}) : bound(bound), slots(bound), prepare(std::move(prepare)), emit(std::move(emit)), enter(std::move(enter)) {
         if (workers == 0 || bound == 0) throw std::logic_error("ordered preparation needs workers and a bound");
         threads.reserve(workers);
-        for (std::size_t index = 0; index < workers; ++index) threads.emplace_back([this, index] { serve(index); });
+        for (std::size_t index = 0; index < workers; ++index) threads.emplace_back([this, index] {
+            const Coherence::DriverAccessScope driverAccess;
+            serve(index);
+        });
     }
     ~OrderedPrepare() {
         {

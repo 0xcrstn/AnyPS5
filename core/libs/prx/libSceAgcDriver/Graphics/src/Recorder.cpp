@@ -429,6 +429,7 @@ ReleaseQueue& ReleaseThreadQueue() {
 }
 
 void ReleaseThreadMain() {
+    const Coherence::DriverAccessScope driverAccess;
     CpuTopology::PinHelperThread("release thread");
     auto& queue = ReleaseThreadQueue();
     std::unique_lock lock(queue.mutex);
@@ -1036,6 +1037,15 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             // The wait runs without the mutex when this acquisition is the outermost one (a stage-A
             // read, a game thread); the recorder is not dereferenced after the call.
             recorder.SyncThrough(address, bytes, true);
+        });
+    }
+    if (completionDepth == 0 && StorageTexture::PointerWriterReaches(address, bytes)) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        StorageTexture::NotePointerReadWait();
+        Recorder::ForEachActive([&](Recorder& recorder) {
+            Recorder::CountSync(1);
+            recorder.Sync();
         });
     }
     if (AnyDeviceResidentOverlaps(address, bytes)) {

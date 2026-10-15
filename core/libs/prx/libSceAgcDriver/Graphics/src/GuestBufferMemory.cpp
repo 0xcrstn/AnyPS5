@@ -1581,6 +1581,7 @@ private:
         const auto wanted = disabled ? 0u : static_cast<unsigned>(std::clamp(requested, 0, 16));
         for (unsigned i = 0; i < wanted; ++i) {
             threads.emplace_back([this](std::stop_token token) {
+                const Coherence::DriverAccessScope driverAccess;
                 CpuTopology::PinHelperThread("mirror refresh");
                 helper(token);
             });
