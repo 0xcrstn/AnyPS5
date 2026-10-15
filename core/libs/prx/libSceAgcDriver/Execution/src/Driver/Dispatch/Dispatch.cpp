@@ -85,12 +85,18 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
             if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
         }
         if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
-            if (drawRecordState().active) drawRecordState().settled = true;
+            if (drawRecordState().active) {
+                drawRecordState().settled = true;
+                finishDrawRecords();
+            }
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
         if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
-            if (drawRecordState().active) drawRecordState().settled = true;
+            if (drawRecordState().active) {
+                drawRecordState().settled = true;
+                finishDrawRecords();
+            }
             pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
             return;
         }
