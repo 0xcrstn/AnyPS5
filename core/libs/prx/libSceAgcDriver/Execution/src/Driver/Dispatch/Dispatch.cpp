@@ -54,7 +54,7 @@ FrozenFallback Driver::dispatchHleFallback(const Registers& shader, std::span<co
 
 FrozenFallback Driver::dispatchFrozenFallback(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     static const bool debug = std::getenv("APS5_PROBE_DISPATCH") != nullptr || std::getenv("APS5_DUMP_SHADERS") != nullptr || std::getenv("APS5_TRACE_DISPATCH_CACHE") != nullptr || std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr || std::getenv("APS5_NO_UNLOCKED_DEVICE") != nullptr;
-    if (debug || verifyDataHits() || traceCapSync() || dispatchMissDiagnosisEnabled() || ShaderRecompiler::DebugProbeActive()) return FrozenFallback::Debug;
+    if (debug || verifyDataHits() || traceCapSync() || ShaderRecompiler::DebugProbeActive()) return FrozenFallback::Debug;
     if (device.Load() == nullptr) return FrozenFallback::NoDevice;
     if (GuestMemory::GpuMutex().HeldByThisThread()) return FrozenFallback::GpuMutexHeld;
     if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value()) return FrozenFallback::Labels;

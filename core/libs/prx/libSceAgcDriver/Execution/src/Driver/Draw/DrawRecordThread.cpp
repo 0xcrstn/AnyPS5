@@ -23,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -812,14 +813,47 @@ void Driver::noteDrawRecordRecipe(DrawRecordResult& result, std::shared_ptr<cons
     result.recipeStages = stages;
 }
 
+struct PacketWaitCounts {
+    std::array<std::atomic<std::uint64_t>, 0x103> waits{};
+    std::array<std::atomic<std::uint64_t>, 0x103> waitedNs{};
+};
+
+PacketWaitCounts& packetWaitCounts() {
+    static PacketWaitCounts counts;
+    return counts;
+}
+
+std::uint32_t& packetWaitOpcode() {
+    thread_local std::uint32_t opcode = 0x102u;
+    return opcode;
+}
+
+void Driver::waitDrawRecordsAt(std::uint32_t opcode) {
+    packetWaitOpcode() = std::min<std::uint32_t>(opcode, 0x102u);
+    struct Reset {
+        ~Reset() { packetWaitOpcode() = 0x102u; }
+    } reset;
+    waitDrawRecords();
+}
+
 void Driver::waitDrawRecords() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto opcode = packetWaitOpcode();
+    const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto frozenPending = profile && !frozenDraws().Idle();
     drainFrozen(false);
     mergeFrozenRecords();
     auto& records = drawRecords();
-    if (records.Pending()) {
+    const bool pending = records.Pending();
+    if (pending) {
         ++drawRecordCounters().packetWaits;
         if (GuestMemory::GpuMutex().HeldByThisThread()) runDrawRecords();
         else records.WaitIdle();
+    }
+    if (profile && (pending || frozenPending)) {
+        auto& counts = packetWaitCounts();
+        counts.waits[opcode].fetch_add(1, std::memory_order_relaxed);
+        counts.waitedNs[opcode].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     }
     if (auto& state = drawRecordState(); state.active && !state.settled) state.settled = true;
     Graphics::Recorder::DrainChunks();
@@ -899,6 +933,27 @@ void Driver::reportDrawRecords() {
     static std::array<std::uint64_t, 8> last{};
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
+    {
+        auto& counts = packetWaitCounts();
+        std::vector<std::tuple<std::uint64_t, std::uint64_t, std::uint32_t>> rows;
+        for (std::uint32_t opcode = 0; opcode < counts.waits.size(); ++opcode) {
+            const auto waits = counts.waits[opcode].exchange(0, std::memory_order_relaxed);
+            const auto waitedNs = counts.waitedNs[opcode].exchange(0, std::memory_order_relaxed);
+            if (waits != 0) rows.emplace_back(waitedNs, waits, opcode);
+        }
+        std::sort(rows.begin(), rows.end(), std::greater<>{});
+        std::string text;
+        for (std::size_t i = 0; i < rows.size() && i < 12; ++i) {
+            const auto [waitedNs, waits, opcode] = rows[i];
+            char item[96];
+            const char* name = opcode == 0x100u ? "flip" : opcode == 0x101u ? "rendering wait" : opcode == 0x102u ? "not a packet" : nullptr;
+            if (name != nullptr) std::snprintf(item, sizeof(item), " %s x%llu %.1fms", name, static_cast<unsigned long long>(waits), static_cast<double>(waitedNs) / 1e6);
+            else std::snprintf(item, sizeof(item), " 0x%02x x%llu %.1fms", opcode, static_cast<unsigned long long>(waits), static_cast<double>(waitedNs) / 1e6);
+            text += item;
+        }
+        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s
+", text.empty() ? " none" : text.c_str());
+    }
     const auto seconds = std::chrono::duration<double>(now - lastReport).count();
     lastReport = now;
     const auto counts = drawRecords().Counts();
