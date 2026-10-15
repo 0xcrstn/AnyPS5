@@ -109,6 +109,7 @@ struct SpirvEmitterState {
     bool float16DenormPreserve = false;
     bool sharedFloatFunctions = true;
     bool outlineImageModes = false;
+    bool sharedBufferHelpers = true;
     struct OutlinedImageModes {
         MemoryInfo memory;
         std::vector<std::uint64_t> shape;
@@ -128,6 +129,9 @@ struct SpirvEmitterState {
     std::uint32_t storageBufferU8Variable = 0;
     std::vector<std::uint32_t> memoryByteOffsets;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
+    std::uint32_t helperBufferElement = 0;
+    std::uint32_t helperBufferByteOffset = 0;
+    std::uint32_t helperBufferMisalignment = 0;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedGpuBufferFunctions;
     std::uint32_t bufferFormatTable = 0;
     std::uint32_t bdaPagetableVariable = 0;

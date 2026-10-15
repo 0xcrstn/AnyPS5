@@ -178,6 +178,24 @@ HDR output is available on Windows only. Titles see it when the monitor showing 
 
 Recompiled shaders and the Vulkan pipeline cache are kept in a `shader_cache/` directory beside the output executable, so later runs skip recompilation. Set `ANYPS5_SHADER_CACHE_DIR` to use another directory, or set `ANYPS5_NO_SHADER_CACHE` to any non-empty value other than `0` to disable both caches. Shaders are stored in a subdirectory named after the recompiler's source version; subdirectories of other versions unused for 14 days are removed the first time a run looks up a shader. The pipeline cache is one `vk-pipelines-*.bin` file per GPU and driver version. Deleting the directory is safe: it is rebuilt on the next run.
 
+The cache is kept in layers: resource plans live in a `plans-<version>/` subdirectory named after the recompiler's front end only, so a build that changed only the SPIR-V emitter keeps them, and a new driver starts from the pipeline cache an earlier driver with the same pipeline cache UUID wrote. `APS5_SHADER_CACHE_V2=0` keeps everything under the full source version and starts every driver version with an empty pipeline cache. `APS5_VERIFY_SHADER_CACHE=1` prepares a fresh plan for every cached one and stops the title when they differ. The creation recipes of compute pipelines are kept in `pipeline-recipes/` for prewarming (see Shader compilation).
+
+### Shader compilation
+
+Vulkan pipelines are compiled on a scheduler that runs the work a queue is waiting for first. Each switch below is on unless it is set to `0` (`legacy` for the scheduler); switches that depend on another one are off when that one is off.
+
+- `APS5_COMPILE_SCHEDULER`: the priority compile scheduler. A pipeline a draw or dispatch needs now goes ahead of pipelines compiled ahead of use, and one worker is kept for it. `APS5_COMPILE_WORKERS` (a quarter of the logical processors, 2 to 8) sets the number of compile threads and `APS5_COMPILE_BUDGET_MIB` (2048) the memory that speculative compiles may reserve. `legacy`, or `APS5_LOCKED_PIPELINES`, builds pipelines on the thread that needs them.
+- `APS5_COMPILE_PARK`: a draw or dispatch whose pipeline is still compiling gives up its queue's turn instead of blocking the queue worker, and continues when the pipeline is ready.
+- `APS5_PIPELINE_COMPILE_AHEAD`: the compute pipelines of dispatches queued behind the one running are compiled ahead, after the pipelines a queue is waiting for.
+- `APS5_PIPELINE_CONTENT_DEDUP`: compute shaders whose pipelines would be identical share one pipeline.
+- `APS5_PIPELINE_PREWARM`: the compute pipelines of earlier runs are compiled again when the device starts, before the title asks for them (needs `APS5_PIPELINE_CONTENT_DEDUP`).
+- `APS5_SPIRV_INTERN`: identical compiled shaders are kept in memory once.
+- `APS5_PIPELINE_CACHE_PROBES`: before a draw or dispatch waits for its pipeline to compile, the driver is asked to create it from the Vulkan pipeline cache only; a pipeline an earlier run compiled is then used at once (needs `VK_EXT_pipeline_creation_cache_control`).
+- `APS5_SHARED_BUFFER_HELPERS`: formatted buffer accesses of all buffers share one function per access shape instead of one per buffer, which keeps compute shaders with many buffers smaller before specialization.
+- `APS5_OUTLINE_IMAGE_MODES`: an image access that depends on the image's run-time format calls one function per image instead of repeating every format's code at each access, which keeps very large compute shaders several times smaller.
+
+Off by default: `APS5_VERIFY_COMPILE_JOBS=1` checks that every shared or prewarmed pipeline was built from the recipe the draw or dispatch asks for, and `APS5_VERIFY_SHADER_EMISSION=1` compiles each shader in its alternative forms and stops the title when their interfaces differ. `APS5_COMPILE_TRACE=<file>` (or `1`) writes one JSON line per compile step with its timing.
+
 ### Storing GPU results at each flip
 
 GPU results in storage images and render targets stay on the GPU until something reads their memory. A title that frees such an image after waiting for its GPU work and reuses the memory can have its new data overwritten when the results are stored later ([TechnicalDebt](../dev/TechnicalDebt.md)). `APS5_STORE_AT_FLIP=1` stores every pending result when a display buffer is flipped, at the cost of one write-back per pending image and frame. `APS5_STORE_AT_FLIP=shadow` stores them the same way but leaves the stores in the device-local unit shadows, which reach guest memory when a read the driver sees (a CPU access through the flush hook, a copy, a scanout) asks for them: a title's own CPU loads do not see them. Any other value stops the title at its first flip.
