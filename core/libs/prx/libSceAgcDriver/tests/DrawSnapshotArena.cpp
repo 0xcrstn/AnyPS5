@@ -998,6 +998,11 @@ void DrawParamsTests(const Context& context) {
         Require(a->dynamicOffsets[0].size() == 1 && a->dynamicOffsets[0][0] == a->snapshots.front().offset && b->dynamicOffsets[0].size() == 1 && b->dynamicOffsets[0][0] == b->snapshots.front().offset, "a draw's dynamic offset is not its snapshot's offset");
         Require(Holds(a->snapshots.front(), std::byte{0x21}) && Holds(b->snapshots.front(), std::byte{0x22}), "draw parameters changed a snapshot's bytes");
         if (a->snapshots.front().handle == b->snapshots.front().handle) Require(second.persistentSets == 1 && b->allocation.set == a->allocation.set, "two draws whose inputs sit in one arena buffer at different offsets did not share a descriptor set");
+        ShaderResources::SetRecordBindingsMode(ShaderResources::RecordBindings::Legacy);
+        Statistics legacy{};
+        const auto c = fixture.Bindings(4096, 1024, &legacy);
+        Require(legacy.persistentSets == 0 && c->allocation.set != a->allocation.set && c->dynamicOffsets[0].size() == 1 && c->dynamicOffsets[0][0] == c->snapshots.front().offset && Holds(c->snapshots.front(), std::byte{0x21}), "APS5_RECORD_BINDINGS=legacy with draw parameters bound another range or reused a set");
+        ShaderResources::SetRecordBindingsMode(ShaderResources::RecordBindings::Persistent);
         fixture.Release();
         fixture.GetRecorder().Sync();
     }
