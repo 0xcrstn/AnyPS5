@@ -906,6 +906,13 @@ int main(int argc, char** argv) {
             std::puts("Wait floor verify failed as required");
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--wait-floor-activation") {
+            testWaitAfterWaitRejectsOverwrittenLabel();
+            testWaitObservesValueStoredAfterActivation();
+            LibcRunShutdown_nid_postfix();
+            std::puts("Wait floor activation tests passed");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--readonly-resummarize") {
             testReadOnlyResummarize();
             LibcRunShutdown_nid_postfix();
@@ -996,8 +1003,6 @@ int main(int argc, char** argv) {
         testEndOfPipeLabelsWithoutWork();
         testLabelHeldAtSubmission();
         testWideLabelStoredSinceSubmission();
-        testWaitAfterWaitRejectsOverwrittenLabel();
-        testWaitObservesValueStoredAfterActivation();
         testWaitFreeSubmissionAfterEarlierQueue0Work();
         testWaitFreeSubmissionQueue0WaitsOn();
         testMultiAcbs();
