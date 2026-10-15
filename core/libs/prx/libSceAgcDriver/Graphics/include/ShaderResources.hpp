@@ -174,12 +174,16 @@ public:
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
         std::shared_ptr<const DrawBindings> persistent;
+        std::array<std::vector<std::uint32_t>, 2> dynamicOffsets;
         ~DrawBindings();
     };
     enum class RecordBindings : std::uint8_t { Legacy, Persistent };
     static RecordBindings ParseRecordBindings(const char* text);
     static RecordBindings RecordBindingsMode();
     static void SetRecordBindingsMode(RecordBindings mode);
+    static bool DrawParamsEnabled();
+    static void SetDrawParams(bool enabled);
+    std::span<const std::uint32_t> TemplateOffsets(std::size_t set) const { return templateOffsets[set]; }
     static constexpr std::size_t PersistentDrawSetSlots = 4;
     enum class WholeCopy : std::uint8_t { NotAnalysed, IndexVertex, IndexInstance, IndexMemory, IndexUserData, IndexOther, NoDrawRange, IndexAtDraw, IndexAtDrawUserWord, IndexAtDrawUnderflow, IndexAtDrawOverflow, Offset, Soffset, ScalarOffset, Wrap, Opcode, Alias, Swizzled, AddTid, BeyondFourGiB, OverHalf, Disabled, Count };
     static const char* WholeCopyName(WholeCopy reason);
@@ -458,6 +462,7 @@ private:
         std::vector<std::size_t> imageAllocations;
         VkDescriptorBindingFlags flags = 0;
         std::int32_t set = -1;
+        bool drawParams = false;
     };
 
     struct TableStage {
@@ -711,6 +716,8 @@ private:
         bool mipmappedImage = false;
     };
     std::vector<SamplerSource> samplerSources;
+    std::array<std::vector<std::size_t>, 2> dynamicSlots;
+    std::array<std::vector<std::uint32_t>, 2> templateOffsets;
     bool reusable = false;
     bool addressTemplate = false;
     mutable std::atomic<bool> addressUsed{false};

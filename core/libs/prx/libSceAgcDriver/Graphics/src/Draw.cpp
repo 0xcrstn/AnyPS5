@@ -547,6 +547,7 @@ struct BoundDrawState {
     bool sets = false;
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkDescriptorSet fragmentSet = VK_NULL_HANDLE;
+    std::array<std::vector<std::uint32_t>, 2> dynamicOffsets;
     bool pushed = false;
     VkShaderStageFlags pushStages = 0;
     std::array<std::byte, PipelinePushConstantBytes> push{};
@@ -2440,16 +2441,18 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
         const auto fragmentSet = drawBindings->fragmentAllocation.set;
-        if (bound != nullptr && bound->sets && bound->set == set && bound->fragmentSet == fragmentSet) {
+        const auto& offsets = drawBindings->dynamicOffsets;
+        if (bound != nullptr && bound->sets && bound->set == set && bound->fragmentSet == fragmentSet && bound->dynamicOffsets == offsets) {
             ++dirtyRecordCounts().setsSkipped;
         } else {
-            if (set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, set);
-            if (fragmentSet != VK_NULL_HANDLE) commands.BindDescriptorSet(context, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, fragmentSet);
+            if (set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, set, offsets[0]);
+            if (fragmentSet != VK_NULL_HANDLE) commands.BindDescriptorSet(context, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, fragmentSet, offsets[1]);
             if (bound != nullptr) {
                 ++dirtyRecordCounts().sets;
                 bound->sets = true;
                 bound->set = set;
                 bound->fragmentSet = fragmentSet;
+                bound->dynamicOffsets = offsets;
             }
         }
     } else {
