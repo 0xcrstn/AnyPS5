@@ -227,10 +227,16 @@ struct LabelRangeInFlight {
     std::uint64_t end;
 };
 
-struct LabelRangesInFlightTag {};
+struct LabelRangesInFlight {
+    static constexpr std::size_t Capacity = 256;
+    std::array<LabelRangeInFlight, Capacity> ranges;
+    std::size_t count;
+    bool overflowed;
+};
 
-std::vector<LabelRangeInFlight>& labelRangesInFlight() {
-    return HostThreadLocal<std::vector<LabelRangeInFlight>, LabelRangesInFlightTag>();
+LabelRangesInFlight& labelRangesInFlight() {
+    thread_local LabelRangesInFlight inFlight{};
+    return inFlight;
 }
 
 std::uint64_t& labelItemsFrozen() {
@@ -244,16 +250,24 @@ std::atomic<std::uint64_t>& labelItemsRecorded() {
 }
 
 void noteLabelRangeInFlight(std::uint64_t sequence, std::uint64_t address, std::size_t bytes) {
-    if (bytes != 0) labelRangesInFlight().push_back({sequence, address, address + bytes});
+    if (bytes == 0) return;
+    auto& inFlight = labelRangesInFlight();
+    if (inFlight.count == LabelRangesInFlight::Capacity) {
+        inFlight.overflowed = true;
+        return;
+    }
+    inFlight.ranges[inFlight.count++] = {sequence, address, address + bytes};
 }
 
 bool labelInFlightOverlaps(std::uint64_t address, std::size_t bytes) {
     const auto& deferred = deferredLabels().labels;
     if (std::any_of(deferred.begin(), deferred.end(), [&](const DeferredLabel& label) { return address < label.address + label.size && label.address < address + bytes; })) return true;
-    auto& ranges = labelRangesInFlight();
+    auto& inFlight = labelRangesInFlight();
+    if (inFlight.overflowed) return true;
     const auto recorded = labelItemsRecorded().load(std::memory_order_acquire);
-    std::erase_if(ranges, [&](const LabelRangeInFlight& range) { return range.sequence <= recorded; });
-    return std::any_of(ranges.begin(), ranges.end(), [&](const LabelRangeInFlight& range) { return address < range.end && range.begin < address + bytes; });
+    const auto live = std::remove_if(inFlight.ranges.begin(), inFlight.ranges.begin() + static_cast<std::ptrdiff_t>(inFlight.count), [&](const LabelRangeInFlight& range) { return range.sequence <= recorded; });
+    inFlight.count = static_cast<std::size_t>(live - inFlight.ranges.begin());
+    return std::any_of(inFlight.ranges.begin(), live, [&](const LabelRangeInFlight& range) { return address < range.end && range.begin < address + bytes; });
 }
 
 bool& commandProcessorSyncPending() {
@@ -1322,7 +1336,8 @@ void Driver::waitDrawRecords() {
     Graphics::Recorder::DrainChunks();
     finishDrawRecords();
     commandProcessorSyncPending() = false;
-    labelRangesInFlight().clear();
+    labelRangesInFlight().count = 0;
+    labelRangesInFlight().overflowed = false;
 }
 
 void Driver::startDrawRecords() {
