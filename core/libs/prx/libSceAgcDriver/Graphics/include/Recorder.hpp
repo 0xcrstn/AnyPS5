@@ -133,7 +133,7 @@ public:
         bool continued = false;
         bool barrier = true;
     };
-    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, bool depth = false);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     std::uint64_t OpenPassSerial() const;
     static bool ChunkedRecordingEnabled();
@@ -798,6 +798,8 @@ private:
         struct RenderPass {
             bool open = false;
             bool fenced = false;
+            bool fencedBesidesDepth = false;
+            bool depth = false;
             std::uint64_t key = 0;
             std::uint64_t serial = 0;
             std::uint32_t timing = NoTiming;
@@ -810,6 +812,7 @@ private:
         std::vector<const void*> dispatchOwners;
         bool dispatchBarrierPending = false;
         bool dispatchBarrierDeferred = false;
+        bool drawDepth = false;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
         // Queued DCC key stores (see QueueKeyStore).

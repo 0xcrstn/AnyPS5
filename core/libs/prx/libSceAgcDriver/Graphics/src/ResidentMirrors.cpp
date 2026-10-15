@@ -284,6 +284,17 @@ bool BufferMirrorsEnabled() {
     return enabled;
 }
 
+bool ParseDrawPlacement(const char* text) {
+    if (text == nullptr || std::string_view(text) == "1") return true;
+    if (std::string_view(text) == "0") return false;
+    throw std::runtime_error("APS5_DRAW_BDA_PLACEMENT must be 0 or 1");
+}
+
+bool DrawPlacementEnabled() {
+    static const bool enabled = ParseDrawPlacement(std::getenv("APS5_DRAW_BDA_PLACEMENT"));
+    return enabled;
+}
+
 ShaderRecompiler::BdaPlacement::Mode PlacementSetting() {
     static const auto mode = ShaderRecompiler::BdaPlacement::ParseMode(std::getenv("APS5_BDA_PLACEMENT"));
     return mode;

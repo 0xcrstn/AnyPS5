@@ -2364,9 +2364,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
-    const auto passImages = resources.StorageImages();
+    const auto depthPassMerge = DepthPassMergeSetting();
+    const auto passImages = depthPassMerge != DepthPassMerge::Off ? resources.PassImages() : resources.StorageImages();
     std::vector<std::pair<VkImage, bool>> passAttachments;
-    passAttachments.reserve(record.targets.size());
+    passAttachments.reserve(record.targets.size() + 1u);
+    const VkImage depthImage = state.depth && depthPassMerge != DepthPassMerge::Off ? PeekDepthSurfaceImage(context, *state.depth) : VK_NULL_HANDLE;
+    if (depthImage != VK_NULL_HANDLE) passAttachments.emplace_back(depthImage, true);
     for (const auto& target : record.targets) {
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
@@ -2375,10 +2378,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool knownAddressWrites = unknownMemory && readOnlyAddressPasses != ReadOnlyAddressPasses::Off && resources.KnownAddressWrites();
     const bool unknownWrites = unknownMemory && !(knownAddressWrites && readOnlyAddressPasses == ReadOnlyAddressPasses::On);
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownWrites, knownAddressWrites && unknownWrites};
-    const bool fenced = state.depth.has_value() || !record.proxies.empty();
+    const bool depthFenced = state.depth.has_value() && (depthPassMerge != DepthPassMerge::On || depthImage == VK_NULL_HANDLE);
+    const bool fenced = depthFenced || !record.proxies.empty();
     parts.lap(RecordAccess);
     resources.UseMirrors(*recorder);
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess, state.depth.has_value() && record.proxies.empty());
     parts.lap(RecordPassStart);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -2499,6 +2503,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    if (resources.HasPlacements()) resources.RecordPlacementCopyBack(*recorder, recorder->Commands());
     if (bound != nullptr) bound->pass = recorder->OpenPassSerial();
     parts.lap(RecordLeave);
     timer.phase(PhaseRecord);
