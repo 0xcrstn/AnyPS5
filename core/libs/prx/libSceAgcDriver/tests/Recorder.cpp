@@ -11087,12 +11087,10 @@ bool stagedDrawBuildTests(const Device& device, Recorder& recorder) {
         Require(!VerifyStagedDrawBuilds() || adopted.stagedVerified - before.stagedVerified == 1, "APS5_VERIFY_STAGED_DRAW_BUILDS checked no adopted build");
         const auto second = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
         const auto repeated = ParallelResolveStatistics();
-        const bool cached = repeated.resourcesResolved == adopted.resourcesResolved + 1;
-        Require(cached != (repeated.stagedBuilt == adopted.stagedBuilt + 1), "a draw repeating an adopted build was neither served by its cached template nor staged again");
+        Require(repeated.resourcesResolved == adopted.resourcesResolved + 1 && repeated.stagedBuilt == adopted.stagedBuilt, "a draw repeating an adopted staged build was not served by its cached template");
         scene.clear();
         EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *second);
         scene.check("a draw repeating an adopted build rendered other pixels");
-        Require(cached || ParallelResolveStatistics().stagedAdopted - adopted.stagedAdopted == 1, "a second staged build of the same draw was not adopted");
         const auto discarded = ResolveDraw(context, scene.state, scene.indexed, scene.shaders);
         static_cast<void>(discarded);
         scene.clear();
