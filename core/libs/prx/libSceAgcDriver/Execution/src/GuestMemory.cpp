@@ -83,6 +83,7 @@ std::uintptr_t userAddressLimit() {
 }
 
 namespace {
+void reportCollectCoverage();
 std::atomic<std::uint64_t> forgetCalls{0};
 // See ForgetSerial: odd while a ForgetPages call stores its page states.
 std::atomic<std::uint64_t> forgetSerial{0};
@@ -413,10 +414,7 @@ public:
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
-        if (collectCoverageEnabled()) {
-            auto& coverage = coverageCounters();
-            AgcDriver::ProfilePrint_nid_no_patch(" (epoch coverage hits: own %llu, shared %llu; verify walks %llu, %llu found writes the epoch may hide)", static_cast<unsigned long long>(coverage.threadHits.load()), static_cast<unsigned long long>(coverage.sharedHits.load()), static_cast<unsigned long long>(coverage.verifyWalks.load()), static_cast<unsigned long long>(coverage.verifyLate.load()));
-        }
+        reportCollectCoverage();
         auto& refusals = collectRefusals();
         AgcDriver::ProfilePrint_nid_no_patch(" collect refused: unwatched %llu, outside the watched coverage %llu (last 0x%llx), walk failed %llu (last 0x%llx);", static_cast<unsigned long long>(refusals.unwatched.load()), static_cast<unsigned long long>(refusals.uncovered.load()), static_cast<unsigned long long>(refusals.lastUncovered.load()), static_cast<unsigned long long>(refusals.walk.load()), static_cast<unsigned long long>(refusals.lastWalk.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
@@ -1329,6 +1327,13 @@ struct CoverageCounters {
 CoverageCounters& coverageCounters() {
     static CoverageCounters counters;
     return counters;
+}
+
+void reportCollectCoverage() {
+    if (collectCoverageEnabled()) {
+        auto& coverage = coverageCounters();
+        AgcDriver::ProfilePrint_nid_no_patch(" (epoch coverage hits: own %llu, shared %llu; verify walks %llu, %llu found writes the epoch may hide)", static_cast<unsigned long long>(coverage.threadHits.load()), static_cast<unsigned long long>(coverage.sharedHits.load()), static_cast<unsigned long long>(coverage.verifyWalks.load()), static_cast<unsigned long long>(coverage.verifyLate.load()));
+    }
 }
 
 class EpochCoverage {

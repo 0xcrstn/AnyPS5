@@ -3668,8 +3668,7 @@ bool PrecollectOnWorkers() {
     static const bool enabled = [] {
         if (std::getenv("APS5_PRECOLLECT_ON_WORKERS") == nullptr) return false;
         if (!GuestMemory::CollectCoverageEnabled()) {
-            std::fprintf(stderr, "[parallel-resolve] APS5_PRECOLLECT_ON_WORKERS ignored: it needs APS5_COLLECT_COVERAGE
-");
+            std::fprintf(stderr, "[parallel-resolve] APS5_PRECOLLECT_ON_WORKERS ignored: it needs APS5_COLLECT_COVERAGE\n");
             return false;
         }
         return true;
