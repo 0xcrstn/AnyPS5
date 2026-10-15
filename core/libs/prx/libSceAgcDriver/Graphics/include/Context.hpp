@@ -18,6 +18,10 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver {
+class CompileTicket;
+}
+
 namespace AgcDriver::Graphics {
 
 class TextureDetiler;
@@ -303,6 +307,7 @@ struct Context {
     PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
     void* pipelineBuildOwner = nullptr;
     void (*pipelineBuildRunner)(void* owner, std::size_t reservedBytes, const std::function<void()>& build) = nullptr;
+    std::shared_ptr<CompileTicket> (*pipelineBuildSubmitter)(void* owner, std::size_t reservedBytes, std::function<void()> build) = nullptr;
 
     PipelineCacheSynchronization::PipelineUseLock LockPipelineCacheForUse() const {
         return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};

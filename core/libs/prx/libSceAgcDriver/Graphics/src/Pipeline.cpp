@@ -1076,6 +1076,7 @@ struct PipelineStore {
         VkDevice device;
         std::vector<std::byte> key;
         std::shared_future<std::shared_ptr<Pipeline>> result;
+        std::shared_ptr<CompileTicket> ticket;
     };
     std::unordered_map<std::uint64_t, Pending> pending;
     std::condition_variable settled;
@@ -1224,6 +1225,117 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     lock.unlock();
     promise.set_value(pipeline);
     return pipeline;
+}
+
+namespace {
+
+void publishPipeline(PipelineStore& store, const Context& context, std::uint64_t hash, const std::vector<std::byte>& key, const std::shared_ptr<Pipeline>& pipeline) {
+    if (!store.index.contains(hash)) {
+        store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
+        store.index[hash] = std::prev(store.entries.end());
+    }
+    constexpr std::size_t bound = 1024;
+    while (store.entries.size() > bound) {
+        const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
+        if (victim == store.entries.end()) break;
+        store.index.erase(victim->hash);
+        store.entries.erase(victim);
+        ++store.evicted;
+    }
+}
+
+struct PipelineBuildInputs {
+    Context context;
+    State state;
+    VertexInputLayout vertexInput;
+    std::vector<std::uint32_t> mainKey;
+    std::vector<std::uint32_t> fragmentKey;
+    PipelineSetLayouts layouts;
+    std::vector<ShaderRecompiler::RecompileResult> programs;
+    std::vector<std::vector<std::byte>> pushConstants;
+    std::vector<CompiledShader> shaders;
+    VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+};
+
+std::shared_ptr<PipelineBuildInputs> ownBuildInputs(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    auto inputs = std::make_shared<PipelineBuildInputs>();
+    inputs->context = context;
+    inputs->state = state;
+    inputs->vertexInput = vertexInput;
+    inputs->mainKey.assign(resources.mainKey.begin(), resources.mainKey.end());
+    inputs->fragmentKey.assign(resources.fragmentKey.begin(), resources.fragmentKey.end());
+    inputs->layouts = resources;
+    inputs->layouts.mainKey = inputs->mainKey;
+    inputs->layouts.fragmentKey = inputs->fragmentKey;
+    inputs->programs.reserve(shaders.size());
+    inputs->pushConstants.reserve(shaders.size());
+    for (const auto& shader : shaders) {
+        Require(shader.program != nullptr, "a graphics pipeline build needs every stage's program");
+        inputs->programs.push_back(*shader.program);
+        inputs->pushConstants.emplace_back(shader.pushConstants.begin(), shader.pushConstants.end());
+    }
+    for (std::size_t index = 0; index < shaders.size(); ++index) {
+        auto shader = shaders[index];
+        shader.program = &inputs->programs[index];
+        shader.pushConstants = inputs->pushConstants[index];
+        inputs->shaders.push_back(shader);
+    }
+    inputs->attachmentLayout = attachmentLayout;
+    return inputs;
+}
+
+}
+
+std::shared_ptr<CompileTicket> TryCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
+    if (disabled || context.pipelineBuildSubmitter == nullptr) return nullptr;
+    auto& store = Pipelines();
+    std::unique_lock lock(store.mutex);
+    std::vector<std::byte> key;
+    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (key.empty()) return nullptr;
+    const auto hash = hashKey(key);
+    if (const auto found = store.index.find(hash); found != store.index.end()) {
+        if (found->second->key != key || alive(*found->second, context)) return nullptr;
+        abandon(store, found->second);
+    }
+    if (const auto building = store.pending.find(hash); building != store.pending.end()) return building->second.key == key ? building->second.ticket : nullptr;
+    ++store.misses;
+    for (auto it = store.entries.begin(); it != store.entries.end();) {
+        it = alive(*it, context) ? std::next(it) : abandon(store, it);
+    }
+    auto inputs = ownBuildInputs(context, state, vertexInput, resources, shaders, attachmentLayout);
+    std::size_t words = 0;
+    for (const auto& program : inputs->programs) words += program.spirv.WordCount();
+    auto promise = std::make_shared<std::promise<std::shared_ptr<Pipeline>>>();
+    auto& pending = store.pending.emplace(hash, PipelineStore::Pending{context.device, key, promise->get_future().share(), nullptr}).first->second;
+    pending.ticket = context.pipelineBuildSubmitter(context.pipelineBuildOwner, words * sizeof(std::uint32_t) * 8u, [inputs, promise, hash, key] {
+        auto& owner = Pipelines();
+        std::shared_ptr<Pipeline> pipeline;
+        try {
+            pipeline = std::make_shared<Pipeline>(inputs->context, inputs->state, inputs->vertexInput, inputs->layouts, inputs->shaders, inputs->attachmentLayout);
+        } catch (...) {
+            {
+                std::lock_guard failed(owner.mutex);
+                owner.pending.erase(hash);
+                owner.settled.notify_all();
+            }
+            promise->set_exception(std::current_exception());
+            throw;
+        }
+        {
+            std::lock_guard built(owner.mutex);
+            owner.pending.erase(hash);
+            owner.settled.notify_all();
+            publishPipeline(owner, inputs->context, hash, key, pipeline);
+        }
+        promise->set_value(pipeline);
+    });
+    if (pending.ticket == nullptr) {
+        store.pending.erase(hash);
+        return nullptr;
+    }
+    return pending.ticket;
 }
 
 std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {

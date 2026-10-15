@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CompileService.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -27,6 +28,7 @@
 #include "ImageTableAbi.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <future>
 #include <functional>
@@ -4787,6 +4789,95 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     return words;
 }
 
+void pipelineParkingTests() {
+    using namespace AgcDriver::Graphics;
+    using namespace std::chrono_literals;
+    using ShaderRecompiler::RecompileResult;
+    using ShaderRecompiler::ShaderStage;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.device = makeHandle<VkDevice>();
+    context.limits.maxColorAttachments = 8;
+    context.limits.maxPushConstantsSize = 256;
+    DescriptorCache cache(context);
+    context.descriptorCache = &cache;
+    AgcDriver::CompileService::Limits limits;
+    limits.workers = 1;
+    limits.demandReservedWorkers = 0;
+    AgcDriver::CompileService service(limits);
+    context.pipelineBuildOwner = &service;
+    context.pipelineBuildSubmitter = [](void* owner, std::size_t bytes, std::function<void()> build) -> std::shared_ptr<AgcDriver::CompileTicket> {
+        static std::atomic<std::uint64_t> sequence{0};
+        return static_cast<AgcDriver::CompileService*>(owner)->Submit("parked:" + std::to_string(++sequence), AgcDriver::CompilePriority::Demand, bytes, [build = std::move(build)](const AgcDriver::CompileTicket&) { build(); });
+    };
+    RecompileResult vertex;
+    vertex.spirv = makeModule({});
+    vertex.variantId = 401;
+    RecompileResult fragment;
+    fragment.spirv = makeModule({.fragment = true});
+    fragment.variantId = 402;
+    const std::array<CompiledShader, 2> shaders{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.hasColorTarget = true;
+    state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    state.colors.push_back(state.color);
+    state.blend.colorWriteMask = 15;
+    state.blends.push_back(state.blend);
+    std::mutex gateMutex;
+    std::condition_variable gateSignal;
+    bool released = false, fail = false;
+    int whole = 0;
+    graphicsPipelineHook = [&](const VkGraphicsPipelineCreateInfo& info) {
+        if ((info.flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) != 0) return;
+        std::unique_lock lock(gateMutex);
+        ++whole;
+        gateSignal.wait_for(lock, 10s, [&] { return released; });
+        if (fail) {
+            fail = false;
+            throw std::runtime_error("injected pipeline creation failure");
+        }
+    };
+    struct HookReset {
+        ~HookReset() { graphicsPipelineHook = nullptr; }
+    } hookReset;
+    auto ticket = TryPrewarmPipeline(context, state, shaders);
+    Require(ticket != nullptr, "a pipeline miss did not hand out a ticket");
+    Require(TryPrewarmPipeline(context, state, shaders) == ticket, "a second miss of the same pipeline did not join the build in flight");
+    {
+        std::lock_guard lock(gateMutex);
+        released = true;
+    }
+    gateSignal.notify_all();
+    ticket->Wait();
+    Require(ticket->Ready(), "the parked build did not settle ready");
+    Require(TryPrewarmPipeline(context, state, shaders) == nullptr, "a built pipeline still parks");
+    const auto creates = mock.graphicsPipelineCreateCount;
+    PrewarmPipeline(context, state, shaders);
+    Require(mock.graphicsPipelineCreateCount == creates && whole == 1, "the pipeline a parked build published was built again");
+    auto failing = state;
+    failing.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    {
+        std::lock_guard lock(gateMutex);
+        fail = true;
+    }
+    auto failed = TryPrewarmPipeline(context, failing, shaders);
+    Require(failed != nullptr, "a second pipeline miss did not hand out a ticket");
+    bool threw = false;
+    try {
+        failed->Wait();
+    } catch (const std::runtime_error& error) {
+        threw = std::string_view(error.what()) == "injected pipeline creation failure";
+    }
+    Require(threw && failed->State() == AgcDriver::CompileState::Failed, "a failed parked build did not rethrow its own error");
+    auto retried = TryPrewarmPipeline(context, failing, shaders);
+    Require(retried != nullptr && retried != failed, "a failed build stayed pending");
+    retried->Wait();
+    Require(TryPrewarmPipeline(context, failing, shaders) == nullptr, "the retried build did not publish its pipeline");
+    service.Close();
+    ClearCachedPipelines(context.device);
+}
+
 void pipelineLibraryConcurrencyTests() {
     using namespace AgcDriver::Graphics;
     using namespace std::chrono_literals;
@@ -7015,6 +7106,7 @@ int main(int argc, char** argv) {
         retainedPixelStageTests();
         pipelineLibrarySetTests();
         pipelineLibraryConcurrencyTests();
+        pipelineParkingTests();
         hdrComponentSwapTests();
         depthMaintenanceTests();
         hardwareScreenOffsetTests();

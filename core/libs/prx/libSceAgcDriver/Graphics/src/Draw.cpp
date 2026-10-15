@@ -2488,8 +2488,10 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-void PrewarmPipeline(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
-    if (shaders.empty() || shaders.front().program == nullptr || context.descriptorCache == nullptr) return;
+namespace {
+
+template<typename TUse>
+auto withPipelineInputs(const Context& context, const State& state, std::span<const CompiledShader> shaders, TUse&& use) {
     bool memoized = false, hit = false;
     const auto fragmentOutputs = CachedFragmentOutputs(context, shaders, state, memoized, hit);
     const auto masked = maskedState(state, fragmentOutputs);
@@ -2504,7 +2506,19 @@ void PrewarmPipeline(const Context& context, const State& state, std::span<const
     static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
     static const bool recordDraws = std::getenv("APS5_SYNC_DRAWS") == nullptr;
     const bool lean = recordDraws && !drawTransitions;
-    CachedPipeline(context, pipelineState, vertexInput, described.View(), shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    return use(pipelineState, vertexInput, described.View(), lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+}
+
+}
+
+void PrewarmPipeline(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+    if (shaders.empty() || shaders.front().program == nullptr || context.descriptorCache == nullptr) return;
+    withPipelineInputs(context, state, shaders, [&](const State& pipelineState, const VertexInputLayout& vertexInput, const PipelineSetLayouts& layouts, VkImageLayout attachmentLayout) { return CachedPipeline(context, pipelineState, vertexInput, layouts, shaders, attachmentLayout); });
+}
+
+std::shared_ptr<CompileTicket> TryPrewarmPipeline(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+    if (shaders.empty() || shaders.front().program == nullptr || context.descriptorCache == nullptr || context.pipelineBuildSubmitter == nullptr) return nullptr;
+    return withPipelineInputs(context, state, shaders, [&](const State& pipelineState, const VertexInputLayout& vertexInput, const PipelineSetLayouts& layouts, VkImageLayout attachmentLayout) { return TryCachedPipeline(context, pipelineState, vertexInput, layouts, shaders, attachmentLayout); });
 }
 
 const char* ResolveSerialName(ResolveSerial serial) {

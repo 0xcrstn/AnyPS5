@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CompileService.hpp"
+#include "prx/libSceAgcDriver/Execution/include/QueueScheduler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -103,6 +105,21 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         localDevice = device;
     }
     timing.Mark("device_setup");
+    const auto parkForPipeline = [&](const Graphics::State& pipelineState, std::span<const Graphics::CompiledShader> pipelineStages) {
+        if (!VulkanDevice::CompileParkingEnabled() || !onWorkerThread() || frozenSink() != nullptr || GuestMemory::GpuMutex().HeldByThisThread()) return;
+        auto ticket = localDevice->TryDrawPipeline(pipelineState, pipelineStages);
+        if (ticket == nullptr) return;
+        ParkedOp op;
+        op.queue = submission.queue;
+        op.submission = submission.serial;
+        op.cursor = currentPacketOffset();
+        op.what = "draw waiting for its graphics pipeline";
+        op.arm = [device = localDevice, ticket](std::function<void()> wake) { return device->ArmCompileWait(ticket, std::move(wake)); };
+        op.resume = [ticket] { ticket->Wait(); };
+        ParkPacket(std::move(op));
+        static const bool verify = std::getenv("APS5_VERIFY_COMPILE_JOBS") != nullptr;
+        if (verify) require(localDevice->TryDrawPipeline(pipelineState, pipelineStages) == nullptr, "APS5_VERIFY_COMPILE_JOBS: a draw resumed after its pipeline build settled, but the pipeline is still not cached");
+    };
     phaseTiming.Phase(DrawRowVectors);
 
     const bool planned = bindingPlan() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
@@ -628,6 +645,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
                 return DrawVerdict::Rejected;
             }
             phaseTiming.Phase(DrawRowVectors);
+            parkForPipeline(graphics, stages);
             localDevice->PrewarmDrawPipeline(graphics, stages);
             phaseTiming.Phase(DrawRowPipelinePrepare);
             lockForDraw();
@@ -657,6 +675,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             return DrawVerdict::Rejected;
         }
         phaseTiming.Phase(DrawRowVectors);
+        parkForPipeline(graphics, stages);
         localDevice->PrewarmDrawPipeline(graphics, stages);
         phaseTiming.Phase(DrawRowPipelinePrepare);
     }

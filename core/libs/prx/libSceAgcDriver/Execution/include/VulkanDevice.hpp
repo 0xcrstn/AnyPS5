@@ -60,6 +60,7 @@ public:
     void WaitIdle();
     void PrepareForReplacement();
     static bool PipelineCompileAheadEnabled();
+    static bool CompileParkingEnabled();
     void BuildComputePipelineAhead(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress);
     struct PipelineAheadStatistics {
         std::uint64_t accepted, built, present, failed, refused, duplicate, demanded, cancelled, useful, joined;
@@ -328,6 +329,8 @@ public:
     void EnqueueDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
     bool PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders);
     void PrewarmDrawPipeline(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders);
+    std::shared_ptr<CompileTicket> TryDrawPipeline(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders);
+    bool ArmCompileWait(const std::shared_ptr<CompileTicket>& ticket, std::function<void()> wake);
 
 private:
     VulkanDevice(const PresentationWindow* window, bool compileOnly);
