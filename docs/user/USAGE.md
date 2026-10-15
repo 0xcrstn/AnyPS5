@@ -219,14 +219,14 @@ A `WAIT_REG_MEM` on one queue may be satisfied by a label another queue recorded
 
 With `APS5_COHERENCE_ORDERING=1` or `verify`, a label also waits behind the write-backs its batch still owes, so a title's own CPU loads never see a label before the results it releases. `APS5_LABEL_PUBLICATION=ordered` or `early` names the same choice; a value that contradicts `APS5_COHERENCE_ORDERING` stops the title.
 
-`APS5_TRACE_WAIT_CHAIN=1` prints a `[waitchain]` line per queue every 10 s. The line splits the time each blocked wait spent into: producer label not recorded yet, recorded but not submitted, submitted but not finished on the GPU, finished but not stored for the CPU, and stored but not seen yet. A `[labels]` line gives the same latencies over all labels. Slow-wait reports name the label that satisfied the wait.
+In runs with `APS5_PROFILE_DRAW` (as `run.ps1 -Perf` and `-Debug` set it), `APS5_TRACE_WAIT_CHAIN=1` prints a `[waitchain]` line per queue every 10 s. The line splits the time each blocked wait spent into: producer label not recorded yet, recorded but not submitted, submitted but not finished on the GPU, finished but not stored for the CPU, and stored but not seen yet. A `[labels]` line gives the same latencies over all labels. Slow-wait reports name the label that satisfied the wait.
 
 `APS5_QUEUE_SCHEDULER` chooses how the GPU queues' workers take turns:
 - `off` (the default) runs them as before.
 - `serial` runs one packet at a time across all queues; the oldest runnable submission goes next, and a queue waiting on a label gives up its turn. It is a reference for comparing results, not a fast mode.
 - `dag` runs the queues concurrently, as `off` does, and lets a packet whose shader is still compiling wait without holding any lock.
 
-`APS5_QUEUE_SCHEDULER_VERIFY=1` stops the title when a queue runs a packet out of order or while it is waiting for a compile. A `[scheduler]` line every 10 s counts turns, hand-overs and parked packets.
+`APS5_QUEUE_SCHEDULER_VERIFY=1` stops the title when a queue runs a packet out of order or while it is waiting for a compile. With `APS5_PROFILE_DRAW`, a `[scheduler]` line every 10 s counts turns, hand-overs and parked packets whenever the scheduler or its verify mode is on.
 
 `APS5_LABEL_TIMELINE=on` lets a wait be satisfied by another queue's recorded label only with a proof: the label was recorded after the wait became active and covers every awaited byte, or it is the newest value and nothing wrote over it since. Anything else waits for guest memory. `verify` stops the title instead of waiting. A compare function the driver does not know stops the title in both modes. The `[waitchain]` line counts waits by proof.
 
