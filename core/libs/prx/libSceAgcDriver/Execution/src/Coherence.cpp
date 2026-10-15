@@ -834,9 +834,12 @@ Counters CurrentCounters() {
 
 std::string Report() {
     const auto c = CurrentCounters();
-    char text[448];
+    char text[768];
     std::snprintf(text, sizeof(text), "[coherence] reservations %llu, completions %llu, abandoned %llu, active %llu, publications checked %llu, stale publications %llu, stale reads %llu, undrained releases %llu, remapped completions %llu, committed %llu, evicted %llu", static_cast<unsigned long long>(c.reservations), static_cast<unsigned long long>(c.completions), static_cast<unsigned long long>(c.abandoned), static_cast<unsigned long long>(c.activeWriters), static_cast<unsigned long long>(c.publicationsChecked), static_cast<unsigned long long>(c.stalePublications), static_cast<unsigned long long>(c.staleReads), static_cast<unsigned long long>(c.undrainedReleases), static_cast<unsigned long long>(c.remappedCompletions), static_cast<unsigned long long>(c.committedIntervals), static_cast<unsigned long long>(c.evictedIntervals));
-    return text;
+    std::string line = text;
+    std::snprintf(text, sizeof(text), "; protections %llu (refused %llu, partial %llu, live %llu), faults resolved %llu, locked faults %llu, leases %llu, lease waits %llu, uncovered releases %llu", static_cast<unsigned long long>(c.protections), static_cast<unsigned long long>(c.refusedProtections), static_cast<unsigned long long>(c.partialProtections), static_cast<unsigned long long>(c.liveProtections), static_cast<unsigned long long>(c.faultsResolved), static_cast<unsigned long long>(c.lockedFaults), static_cast<unsigned long long>(c.leases), static_cast<unsigned long long>(c.leaseWaits), static_cast<unsigned long long>(c.uncoveredReleases));
+    line += text;
+    return line;
 }
 
 std::vector<std::string> RecentEvents(Interval range, std::size_t limit) {
