@@ -1208,6 +1208,25 @@ ShaderResources::ShaderResources(const Context& context, std::span<const Compile
 
 ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots) : ShaderResources(context, compute, snapshots, false) {}
 
+ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, StagedDraw) : context(context), guestMemory(context), stagedTarget(target), stagedColorAttachments(colorAttachments), stagedIndexAddress(indexAddress), stagedIndexBytes(indexBytes) {
+    drawBuild = true;
+    if (!prepareAddressBindings(shaders, snapshots, true)) {
+        lockedBuild = true;
+        return;
+    }
+    unlockedPrepare = true;
+    buildPrepare(shaders, &stagedTarget, colorAttachments, indexAddress, indexBytes);
+}
+
+void ShaderResources::CompleteDraw(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
+    Require(drawBuild && !completed && (unlockedPrepare || lockedBuild), "a staged draw build was completed twice or never staged");
+    if (lockedBuild) {
+        prepareAddressBindings(shaders, snapshots);
+        buildPrepare(shaders, &stagedTarget, stagedColorAttachments, stagedIndexAddress, stagedIndexBytes);
+    }
+    buildComplete();
+}
+
 namespace {
 
 // Whether a compute stage maps registered guest memory through BDA tables (see prepareAddressBindings).

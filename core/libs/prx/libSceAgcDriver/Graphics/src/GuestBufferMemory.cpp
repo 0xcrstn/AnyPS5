@@ -2937,6 +2937,31 @@ void GuestBufferMemory::AcquireRegistered() {
     }
 }
 
+bool GuestBufferMemory::AcquireCachedSpace() {
+    Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
+    if (!addressSpaceCacheEnabled()) return false;
+    auto current = Spaces().current.load();
+    if (current == nullptr || !current->sparseMirrors.empty() || !current->writableMirrors.empty() || !current->heapRuns.empty()) return false;
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (current->device != context.device || current->generation != generation || current->importsEpoch != state.epoch) return false;
+        importFloor = state.useCounter + 1;
+        const auto stamp = ++state.useCounter;
+        for (const auto& region : current->base) {
+            if (region.direct != nullptr) region.direct->lastUse = stamp;
+        }
+    }
+    ensurePinWaiter();
+    static const bool sortedLookup = std::getenv("APS5_NO_SORTED_SNAPSHOT_LOOKUP") == nullptr;
+    Spaces().hits.fetch_add(1, std::memory_order_relaxed);
+    space = std::move(current);
+    for (const auto& range : space->copied) addCopiedRange(range);
+    regionsSorted = sortedLookup;
+    return true;
+}
+
 void GuestBufferMemory::validate(std::uint64_t address, std::size_t bytes) const {
     Require(!uploaded, "guest memory ownership is frozen for GPU execution");
     Require(address != 0 && bytes != 0, "empty guest memory range");
