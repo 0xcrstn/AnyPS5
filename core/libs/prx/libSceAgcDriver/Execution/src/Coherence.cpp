@@ -26,7 +26,7 @@ constexpr std::uint64_t ProtectionGranule = 4096;
 enum class EventType : std::uint8_t { Reserve, Recorded, Complete, Commit, Abandon, Publish, StalePublish, StaleRead, Undrained, Remapped };
 
 constexpr const char* EventNames[] = {"reserve", "recorded", "complete", "commit", "abandon", "publish", "stale-publish", "stale-read", "undrained", "remapped"};
-constexpr const char* ProducerNames[] = {"pointer-writer", "element-writer"};
+constexpr const char* ProducerNames[] = {"pointer-writer", "element-writer", "label-store"};
 constexpr const char* SourceNames[] = {"pending-image", "shadow-unit", "resident-staging", "read-lease"};
 
 struct Event {

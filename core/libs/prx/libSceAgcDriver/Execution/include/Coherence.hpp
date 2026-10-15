@@ -55,7 +55,7 @@ using BackingTranslator = std::size_t (*)(std::uintptr_t address, std::size_t by
 void SetBackingTranslator(BackingTranslator translator);
 std::vector<BackingRun> Translate(Interval range);
 
-enum class Producer : std::uint8_t { PointerWriter, ElementWriter, Count };
+enum class Producer : std::uint8_t { PointerWriter, ElementWriter, LabelStore, Count };
 enum class Source : std::uint8_t { PendingImage, ShadowUnit, ResidentStaging, ReadLease, Count };
 
 const char* ProducerName(Producer producer);
