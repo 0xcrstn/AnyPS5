@@ -2592,6 +2592,23 @@ bool Recorder::VerifyInPlaceDrawInputs() {
     return enabled;
 }
 
+namespace {
+
+bool StrictInPlaceDrawInputs() {
+    static const bool strict = [] {
+        const char* value = std::getenv("APS5_VERIFY_IN_PLACE_DRAW_INPUTS");
+        return value != nullptr && std::strcmp(value, "strict") == 0;
+    }();
+    return strict;
+}
+
+std::atomic<std::uint64_t>& InPlaceInputsChangedAfterSubmit() {
+    static std::atomic<std::uint64_t> changed{0};
+    return changed;
+}
+
+}
+
 void Recorder::NoteInPlaceDrawInput(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || !VerifyInPlaceDrawInputs()) return;
     ensureOpen();
@@ -3667,7 +3684,22 @@ void Recorder::Submit() {
         std::snprintf(message, sizeof(message), "APS5_VERIFY_IN_PLACE_DRAW_INPUTS: a CPU store reached the draw input 0x%llx+0x%llx bound in place before its batch was submitted", static_cast<unsigned long long>(input.begin), static_cast<unsigned long long>(input.end - input.begin));
         throw std::runtime_error(message);
     }
-    open->inPlaceInputs.clear();
+    if (!open->inPlaceInputs.empty()) {
+        OnCompleteWithoutGuestAccess([inputs = std::move(open->inPlaceInputs)] {
+            for (const auto& input : inputs) {
+                const auto bytes = static_cast<std::size_t>(input.end - input.begin);
+                GuestMemory::CollectWritesUncached(input.begin, bytes);
+                if (GuestMemory::UnchangedSince(input.begin, bytes, input.generation)) continue;
+                char message[256];
+                std::snprintf(message, sizeof(message), "APS5_VERIFY_IN_PLACE_DRAW_INPUTS: a CPU store reached the draw input 0x%llx+0x%llx bound in place before its batch completed", static_cast<unsigned long long>(input.begin), static_cast<unsigned long long>(input.end - input.begin));
+                if (StrictInPlaceDrawInputs()) throw std::runtime_error(message);
+                const auto changed = InPlaceInputsChangedAfterSubmit().fetch_add(1, std::memory_order_relaxed) + 1;
+                if (changed <= 20 || changed % 1000 == 0) std::fprintf(stderr, "[in-place-inputs] %s (%llu so far; after the submit, so possibly after the GPU read)
+", message, static_cast<unsigned long long>(changed));
+            }
+        });
+        open->inPlaceInputs.clear();
+    }
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     if (open->guestCompletions && AnyDeviceResident()) PublishAllDeviceResident(*this, ResidentSite::Completion);
