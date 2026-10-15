@@ -413,6 +413,10 @@ public:
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        if (collectCoverageEnabled()) {
+            auto& coverage = coverageCounters();
+            AgcDriver::ProfilePrint_nid_no_patch(" (epoch coverage hits: own %llu, shared %llu; verify walks %llu, %llu found writes the epoch may hide)", static_cast<unsigned long long>(coverage.threadHits.load()), static_cast<unsigned long long>(coverage.sharedHits.load()), static_cast<unsigned long long>(coverage.verifyWalks.load()), static_cast<unsigned long long>(coverage.verifyLate.load()));
+        }
         auto& refusals = collectRefusals();
         AgcDriver::ProfilePrint_nid_no_patch(" collect refused: unwatched %llu, outside the watched coverage %llu (last 0x%llx), walk failed %llu (last 0x%llx);", static_cast<unsigned long long>(refusals.unwatched.load()), static_cast<unsigned long long>(refusals.uncovered.load()), static_cast<unsigned long long>(refusals.lastUncovered.load()), static_cast<unsigned long long>(refusals.walk.load()), static_cast<unsigned long long>(refusals.lastWalk.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
@@ -1305,6 +1309,95 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     return complete;
 }
 
+bool collectCoverageEnabled() {
+    static const bool enabled = std::getenv("APS5_COLLECT_COVERAGE") != nullptr;
+    return enabled;
+}
+
+bool collectCoverageVerified() {
+    static const bool verified = std::getenv("APS5_VERIFY_COLLECT_COVERAGE") != nullptr;
+    return verified;
+}
+
+struct CoverageCounters {
+    std::atomic<std::uint64_t> threadHits{0};
+    std::atomic<std::uint64_t> sharedHits{0};
+    std::atomic<std::uint64_t> verifyWalks{0};
+    std::atomic<std::uint64_t> verifyLate{0};
+};
+
+CoverageCounters& coverageCounters() {
+    static CoverageCounters counters;
+    return counters;
+}
+
+class EpochCoverage {
+public:
+    bool Covers(std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t first, std::uint64_t stop) const {
+        if (epoch != this->epoch || unwatched != this->unwatched || ranges.empty()) return false;
+        auto it = std::upper_bound(ranges.begin(), ranges.end(), first, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& range) { return value < range.first; });
+        if (it == ranges.begin()) return false;
+        --it;
+        return it->first <= first && stop <= it->second;
+    }
+
+    void Add(std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t begin, std::uint64_t end) {
+        if (begin >= end) return;
+        if (epoch != this->epoch || unwatched != this->unwatched || ranges.size() >= MaxRanges) {
+            this->epoch = epoch;
+            this->unwatched = unwatched;
+            ranges.clear();
+        }
+        auto it = std::lower_bound(ranges.begin(), ranges.end(), begin, [](const std::pair<std::uint64_t, std::uint64_t>& range, std::uint64_t value) { return range.second < value; });
+        auto last = it;
+        while (last != ranges.end() && last->first <= end) {
+            begin = std::min(begin, last->first);
+            end = std::max(end, last->second);
+            ++last;
+        }
+        it = ranges.erase(it, last);
+        ranges.insert(it, {begin, end});
+    }
+
+private:
+    static constexpr std::size_t MaxRanges = 8192;
+    std::uint64_t epoch = 0;
+    std::uint64_t unwatched = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+};
+
+thread_local EpochCoverage threadCoverage;
+
+struct SharedCoverageSlot {
+    std::mutex mutex;
+    EpochCoverage coverage;
+};
+
+std::array<SharedCoverageSlot, 32>& sharedCoverage() {
+    static std::array<SharedCoverageSlot, 32> slots;
+    return slots;
+}
+
+bool coveredThisEpoch(std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t first, std::uint64_t stop) {
+    if (threadCoverage.Covers(epoch, unwatched, first, stop)) {
+        coverageCounters().threadHits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    auto& slot = sharedCoverage()[epoch % sharedCoverage().size()];
+    std::lock_guard lock(slot.mutex);
+    if (!slot.coverage.Covers(epoch, unwatched, first, stop)) return false;
+    coverageCounters().sharedHits.fetch_add(1, std::memory_order_relaxed);
+    threadCoverage.Add(epoch, unwatched, first, stop);
+    return true;
+}
+
+void noteCovered(std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t begin, std::uint64_t end) {
+    threadCoverage.Add(epoch, unwatched, begin, end);
+    auto& slot = sharedCoverage()[epoch % sharedCoverage().size()];
+    std::lock_guard lock(slot.mutex);
+    slot.coverage.Add(epoch, unwatched, begin, end);
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
@@ -1317,7 +1410,23 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto epoch = currentCollectEpoch();
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
-    if (useMemo && !sharedCollectMemo()) {
+    const bool coverage = useMemo && collectCoverageEnabled() && threadCollectEpoch != 0;
+    if (coverage && coveredThisEpoch(epoch, unwatched, first, stop)) {
+        collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        if (collectCoverageVerified()) {
+            const auto lock = lockTracker(tracker);
+            const auto dirtyBefore = collectDirty.load(std::memory_order_relaxed);
+            coverageCounters().verifyWalks.fetch_add(1, std::memory_order_relaxed);
+            if (!tracker.watched || !tracker.covers(first, static_cast<std::size_t>(stop - first)) || !walkWrites(tracker, first, stop, StampKind::Cpu)) throw std::runtime_error("APS5_VERIFY_COLLECT_COVERAGE: a range covered by this collect epoch can no longer be walked");
+            if (collectDirty.load(std::memory_order_relaxed) != dirtyBefore) {
+                noteDirty(first, stop);
+                coverageCounters().verifyLate.fetch_add(1, std::memory_order_relaxed);
+            }
+            return tracker.generation;
+        }
+        return tracker.generation.load(std::memory_order_relaxed);
+    }
+    if (useMemo && !coverage && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
         for (const auto& entry : threadCollectMemo.entries) {
@@ -1357,6 +1466,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto remember = [&](std::uint64_t begin, std::uint64_t end) {
         if (!collectMemoEnabled()) return;
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
+        if (coverage) {
+            noteCovered(epoch, serial, begin, end);
+            return;
+        }
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {begin, end, epoch, serial};
         else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {begin, end, epoch, serial};
     };
@@ -1412,6 +1525,10 @@ std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, false);
+}
+
+bool CollectCoverageEnabled() {
+    return collectCoverageEnabled();
 }
 
 bool EpochDirtySetEnabled() {
