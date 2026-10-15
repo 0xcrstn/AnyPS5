@@ -273,7 +273,7 @@ public:
     // does when it lists no image, and all an access AccessKeptByCpu approved needs): whether any
     // unit was published.
     static bool PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason = "memory access");
-    static bool StoreForPointerAccess(std::uint64_t address, std::size_t bytes, bool writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt);
+    static bool StoreForPointerAccess(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt);
     static void AuditPointerReads(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt);
     static void MaterializeForNativeAccess(std::uint64_t address, std::size_t bytes);
     static std::size_t FlushUnprotected(const char* reason);

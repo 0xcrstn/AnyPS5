@@ -4317,7 +4317,9 @@ void pointerAccessShadowTests(const Device& device, Recorder& recorder) {
     };
     write({{1.0f, 0.0f, 0.0f, 1.0f}});
     build(false, {}, false);
-    Require(StorageTexture::FindPending(address + unit, unit) == image, "an address-based build that only reads stored a pending image");
+    Require(StorageTexture::FindPending(address + unit, unit) == nullptr, "an address-based build that only reads left an image pending over its heap");
+    Require(holds({255, 0, 0, 255}), "the image stored before an address-based build that only reads did not reach its heap");
+    write({{1.0f, 0.0f, 0.0f, 1.0f}});
     build(true, {{address + unit, address + 2 * unit}}, false);
     Require(StorageTexture::FindPending(address + unit, unit) == image, "an address-based build stored the image of its own target");
     build(true, {}, false);
@@ -4616,17 +4618,18 @@ int coherenceOrderingTests(const Device& device, Recorder& recorder) {
         auto reader = record(false, MakeBdaDwordReadTestShader(address + 4 * unit, 1, false, true));
         complete(reader);
     }
-    Require(Coherence::CurrentCounters().staleReads != 0, "audit 1 did not flag a read-only address-based build reading host bytes under a pending image");
-    Require(StorageTexture::FindPending(address + 4 * unit, unit) == image, "the reference reader stored the pending image");
+    Require(StorageTexture::FindPending(address + 4 * unit, unit) == nullptr && dword() == 0xff0000ffu, "a read-only address-based build read host bytes under a pending image");
+    Require(Coherence::CurrentCounters().staleReads == 0, "audit 1 flagged a read-only address-based build that stored the pending image first: " + Coherence::Report());
 
     Coherence::SetModesForTests(Coherence::Mode::Reference, Coherence::Mode::Verify, Coherence::Mode::Reference);
     Coherence::ResetForTests();
+    paint({{0.0f, 1.0f, 0.0f, 1.0f}});
     {
         auto reader = record(false, MakeBdaDwordReadTestShader(address + 4 * unit, 1, false, true));
         complete(reader);
     }
     Require(StorageTexture::FindPending(address + 4 * unit, unit) == nullptr, "an ordered read-only address-based build left the image pending over its heap");
-    Require(dword() == 0xff0000ffu, "an ordered read-only address-based build read stale bytes under a pending image");
+    Require(dword() == 0xff00ff00u, "an ordered read-only address-based build read stale bytes under a pending image");
     counters = Coherence::CurrentCounters();
     Require(counters.staleReads == 0 && counters.stalePublications == 0, "ordered pointer reader: " + Coherence::Report());
     std::cout << "coherence ordering with address-based stores and loads: ok\n";

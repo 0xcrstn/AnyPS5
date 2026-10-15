@@ -12,6 +12,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <tuple>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -63,6 +64,7 @@ struct Registry {
     std::map<std::uint64_t, std::shared_ptr<ResidentMirror>> byBase;
     std::vector<std::shared_ptr<ResidentMirror>> used;
     std::map<std::uint64_t, Seen> seen;
+    std::vector<std::tuple<const Recorder*, std::uint64_t, std::uint64_t>> pointerWrites;
     std::uint64_t bytes = 0;
     std::atomic<bool> any{false};
 };
@@ -267,6 +269,14 @@ void NoteMirroredWrite(std::uint64_t begin, std::uint64_t end) {
     }
 }
 
+void NotePointerWrite(const Recorder& recorder, std::uint64_t begin, std::uint64_t end) {
+    if (end <= begin) return;
+    NoteMirroredWrite(begin, end);
+    auto& registry = Mirrors();
+    std::lock_guard lock(registry.mutex);
+    registry.pointerWrites.emplace_back(&recorder, begin, end);
+}
+
 void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirror>> mirrors) {
     if (mirrors.empty()) return;
     auto& registry = Mirrors();
@@ -280,6 +290,9 @@ void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirr
         const bool whole = recorder.PendingLabelIn(mirror->base, static_cast<std::size_t>(mirror->bytes)) || recorder.QueuedStoreOverlaps(mirror->base, static_cast<std::size_t>(mirror->bytes));
         std::lock_guard lock(registry.mutex);
         for (const auto& write : pending) markBlocks(*mirror, write.begin, write.end);
+        for (const auto& [writer, begin, end] : registry.pointerWrites) {
+            if (writer == &recorder) markBlocks(*mirror, begin, end);
+        }
         if (whole) markBlocks(*mirror, mirror->base, mirror->base + mirror->bytes);
     }
     {
@@ -327,7 +340,11 @@ void RefreshMirrorsForDirectUse(Recorder& recorder, std::span<const std::shared_
 
 void SubmitMirrors(Recorder& recorder) {
     auto& registry = Mirrors();
-    if (!registry.any.load(std::memory_order_acquire)) return;
+    if (!registry.any.load(std::memory_order_acquire)) {
+        std::lock_guard lock(registry.mutex);
+        registry.pointerWrites.erase(std::remove_if(registry.pointerWrites.begin(), registry.pointerWrites.end(), [&](const auto& write) { return std::get<0>(write) == &recorder; }), registry.pointerWrites.end());
+        return;
+    }
     const auto batch = recorder.Submissions() + 1;
     std::vector<std::shared_ptr<ResidentMirror>> used;
     {
@@ -336,6 +353,7 @@ void SubmitMirrors(Recorder& recorder) {
             if (mirror->usedBy == &recorder && mirror->usedBatch == batch) used.push_back(mirror);
         }
         registry.used.erase(std::remove_if(registry.used.begin(), registry.used.end(), [&](const std::shared_ptr<ResidentMirror>& mirror) { return mirror->usedBy == &recorder; }), registry.used.end());
+        registry.pointerWrites.erase(std::remove_if(registry.pointerWrites.begin(), registry.pointerWrites.end(), [&](const auto& write) { return std::get<0>(write) == &recorder; }), registry.pointerWrites.end());
     }
     std::vector<std::uint8_t> changed;
     VkCommandBuffer prologue = VK_NULL_HANDLE;
