@@ -9524,6 +9524,174 @@ void framebufferMutexTests(const Device& device) {
     std::cout << "framebuffer mutex tests passed\n";
 }
 
+struct ResolveScene {
+    Context& context;
+    std::span<const CompiledShader> shaders;
+    const State& state;
+    const AgcDriver::Pm4::DrawParameters& triangle;
+    const AgcDriver::Pm4::DrawParameters& indexed;
+    std::function<void()> clear;
+    std::function<void(const char*)> check;
+};
+
+bool withResolveScene(const Device& device, Recorder& recorder, const std::function<bool(ResolveScene&)>& body) {
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0 || device.GetContext().descriptorCache == nullptr) return false;
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 3;
+    void* watched = AllocateWatched(bytes, unit);
+    std::vector<std::byte> fallback(watched == nullptr ? bytes + unit : 0);
+    auto* block = watched != nullptr ? static_cast<std::byte*>(watched) : reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(fallback.data()) + unit - 1) & ~(unit - 1));
+    struct Release {
+        void* watched;
+        ~Release() { if (watched != nullptr) ReleaseWatched(watched, bytes); }
+    } release{watched};
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    if (HostImportFor(context, address, bytes) == nullptr) return false;
+    const auto shader = [](auto& words, std::uint64_t variant) {
+        ShaderRecompiler::RecompileResult program;
+        program.spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
+        program.variantId = variant;
+        return program;
+    };
+    auto vertex = shader(VERTEXRANGE_VERT_SPV, 305);
+    auto pixel = shader(COVER_FRAG_SPV, 306);
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.color = {address, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {64, 64};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, 64, 64, -64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    const auto vertices = address + unit;
+    const auto indices = address + 2 * unit;
+    const std::array<float, 4> offset{0.5f, 0.0f, 0.0f, 0.0f};
+    for (std::size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex) AgcDriver::GuestMemory::Write(vertices + vertexIndex * 16, std::as_bytes(std::span(offset)));
+    const std::array<std::uint16_t, 3> indexWords{0, 1, 2};
+    AgcDriver::GuestMemory::Write(indices, std::as_bytes(std::span(indexWords)));
+    vertex.vertexAttributes = {ShaderRecompiler::VertexAttribute{0, 4, {{static_cast<std::uint32_t>(vertices), static_cast<std::uint32_t>(vertices >> 32u) | (16u << 16u), 3u, 77u << 12u}}, 0}};
+    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
+    auto indexed = triangle;
+    indexed.indexed = true;
+    indexed.indexSize = 2;
+    indexed.indexAddress = indices;
+    ResolveScene scene{context, shaders, state, triangle, indexed, {}, {}};
+    scene.clear = [&] {
+        std::vector<std::byte> cleared(unit);
+        AgcDriver::GuestMemory::Write(address, cleared);
+    };
+    scene.check = [&](const char* what) {
+        WaitForOptimizedPipelines(context.device);
+        std::vector<std::byte> texels(64 * 64 * 4);
+        ReadColorTarget(state.color, texels);
+        for (std::size_t y = 0; y < 64; ++y) {
+            for (std::size_t x = 0; x < 64; ++x) {
+                const auto expected = x < 16 ? std::byte{0} : std::byte{255};
+                Require(texels[(y * 64 + x) * 4] == expected, what);
+            }
+        }
+    };
+    return body(scene);
+}
+
+std::uint64_t revalidations(const ParallelResolveCounts& counts, ShaderResources::EpochProofVerdict verdict) {
+    return counts.revalidations[static_cast<std::size_t>(verdict)];
+}
+
+bool parallelRevalidateTests(const Device& device, Recorder& recorder) {
+    if (!ParallelRevalidateRequested()) {
+        std::cout << "skipped, the parallel revalidate test needs APS5_PARALLEL_RESOLVE=1 and APS5_PARALLEL_REVALIDATE=1\n";
+        return false;
+    }
+    AgcDriver::GuestMemory::SetEpochDirtySet(true);
+    return withResolveScene(device, recorder, [&](ResolveScene& scene) {
+        using Verdict = ShaderResources::EpochProofVerdict;
+        const auto& context = scene.context;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        StorageTexture::BumpPendingSerial();
+        for (int round = 0; round < 2; ++round) {
+            for (const auto* draw : {&scene.triangle, &scene.indexed}) {
+                scene.clear();
+                Draw(context, scene.state, *draw, scene.shaders);
+                scene.check("a serial draw before the resolved ones rendered other pixels");
+            }
+        }
+        const auto skipsBefore = ShaderResources::EpochSkips();
+        scene.clear();
+        Draw(context, scene.state, scene.triangle, scene.shaders);
+        scene.check("a serial draw proved by its epoch proof rendered other pixels");
+        if (ShaderResources::EpochSkips() == skipsBefore) {
+            std::cout << "skipped, the scene's template is not served by the resource cache under an epoch proof\n";
+            return false;
+        }
+        const auto before = ParallelResolveStatistics();
+        const auto first = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        const auto second = ResolveDraw(context, scene.state, scene.indexed, scene.shaders);
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *first);
+        scene.check("a draw whose template proof was adopted rendered other pixels");
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.indexed, scene.shaders, {}, *second);
+        scene.check("a second draw adopting a proof made before the first one's encode rendered other pixels");
+        const auto adopted = ParallelResolveStatistics();
+        Require(adopted.resourcesAdopted - before.resourcesAdopted == 2, "the scene's templates were not adopted from the resolve");
+        Require(revalidations(adopted, Verdict::Adopted) - revalidations(before, Verdict::Adopted) == 2, "two epoch proofs checked on the side were not both adopted at encode");
+        Require(!VerifyParallelRevalidate() || adopted.revalidationsVerified - before.revalidationsVerified == 2, "APS5_VERIFY_PARALLEL_REVALIDATE checked fewer proofs than were adopted");
+        const auto reproved = ResolveDraw(context, scene.state, scene.triangle, scene.shaders);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        scene.clear();
+        Draw(context, scene.state, scene.triangle, scene.shaders);
+        scene.check("a serial draw that proved its template again rendered other pixels");
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.triangle, scene.shaders, {}, *reproved);
+        scene.check("a draw whose proof was made before its template was proved again rendered other pixels");
+        const auto basis = ParallelResolveStatistics();
+        Require(revalidations(basis, Verdict::Basis) - revalidations(adopted, Verdict::Basis) == 1 && revalidations(basis, Verdict::Adopted) == revalidations(adopted, Verdict::Adopted), "a proof made before the template was proved again was adopted");
+        const auto stale = ResolveDraw(context, scene.state, scene.indexed, scene.shaders);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        scene.clear();
+        EncodeDraw(context, scene.state, scene.indexed, scene.shaders, {}, *stale);
+        scene.check("a draw whose proof was refused by a new collect epoch rendered other pixels");
+        const auto stamps = ParallelResolveStatistics();
+        Require(revalidations(stamps, Verdict::Stamps) - revalidations(basis, Verdict::Stamps) == 1 && revalidations(stamps, Verdict::Adopted) == revalidations(basis, Verdict::Adopted), "a proof whose collect epoch ended between resolve and encode was adopted");
+        Require(!VerifyParallelRevalidate() || stamps.revalidationsVerified == adopted.revalidationsVerified, "APS5_VERIFY_PARALLEL_REVALIDATE counted a refused proof as verified");
+        std::cout << "parallel revalidate tests passed" << (VerifyParallelRevalidate() ? " (verified)" : "") << "\n";
+        return true;
+    });
+}
+
 bool parallelResolveTests(const Device& device, Recorder& recorder) {
     if (!device.Graphics() || device.GetContext().hostImportAlignment == 0 || device.GetContext().descriptorCache == nullptr) return false;
     constexpr std::size_t unit = 65536;
@@ -9745,6 +9913,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--parallel-resolve-only") {
             return parallelResolveTests(device, recorder) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--parallel-revalidate-only") {
+            return parallelRevalidateTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {
             pendingWriteSnapshotTests(device, recorder);

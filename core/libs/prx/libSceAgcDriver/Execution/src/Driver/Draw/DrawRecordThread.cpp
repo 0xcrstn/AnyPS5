@@ -228,6 +228,7 @@ bool Driver::parallelResolve() {
             std::fprintf(stderr, "[record-thread] APS5_PARALLEL_RESOLVE ignored: it needs APS5_PREPARE_WORKERS\n");
             return false;
         }
+        if (Graphics::ParallelRevalidateRequested()) std::fprintf(stderr, "[record-thread] parallel revalidate: preparation workers check template epoch proofs against the dirty log; the record thread adopts them after a stamp compare%s\n", Graphics::VerifyParallelRevalidate() ? " and verifies each against the serial Revalidate" : "");
         std::fprintf(stderr, "[record-thread] parallel resolve: preparation workers resolve draw inputs, templates and pipelines; the record thread encodes%s\n", Graphics::VerifyParallelResolve() ? " and verifies every adopted decision against the serial resolve" : "");
         return true;
     }();

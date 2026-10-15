@@ -148,6 +148,8 @@ const char* ResolveRedoName(ResolveRedo redo);
 struct ResolvedDraw;
 bool ParallelResolveRequested();
 bool VerifyParallelResolve();
+bool ParallelRevalidateRequested();
+bool VerifyParallelRevalidate();
 std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
 void EncodeDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const ResolvedDraw& resolved, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
 
@@ -167,6 +169,8 @@ struct ParallelResolveCounts {
     std::array<std::uint64_t, static_cast<std::size_t>(ResolveRefusal::Count)> resourceRefusals{};
     std::array<std::uint64_t, static_cast<std::size_t>(ResolveRedo::Count)> redos{};
     std::array<std::uint64_t, static_cast<std::size_t>(ResolveSerial::Count)> moved{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::EpochProofVerdict::Count)> revalidations{};
+    std::uint64_t revalidationsVerified = 0;
 };
 ParallelResolveCounts ParallelResolveStatistics();
 

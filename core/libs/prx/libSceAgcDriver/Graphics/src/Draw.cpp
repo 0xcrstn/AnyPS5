@@ -1716,7 +1716,10 @@ struct FoundTemplate {
     const ResourceCache::Key* key = nullptr;
     std::shared_ptr<ShaderResources> cached;
     const ShaderResources::MovedReadOnlyPlan* plan = nullptr;
+    const ShaderResources::EpochProofResult* proof = nullptr;
 };
+
+bool revalidateAdopted(ShaderResources& cached, std::span<const CompiledShader> shaders, const ShaderResources::EpochProofResult& proof, const State& state, const Pm4::DrawParameters& draw);
 
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const FoundTemplate* found = nullptr) {
     ResolvedResources resolved;
@@ -1734,7 +1737,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     if (resolved.cacheable) {
         resolved.contentKey = found != nullptr ? *found->key : DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         if (auto cached = found != nullptr ? found->cached : SharedResourceCache().Find(resolved.contentKey)) {
-            const bool valid = cached->Revalidate(shaders);
+            const bool valid = found != nullptr && found->proof != nullptr ? revalidateAdopted(*cached, shaders, *found->proof, state, draw) : cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = found != nullptr ? cached->CheckMovedReadOnlyBuffers(*found->plan, *recorder) : cached->MovedReadOnlyBuffers(shaders, *recorder);
@@ -2551,6 +2554,25 @@ bool VerifyParallelResolve() {
     return verify;
 }
 
+bool ParallelRevalidateRequested() {
+    static const bool requested = [] {
+        const char* text = std::getenv("APS5_PARALLEL_REVALIDATE");
+        if (text == nullptr || std::strcmp(text, "0") == 0) return false;
+        if (ParallelResolveRequested()) return true;
+        std::fprintf(stderr, "[record-thread] APS5_PARALLEL_REVALIDATE ignored: it needs APS5_PARALLEL_RESOLVE\n");
+        return false;
+    }();
+    return requested;
+}
+
+bool VerifyParallelRevalidate() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_PARALLEL_REVALIDATE");
+        return ParallelRevalidateRequested() && text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
 struct ResolvedDraw {
     VkDevice device = VK_NULL_HANDLE;
     ResolveStamp stamp;
@@ -2571,6 +2593,7 @@ struct ResolvedDraw {
     std::optional<ShaderResources::MovedReadOnlyPlan> plan;
     std::shared_ptr<Pipeline> pipeline;
     std::vector<std::uint8_t> proxied;
+    ShaderResources::EpochProofResult epochProof;
 };
 
 namespace {
@@ -2578,6 +2601,7 @@ namespace {
 constexpr std::size_t ResolveRefusalCount = static_cast<std::size_t>(ResolveRefusal::Count);
 constexpr std::size_t ResolveRedoCount = static_cast<std::size_t>(ResolveRedo::Count);
 constexpr std::size_t ResolveSerialCount = static_cast<std::size_t>(ResolveSerial::Count);
+constexpr std::size_t EpochVerdictCount = static_cast<std::size_t>(ShaderResources::EpochProofVerdict::Count);
 
 struct ResolveCounters {
     std::atomic<std::uint64_t> resolves{0};
@@ -2595,6 +2619,8 @@ struct ResolveCounters {
     std::array<std::atomic<std::uint64_t>, ResolveRefusalCount> resourceRefusals{};
     std::array<std::atomic<std::uint64_t>, ResolveRedoCount> redos{};
     std::array<std::atomic<std::uint64_t>, ResolveSerialCount> moved{};
+    std::array<std::atomic<std::uint64_t>, EpochVerdictCount> revalidations{};
+    std::atomic<std::uint64_t> revalidationsVerified{0};
 };
 
 ResolveCounters& resolveCounters() {
@@ -2644,6 +2670,21 @@ void requireSameResources(const ResolvedResources& serial, const ResolvedResourc
         const auto& second = resolved.moved[i];
         if (first.allocation != second.allocation || first.address != second.address || first.size != second.size || first.words != second.words) resolveDiffers("a moved buffer", identity);
     }
+}
+
+bool revalidateAdopted(ShaderResources& cached, std::span<const CompiledShader> shaders, const ShaderResources::EpochProofResult& proof, const State& state, const Pm4::DrawParameters& draw) {
+    auto& counters = resolveCounters();
+    const bool verify = VerifyParallelRevalidate();
+    const auto verdict = cached.AdoptEpochProof(proof, !verify);
+    counters.revalidations[static_cast<std::size_t>(verdict)].fetch_add(1, std::memory_order_relaxed);
+    if (!verify) return verdict == ShaderResources::EpochProofVerdict::Adopted || cached.Revalidate(shaders);
+    ShaderResources::ProofReport report;
+    const bool valid = cached.Revalidate(shaders, &report);
+    if (verdict == ShaderResources::EpochProofVerdict::Adopted) {
+        if (!valid || report.path != ShaderResources::ProofPath::EpochSkip) throw std::logic_error(std::string("APS5_VERIFY_PARALLEL_REVALIDATE: the worker's epoch proof was adopted, but the serial Revalidate ") + (valid ? "took another proof path" : "refused the template") + " for the " + drawIdentity(state, draw, shaders));
+        counters.revalidationsVerified.fetch_add(1, std::memory_order_relaxed);
+    }
+    return valid;
 }
 
 ResolveRedo adoptDrawInputs(const Context& context, const ResolvedDraw& early) {
@@ -2709,7 +2750,7 @@ ResolvedResources encodeDrawResources(const Context& context, const State& state
     }
     if (!adopted) return resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
     resolveCounters().resourcesAdopted.fetch_add(1, std::memory_order_relaxed);
-    const FoundTemplate found{&early.key, early.resources, &*early.plan};
+    const FoundTemplate found{&early.key, early.resources, &*early.plan, ParallelRevalidateRequested() ? &early.epochProof : nullptr};
     auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, &found);
     if (VerifyParallelResolve()) {
         DrawOutcome serialOutcome;
@@ -2756,6 +2797,17 @@ const char* serialAt(std::size_t index) {
     return ResolveSerialName(static_cast<ResolveSerial>(index));
 }
 
+const char* epochVerdictAt(std::size_t index) {
+    return ShaderResources::EpochProofVerdictName(static_cast<ShaderResources::EpochProofVerdict>(index));
+}
+
+std::string verifiedSince(const std::atomic<std::uint64_t>& value, std::uint64_t& last) {
+    const auto current = value.load(std::memory_order_relaxed);
+    const auto delta = current - last;
+    last = current;
+    return std::to_string(delta);
+}
+
 void reportParallelResolve() {
     static std::mutex reportMutex;
     std::unique_lock lock(reportMutex, std::try_to_lock);
@@ -2779,8 +2831,12 @@ void reportParallelResolve() {
     const auto resources = countList(counters.resourceRefusals, lastResources, refusalAt, 1);
     const auto redos = countList(counters.redos, lastRedos, redoAt, 1);
     const auto moved = countList(counters.moved, lastMoved, serialAt, 0);
+    std::string pieces;
+    static std::array<std::uint64_t, EpochVerdictCount> lastRevalidations{};
+    static std::uint64_t lastRevalidationsVerified = 0;
+    if (ParallelRevalidateRequested()) pieces += "; template proofs from the workers by verdict:" + countList(counters.revalidations, lastRevalidations, epochVerdictAt, 1) + ", verified " + verifiedSince(counters.revalidationsVerified, lastRevalidationsVerified);
     const auto perDraw = [](std::uint64_t ns, std::uint64_t count) { return count != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(count) : 0.0; };
-    AgcDriver::ProfilePrint_nid_no_patch("[parallel-resolve] %.3f s: %llu resolved on workers (%.2f us each): inputs %llu, templates %llu, pipelines %llu; %llu encodes (%.2f us each): inputs adopted %llu, templates adopted %llu, pipelines adopted %llu, verified %llu; inputs resolved in encode by reason:%s; templates resolved in encode by reason:%s; redone in encode by reason:%s; serials moved between resolve and encode:%s\n", seconds, static_cast<unsigned long long>(delta[0]), perDraw(delta[1], delta[0]), static_cast<unsigned long long>(delta[2]), static_cast<unsigned long long>(delta[3]), static_cast<unsigned long long>(delta[4]), static_cast<unsigned long long>(delta[5]), perDraw(delta[6], delta[5]), static_cast<unsigned long long>(delta[7]), static_cast<unsigned long long>(delta[8]), static_cast<unsigned long long>(delta[9]), static_cast<unsigned long long>(delta[10]), inputs.c_str(), resources.c_str(), redos.c_str(), moved.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[parallel-resolve] %.3f s: %llu resolved on workers (%.2f us each): inputs %llu, templates %llu, pipelines %llu; %llu encodes (%.2f us each): inputs adopted %llu, templates adopted %llu, pipelines adopted %llu, verified %llu; inputs resolved in encode by reason:%s; templates resolved in encode by reason:%s; redone in encode by reason:%s; serials moved between resolve and encode:%s%s\n", seconds, static_cast<unsigned long long>(delta[0]), perDraw(delta[1], delta[0]), static_cast<unsigned long long>(delta[2]), static_cast<unsigned long long>(delta[3]), static_cast<unsigned long long>(delta[4]), static_cast<unsigned long long>(delta[5]), perDraw(delta[6], delta[5]), static_cast<unsigned long long>(delta[7]), static_cast<unsigned long long>(delta[8]), static_cast<unsigned long long>(delta[9]), static_cast<unsigned long long>(delta[10]), inputs.c_str(), resources.c_str(), redos.c_str(), moved.c_str(), pieces.c_str());
 }
 
 void drawBody(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const ResolvedDraw* early) {
@@ -3524,6 +3580,7 @@ std::shared_ptr<const ResolvedDraw> ResolveDraw(const Context& context, const St
                     resolved->resources = std::move(cached);
                     resolved->plan = std::move(plan);
                     resolved->resourcesRefusal = ResolveRefusal::None;
+                    if (ParallelRevalidateRequested()) resolved->epochProof = resolved->resources->ResolveEpochProof();
                 }
             }
         } catch (const std::exception&) {
@@ -3584,6 +3641,8 @@ ParallelResolveCounts ParallelResolveStatistics() {
     }
     for (std::size_t i = 0; i < ResolveRedoCount; ++i) counts.redos[i] = counters.redos[i].load();
     for (std::size_t i = 0; i < ResolveSerialCount; ++i) counts.moved[i] = counters.moved[i].load();
+    for (std::size_t i = 0; i < EpochVerdictCount; ++i) counts.revalidations[i] = counters.revalidations[i].load();
+    counts.revalidationsVerified = counters.revalidationsVerified.load();
     return counts;
 }
 

@@ -2448,7 +2448,7 @@ bool EpochRevalidate() {
 
 // Turns the lookups' records into this object's per-texture validation records (see
 // ValidatedSurface); the last record of an object is the freshest.
-bool ShaderResources::epochProofHolds() {
+bool ShaderResources::epochProofScalarsHold() {
     if (!epochProof.valid) return false;
     const auto epoch = GuestMemory::CollectEpoch();
     if (epoch == 0 || epoch != epochProof.epoch) return false;
@@ -2456,7 +2456,11 @@ bool ShaderResources::epochProofHolds() {
     if (Recorder::KeyStoreSerial() != epochProof.keyStores || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != epochProof.registry || DepthSurfaceSerial() != epochProof.depth || StorageCacheSerial() != epochProof.storageCache) return false;
     if (!HostImportsUnchanged(context, importsProof)) return false;
     if ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0) return false;
-    if (guestMemory.HasStagedRegions()) return false;
+    return !guestMemory.HasStagedRegions();
+}
+
+bool ShaderResources::epochProofHolds() {
+    if (!epochProofScalarsHold()) return false;
     std::uint64_t through = 0;
     if (!GuestMemory::UnchangedSinceDirtySerial(proofRanges, epochProof.dirtySerial, &through)) return false;
     epochProof.dirtySerial = through;
@@ -2471,6 +2475,57 @@ void ShaderResources::recordEpochProof(std::uint64_t dirtySerial) {
         if (texture != nullptr && texture->IsDepthCopy()) return;
     }
     epochProof = {true, epoch, dirtySerial, Recorder::KeyStoreSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfaceSerial(), StorageCacheSerial()};
+}
+
+const char* ShaderResources::EpochProofVerdictName(EpochProofVerdict verdict) {
+    constexpr std::array<const char*, static_cast<std::size_t>(EpochProofVerdict::Count)> names{"held", "adopted", "disabled", "template busy", "no epoch proof", "dirty on the worker", "template proved again", "serials moved", "dirty since the worker"};
+    return names.at(static_cast<std::size_t>(verdict));
+}
+
+ShaderResources::EpochProofResult ShaderResources::ResolveEpochProof() const {
+    EpochProofResult result;
+    if (!reusable || !ParallelRevalidateRequested() || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return result;
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::uint64_t serial = 0;
+    {
+        std::unique_lock lock(proofMutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            result.verdict = EpochProofVerdict::Busy;
+            return result;
+        }
+        if (!epochProof.valid || pendingSerialSeen == 0) {
+            result.verdict = EpochProofVerdict::NoProof;
+            return result;
+        }
+        ranges.assign(proofRanges.begin(), proofRanges.end());
+        serial = epochProof.dirtySerial;
+        result.basis = proofBasis;
+    }
+    std::uint64_t through = 0;
+    if (!GuestMemory::UnchangedSinceDirtySerial(ranges, serial, &through)) {
+        result.verdict = EpochProofVerdict::Dirty;
+        return result;
+    }
+    result.dirtyThrough = through;
+    result.verdict = EpochProofVerdict::Held;
+    return result;
+}
+
+ShaderResources::EpochProofVerdict ShaderResources::AdoptEpochProof(const EpochProofResult& result, bool apply) {
+    if (result.verdict != EpochProofVerdict::Held) return result.verdict;
+    const auto start = std::chrono::steady_clock::now();
+    if (!reusable || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return EpochProofVerdict::Disabled;
+    std::lock_guard lock(proofMutex);
+    if (proofBasis != result.basis) return EpochProofVerdict::Basis;
+    if (!epochProofScalarsHold()) return EpochProofVerdict::Stamps;
+    std::uint64_t through = 0;
+    if (!GuestMemory::UnchangedSinceDirtySerial(proofRanges, std::max(epochProof.dirtySerial, result.dirtyThrough), &through)) return EpochProofVerdict::DirtyTail;
+    if (!apply) return EpochProofVerdict::Adopted;
+    epochProof.dirtySerial = through;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) countRevalidate(true, true, start, true);
+    else Revalidations().epochSkips.fetch_add(1, std::memory_order_relaxed);
+    return EpochProofVerdict::Adopted;
 }
 
 std::uint64_t ShaderResources::EpochSkips() {
@@ -2852,6 +2907,8 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    std::unique_lock<std::recursive_mutex> proofLock(proofMutex, std::defer_lock);
+    if (ParallelRevalidateRequested()) proofLock.lock();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto dirtySerialBefore = GuestMemory::DirtySerial();
@@ -2867,6 +2924,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         epochSkip = true;
     }
+    ++proofBasis;
     for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     for (const auto& range : describedRanges) {
         CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));

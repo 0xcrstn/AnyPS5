@@ -297,6 +297,15 @@ public:
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static std::uint64_t EpochSkips();
     static std::uint64_t EpochSkipDisagreements();
+    enum class EpochProofVerdict : std::uint8_t { Held, Adopted, Disabled, Busy, NoProof, Dirty, Basis, Stamps, DirtyTail, Count };
+    static const char* EpochProofVerdictName(EpochProofVerdict verdict);
+    struct EpochProofResult {
+        EpochProofVerdict verdict = EpochProofVerdict::Disabled;
+        std::uint64_t basis = 0;
+        std::uint64_t dirtyThrough = 0;
+    };
+    EpochProofResult ResolveEpochProof() const;
+    EpochProofVerdict AdoptEpochProof(const EpochProofResult& result, bool apply);
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
@@ -549,6 +558,9 @@ private:
     };
     EpochProof epochProof;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> proofRanges;
+    mutable std::recursive_mutex proofMutex;
+    std::uint64_t proofBasis = 0;
+    bool epochProofScalarsHold();
     bool epochProofHolds();
     void recordEpochProof(std::uint64_t dirtySerial);
     Context context;
