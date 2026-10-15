@@ -129,6 +129,7 @@ endforeach()
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ComputePipelineCapture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DispatchFreeze.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostHdr.cpp
@@ -2518,6 +2519,31 @@ if(BUILD_TESTING)
             FIXTURES_REQUIRED agc_pm4_replay_capture TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_driver_pm4_replay agc_driver_pm4_replay_tool PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_executable(agc_dispatch_replay EXCLUDE_FROM_ALL tools/DispatchReplay.cpp)
+target_include_directories(agc_dispatch_replay PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_dispatch_replay PRIVATE libSceAgcDriver SDL2-static libc)
+set_target_properties(agc_dispatch_replay PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_dispatch_replay)
+
+if(BUILD_TESTING)
+    add_test_executable(agc_dispatch_freeze_tests tests/DispatchFreeze.cpp)
+    target_include_directories(agc_dispatch_freeze_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR})
+    target_link_libraries(agc_dispatch_freeze_tests PRIVATE libSceAgcDriver SDL2-static libc)
+    set_target_properties(agc_dispatch_freeze_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_dispatch_freeze_tests)
+    add_dependencies(agc_dispatch_freeze_tests agc_dispatch_replay)
+    set(agcDispatchFreezeCapture "${CMAKE_CURRENT_BINARY_DIR}/dispatch-freeze/capture.aps5frz")
+    add_test(NAME agc_dispatch_freeze COMMAND agc_dispatch_freeze_tests "${agcDispatchFreezeCapture}")
+    set_tests_properties(agc_dispatch_freeze PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 FIXTURES_SETUP agc_dispatch_freeze_capture TIMEOUT 30)
+    add_test(NAME agc_dispatch_replay_factorial COMMAND ${CMAKE_COMMAND} -DTOOL=$<TARGET_FILE:agc_dispatch_replay> "-DCAPTURE=${agcDispatchFreezeCapture}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/DispatchReplayFactorial.cmake)
+    set_tests_properties(agc_dispatch_replay_factorial PROPERTIES FIXTURES_REQUIRED agc_dispatch_freeze_capture TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_dispatch_freeze agc_dispatch_replay_factorial PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

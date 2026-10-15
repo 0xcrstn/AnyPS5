@@ -1,0 +1,23 @@
+foreach(variable TOOL CAPTURE)
+    if(NOT DEFINED ${variable})
+        message(FATAL_ERROR "${variable} is not set")
+    endif()
+endforeach()
+
+foreach(configuration IN ITEMS "legacy;host" "radix;host" "legacy;device" "radix;device")
+    list(GET configuration 0 abi)
+    list(GET configuration 1 placement)
+    execute_process(COMMAND ${CMAKE_COMMAND} -E env ANYPS5_NO_SHADER_CACHE=1 APS5_BDA_ABI=${abi} APS5_BDA_PLACEMENT=${placement} "${TOOL}" "${CAPTURE}" --repeat 3
+        RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE errors)
+    if(NOT code STREQUAL "0")
+        message(FATAL_ERROR "agc_dispatch_replay with APS5_BDA_ABI=${abi} APS5_BDA_PLACEMENT=${placement} exited with ${code}:\n${output}${errors}")
+    endif()
+    if(NOT output MATCHES "\"abi\":\"${abi}\",\"placement\":\"${placement}\"" OR NOT output MATCHES "\"repeats\":3,\"median_ms\":[0-9.]+,\"min_ms\":[0-9.]+,\"mismatched_bytes\":0,")
+        message(FATAL_ERROR "agc_dispatch_replay with APS5_BDA_ABI=${abi} APS5_BDA_PLACEMENT=${placement} did not report a matching replay:\n${output}${errors}")
+    endif()
+endforeach()
+
+execute_process(COMMAND "${TOOL}" "${CAPTURE}.missing" RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE errors)
+if(NOT code STREQUAL "2" OR NOT errors MATCHES "cannot open dispatch capture")
+    message(FATAL_ERROR "agc_dispatch_replay exited with ${code} instead of 2 on a missing capture:\n${output}${errors}")
+endif()

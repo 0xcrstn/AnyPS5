@@ -47,6 +47,10 @@ void ShaderResources::UseMirrors(Recorder& recorder) const {
     if (!bufferMirrors.empty()) Graphics::UseMirrors(recorder, bufferMirrors);
 }
 
+std::vector<DispatchFreeze::Reach> ShaderResources::ReachableRanges() const {
+    return guestMemory.ReachableRanges(usesBda);
+}
+
 bool ShaderResources::HasPlacements() const {
     return bda != nullptr && bda->HasPlacements();
 }

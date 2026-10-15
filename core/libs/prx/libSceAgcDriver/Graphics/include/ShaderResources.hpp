@@ -263,6 +263,7 @@ public:
     void UseMirrors(Recorder& recorder) const;
     void RecordPlacementCopyBack(Recorder& recorder, VkCommandBuffer commands) const;
     [[nodiscard]] bool HasPlacements() const;
+    [[nodiscard]] std::vector<DispatchFreeze::Reach> ReachableRanges() const;
     void PublishResidentReads(Recorder& recorder) const;
     void RefreshMirrorsForDirectUse(Recorder& recorder) const;
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }

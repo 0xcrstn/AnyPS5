@@ -4834,6 +4834,15 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::PlacedRanges(std
     return result;
 }
 
+std::vector<DispatchFreeze::Reach> GuestBufferMemory::ReachableRanges(bool addressBased) const {
+    std::vector<DispatchFreeze::Reach> result;
+    for (const auto& region : regions) result.push_back({region.begin, region.end, region.writable});
+    if (addressBased) {
+        for (const auto& range : AddressRanges()) result.push_back({range.begin, range.end, (range.permissions & ShaderRecompiler::BdaAbi::Write) != 0u});
+    }
+    return result;
+}
+
 Recorder::BoundPlacement GuestBufferMemory::Placement() const {
     Recorder::BoundPlacement result;
     result.addressBased = HoldsLease();
