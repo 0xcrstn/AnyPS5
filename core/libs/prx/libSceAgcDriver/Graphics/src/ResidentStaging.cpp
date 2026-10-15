@@ -328,7 +328,7 @@ std::uint64_t PublishDeviceResident(Recorder& recorder, std::uint64_t address, s
     {
         std::lock_guard lock(registry.mutex);
         taken = selectLocked(registry, [&](std::uint64_t begin, const Entry& entry) { return begin < end && address < entry.end; });
-        if (site != ResidentSite::Hook && site != ResidentSite::Scanout) {
+        if (site != ResidentSite::Hook && site != ResidentSite::Scanout && site != ResidentSite::AddressBased) {
             for (auto& piece : taken) {
                 piece.begin = std::max(piece.begin, address);
                 piece.end = std::min(piece.end, end);
