@@ -62,6 +62,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         }();
     }
     const bool planned = planValues != nullptr && (planValues->plan == nullptr || !ShaderMemory::UsesImageTables(*planValues->plan));
+    if (!planned && incremental != nullptr) *incremental = {};
     if (planned) {
         const auto& values = planValues;
         phaseTiming.Phase(DrawRowCapture);
