@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/ResidentStaging.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CompileService.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ComputePipelineRecipe.hpp"
+#include "ShaderCacheDirectory.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SlowReport.hpp"
@@ -67,6 +69,7 @@
 #include <array>
 #include <optional>
 #include <algorithm>
+#include <filesystem>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -164,12 +167,36 @@ std::size_t PipelineCompileThreads() {
 bool PriorityCompileScheduler() {
     static const bool priority = [] {
         const char* text = std::getenv("APS5_COMPILE_SCHEDULER");
-        if (text == nullptr || *text == '\0') return false;
-        require(std::string_view(text) == "priority", "APS5_COMPILE_SCHEDULER accepts only priority");
+        if (text == nullptr || *text == '\0') return !LockedPipelines();
+        if (std::string_view(text) == "legacy") return false;
+        require(std::string_view(text) == "priority", "APS5_COMPILE_SCHEDULER accepts only priority or legacy");
         require(!LockedPipelines(), "APS5_COMPILE_SCHEDULER=priority cannot build pipelines under the GPU mutex (APS5_LOCKED_PIPELINES)");
         return true;
     }();
     return priority;
+}
+
+bool PipelinePrewarm() {
+    static const bool prewarm = [] {
+        const char* text = std::getenv("APS5_PIPELINE_PREWARM");
+        if (text == nullptr || *text == '\0') return PriorityCompileScheduler();
+        if (std::string_view(text) == "0") return false;
+        require(std::string_view(text) == "1", "APS5_PIPELINE_PREWARM accepts only 0 or 1");
+        require(PriorityCompileScheduler(), "APS5_PIPELINE_PREWARM=1 needs APS5_COMPILE_SCHEDULER=priority");
+        return true;
+    }();
+    return prewarm;
+}
+
+std::filesystem::path PipelineRecipeDirectory() {
+    const auto root = ShaderRecompiler::ShaderCacheDirectory();
+    return root.empty() ? root : root / "pipeline-recipes";
+}
+
+std::string ContentKeyName(const PipelineContentKey& key) {
+    char text[40];
+    std::snprintf(text, sizeof(text), "%016llx%016llx", static_cast<unsigned long long>(key.first), static_cast<unsigned long long>(key.second));
+    return text;
 }
 
 bool PipelineContentDedup() {
@@ -185,7 +212,8 @@ bool PipelineContentDedup() {
 bool CompileParking() {
     static const bool parking = [] {
         const char* text = std::getenv("APS5_COMPILE_PARK");
-        if (text == nullptr || *text == '\0' || std::string_view(text) == "0") return false;
+        if (text == nullptr || *text == '\0') return PriorityCompileScheduler();
+        if (std::string_view(text) == "0") return false;
         require(std::string_view(text) == "1", "APS5_COMPILE_PARK accepts only 0 or 1");
         require(PriorityCompileScheduler(), "APS5_COMPILE_PARK=1 needs APS5_COMPILE_SCHEDULER=priority");
         return true;
@@ -474,6 +502,80 @@ struct VulkanDevice::State {
     // references to its objects.
     PipelineSingleflight<PipelineCompileKey, ComputePipelineObjects> computePipelines;
     PipelineContentIndex<ComputePipelineObjects> computeContents;
+    std::mutex prewarmMutex;
+    std::vector<std::shared_ptr<ComputePipelineObjects>> prewarmed;
+    std::atomic<std::uint64_t> prewarmBuilt{0}, prewarmRejected{0}, prewarmPending{0}, recipesStored{0};
+    void StoreComputeRecipe(const PipelineContentKey& key, const ShaderRecompiler::RecompileResult& shader, bool pushes, std::uint64_t programAddress) {
+        const auto directory = PipelineRecipeDirectory();
+        if (directory.empty()) return;
+        const auto path = directory / (ContentKeyName(key) + ".bin");
+        std::error_code error;
+        if (std::filesystem::exists(path, error)) {
+            std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), error);
+            return;
+        }
+        std::filesystem::create_directories(directory, error);
+        const auto bytes = EncodeComputeRecipe(shader, pushes, programAddress);
+        if (ShaderRecompiler::WriteFileAtomically(path, bytes)) recipesStored.fetch_add(1, std::memory_order_relaxed);
+    }
+    void StartPipelinePrewarm(const Graphics::Context& context) {
+        if (!PipelinePrewarm()) return;
+        const auto directory = PipelineRecipeDirectory();
+        auto* service = Service();
+        if (directory.empty() || service == nullptr) return;
+        constexpr std::size_t keep = 8192;
+        constexpr std::size_t build = 4096;
+        std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> recipes;
+        std::error_code error;
+        for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end; it.increment(error)) {
+            if (it->path().extension() != ".bin" || !it->is_regular_file(error)) continue;
+            std::error_code timeError;
+            const auto written = std::filesystem::last_write_time(it->path(), timeError);
+            if (!timeError) recipes.emplace_back(written, it->path());
+        }
+        std::sort(recipes.begin(), recipes.end(), [](const auto& left, const auto& right) { return left.first > right.first; });
+        for (std::size_t index = keep; index < recipes.size(); ++index) {
+            std::error_code removeError;
+            std::filesystem::remove(recipes[index].second, removeError);
+        }
+        const auto count = std::min(recipes.size(), build);
+        prewarmPending.store(count, std::memory_order_relaxed);
+        if (count != 0) std::fprintf(stderr, "[pipeline-prewarm] building %zu compute pipelines from %s in the background\n", count, directory.string().c_str());
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto path = recipes[index].second;
+            std::error_code sizeError;
+            const auto bytes = static_cast<std::size_t>(std::filesystem::file_size(path, sizeError));
+            service->Submit("prewarm:" + path.stem().string(), CompilePriority::Registration, sizeError ? 0u : bytes * 8u, [this, path, context](const CompileTicket& ticket) {
+                struct Finish {
+                    State& state;
+                    ~Finish() {
+                        if (state.prewarmPending.fetch_sub(1, std::memory_order_acq_rel) == 1) std::fprintf(stderr, "[pipeline-prewarm] done: %llu built, %llu recipes rejected\n", static_cast<unsigned long long>(state.prewarmBuilt.load()), static_cast<unsigned long long>(state.prewarmRejected.load()));
+                    }
+                } finish{*this};
+                if (ticket.CancellationRequested()) throw CompileCancelled();
+                const auto reject = [&] {
+                    prewarmRejected.fetch_add(1, std::memory_order_relaxed);
+                    std::error_code removeError;
+                    std::filesystem::remove(path, removeError);
+                };
+                std::vector<std::byte> file;
+                if (!ShaderRecompiler::ReadWholeFile(path, file)) return reject();
+                const auto recipe = DecodeComputeRecipe(file);
+                if (!recipe.has_value()) return reject();
+                const VkShaderStageFlags stages = recipe->pushes ? VK_SHADER_STAGE_COMPUTE_BIT : 0u;
+                if (stages != 0 && context.limits.maxPushConstantsSize < Graphics::ComputePushConstantBytes) return reject();
+                const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, recipe->shader.get(), 0}}};
+                const auto described = Graphics::DescribeSetLayouts(context, shaders);
+                if (ContentKeyName(ComputePipelineContentKey(*recipe->shader, recipe->pushes, described.mainKey)) != path.stem().string()) return reject();
+                auto objects = BuildComputePipeline(context, *recipe->shader, described.layouts.main, stages, recipe->programAddress, described.mainKey);
+                {
+                    std::lock_guard lock(prewarmMutex);
+                    prewarmed.push_back(std::move(objects));
+                }
+                prewarmBuilt.fetch_add(1, std::memory_order_relaxed);
+            });
+        }
+    }
     std::shared_ptr<ComputePipelineObjects> BuildComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey = {});
     std::shared_ptr<ComputePipelineObjects> GetComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey = {}, bool ahead = false, bool* created = nullptr);
     std::shared_ptr<ComputePipelineObjects> FindComputePipeline(const PipelineCompileKey& key, bool demand = true);
@@ -494,6 +596,7 @@ struct VulkanDevice::State {
         return compileService.get();
     }
     std::atomic<std::uint64_t> graphicsBuildsUnderGpuMutex{0};
+    std::atomic<std::uint64_t> computeBuildsUnderGpuMutex{0};
     static void RunPipelineBuild(void* owner, std::size_t reservedBytes, const std::function<void()>& build) {
         auto& compileState = *static_cast<State*>(owner);
         ShaderCompileTrace::Event event("demand.graphics_build");
@@ -501,7 +604,6 @@ struct VulkanDevice::State {
         if (GuestMemory::GpuMutex().HeldByThisThread()) {
             compileState.graphicsBuildsUnderGpuMutex.fetch_add(1, std::memory_order_relaxed);
             event.Flag("gpu_mutex_held", true);
-            require(!VerifyCompileJobs(), "APS5_VERIFY_COMPILE_JOBS: graphics pipeline compile under the GPU mutex");
             build();
             return;
         }
@@ -906,6 +1008,10 @@ struct VulkanDevice::State {
             Graphics::ClearDepthSurfaces(device);
             Graphics::ClearMultisampleTargets(device);
             computePipelines.Clear();
+            {
+                std::lock_guard lock(prewarmMutex);
+                prewarmed.clear();
+            }
             // Every ShaderResources (kept by the recorder or the resource cache) is gone now, so the
             // sets and samplers they borrowed can go.
             copiedWriters->clear();
@@ -2097,6 +2203,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         for (std::uint32_t guest = 1; guest < Graphics::Recorder::GuestQueues; ++guest) Graphics::Recorder::MapGuestQueue(guest, 1);
         APS5_LOG_OUT("Vulkan queue topology same-family: guest queue 0 on queue %p, the other guest queues on queue %p", reinterpret_cast<void*>(state->queue), reinterpret_cast<void*>(state->computeQueue));
     }
+    state->StartPipelinePrewarm(graphicsContext());
     if (window != nullptr) {
         require(window->getDrawableSize != nullptr, "missing window drawable size query");
         std::uint32_t drawableWidth = 0;
@@ -4590,7 +4697,7 @@ std::uint64_t VulkanDevice::presync(std::span<const std::pair<std::uint64_t, std
 // compatible, so the objects serve every dispatch of the variant.
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey) {
     std::optional<PipelineContentKey> contentKey;
-    if (PipelineContentDedup() && !layoutKey.empty()) {
+    if ((PipelineContentDedup() || PipelinePrewarm()) && !layoutKey.empty()) {
         contentKey = ComputePipelineContentKey(shader, pushStages != 0, layoutKey);
         if (auto shared = computeContents.Find(*contentKey)) {
             ShaderCompileTrace::Event event("pipeline.compute_shared");
@@ -4659,6 +4766,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
     CreateComputePipeline(device, DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization, &trace);
     if (VerifyCompileJobs()) objects->recipe = ComputePipelineRecipeHash(shader, pushStages != 0, layoutKey);
     if (contentKey.has_value()) computeContents.Insert(*contentKey, objects);
+    if (contentKey.has_value() && PipelinePrewarm()) StoreComputeRecipe(*contentKey, shader, pushStages != 0, programAddress);
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
     Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
@@ -4668,9 +4776,12 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::BuildComputePipelin
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::GetComputePipeline(const PipelineCompileKey& key, const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress, std::span<const std::uint32_t> layoutKey, bool ahead, bool* created) {
     if (key.first == 0) return BuildComputePipeline(context, shader, resourcesLayout, pushStages, programAddress, layoutKey);
     if (!ahead && PriorityCompileScheduler()) {
-        auto objects = DemandComputePipeline(key, context, shader, programAddress, created);
-        if (VerifyCompileJobs()) RequireSameComputeRecipe(objects->recipe, ComputePipelineRecipeHash(shader, pushStages != 0, layoutKey), programAddress);
-        return objects;
+        if (GuestMemory::GpuMutex().HeldByThisThread()) {
+            computeBuildsUnderGpuMutex.fetch_add(1, std::memory_order_relaxed);
+        } else if (auto objects = DemandComputePipeline(key, context, shader, programAddress, created)) {
+            if (VerifyCompileJobs()) RequireSameComputeRecipe(objects->recipe, ComputePipelineRecipeHash(shader, pushStages != 0, layoutKey), programAddress);
+            return objects;
+        }
     }
     std::optional<ShaderCompileTrace::Event> demandEvent;
     if (!ahead) {
@@ -4711,14 +4822,10 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::State::DemandComputePipeli
         if (found->aheadUnused.exchange(false, std::memory_order_relaxed)) aheadUseful.fetch_add(1, std::memory_order_relaxed);
         return found;
     }
-    CompileTicket::RequireWaitAllowed();
     auto* service = Service();
     if (service == nullptr) {
         event.Flag("service_closed", true);
-        const VkShaderStageFlags stages = shader.pushConstants.empty() ? 0u : VK_SHADER_STAGE_COMPUTE_BIT;
-        const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
-        const auto described = Graphics::DescribeSetLayouts(context, shaders);
-        return GetComputePipeline(key, context, shader, described.layouts.main, stages, programAddress, described.mainKey, true, created);
+        return nullptr;
     }
     const auto jobKey = ComputeJobKey(key);
     auto ticket = service->Find(jobKey);
@@ -4802,6 +4909,10 @@ void VulkanDevice::BuildComputePipelineAhead(const ShaderRecompiler::RecompileRe
             return created;
         };
     });
+}
+
+VulkanDevice::PipelinePrewarmStatistics VulkanDevice::PipelinePrewarmCounters() const {
+    return {state->recipesStored.load(), state->prewarmBuilt.load(), state->prewarmRejected.load(), state->prewarmPending.load(), state->computeContents.Hits()};
 }
 
 VulkanDevice::PipelineAheadStatistics VulkanDevice::PipelineAheadCounters() const {

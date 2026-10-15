@@ -2576,13 +2576,22 @@ void verifyDescriptorPhis() {
         return request;
     };
     const auto countOps = [](std::span<const std::uint32_t> words, std::uint32_t opcode) {
-        std::size_t count = 0;
+        std::map<std::uint32_t, std::size_t> perFunction;
+        std::map<std::uint32_t, std::size_t> calls;
+        std::uint32_t entry = 0;
+        std::uint32_t current = 0;
         for (std::size_t cursor = 5; cursor < words.size();) {
             const auto length = words[cursor] >> 16u;
             require(length != 0 && length <= words.size() - cursor, "descriptor Phi: truncated SPIR-V instruction");
-            count += (words[cursor] & 0xffffu) == opcode ? 1u : 0u;
+            const auto op = words[cursor] & 0xffffu;
+            if (op == 15u) entry = words[cursor + 2];
+            if (op == 54u) current = words[cursor + 2];
+            if (op == 57u) ++calls[words[cursor + 3]];
+            if (op == opcode) ++perFunction[current];
             cursor += length;
         }
+        std::size_t count = 0;
+        for (const auto& [function, uses] : perFunction) count += function == entry ? uses : uses * calls[function];
         return count;
     };
     constexpr std::uint32_t OpImageSampleExplicitLod = 88;

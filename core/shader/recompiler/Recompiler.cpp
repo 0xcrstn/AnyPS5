@@ -744,6 +744,17 @@ void VerifyEmission(const RecompileRequest& request, const IrProgram& program, c
         event.Number("shared_functions", sharedShape.functions).Number("in_place_functions", inPlaceShape.functions).Number("shared_helper_words", sharedShape.helperFunctionWords).Number("in_place_helper_words", inPlaceShape.helperFunctionWords);
     }
     if (const auto difference = CompareSpirvInterfaces(inPlace, shared)) throw std::runtime_error("APS5_VERIFY_SHADER_EMISSION: shared float functions change the interface of shader 0x" + std::to_string(request.shader.codeAddress) + ": " + *difference);
+    options.sharedFloatFunctions.reset();
+    options.outlineImageModes = true;
+    const auto outlined = spirvEmitter.Emit(program, inputInfo, bindings, options);
+    options.outlineImageModes = false;
+    const auto inlineModes = spirvEmitter.Emit(program, inputInfo, bindings, options);
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    static_cast<void>(ValidateAndOptimizeSpirv(outlined, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, false));
+    static_cast<void>(ValidateAndOptimizeSpirv(inlineModes, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, false));
+#endif
+    if (event.Active()) event.Number("outlined_image_words", outlined.size()).Number("inline_image_words", inlineModes.size()).Number("outlined_image_functions", DescribeSpirvShape(outlined).functions);
+    if (const auto difference = CompareSpirvInterfaces(inlineModes, outlined)) throw std::runtime_error("APS5_VERIFY_SHADER_EMISSION: outlined image modes change the interface of shader 0x" + std::to_string(request.shader.codeAddress) + ": " + *difference);
 }
 
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program, bool consume = false) {

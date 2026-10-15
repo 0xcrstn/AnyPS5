@@ -845,6 +845,20 @@ if(ANYPS5_ENABLE_SPIRV_TOOLS)
     configure_windows_unwind(agc_spirv_optimizer_tests)
 endif()
 
+add_test_executable(agc_image_mode_outlining_tests EXCLUDE_FROM_ALL tests/ImageModeOutlining.cpp)
+target_link_libraries(agc_image_mode_outlining_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_image_mode_outlining_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_image_mode_outlining_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_image_mode_outlining_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_image_mode_outlining COMMAND agc_image_mode_outlining_tests)
+    set_tests_properties(agc_image_mode_outlining PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_image_mode_outlining PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_float16_conversion_tests EXCLUDE_FROM_ALL tests/Float16Conversion.cpp)
 target_link_libraries(agc_float16_conversion_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_float16_conversion_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -1989,6 +2003,7 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_bda_device_range_cache agc_driver_bda_device_range_cache_verify PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    set_property(TEST agc_driver_compute_pipeline_outside_gpu_mutex APPEND PROPERTY ENVIRONMENT "APS5_PIPELINE_PREWARM=0")
     add_test(NAME agc_driver_compute_pipeline_ahead_off COMMAND agc_driver_compute_pipeline_ahead_tests off)
     set_tests_properties(agc_driver_compute_pipeline_ahead agc_driver_compute_pipeline_ahead_off PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINE_COMPILE_THREADS=2" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
