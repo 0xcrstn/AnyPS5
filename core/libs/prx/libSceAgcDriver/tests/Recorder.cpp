@@ -5137,6 +5137,151 @@ int coherenceLazyReleaseTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
+int deferredPointerStoreTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& base = device.GetContext();
+    if (!base.bufferDeviceAddress || !StorageTexture::DeferredPointerStores()) {
+        std::cout << "skipped, buffer device addresses or APS5_DEFERRED_POINTER_STORES are unavailable\n";
+        return 77;
+    }
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 4 * unit;
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot allocate the shared deferred-store section");
+    try {
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    } catch (...) {
+        CloseHandle(section);
+        throw;
+    }
+    CloseHandle(section);
+    struct Release {
+        void* block;
+        ~Release() {
+            GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        }
+    } release{block};
+#else
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "unit shadows are on without write watching");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+#endif
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host import of the deferred-store block refused or compared: not tested\n";
+        return 77;
+    }
+    CollectWritesUncached(address, bytes);
+    const auto* words = static_cast<const std::uint8_t*>(block);
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address + unit;
+    resource.width = 128;
+    resource.height = 128;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == unit, "the deferred-store image does not fill its 64 KiB block");
+    auto image = StorageTexture::Create(context, detiler, resource, 0);
+    const auto paint = [&](std::array<float, 4> color) {
+        image->Refresh();
+        const VkClearColorValue value{{color[0], color[1], color[2], color[3]}};
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+    };
+    auto output = std::make_shared<Buffer>(base, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    struct Use {
+        std::shared_ptr<GuestBufferMemory> memory;
+        std::shared_ptr<BdaResources> bda;
+        std::shared_ptr<AddressProgram> program;
+    };
+    constexpr std::uint32_t stored = 0xa1b2c3d4u;
+    const auto writer = [&](std::uint64_t at) {
+        Use use;
+        use.memory = std::make_shared<GuestBufferMemory>(base);
+        use.memory->AcquireRegistered();
+        use.memory->SetPointerAccess(true, {});
+        use.memory->Upload(true);
+        use.bda = std::make_shared<BdaResources>(base, *use.memory);
+        const auto code = MakeBdaStoreTestShader(at, stored, 32, false);
+        use.program = std::make_shared<AddressProgram>(base, code, std::array<VkDescriptorBufferInfo, 3>{use.bda->Table(), use.bda->Fault(), VkDescriptorBufferInfo{output->Handle(), 0, 16}});
+        use.program->Record(recorder);
+        use.memory->ForgetPointerShadows();
+        const auto id = StorageTexture::NotePointerWriter(use.memory->PointerHeaps());
+        recorder.OnComplete([use, id] {
+            use.bda->CheckFault();
+            StorageTexture::RetirePointerWriter(id);
+            use.memory->WriteBack();
+        });
+        return use;
+    };
+    const auto holds = [&](std::uint64_t at) { return words[at] == 0xd4 && words[at + 1] == 0xc3 && words[at + 2] == 0xb2 && words[at + 3] == 0xa1; };
+
+    paint({1.0f, 0.0f, 0.0f, 1.0f});
+    {
+        const auto use = writer(address + unit + 16);
+        Require(StorageTexture::FindPending(address + unit, unit) == image, "a pointer writer stored the pending image before it in deferred mode");
+        StorageTexture::FlushAllPending("flip", PublishScope::Whole);
+        Require(StorageTexture::FindPending(address + unit, unit) == image, "a flip stored an image older than a pointer writer still in flight");
+        recorder.Sync();
+    }
+    StorageTexture::FlushAllPending("flip", PublishScope::Whole);
+    recorder.Sync();
+    Require(StorageTexture::FindPending(address + unit, unit) == nullptr, "a flip after the pointer writer completed left the image pending");
+    Require(holds(unit + 16), "a deferred image store landed over a pointer store");
+
+    paint({0.0f, 1.0f, 0.0f, 1.0f});
+    {
+        const auto use = writer(address + unit + 32);
+        Require(StorageTexture::FlushPending(address + unit, unit, nullptr, "storage refresh"), "a non-deferrable store of an image behind a pointer writer was skipped");
+        recorder.Sync();
+    }
+    Require(holds(unit + 32), "a store synced behind a pointer writer landed over its pointer store");
+
+    paint({0.0f, 0.0f, 1.0f, 1.0f});
+    StorageTexture::FlushAllPending("flip", PublishScope::Whole);
+    recorder.Sync();
+    Require(words[unit] == 0 && words[unit + 2] == 0xff && words[unit + 3] == 0xff, "a flip with no pointer writer in flight did not store the image");
+    std::cout << "deferred pointer stores: ok\n";
+    return 0;
+}
+
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -11357,6 +11502,13 @@ int main(int argc, char** argv) {
             }
             unitShadowTests(device, recorder);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--deferred-pointer-stores-only") {
+            if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, unit shadows or host imports are unavailable\n";
+                return 77;
+            }
+            return deferredPointerStoreTests(device, recorder);
         }
         if (argc == 2 && std::string_view(argv[1]) == "--coherence-ordering-only") {
             if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {

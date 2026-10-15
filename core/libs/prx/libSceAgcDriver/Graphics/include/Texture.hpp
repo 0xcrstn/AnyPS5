@@ -225,6 +225,9 @@ public:
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     static void MarkPendingReached(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::vector<std::uint8_t>& reached);
+    static bool DeferredPointerStores();
+    static std::uint64_t NotePointerWriter(std::span<const std::pair<std::uint64_t, std::uint64_t>> heaps);
+    static void RetirePointerWriter(std::uint64_t writer);
     // Moves with every change of the pending registry (an image marked dirty, stored, flushed or
     // dropped; after the store for a flush), bumped under the registry's mutex with the change, so
     // a reader that loads it before and after its own reads knows the registry it consulted stayed
@@ -637,6 +640,8 @@ private:
     std::uint64_t version = 0;
     Coherence::Version coherenceVersion = 0;
     std::uint64_t accessProtection = 0;
+    std::uint64_t pointerEpoch = 0;
+    bool behindPointerWriter() const;
     void settleProtection();
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     std::vector<bool> layerOriginal;

@@ -4588,6 +4588,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
 }
 
 ShaderResources::~ShaderResources() {
+    StorageTexture::RetirePointerWriter(std::exchange(pointerWriter, 0));
     release();
 }
 
@@ -5329,6 +5330,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     if (usesBda && !bdaReadOnly) {
         guestMemory.ForgetPointerShadows();
         guestMemory.PointerRecorded();
+        if (StorageTexture::DeferredPointerStores()) {
+            StorageTexture::RetirePointerWriter(std::exchange(pointerWriter, 0));
+            pointerWriter = StorageTexture::NotePointerWriter(guestMemory.PointerHeaps());
+        }
         if (Coherence::Ordering()) recorder.NotePendingWrites(guestMemory.PointerHeaps());
         const auto placed = bda != nullptr ? bda->PlacedIntervals() : std::span<const std::pair<std::uint64_t, std::uint64_t>>{};
         for (const auto& [begin, end] : guestMemory.PointerHeaps()) {
@@ -5377,6 +5382,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
 
 void ShaderResources::CheckFaults() const {
     if (bda) {
+        struct Retire {
+            std::uint64_t& writer;
+            ~Retire() { StorageTexture::RetirePointerWriter(std::exchange(writer, 0)); }
+        } retire{pointerWriter};
         bda->CheckFault();
         guestMemory.CompletePointerWrites(bda->WrittenRanges());
     }
@@ -5384,6 +5393,10 @@ void ShaderResources::CheckFaults() const {
 
 void ShaderResources::WriteBackBuffers() {
     if (bda) {
+        struct Retire {
+            std::uint64_t& writer;
+            ~Retire() { StorageTexture::RetirePointerWriter(std::exchange(writer, 0)); }
+        } retire{pointerWriter};
         bda->CheckFault();
         guestMemory.CompletePointerWrites(bda->WrittenRanges());
     }

@@ -1435,6 +1435,60 @@ bool FillClearColor(VkFormat format, std::uint32_t elementBytes, std::span<const
 thread_local const StorageTexture* refreshing = nullptr;
 thread_local std::span<const std::pair<std::uint64_t, std::uint64_t>> pointerExempt;
 
+enum class PointerStores : std::uint8_t { Eager, Deferred, Verify };
+
+PointerStores PointerStoreMode() {
+    static const PointerStores mode = [] {
+        const char* text = std::getenv("APS5_DEFERRED_POINTER_STORES");
+        if (text == nullptr || std::strcmp(text, "0") == 0) return PointerStores::Eager;
+        if (std::strcmp(text, "1") == 0) return PointerStores::Deferred;
+        if (std::strcmp(text, "verify") == 0) return PointerStores::Verify;
+        throw std::runtime_error(std::string("APS5_DEFERRED_POINTER_STORES=") + text + ": expected 0, 1 or verify");
+    }();
+    return mode;
+}
+
+struct PointerWriterEntry {
+    std::uint64_t id;
+    std::uint64_t epoch;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> heaps;
+};
+
+struct PointerWriterRegistry {
+    std::mutex mutex;
+    std::vector<PointerWriterEntry> live;
+    std::uint64_t next = 0;
+    std::atomic<std::uint64_t> epoch{0};
+    std::atomic<std::size_t> count{0};
+};
+
+PointerWriterRegistry& PointerWriters() {
+    static PointerWriterRegistry registry;
+    return registry;
+}
+
+struct PointerStoreCounters {
+    std::atomic<std::uint64_t> deferred{0}, synced{0}, exposed{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+PointerStoreCounters& PointerStoreStats() {
+    static PointerStoreCounters counters;
+    return counters;
+}
+
+void ReportPointerStores() {
+    auto& stats = PointerStoreStats();
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = stats.lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10000 || !stats.lastReport.compare_exchange_strong(last, now)) return;
+    std::fprintf(stderr, "[pointer-stores] 10 s: deferred %llu image stores behind pointer writers, synced %llu write-backs behind them, %llu pointer builds with pending images over their heaps\n", static_cast<unsigned long long>(stats.deferred.exchange(0)), static_cast<unsigned long long>(stats.synced.exchange(0)), static_cast<unsigned long long>(stats.exposed.exchange(0)));
+}
+
+bool DeferrableStore(const char* reason) {
+    return reason != nullptr && (std::strcmp(reason, "flip") == 0 || std::strcmp(reason, "address-based heap") == 0);
+}
+
 void FlushHook(std::uint64_t address, std::size_t bytes) {
     StorageTexture::FlushPending(address, bytes);
 }
@@ -3387,6 +3441,7 @@ void StorageTexture::refreshGeneration() {
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     if (Coherence::Tracking()) coherenceVersion = Coherence::NextVersion();
+    if (!anyLayerPending()) pointerEpoch = PointerWriters().epoch.load(std::memory_order_acquire);
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (!handedFrom.empty()) supersedeHandedFrom(first, count);
     std::vector<bool> unsaved(trackedLayers, false);
@@ -3548,6 +3603,11 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
             if (texture != except && texture != exempt && texture->overlaps(address, bytes) && std::none_of(exemptRanges.begin(), exemptRanges.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return texture->overlaps(range.first, static_cast<std::size_t>(range.second - range.first)); })) {
+                if (DeferrableStore(reason) && PointerStoreMode() != PointerStores::Eager && texture->behindPointerWriter()) {
+                    PointerStoreStats().deferred.fetch_add(1, std::memory_order_relaxed);
+                    ++it;
+                    continue;
+                }
                 if (!texture->pendingUnitInside(address, bytes)) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
                     ++it;
@@ -3776,7 +3836,54 @@ bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes
     return PublishShadow(address, bytes, scope, PublishReasonFor(reason)) != 0;
 }
 
+bool StorageTexture::DeferredPointerStores() {
+    return PointerStoreMode() != PointerStores::Eager;
+}
+
+std::uint64_t StorageTexture::NotePointerWriter(std::span<const std::pair<std::uint64_t, std::uint64_t>> heaps) {
+    auto& registry = PointerWriters();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> sorted(heaps.begin(), heaps.end());
+    std::sort(sorted.begin(), sorted.end());
+    std::lock_guard lock(registry.mutex);
+    const auto id = ++registry.next;
+    const auto epoch = registry.epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    registry.live.push_back({id, epoch, std::move(sorted)});
+    registry.count.store(registry.live.size(), std::memory_order_release);
+    return id;
+}
+
+void StorageTexture::RetirePointerWriter(std::uint64_t writer) {
+    if (writer == 0) return;
+    auto& registry = PointerWriters();
+    std::lock_guard lock(registry.mutex);
+    std::erase_if(registry.live, [&](const PointerWriterEntry& entry) { return entry.id == writer; });
+    registry.count.store(registry.live.size(), std::memory_order_release);
+}
+
+bool StorageTexture::behindPointerWriter() const {
+    auto& registry = PointerWriters();
+    if (registry.count.load(std::memory_order_acquire) == 0 || guestBytes == 0) return false;
+    const auto begin = descriptor.baseAddress;
+    const auto end = begin + guestBytes;
+    std::lock_guard lock(registry.mutex);
+    for (const auto& entry : registry.live) {
+        if (entry.epoch <= pointerEpoch) continue;
+        const auto it = std::upper_bound(entry.heaps.begin(), entry.heaps.end(), begin, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& heap) { return value < heap.first; });
+        if (it != entry.heaps.begin() && std::prev(it)->second > begin) return true;
+        if (it != entry.heaps.end() && it->first < end) return true;
+    }
+    return false;
+}
+
 bool StorageTexture::StoreForPointerAccess(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt) {
+    if (PointerStoreMode() != PointerStores::Eager) {
+        if (PointerStoreMode() == PointerStores::Verify) {
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> heap{{{address, address + bytes}}};
+            if (AnyPendingOverlaps(heap)) PointerStoreStats().exposed.fetch_add(1, std::memory_order_relaxed);
+        }
+        ReportPointerStores();
+        return PublishShadowsOnly(address, bytes, PublishScope::Whole, "address-based heap");
+    }
     const auto previous = std::exchange(pointerExempt, exempt);
     struct Restore {
         std::span<const std::pair<std::uint64_t, std::uint64_t>> previous;
@@ -5232,6 +5339,11 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    if (PointerStoreMode() != PointerStores::Eager && behindPointerWriter()) {
+        PointerStoreStats().synced.fetch_add(1, std::memory_order_relaxed);
+        if (auto* recorder = Recorder::Active()) recorder->Sync();
+        if (PointerStoreMode() == PointerStores::Verify) Require(!behindPointerWriter(), "APS5_DEFERRED_POINTER_STORES=verify: a storage image older than an address-based build that may store through pointers over its memory was written back before that build completed");
+    }
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
