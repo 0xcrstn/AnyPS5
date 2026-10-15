@@ -2319,6 +2319,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     std::optional<ShaderResources::DrawIndexRanges> drawRanges;
     if (args == nullptr) drawRanges = drawIndexRanges(state, draw, shaders, inputs);
     resources.PublishResidentReads(*recorder);
+    static const bool verifyDataWords = std::getenv("APS5_VERIFY_PIPELINE_MODES") != nullptr;
+    if (verifyDataWords) resources.VerifyDataWords(shaders, record.moved);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.profile ? &outcome.bindings : nullptr, drawRanges ? &*drawRanges : nullptr, record.prefills);
     parts.lap(RecordBindings);
     const bool capture = CaptureInputsEnabled();

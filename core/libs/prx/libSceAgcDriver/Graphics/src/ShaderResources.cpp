@@ -5049,6 +5049,46 @@ std::vector<ShaderResources::SnapshotRequest> ShaderResources::PlanDrawSnapshots
     return requests;
 }
 
+void ShaderResources::VerifyDataWords(std::span<const CompiledShader> shaders, std::span<const MovedBuffer> moved) const {
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) continue;
+        for (const auto& binding : shader.program->bindings) {
+            if (!DataRole(binding.role)) continue;
+            const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+            Require(kept != bindings.end() && kept->allocations.size() == 1, "APS5_VERIFY_PIPELINE_MODES: a draw's data binding " + std::to_string(binding.binding) + " has no single allocation in its resource template");
+            const auto index = kept->allocations.front();
+            const auto& item = allocations[index];
+            if (item.guest || item.buffer == nullptr) continue;
+            const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index && !entry.words.empty(); });
+            std::vector<std::uint32_t> bound;
+            const char* source = "the template's buffer";
+            if (override != moved.end()) {
+                bound = override->words;
+                source = "the moved data words";
+            } else if (!item.dataWords.empty()) {
+                bound = item.dataWords;
+                source = "the template's refreshed data words";
+            } else {
+                bound.resize(item.size / sizeof(std::uint32_t));
+                std::memcpy(bound.data(), item.buffer->Bytes().data(), bound.size() * sizeof(std::uint32_t));
+                for (const auto& patch : dataPatches) {
+                    if (patch.allocation != index || patch.byte >= item.size) continue;
+                    auto bytes = std::as_writable_bytes(std::span(bound));
+                    const auto expected = std::as_bytes(std::span(binding.guestDescriptor));
+                    if (patch.byte < expected.size()) bytes[patch.byte] = expected[patch.byte];
+                }
+            }
+            if (bound == binding.guestDescriptor) continue;
+            std::size_t word = 0;
+            while (word < bound.size() && word < binding.guestDescriptor.size() && bound[word] == binding.guestDescriptor[word]) ++word;
+            char text[256];
+            std::snprintf(text, sizeof(text), "APS5_VERIFY_PIPELINE_MODES: stage %u of the program at 0x%llx binds data words that differ from the draw's at word %zu of %zu (bound 0x%08x, draw 0x%08x, from %s)", static_cast<unsigned>(shader.stage), static_cast<unsigned long long>(shader.programAddress), word, binding.guestDescriptor.size(), word < bound.size() ? bound[word] : 0u, word < binding.guestDescriptor.size() ? binding.guestDescriptor[word] : 0u, source);
+            throw std::runtime_error(text);
+        }
+    }
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindingsStatistics* statistics, const DrawIndexRanges* drawRanges, std::span<const DrawSnapshotArena::Prefill> prefills) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !(AddressBasedDrawSnapshots() && bdaReadOnly))) return {};
     auto lapStart = statistics != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

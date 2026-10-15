@@ -165,6 +165,20 @@ Key Combined(const Key& part, const Key& context) {
 
 }
 
+namespace {
+
+thread_local bool onlyReadyParts = false;
+
+}
+
+ReadyPipelineLibraryParts::ReadyPipelineLibraryParts() : previous(onlyReadyParts) {
+    onlyReadyParts = true;
+}
+
+ReadyPipelineLibraryParts::~ReadyPipelineLibraryParts() {
+    onlyReadyParts = previous;
+}
+
 std::span<const VkDynamicState> PipelineLibraryDynamicStates() {
     return dynamicStates;
 }
@@ -255,6 +269,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             handles[part] = found->second;
             continue;
         }
+        if (onlyReadyParts && !partsOnly) throw PipelineLibraryPartsMissing{};
         if (const auto building = device.building[part].find(key); building != device.building[part].end()) {
             joined[part] = building->second;
             ++device.counters.joinedParts[part];
