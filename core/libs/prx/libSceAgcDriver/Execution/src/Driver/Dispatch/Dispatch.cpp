@@ -559,8 +559,10 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 
-    if (VulkanDevice::CompileParkingEnabled() && sink == nullptr && onWorkerThread() && !GuestMemory::GpuMutex().HeldByThisThread()) {
+    const bool parkWorker = sink != nullptr && !sink->inOrder && FrozenPipeline::OnWorker();
+    if (VulkanDevice::CompileParkingEnabled() && (parkWorker || (sink == nullptr && onWorkerThread())) && !GuestMemory::GpuMutex().HeldByThisThread()) {
         if (auto ticket = localDevice->TryComputePipeline(compiled, address)) {
+            if (parkWorker) throw PreparationParked{[device = localDevice, ticket](std::function<void()> wake) { return device->ArmCompileWait(ticket, std::move(wake)); }, [ticket] { ticket->Wait(); }};
             ParkedOp op;
             op.queue = submission.queue;
             op.submission = submission.serial;

@@ -1208,6 +1208,9 @@ void Driver::reportDrawRecords() {
         static std::uint64_t lastFullWaits = 0;
         const auto fullWaits = pipeline.fullWaits - lastFullWaits;
         lastFullWaits = pipeline.fullWaits;
+        static std::uint64_t lastParked = 0;
+        const auto parked = pipeline.parked - lastParked;
+        lastParked = pipeline.parked;
         const auto reasons = [](const std::array<std::atomic<std::uint64_t>, Reasons>& values, std::array<std::uint64_t, Reasons>& last) {
             std::string text;
             for (std::size_t reason = 1; reason < Reasons; ++reason) {
@@ -1223,7 +1226,7 @@ void Driver::reportDrawRecords() {
         const auto orderedText = reasons(counters.orderedRedos, lastOrdered);
         const auto busy = seconds > 0 ? static_cast<double>(workerDelta[7]) / (seconds * 1e9 * workers) * 100.0 : 0.0;
         char text[512];
-        std::snprintf(text, sizeof(text), "; prepare workers %u: %llu frozen draws (freeze %.2f us each, %llu register files copied so far), %llu prepared to nothing; inline on queue 0 after a drain: %s; redone in order on the record thread: stale %llu, unchecked %llu, after a worker error or rejection %llu, refused by a worker: %s; workers busy %.1f %%, reorder buffer full %llu, record queue full %llu", workers, static_cast<unsigned long long>(workerDelta[0]), workerDelta[0] != 0 ? static_cast<double>(workerDelta[1]) / 1000.0 / static_cast<double>(workerDelta[0]) : 0.0, static_cast<unsigned long long>(counters.frozenCopies.load()), static_cast<unsigned long long>(workerDelta[2]), inlineText.c_str(), static_cast<unsigned long long>(workerDelta[4]), static_cast<unsigned long long>(workerDelta[5]), static_cast<unsigned long long>(workerDelta[6]), orderedText.c_str(), busy, static_cast<unsigned long long>(fullWaits), static_cast<unsigned long long>(workerDelta[3]));
+        std::snprintf(text, sizeof(text), "; prepare workers %u: %llu frozen draws (freeze %.2f us each, %llu register files copied so far), %llu prepared to nothing; inline on queue 0 after a drain: %s; redone in order on the record thread: stale %llu, unchecked %llu, after a worker error or rejection %llu, refused by a worker: %s; workers busy %.1f %%, parked on a compile %llu, reorder buffer full %llu, record queue full %llu", workers, static_cast<unsigned long long>(workerDelta[0]), workerDelta[0] != 0 ? static_cast<double>(workerDelta[1]) / 1000.0 / static_cast<double>(workerDelta[0]) : 0.0, static_cast<unsigned long long>(counters.frozenCopies.load()), static_cast<unsigned long long>(workerDelta[2]), inlineText.c_str(), static_cast<unsigned long long>(workerDelta[4]), static_cast<unsigned long long>(workerDelta[5]), static_cast<unsigned long long>(workerDelta[6]), orderedText.c_str(), busy, static_cast<unsigned long long>(parked), static_cast<unsigned long long>(fullWaits), static_cast<unsigned long long>(workerDelta[3]));
         ahead += text;
         if (prepareDispatches()) {
             static std::array<std::uint64_t, Reasons> lastDispatchInline{};
