@@ -3620,7 +3620,7 @@ void noteFlipStores(std::uint64_t images, std::uint64_t imageBytes, std::uint64_
     const auto now = std::chrono::steady_clock::now();
     if (now - last < std::chrono::seconds(10)) return;
     last = now;
-    AgcDriver::ProfilePrint_nid_no_patch("[flip-stores] last 10 s: %llu flips stored %llu unprotected images (%.1f MiB) and published %llu unprotected shadow units (%.1f MiB); per flip %.1f MiB\n", static_cast<unsigned long long>(flips), static_cast<unsigned long long>(storedImages), static_cast<double>(storedImageBytes) / 1048576.0, static_cast<unsigned long long>(publishedUnits), static_cast<double>(publishedUnitBytes) / 1048576.0, static_cast<double>(storedImageBytes + publishedUnitBytes) / 1048576.0 / static_cast<double>(flips));
+    AgcDriver::ProfilePrint_nid_no_patch("[flip-stores] last 10 s: %llu flips stored %llu unprotected images (%.1f MiB) and published %llu unprotected shadow units (up to %.1f MiB); per flip up to %.1f MiB\n", static_cast<unsigned long long>(flips), static_cast<unsigned long long>(storedImages), static_cast<double>(storedImageBytes) / 1048576.0, static_cast<unsigned long long>(publishedUnits), static_cast<double>(publishedUnitBytes) / 1048576.0, static_cast<double>(storedImageBytes + publishedUnitBytes) / 1048576.0 / static_cast<double>(flips));
     flips = storedImages = storedImageBytes = publishedUnits = publishedUnitBytes = 0;
 }
 
