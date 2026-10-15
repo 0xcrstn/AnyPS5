@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchRelocation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareWorkers.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CacheSizing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
@@ -235,6 +236,37 @@ private:
     void postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::string identity, std::function<void(DrawRecordResult&)> record);
     static void noteDrawRecordRecipe(DrawRecordResult& result, std::shared_ptr<const DrawRecipe> built, std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void reportDrawRecords();
+    struct DrawInputs;
+    struct FrozenDraw;
+    struct PreparedFrozenDraw;
+    struct FrozenSink {
+        bool inOrder = false;
+        FrozenFallback refused = FrozenFallback::None;
+        std::shared_ptr<DrawInputs> inputs;
+        std::vector<PreparedRead> reads;
+        std::uint64_t program = 0;
+        bool Refuse(FrozenFallback reason) {
+            if (inOrder) return false;
+            refused = reason;
+            return true;
+        }
+    };
+    using FrozenPipeline = OrderedPrepare<std::shared_ptr<FrozenDraw>, std::shared_ptr<PreparedFrozenDraw>>;
+    static std::uint32_t prepareWorkers();
+    static std::uint32_t frozenBound();
+    static FrozenPipeline& frozenDraws();
+    static FrozenSink*& frozenSink();
+    static bool& frozenProducer();
+    static void startDrawRecords();
+    static void noteRecordHistory(std::uint64_t ticket, const std::shared_ptr<DrawRecordResult>& result);
+    static void recordDrawInputs(const DrawInputs& inputs, DrawRecordResult& result, const std::shared_ptr<VulkanDevice>& localDevice);
+    void noteDrawInputWriters(const DrawInputs& inputs, std::uint32_t queue);
+    FrozenFallback frozenFallback(std::span<const std::uint32_t> packet);
+    DrawVerdict freezeDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
+    std::shared_ptr<PreparedFrozenDraw> prepareFrozen(const FrozenDraw& frozen, bool inOrder);
+    void emitFrozen(const std::shared_ptr<FrozenDraw>& frozen, std::optional<std::shared_ptr<PreparedFrozenDraw>>& prepared, std::exception_ptr error);
+    void drainFrozen(bool records);
+    void mergeFrozenRecords();
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
@@ -440,6 +472,8 @@ private:
     std::mutex drawCacheMutex;
     std::shared_ptr<DrawRecordResult> drawRecordResult;
     PrepareAheadWindow<DrawRecordResult> drawRecordWindow;
+    std::mutex frozenPostedMutex;
+    std::vector<std::shared_ptr<DrawRecordResult>> frozenPosted;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     std::optional<DrawKeySightings> drawKeySightings;
     std::optional<DrawKeySightings> drawShapeSightings;
