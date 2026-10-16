@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineRecipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Optimization/DescriptorBindingBuilder.hpp"
@@ -1495,6 +1496,10 @@ void verifyCaptureValues() {
         const auto lean = values.CaptureValues(*prepared);
         AgcDriver::ShaderMemory full({});
         const auto reference = full.Capture(*prepared);
+        AgcDriver::ShaderMemory tracedMemory({});
+        AgcDriver::ShaderMemory::IncrementalState tracedState;
+        const auto traced = tracedMemory.CaptureValues(*prepared, tracedState, true);
+        require(sameSnapshot(traced->snapshot, reference->snapshot) && SameResourceTrace(*traced, *reference), "capture values: traced plan fallback changed its snapshot or dependency metadata");
         if (!sameSnapshot(lean->snapshot, reference->snapshot)) std::cerr << "capture values: " << what << std::endl;
         require(sameSnapshot(lean->snapshot, reference->snapshot), "capture values: the values-only snapshot differs from the full capture");
         const auto leanRegions = values.Regions();
@@ -1622,6 +1627,32 @@ void verifyCaptureValues() {
         const auto lean = values.CaptureValues(*plainPrepared);
         AgcDriver::ShaderMemory full({});
         const auto reference = full.Capture(*plainPrepared);
+        std::vector<std::uint64_t> tracedReads;
+        SrtRuntime tracedRuntime;
+        tracedRuntime.userData = plain.context.userData;
+        tracedRuntime.shaderBase = plain.shader.codeAddress;
+        tracedRuntime.userContext = &tracedReads;
+        tracedRuntime.readMemory = +[](void* context, std::uint64_t address, std::uint32_t* value) {
+            static_cast<std::vector<std::uint64_t>*>(context)->push_back(address);
+            std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+            return true;
+        };
+        tracedRuntime.readSpecializationMemory = tracedRuntime.readMemory;
+        const auto tracedReference = plainPrepared->Capture(tracedRuntime);
+        const auto referenceReads = tracedReads;
+        tracedReads.clear();
+        SrtTapeInstance tracedInstance;
+        tracedRuntime.tapeInstance = &tracedInstance;
+        const auto traceBefore = CompiledWalkCounts();
+        const auto traced = plainPrepared->CaptureValues(tracedRuntime, true);
+        require(tracedReads == referenceReads, "capture values: tracing made a duplicate walk or changed the guest read sequence");
+        tracedReads.clear();
+        tracedRuntime.stableWord = +[](void*, std::uint64_t, std::uint32_t) { return true; };
+        const auto keptTrace = plainPrepared->CaptureValues(tracedRuntime, true);
+        const auto traceAfter = CompiledWalkCounts();
+        require(traceAfter.runs == traceBefore.runs + (compiledWalk ? 2u : 0u), "capture values: a traced straight-line plan did not use the compiled tape");
+        require(!compiledWalk || (tracedReads.empty() && tracedInstance.keptReads != 0u), "capture values: an unchanged traced plan reread guest words");
+        require(sameSnapshot(traced->snapshot, reference->snapshot) && SameResourceTrace(*traced, *reference) && SameResourceTrace(*traced, *tracedReference) && sameSnapshot(keptTrace->snapshot, reference->snapshot) && SameResourceTrace(*keptTrace, *reference), "capture values: the traced tape changed its snapshot or relocation metadata");
         require(sameSnapshot(lean->snapshot, reference->snapshot), "capture values: the compiled walk differs from the traced walk");
         const auto leanRegions = values.Regions();
         const auto fullRegions = full.Regions();
@@ -1639,7 +1670,7 @@ void verifyCaptureValues() {
     fill(tables.second, first, 1u, 12u);
     require(checkPlain()->snapshot.images.at(0).dwords[0] == first[0], "capture values: the compiled walk did not follow a moved SRT pointer");
     const auto compiledAfter = CompiledWalkCounts();
-    require(compiledAfter.runs - compiledBefore.runs == (compiledWalk ? 3u : 0u) && compiledAfter.fallbacks == compiledBefore.fallbacks, "capture values: the compiled walk did not serve the straight-line plan as configured");
+    require(compiledAfter.runs - compiledBefore.runs == (compiledWalk ? 9u : 0u) && compiledAfter.fallbacks == compiledBefore.fallbacks, "capture values: the compiled walk did not serve the straight-line plan as configured");
     const auto plainPrepared = PreparedShaderInvocation::TryCreate(plain, plainHandle);
     require(plainPrepared.has_value(), "capture values: the straight-line shader stopped matching its request");
     const auto plainFullUs = time([&] {
@@ -1965,6 +1996,30 @@ void verifyImageTables() {
     const auto userData = TableUserData(guest);
     auto request = TableRequest(TableMaterialCode, userData);
 
+    const std::vector<std::uint32_t> invariantPhiCode{
+        0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u,
+        0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xbe910380u,
+        0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf068011u, 0xbf850003u,
+        0xf42c0502u, 0x20000000u, 0xbf820002u, 0xf42c0502u, 0x20000000u,
+        0x80118111u, 0xbf0a8211u, 0xbf85fff2u, 0xbf810000u,
+    };
+    const auto invariantPhiRequest = TableRequest(invariantPhiCode, userData);
+    const auto invariantPhiPlan = GetResourcePlan(invariantPhiRequest);
+    require(invariantPhiPlan->info.images.size() == 1u && invariantPhiPlan->info.images[0].table == 0u, "image tables: an invariant descriptor Phi was not planned as one table");
+    const auto invariantPhi = CompileTable(invariantPhiRequest);
+    require(invariantPhi.capture->snapshot.tables.tables.size() == 1u && invariantPhi.capture->snapshot.tables.tables[0].records == 4u && TableBinding(*invariantPhi.result, DescriptorRole::ImageTable) != nullptr && TableBinding(*invariantPhi.result, DescriptorRole::ImageTable)->count == 2u && !invariantPhi.result->spirv.empty(), "image tables: an invariant descriptor Phi lost its table records");
+
+    auto varyingPhiCode = invariantPhiCode;
+    varyingPhiCode[23] = 0x20000020u;
+    bool varyingRefusedOrSplit = false;
+    try {
+        const auto varying = GetResourcePlan(TableRequest(varyingPhiCode, userData));
+        varyingRefusedOrSplit = varying->info.images.size() > 1u;
+    } catch (const std::runtime_error& error) {
+        varyingRefusedOrSplit = std::string_view(error.what()).find("GetImageResource dword 0 is not a valid runtime value") != std::string_view::npos;
+    }
+    require(varyingRefusedOrSplit, "image tables: a descriptor Phi with a differing offset became one invariant table");
+
     const auto plan = GetResourcePlan(request);
     require(plan->info.images.size() == 1u && plan->info.images[0].table == 0u && plan->info.images[0].tableOperation == TableOperation::Supported, "image tables: the T# was not planned as a table");
     const auto& column = plan->descriptorSources.at(plan->info.images[0].source).tableColumn;
@@ -2050,6 +2105,9 @@ void verifyImageTables() {
     const auto emptyCodes = TableCodes(TableMap(*empty.result), 0);
     require(TableMap(*empty.result)[Abi::HeaderElementCount] == 0u && std::all_of(emptyCodes.begin(), emptyCodes.end(), [](std::uint32_t code) { return code == Abi::NullCode || code == Abi::PoisonCode(Abi::OutsideDomainPoison); }), "image tables: an empty table has records");
     require(empty.result->variantId == result.variantId, "image tables: an empty table changed the artifact");
+    const auto* emptyImages = TableBinding(*empty.result, DescriptorRole::ImageTable);
+    require(emptyImages != nullptr && emptyImages->count == 0u, "image tables: the real empty-table compiler path did not reserve a zero-count binding");
+    require(!AgcDriver::Graphics::PipelineShaderIdentity({ShaderStage::Compute, empty.result.get(), 0u}).empty(), "image tables: runtime identity rejected the compiled empty table");
     heap = saved;
 
     std::vector<std::uint32_t> queryCode(TableWholeCode.begin(), TableWholeCode.begin() + 8);
@@ -2774,12 +2832,61 @@ void verifyDescriptorTableWeb() {
     auto chainCode = prologue;
     chainCode.insert(chainCode.end(), {0xf42c0210u, 0x4a000000u, 0xbf8cc07fu, 0xbf068014u, 0xbf850002u, 0xf40c0200u, 0xfa000080u, 0xbf068015u, 0xbf850002u, 0xf40c0200u, 0xfa0000a0u});
     chainCode.insert(chainCode.end(), epilogue.begin(), epilogue.end());
-    auto chain = makeRequest(chainCode);
+    std::vector<std::uint32_t> conditionalCode(prologue.begin(), prologue.begin() + 9);
+    conditionalCode.insert(conditionalCode.end(), {0xf40c0200u, 0xfa000080u, 0xbf8cc07fu, 0xbf068014u, 0xbf850007u, 0xf420090eu, 0xfa000000u, 0xbf8cc07fu, 0x9325a024u, 0xf42c0210u, 0x4a000000u, 0xbf8cc07fu, 0xbf068015u, 0xbf850002u, 0xf40c0200u, 0xfa0000a0u});
+    conditionalCode.insert(conditionalCode.end(), epilogue.begin(), epilogue.end());
+    auto loopCode = prologue;
+    loopCode.insert(loopCode.end(), {0xf40c0200u, 0xfa000080u, 0xbe910380u, 0xbf8cc07fu, 0xf42c0a10u, 0x4a000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbe880428u, 0xbe8a042au, 0xbe8c042cu, 0xbe8e042eu, 0x80118111u, 0xbf0a8211u, 0xbf85fff1u, 0xbf810000u});
+    const std::array<std::tuple<const std::vector<std::uint32_t>*, std::size_t, const char*>, 3> shapes{{
+        {&chainCode, 3u, "a T# chosen by Phis between a constant buffer table read and two SRT T#s"},
+        {&conditionalCode, 3u, "a T# read from a constant buffer table on one branch only, then chosen by Phis with two SRT T#s"},
+        {&loopCode, 2u, "a T# read from a constant buffer table in a loop and sampled in the next iteration"},
+    }};
     const char* direct = std::getenv("APS5_DESCRIPTOR_WEB_DIRECT");
-    if (direct != nullptr && std::string_view(direct) == "off") {
-        expectFailure([&] { static_cast<void>(GetResourcePlan(chain)); }, "GetImageResource dword 0 is not a valid runtime value", "descriptor table web: APS5_DESCRIPTOR_WEB_DIRECT=off accepted a T# Phi whose base edge is a table read");
-    } else {
-        const auto plan = GetResourcePlan(chain);
+    const bool tablesOff = std::getenv("APS5_NO_IMAGE_TABLES") != nullptr;
+    for (const auto& [shapeCode, imageCount, shape] : shapes) {
+        auto request = makeRequest(*shapeCode);
+        if ((tablesOff && shapeCode != &chainCode) || (direct != nullptr && std::string_view(direct) == "off")) {
+            expectFailure([&] { static_cast<void>(GetResourcePlan(request)); }, "GetImageResource dword 0 is not a valid runtime value", (std::string("descriptor table web: a disabled table path accepted ") + shape).c_str());
+            continue;
+        }
+        if (tablesOff) {
+            const auto plan = GetResourcePlan(request);
+            require(std::ranges::none_of(plan->descriptorSources, [](const DescriptorSource& source) { return source.tableColumn.has_value(); }),
+                    "descriptor table web: the scalar fallback planned a disabled table column");
+            for (const auto& [key, expected] : {std::pair{2u, tableSecond}, std::pair{1u, tableFirst}}) {
+                guest.index[0] = key;
+                auto keyed = makeRequest(*shapeCode);
+                AgcDriver::ShaderMemory memory({});
+                const auto capture = memory.Capture(keyed);
+                require(capture->snapshot.tables.tables.empty(), "descriptor table web: the scalar fallback captured a runtime table");
+                const auto holds = [&](const std::array<std::uint32_t, 8>& words) {
+                    return std::ranges::any_of(capture->snapshot.images, [&](const DescriptorValue& value) { return std::equal(words.begin(), words.end(), value.dwords.begin()); });
+                };
+                require(holds(expected) && holds(srtFirst) && holds(srtSecond),
+                        "descriptor table web: the scalar fallback did not capture the selected table record and SRT descriptors");
+                keyed.context.memory = memory.Regions();
+                const auto compiled = Recompile(keyed, *capture);
+                require(compiled->imageTableRanges.empty() && compiled->imageTablePoison.empty() && !compiled->spirv.Resolved().empty(),
+                        "descriptor table web: the scalar fallback did not compile its three captured image arms");
+                const auto bound = [&](const std::array<std::uint32_t, 8>& words) {
+                    return std::ranges::any_of(compiled->bindings, [&](const DescriptorBinding& binding) {
+                        if (binding.role != DescriptorRole::GuestImages) return false;
+                        for (std::size_t offset = 0; offset + words.size() <= binding.guestDescriptor.size(); offset += words.size()) {
+                            if (std::equal(words.begin(), words.end(), binding.guestDescriptor.begin() + static_cast<std::ptrdiff_t>(offset))) return true;
+                        }
+                        return false;
+                    });
+                };
+                require(bound(expected) && bound(srtFirst) && bound(srtSecond),
+                        "descriptor table web: the scalar fallback compiled different image descriptors from its capture");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+                static_cast<void>(ValidateAndOptimizeSpirv(compiled->spirv, keyed.target.vulkanVersion, keyed.target.spirvVersion));
+#endif
+            }
+            continue;
+        }
+        const auto plan = GetResourcePlan(request);
         std::size_t columns = 0;
         std::uint32_t columnImage = 0;
         for (std::uint32_t image = 0; image < plan->info.images.size(); image++) {
@@ -2790,13 +2897,13 @@ void verifyDescriptorTableWeb() {
                 require(column->stride == 32u && column->offset == 0u && !column->address, "descriptor table web: the table edge's column does not read 32-byte T# records through the buffer");
             }
         }
-        require(plan->info.images.size() == 3u && columns == 1u, "descriptor table web: a T# chosen by Phis between a constant buffer table read and two SRT T#s was not planned as one table column and two SRT images");
+        require(plan->info.images.size() == imageCount && columns == 1u, (std::string("descriptor table web: ") + shape + " was not planned as one table column and its SRT images").c_str());
         require(plan->info.images[columnImage].table != NoTable, "descriptor table web: the table edge's image was not assigned a table");
         for (const auto& [key, expected] : {std::pair{2u, tableSecond}, std::pair{1u, tableFirst}}) {
             guest.index[0] = key;
-            auto request = makeRequest(chainCode);
+            auto keyed = makeRequest(*shapeCode);
             AgcDriver::ShaderMemory memory({});
-            const auto capture = memory.Capture(request);
+            const auto capture = memory.Capture(keyed);
             const auto& tables = capture->snapshot.tables;
             require(tables.tables.size() == 1u && key < tables.tables[0].codes.size(), "descriptor table web: the capture has no table for the constant buffer key");
             const auto code = tables.tables[0].codes[key];
@@ -2804,20 +2911,16 @@ void verifyDescriptorTableWeb() {
             const auto holds = [&](const std::array<std::uint32_t, 8>& words) {
                 return std::ranges::any_of(capture->snapshot.images, [&](const DescriptorValue& value) { return std::equal(words.begin(), words.end(), value.dwords.begin()); });
             };
-            require(holds(srtFirst) && holds(srtSecond), "descriptor table web: the snapshot does not hold both SRT T#s");
-            request.context.memory = memory.Regions();
-            const auto compiled = Recompile(request, *capture);
+            require(holds(srtFirst) && (imageCount == 2u || holds(srtSecond)), "descriptor table web: the snapshot does not hold the SRT T#s");
+            keyed.context.memory = memory.Regions();
+            const auto compiled = Recompile(keyed, *capture);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-            static_cast<void>(ValidateAndOptimizeSpirv(compiled->spirv, request.target.vulkanVersion, request.target.spirvVersion));
+            static_cast<void>(ValidateAndOptimizeSpirv(compiled->spirv, keyed.target.vulkanVersion, keyed.target.spirvVersion));
 #else
             static_cast<void>(compiled);
 #endif
         }
     }
-    auto loopCode = prologue;
-    loopCode.insert(loopCode.end(), {0xf40c0200u, 0xfa000080u, 0xbe910380u, 0xbf8cc07fu, 0xf42c0a10u, 0x4a000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbe880428u, 0xbe8a042au, 0xbe8c042cu, 0xbe8e042eu, 0x80118111u, 0xbf0a8211u, 0xbf85fff1u, 0xbf810000u});
-    auto loop = makeRequest(loopCode);
-    expectFailure([&] { static_cast<void>(GetResourcePlan(loop)); }, "GetImageResource dword 0 is not a valid runtime value", "descriptor table web: a T# read in a loop before the iteration's table read replaced it was bound to the new table read");
 }
 
 void verifyUndefinedImageFormats() {
@@ -4016,7 +4119,7 @@ void verifyPixelRequestSerialization() {
     minimal.context.pixel->layerExported = true;
     minimal.context.pixel->ditheredAlphaToCoverage = true;
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQR4AAAA=", "new requests did not use serialization version 30");
+    require(requestPrefix(encoded, 8u) == "NVNQQSAAAAA=", "new requests did not use serialization version 32");
     const std::array<std::uint32_t, 2> fallbacks{0x40u, 0x1ac4u};
     auto withFallbacks = minimal;
     withFallbacks.context.linkedCallFallbacks = fallbacks;
@@ -4134,7 +4237,7 @@ void verifyPixelRequestSerialization() {
     for (std::size_t bytes = 0; bytes < 45u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag, primitive class, layer export, dither or front-face flag, quad pixel mask, quad sample mask or extra LDS allocation was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQR8AAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQSEAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
     static constexpr std::string_view version18Request{
@@ -4261,6 +4364,7 @@ void verifyVertexInfoVersion19() {
     require(allBitsOffset == flagOffset + 2u, "the front-face all-bits flag does not follow the dithered coverage flag");
     constexpr std::size_t extraLdsBytes = 4u;
     version26Pixel.erase(version26Pixel.begin() + static_cast<std::ptrdiff_t>(allBitsOffset), version26Pixel.begin() + static_cast<std::ptrdiff_t>(allBitsOffset + 2u + 16u + extraLdsBytes));
+    version26Pixel.pop_back();
     version26Pixel[4] = 26u;
     const auto replay26 = serializer.Deserialize(encodeBase64(version26Pixel));
     require(replay26.request.context.pixel.has_value() && replay26.request.context.pixel->rasterPrimitive == RasterPrimitive::Rectangle && !replay26.request.context.pixel->frontFaceAllBits, "a version 26 request lost its pixel primitive class or read a front-face all-bits flag");
@@ -4281,21 +4385,25 @@ void verifyVertexInfoVersion19() {
     const auto plainPixel = decodeBase64(encodedPixel);
     require(std::equal(plainPixel.begin(), plainPixel.begin() + static_cast<std::ptrdiff_t>(ldsOffset), version29.begin()) && version29[ldsOffset] == 0x78u && version29[ldsOffset + 1u] == 0x56u && version29[ldsOffset + 2u] == 0x34u && version29[ldsOffset + 3u] == 0x12u, "the extra LDS allocation is not the word after the quad sample masks");
     version29.erase(version29.begin() + static_cast<std::ptrdiff_t>(ldsOffset), version29.begin() + static_cast<std::ptrdiff_t>(ldsOffset + extraLdsBytes));
+    version29.pop_back();
     version29[4] = 29u;
     const auto replay29 = serializer.Deserialize(encodeBase64(version29));
     require(replay29.request.context.pixel.has_value() && replay29.request.context.pixel->extraLdsDwords == 0u && serializer.Serialize(replay29.request) == encodedPixel, "a version 29 request read an extra LDS allocation or misread the fields after it");
     auto version28 = decodeBase64(serializer.Serialize(sampledPixel));
     require(std::equal(maskedBytes.begin(), maskedBytes.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u), version28.begin()) && version28[maskOffset + 1u] == 0x1u && version28[maskOffset + 5u] == 0x2u && version28[maskOffset + 9u] == 0x4u && version28[maskOffset + 13u] == 0x8u, "the quad sample masks are not the four words after the quad pixel mask");
     version28.erase(version28.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u), version28.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + extraLdsBytes));
+    version28.pop_back();
     version28[4] = 28u;
     const auto replay28 = serializer.Deserialize(encodeBase64(version28));
     require(replay28.request.context.pixel.has_value() && replay28.request.context.pixel->quadPixelMask == 0x2u && replay28.request.context.pixel->quadSampleMask == std::array<std::uint16_t, 4>{0xffffu, 0xffffu, 0xffffu, 0xffffu} && decodeBase64(serializer.Serialize(replay28.request)) == maskedBytes, "a version 28 request read quad sample masks or misread the fields after them");
     auto version27 = maskedBytes;
     version27.erase(version27.begin() + static_cast<std::ptrdiff_t>(maskOffset), version27.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + extraLdsBytes));
+    version27.pop_back();
     version27[4] = 27u;
     const auto replay27 = serializer.Deserialize(encodeBase64(version27));
     require(replay27.request.context.pixel.has_value() && replay27.request.context.pixel->quadPixelMask == 0xfu && serializer.Serialize(replay27.request) == encodedPixel, "a version 27 request read a quad pixel mask or misread the fields after it");
     legacyPixel.erase(legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset), legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset + 4u + sampleMaskBytes + extraLdsBytes));
+    legacyPixel.pop_back();
     legacyPixel.resize(legacyPixel.size() - sizeof(std::uint64_t));
     for (const auto version : {19u, 20u, 21u, 22u}) {
         auto versionPixel = legacyPixel;
@@ -6134,6 +6242,14 @@ void verifySrgbDepthCompareModes() {
 int main(int argc, char** argv) {
     try {
         using namespace ShaderRecompiler;
+        if (argc == 2 && std::string_view(argv[1]) == "--request-serialization") {
+            try { verifyCanonicalVersion20And21Requests(); } catch (const std::exception& error) { throw std::runtime_error(std::string("verifyCanonicalVersion20And21Requests: ") + error.what()); }
+            try { verifyPixelRequestSerialization(); } catch (const std::exception& error) { throw std::runtime_error(std::string("verifyPixelRequestSerialization: ") + error.what()); }
+            try { verifyVertexInfoVersion19(); } catch (const std::exception& error) { throw std::runtime_error(std::string("verifyVertexInfoVersion19: ") + error.what()); }
+            try { verifyLegacyPixelRequests(); } catch (const std::exception& error) { throw std::runtime_error(std::string("verifyLegacyPixelRequests: ") + error.what()); }
+            std::cout << "Current and historical shader requests preserve serialized fields and reject unsupported versions\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--quad-mask-no-demote") {
             verifyQuadMaskNeighbourReads();
             std::cout << "Quad masks preserve neighbour-lane helpers or refuse without demote\n";
@@ -6183,7 +6299,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-table-web") {
             verifyDescriptorTableWeb();
-            std::cout << "Descriptor Phis over table reads bind a table column\n";
+            std::cout << "Descriptor Phi table and scalar capture paths passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--srt-read-patching") {

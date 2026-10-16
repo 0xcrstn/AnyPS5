@@ -110,7 +110,7 @@ std::string Driver::describeWait(std::span<const std::uint32_t> packet) {
     std::snprintf(text, sizeof(text), "; waits for (0x%llx & 0x%llx) %s 0x%llx", static_cast<unsigned long long>(target), static_cast<unsigned long long>(mask), functions[packet[1] & 7u], static_cast<unsigned long long>(reference));
     std::string description = text;
     if (GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(target)), wide ? 8u : 4u)) {
-        const std::uint64_t value = wide ? *reinterpret_cast<const volatile std::uint64_t*>(target) : *reinterpret_cast<const volatile std::uint32_t*>(target);
+        const std::uint64_t value = GuestMemory::LoadDriverAtomic(target, wide ? 8 : 4);
         std::snprintf(text, sizeof(text), ", value now 0x%llx", static_cast<unsigned long long>(value));
         description += text;
     }

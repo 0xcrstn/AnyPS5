@@ -239,7 +239,7 @@ void Run(const Context& context, ReservedSurface& surface) {
         surface.Data()[0x100] = 0x11;
         sample("after a CPU write to its committed part", true, false);
         sample("after the re-read of the written part", false, true);
-        AgcDriver::GuestMemory::MarkWritten(address + 0x200, 4);
+        AgcDriver::GuestMemory::MarkWritten(address + 0x200, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
         sample("after a driver store into its committed part", true, true);
         sample("after the compare that followed the driver store", false, true);
         surface.Commit(2 * BlockBytes, BlockBytes);
@@ -296,7 +296,7 @@ void UntrackedHint(const Context& context, ReservedSurface& surface) {
         *stored = *stored;
         sample("after a CPU store of the bytes already there", true, true);
         sample("after the compare that followed that store", false, true);
-        AgcDriver::GuestMemory::MarkWritten(address + 0x200, 4);
+        AgcDriver::GuestMemory::MarkWritten(address + 0x200, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
         sample("after a driver store", true, true);
         sample("after the compare that followed the driver store", false, true);
     } catch (...) {

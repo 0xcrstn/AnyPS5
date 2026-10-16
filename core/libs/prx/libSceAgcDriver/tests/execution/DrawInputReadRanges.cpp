@@ -99,8 +99,14 @@ struct Block {
     explicit Block(std::size_t bytes) : bytes(bytes), watched(AgcDriver::GuestMemory::WriteWatched()) {
 #ifdef _WIN32
         if (watched) {
-            data = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, BlockBytes));
-            GuestArena::GuestArenaCommit_nid_postfix(data, bytes, PAGE_READWRITE, bytes);
+            data = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(2 * bytes, BlockBytes));
+            Require(data != nullptr, "cannot reserve the shared draw input block");
+            GuestArena::GuestArenaCommit_nid_postfix(data, 2 * bytes, PAGE_READWRITE, bytes);
+            GuestArena::GuestArenaReset_nid_postfix(data, 2 * bytes);
+            section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+            Require(section != nullptr, "cannot allocate the shared draw input backing");
+            GuestArena::GuestArenaMap_nid_postfix(data, bytes, section, 0, PAGE_READWRITE);
+            GuestArena::GuestArenaMap_nid_postfix(data + bytes, bytes, section, 0, PAGE_READWRITE);
         } else {
             data = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         }
@@ -131,8 +137,9 @@ struct Block {
         }
 #ifdef _WIN32
         if (watched) {
-            GuestArena::GuestArenaReset_nid_postfix(data, bytes);
-            GuestArena::GuestArenaRelease_nid_postfix(data, bytes);
+            GuestArena::GuestArenaReset_nid_postfix(data, 2 * bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(data, 2 * bytes);
+            CloseHandle(section);
         } else {
             VirtualFree(data, 0, MEM_RELEASE);
         }
@@ -150,6 +157,9 @@ struct Block {
     std::uint64_t Address() const { return reinterpret_cast<std::uintptr_t>(data); }
     std::size_t bytes;
     bool watched;
+#ifdef _WIN32
+    HANDLE section = nullptr;
+#endif
     std::uint8_t* data = nullptr;
 };
 
@@ -279,6 +289,9 @@ void ReadRangeTests(AgcDriver::VulkanDevice& device, Block& target, Block& input
             for (std::size_t i = 0; i < InputBytes / 4u; ++i) floats[i] = 0.5f;
             std::memcpy(input.data + ReadOffset, expected.data(), sizeof(expected));
             Draw(device, color, descriptor, program, first, TriangleDescriptor(), 0u);
+#ifdef _WIN32
+            if (target.watched) Require(GuestArena::GuestArenaMappingProtected_nid_postfix(target.Address(), target.bytes), "the draw input range fixture did not retain its real native target guard");
+#endif
             first = false;
             std::memset(input.data, 0, InputBytes);
             char what[200];

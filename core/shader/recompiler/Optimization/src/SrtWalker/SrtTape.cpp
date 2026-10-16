@@ -28,7 +28,7 @@ struct Domain {
 
 class TapeCompiler {
 public:
-    TapeCompiler(const IrResourcePlan& plan, std::vector<SrtTape::Instruction>& instructions, std::size_t& reads) : plan(plan), instructions(instructions), reads(reads) {
+    TapeCompiler(const IrResourcePlan& plan, std::vector<SrtTape::Instruction>& instructions, std::size_t& reads, bool& tracing) : plan(plan), instructions(instructions), reads(reads), tracing(tracing) {
         domains.push_back({false, nullptr});
         domains.push_back({true, nullptr});
     }
@@ -110,17 +110,28 @@ private:
                 return emit(instruction);
             }
             case IrOpcode::Phi: {
+                tracing = false;
                 IrValue* resolved = ResolveInvariantPhi(plan, &value);
                 if (resolved == nullptr) return refuse(SrtCompiledWalkRefusal::Phi);
                 return Compile(resolved, domain);
             }
             case IrOpcode::ReadFirstLane: {
+                tracing = false;
                 if (value.ArgumentCount() < 2 || value.Argument(0) == nullptr || value.Argument(1) == nullptr) return refuse(SrtCompiledWalkRefusal::Opcode);
                 return Compile(value.Argument(0), laneDomain(domain, value.Argument(1)->Resolve()));
             }
             case IrOpcode::BitCastU32F32:
-            case IrOpcode::BitCastF32U32: return Compile(value.Argument(0), domain);
+            case IrOpcode::BitCastF32U32: {
+                const auto child = Compile(value.Argument(0), domain);
+                if (!child) return std::nullopt;
+                SrtTape::Instruction instruction;
+                instruction.step = SrtTape::Step::Forward;
+                instruction.count = 1;
+                instruction.arguments[0] = *child;
+                return emit(instruction);
+            }
             case IrOpcode::CompositeExtractU64: {
+                tracing = false;
                 const auto index = component(value);
                 if (!index) return refuse(SrtCompiledWalkRefusal::Opcode);
                 const auto packed = Compile(value.Argument(0), domain);
@@ -133,6 +144,7 @@ private:
                 return emit(instruction);
             }
             case IrOpcode::CompositeExtractU32x2: {
+                tracing = false;
                 const auto index = component(value);
                 if (!index) return refuse(SrtCompiledWalkRefusal::Opcode);
                 IrValue* source = value.Argument(0)->Resolve();
@@ -157,7 +169,13 @@ private:
                 if (!slot->HasImmediate() || slot->Type() != IrType::U32 || slot->ImmediateU32() >= plan.srtReads.size()) return refuse(SrtCompiledWalkRefusal::FlatOffset);
                 const auto index = slot->ImmediateU32();
                 const bool clean = !scope.clean && index < plan.cleanFlatSlots.size() && plan.cleanFlatSlots[index] != 0u;
-                return Compile(plan.srtReads[index].value, clean ? CleanDomain : domain);
+                const auto child = Compile(plan.srtReads[index].value, clean ? CleanDomain : domain);
+                if (!child) return std::nullopt;
+                SrtTape::Instruction instruction;
+                instruction.step = SrtTape::Step::Forward;
+                instruction.count = 1;
+                instruction.arguments[0] = *child;
+                return emit(instruction);
             }
             case IrOpcode::LoadAddressU32:
             case IrOpcode::ReadConstBuffer:
@@ -212,6 +230,17 @@ private:
             instruction.count = 5;
         }
         instruction.loaded = LoadedFromMemory(*handle);
+        instruction.read = &value;
+        const auto* baseSource = handle->Argument(0)->Resolve();
+        if (!baseSource->HasImmediate() && baseSource->Opcode() == IrOpcode::GetUserData) {
+            const auto reg = RegIndex(static_cast<ScalarReg>(baseSource->Argument(0)->Register().index));
+            if (reg >= plan.userDataBase && reg - plan.userDataBase < SrtUserDataUse::TrackedWords) instruction.origin = static_cast<std::int32_t>(reg - plan.userDataBase);
+        }
+        if (!baseSource->HasImmediate() && baseSource->Opcode() == IrOpcode::ReadConst && baseSource->ArgumentCount() >= 2 && baseSource->Argument(1) != nullptr) {
+            const auto* slot = baseSource->Argument(1)->Resolve();
+            if (slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < plan.srtReads.size() && plan.srtReads[slot->ImmediateU32()].value != nullptr) baseSource = plan.srtReads[slot->ImmediateU32()].value->Resolve();
+        }
+        if (!baseSource->HasImmediate() && IsRawRead(plan, *baseSource)) instruction.baseRead = baseSource;
         ++reads;
         return emit(instruction);
     }
@@ -219,6 +248,7 @@ private:
     const IrResourcePlan& plan;
     std::vector<SrtTape::Instruction>& instructions;
     std::size_t& reads;
+    bool& tracing;
     std::vector<Domain> domains;
     std::map<std::pair<std::uint32_t, const IrValue*>, SrtTape::Operand> compiled;
     std::map<std::pair<std::uint32_t, const IrValue*>, std::uint32_t> laneDomains;
@@ -240,10 +270,15 @@ class SrtTape::Runner {
 public:
     Runner(const SrtTape& tape, const SrtRuntime& runtime, std::vector<std::uint64_t>& values, std::vector<std::uint8_t>& states, SrtTapeInstance* instance) : tape(tape), runtime(runtime), values(values), states(states), instance(instance) {}
 
-    bool Evaluate(const Operand& operand, std::uint64_t& result, int depth = 0) {
+    bool Evaluate(const Operand& operand, std::uint64_t& result, int depth = 0, bool baseWord = false) {
         if (operand.immediate) {
             result = operand.value;
             return true;
+        }
+        const auto& instruction = tape.instructions[operand.slot];
+        if (auto* use = runtime.userDataUse; use != nullptr) {
+            if (instruction.read != nullptr && depth > 0) use->operandReads.push_back(instruction.read);
+            if (instruction.step == Step::UserData && !baseWord) use->asValue |= instruction.index < SrtUserDataUse::TrackedWords ? std::uint64_t{1} << instruction.index : ~std::uint64_t{0};
         }
         if (!evaluate(operand.slot, depth)) return false;
         result = values[operand.slot];
@@ -293,6 +328,9 @@ private:
                 result = runtime.userData[instruction.index];
                 break;
             case Step::ShaderBase: result = runtime.shaderBase; break;
+            case Step::Forward:
+                if (!Evaluate(instruction.arguments[0], result, depth)) return false;
+                break;
             case Step::Operation: {
                 std::array<std::uint64_t, 4> arguments{};
                 for (std::size_t index = 0; index < instruction.count; ++index) {
@@ -323,7 +361,9 @@ private:
                 std::uint64_t low = 0;
                 std::uint64_t high = 0;
                 std::uint64_t offset = 0;
-                if (!Evaluate(instruction.arguments[0], low, depth + 1) || !Evaluate(instruction.arguments[1], high, depth + 1) || !Evaluate(instruction.arguments[2], offset, depth + 1)) return false;
+                const bool directBase = runtime.userDataUse != nullptr && instruction.origin >= 0 && static_cast<std::size_t>(instruction.origin) < runtime.userData.size();
+                if (directBase) runtime.userDataUse->asBase |= std::uint64_t{1} << instruction.origin;
+                if (!Evaluate(instruction.arguments[0], low, depth + 1, directBase) || !Evaluate(instruction.arguments[1], high, depth + 1) || !Evaluate(instruction.arguments[2], offset, depth + 1)) return false;
                 const auto base = ((high << 32u) | static_cast<std::uint32_t>(low)) & AddressMask;
                 std::uint64_t address = 0;
                 if (instruction.step == Step::RawBuffer) {
@@ -347,6 +387,24 @@ private:
                     ++nullRoots;
                     store(slot, 0);
                     return true;
+                }
+                if (auto* use = runtime.userDataUse; use != nullptr) {
+                    std::uint64_t baseAddress = 0;
+                    if (!directBase && instruction.baseRead != nullptr) {
+                        for (auto index = use->readInstructions.size(); index-- > 0;) {
+                            if (use->readInstructions[index] == instruction.baseRead) {
+                                baseAddress = use->reads[index].first;
+                                break;
+                            }
+                        }
+                    }
+                    use->reads.emplace_back(address, directBase ? instruction.origin : -1);
+                    use->readBases.push_back(baseAddress);
+                    use->readInstructions.push_back(instruction.read);
+                }
+                if (auto* trace = runtime.readTrace; trace != nullptr) {
+                    if (trace->leaf == instruction.read) trace->leaves.emplace_back(trace->leafSlot, address);
+                    else trace->otherReads.push_back(address);
                 }
                 if (runtime.stableWord != nullptr && inputsUnchanged(slot, instruction) && runtime.stableWord(runtime.userContext, address, static_cast<std::uint32_t>(instance->values[slot]))) {
                     ++instance->keptReads;
@@ -395,7 +453,8 @@ std::shared_ptr<const SrtTape> SrtTape::Compile(const IrResourcePlan& plan, std:
     tape->userDataBase = plan.userDataBase;
     tape->sourceCount = plan.descriptorSources.size();
     tape->imageCount = plan.info.images.size();
-    TapeCompiler compiler(plan, tape->instructions, tape->reads);
+    tape->tracing = plan.controlFlow.empty();
+    TapeCompiler compiler(plan, tape->instructions, tape->reads, tape->tracing);
     const auto failed = [&] { return compiler.Refusal() != SrtCompiledWalkRefusal::None ? compiler.Refusal() : SrtCompiledWalkRefusal::Opcode; };
     for (const auto& block : plan.controlFlow) {
         Block compiledBlock;
@@ -433,6 +492,14 @@ std::shared_ptr<const SrtTape> SrtTape::Compile(const IrResourcePlan& plan, std:
             if (!operand) return refuse(failed());
             compiledSource.dwords[index] = *operand;
         }
+        if (source.dwordCount != 0u) {
+            auto* lead = source.dwords[0]->Resolve();
+            if (!lead->HasImmediate() && lead->Opcode() == IrOpcode::ReadConst && lead->ArgumentCount() == 2) {
+                const auto* slot = lead->Argument(1)->Resolve();
+                if (slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < plan.srtReads.size()) lead = plan.srtReads[slot->ImmediateU32()].value->Resolve();
+            }
+            if (!lead->HasImmediate() && IsRawRead(plan, *lead)) compiledSource.lead = lead;
+        }
         tape->sources.push_back(compiledSource);
     }
     tape->flatSize = plan.srtReads.size();
@@ -442,7 +509,7 @@ std::shared_ptr<const SrtTape> SrtTape::Compile(const IrResourcePlan& plan, std:
         const bool clean = read.flatOffset < plan.cleanFlatSlots.size() && plan.cleanFlatSlots[read.flatOffset] != 0u;
         const auto operand = compiler.Compile(read.value, clean ? CleanDomain : MainDomain);
         if (!operand) return refuse(failed());
-        tape->flatRoots.push_back({read.flatOffset, *operand});
+        tape->flatRoots.push_back({read.flatOffset, *operand, read.value->Resolve(), read.flatOffset < plan.pureFlatSlots.size() && plan.pureFlatSlots[read.flatOffset] != 0u});
     }
     return tape;
 }
@@ -454,7 +521,7 @@ std::shared_ptr<const SrtTape> SrtTape::For(const IrResourcePlan& plan) {
 }
 
 SrtTape::Outcome SrtTape::Run(const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::uint32_t& nullRootReads) const {
-    if (!Compiled() || (requiresCleanMemory && runtime.readSpecializationMemory == nullptr)) return Outcome::Failed;
+    if (!Compiled() || ((runtime.userDataUse != nullptr || runtime.readTrace != nullptr) && !SupportsTracing()) || (requiresCleanMemory && runtime.readSpecializationMemory == nullptr)) return Outcome::Failed;
     auto& values = HostThreadLocal<std::vector<std::uint64_t>, TapeValuesTag>();
     auto& states = HostThreadLocal<std::vector<std::uint8_t>, TapeStatesTag>();
     values.resize(instructions.size());
@@ -520,11 +587,18 @@ SrtTape::Outcome SrtTape::Run(const SrtRuntime& runtime, std::vector<DescriptorV
             }
         }
         evaluated.push_back(value);
+        if (runtime.userDataUse != nullptr && source.lead != nullptr) runtime.userDataUse->sourceLeads.emplace_back(source.index, source.lead);
     }
     std::vector<std::uint32_t> flattened(flatSize);
     for (const auto& root : flatRoots) {
         std::uint64_t word = 0;
-        if (!runner.Evaluate(root.value, word)) return outcome();
+        if (runtime.readTrace != nullptr && root.pure) {
+            runtime.readTrace->leaf = root.leaf;
+            runtime.readTrace->leafSlot = root.flatOffset;
+        }
+        const bool served = runner.Evaluate(root.value, word);
+        if (runtime.readTrace != nullptr && root.pure) runtime.readTrace->leaf = nullptr;
+        if (!served) return outcome();
         flattened[root.flatOffset] = static_cast<std::uint32_t>(word);
     }
     results = std::move(evaluated);

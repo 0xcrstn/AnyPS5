@@ -489,7 +489,7 @@ void BdaResources::markWrittenPages() const {
                 Require(false, message.str());
             }
         }
-        GuestMemory::MarkWritten(begin, bytes);
+        GuestMemory::MarkWritten(begin, bytes, GuestMemory::WriteExtent::Possible);
         if (Coherence::Tracking()) written.push_back({begin, end});
     }), "invalid BDA written-page record");
     for (std::uint32_t claim = 0; claim < count; ++claim) {

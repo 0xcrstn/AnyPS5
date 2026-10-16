@@ -200,6 +200,13 @@ void changedUnits(const UnitShadow& shadow, std::uint64_t first, std::uint64_t l
     const auto end = std::min(shadow.UnitBegin(last + 1), shadow.ImportEnd());
     if (end <= begin) return;
     GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), std::span(shadow.generation).subspan(static_cast<std::size_t>(first), count), changed, cpu);
+    for (auto unit = first; unit <= last; ++unit) {
+        const auto index = static_cast<std::size_t>(unit - first);
+        if (!shadow.Live(unit) || changed[index] == GuestMemory::BlockUnchanged) continue;
+        const auto from = std::max(shadow.UnitBegin(unit), shadow.importBase);
+        const auto to = std::min(shadow.UnitBegin(unit + 1), shadow.ImportEnd());
+        changed[index] = GuestMemory::ProvenStoredOver(from, static_cast<std::size_t>(to - from), shadow.generation[unit]) ? GuestMemory::BlockWritten : GuestMemory::BlockUnchanged;
+    }
 }
 
 std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t firstUnit, std::uint32_t units) {
@@ -306,7 +313,7 @@ void verifyPublished(const UnitShadow& shadow, const std::vector<SlabCopies>& co
             host.Invalidate();
             const auto address = shadow.importBase + region.dstOffset;
             Stats().verified.fetch_add(1, std::memory_order_relaxed);
-            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(region.size)) || std::memcmp(reinterpret_cast<const void*>(address), host.Bytes().data(), static_cast<std::size_t>(region.size)) != 0) {
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(region.size)) || !GuestMemory::CompareDriverMemory(reinterpret_cast<const void*>(address), host.Bytes().data(), static_cast<std::size_t>(region.size))) {
                 Stats().mismatches.fetch_add(1, std::memory_order_relaxed);
                 static std::atomic<int> reports{0};
                 if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[shadow] verify: published bytes differ from the slab at 0x%llx+0x%llx\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(region.size));

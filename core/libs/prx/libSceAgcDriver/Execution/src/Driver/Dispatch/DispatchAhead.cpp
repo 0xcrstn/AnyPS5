@@ -102,6 +102,7 @@ bool OverlapsLabel(std::span<const ShaderRecompiler::MemoryRegion> regions, cons
 }
 
 void Driver::resolveGroupAhead(const Submission& submission, const QueueState& live, std::size_t from) {
+    DrawTrace::Span groupScope("Driver.ResolveGroupAhead");
     static const bool allQueues = std::getenv("APS5_GROUP_CAPTURE_ALL_QUEUES") != nullptr;
     const bool pipelineOnly = !allQueues && submission.queue == 0;
     if (pipelineOnly && (!VulkanDevice::PipelineCompileAheadEnabled() || !deferredLabels().labels.empty())) return;
@@ -143,6 +144,10 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
         if (pipelineOnly && count > 4096 - (cursor - from)) break;
         const auto packet = std::span(commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        auto packetOrigin = submission.TraceAt(cursor);
+        packetOrigin.job = DrawTrace::Current().job;
+        DrawTrace::ContextScope preparationOrigin(packetOrigin);
+        DrawTrace::BoundaryReference(DrawTrace::Current().packet, "packet");
         const auto next = cursor + count;
         if (header == FlipPacketHeader || header == RenderingWaitPacketHeader || opcode == 0x22 || (Pm4::Predicated(header) && scratch.predication.operation != 0)) break;
         if (opcode == 0x3c || opcode == 0x93) {
@@ -173,6 +178,8 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
             }
             currentPacketOffset() = cursor;
             try {
+                DrawTrace::Span preparationScope("Driver.PrepareDispatchAhead");
+                DrawTrace::Note("prepare_only", std::uint64_t{1});
                 if (opcode == 0x15) dispatch(scratch, packet, submission);
                 else dispatchIndirect(scratch, packet, submission);
                 Pm4::NoteDispatchRegisters(packet, scratch);

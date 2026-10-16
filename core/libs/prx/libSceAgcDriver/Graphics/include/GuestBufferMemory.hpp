@@ -17,6 +17,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "prx/libc/include/GuestArena.hpp"
+
+namespace AgcDriver::GuestMemory { class DriverGpuWrite; }
 
 namespace AgcDriver::Graphics {
 
@@ -57,6 +60,8 @@ struct HostImport {
     bool unwatched = false;
     bool dmaBuf = false;
     bool joined = false;
+    bool mappingProof = false;
+    std::vector<GuestArena::MappingSpan> mappingSpans;
     std::shared_ptr<void> chunk;
     mutable std::uint64_t lastUse = 0;
 };
@@ -81,13 +86,13 @@ void SetImportWatch(const Context& context, ImportWatch watch);
 // The host import of the registered allocation containing [address, address + bytes), made on demand
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
 // the import's buffer.
-const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, bool requireWatched = false);
 struct HostImportView {
     VkBuffer buffer = VK_NULL_HANDLE;
     std::uint64_t base = 0;
 };
 std::optional<HostImportView> ImportedHostRange(const Context& context, std::uint64_t address, std::size_t bytes);
-const HostImport* HostImportSpanning(const Context& context, std::uint64_t address, std::size_t bytes);
+const HostImport* HostImportSpanning(const Context& context, std::uint64_t address, std::size_t bytes, bool requireWatched = false);
 void SetHostImportWindow(std::uint64_t bytes);
 // Tests: the window of one large registered range (64 MiB) and the import budget (0: the configured one).
 void SetHostImportRangeWindow(std::uint64_t bytes);
@@ -324,6 +329,10 @@ public:
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
     void MarkDirectWrites() const;
+    void MarkDirectWrites(Recorder& recorder) const;
+    void RecordDirectWriteSnapshots(Recorder& recorder) const;
+    void MarkObservedDirectWrites() const;
+    void PrepareDirectWriteSnapshots() const;
     // Records, into the recorder's open batch, the copy of every written sub-range of a region the
     // GPU copied out of a host import (see Region::gpuCopy) back into the import: what the shader
     // wrote lands in guest memory by the GPU, ordered after the recorded work, so the region needs
@@ -491,6 +500,14 @@ private:
     bool takeShadow(Region& region, bool addressable);
     static void settleShadow(const Region& region, std::uint64_t generation, bool complete = false);
     void takeHeapReferences();
+    void markDirectWrites(bool observed) const;
+    const GuestMemory::DriverGpuWrite* directWriteSnapshot(std::uint64_t begin, std::uint64_t end) const;
+    struct DirectWriteSnapshot {
+        std::uint64_t begin, end, base, serial;
+        VkBuffer buffer;
+        std::shared_ptr<GuestMemory::DriverGpuWrite> payload;
+    };
+    mutable std::vector<DirectWriteSnapshot> directWriteSnapshots;
     Context context;
     bool stagingAllowed = false;
     bool adjustedRegions = false;

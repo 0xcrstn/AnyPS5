@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCreationTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <array>
@@ -258,6 +259,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     std::array<VkPipeline, 4> handles{};
     std::array<std::shared_future<VkPipeline>, 4> joined;
     std::array<std::optional<std::promise<VkPipeline>>, 4> owned;
+    std::array<bool, 4> registered{};
     std::array<VkGraphicsPipelineLibraryCreateInfoEXT, 4> libraryInfos{};
     std::array<VkGraphicsPipelineCreateInfo, 4> creates{};
     for (std::size_t part = 0; part < flags.size(); ++part) {
@@ -271,9 +273,12 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         }
         if (onlyReadyParts && !partsOnly) throw PipelineLibraryPartsMissing{};
         if (const auto building = device.building[part].find(key); building != device.building[part].end()) {
-            joined[part] = building->second;
-            ++device.counters.joinedParts[part];
-            continue;
+            if (!GuestMemory::GpuMutex().HeldByThisThread() && !context.pipelinePreparationNoWait) {
+                joined[part] = building->second;
+                ++device.counters.joinedParts[part];
+                continue;
+            }
+            ++device.counters.duplicateBuilds;
         }
         auto& library = libraryInfos[part];
         library = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, flags[part] == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT ? &rendering : &shaderRendering};
@@ -309,7 +314,11 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             break;
         }
         owned[part].emplace();
-        device.building[part].emplace(key, owned[part]->get_future().share());
+        if (!device.building[part].contains(key)) {
+            device.building[part].emplace(key, owned[part]->get_future().share());
+            registered[part] = true;
+        }
+        if (GuestMemory::GpuMutex().HeldByThisThread()) ++device.counters.buildsUnderGpuMutex;
     }
     lock.unlock();
     std::exception_ptr failure;
@@ -318,7 +327,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         const auto& key = combinedKeys[part];
         if (failure != nullptr) {
             lock.lock();
-            device.building[part].erase(key);
+            if (registered[part]) device.building[part].erase(key);
             lock.unlock();
             owned[part]->set_exception(failure);
             continue;
@@ -367,14 +376,14 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
                 ++device.counters.built[part];
                 ++ThreadBuiltLibraryParts()[part];
             }
-            device.building[part].erase(key);
+            if (registered[part]) device.building[part].erase(key);
             lock.unlock();
             handles[part] = handle;
             owned[part]->set_value(handle);
         } catch (...) {
             failure = std::current_exception();
             if (!lock.owns_lock()) lock.lock();
-            device.building[part].erase(key);
+            if (registered[part]) device.building[part].erase(key);
             lock.unlock();
             owned[part]->set_exception(failure);
         }
@@ -475,12 +484,14 @@ void OptimizedPipeline::Release() noexcept {
 void WaitForOptimizedPipelines(VkDevice device) {
     auto& store = Libraries();
     std::unique_lock lock(store.mutex);
+    Require(store.pending[device] == 0 || !GuestMemory::GpuMutex().HeldByThisThread(), "pipeline library completion cannot wait under GpuMutex");
     store.idle.wait(lock, [&] { return store.pending[device] == 0; });
 }
 
 void ClearPipelineLibraries(VkDevice device) {
     auto& store = Libraries();
     std::unique_lock lock(store.mutex);
+    Require(store.pending[device] == 0 || !GuestMemory::GpuMutex().HeldByThisThread(), "pipeline library teardown cannot wait under GpuMutex");
     store.idle.wait(lock, [&] { return store.pending[device] == 0; });
     const auto found = store.devices.find(device);
     if (found == store.devices.end()) return;

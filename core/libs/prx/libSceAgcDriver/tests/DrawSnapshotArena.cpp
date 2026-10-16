@@ -400,7 +400,43 @@ void MovedWordTests(Fixture& fixture, bool ring) {
     const auto replaced = take(1, false);
     const std::array<std::uint32_t, 4> originalWords{1u, 2u, 3u, 4u};
     Require((original.handle != replaced.handle || original.offset != replaced.offset) && std::memcmp(original.bytes.data(), originalWords.data(), sizeof(originalWords)) == 0, "moved-word eviction overwrote a snapshot an earlier draw owns");
+    {
+        Recorder other(fixture.GetContext());
+        ShaderResources::MovedBuffer moved{0, 0, 16, {1u, 2u, 3u, 4u}};
+        Statistics firstStatistics;
+        const auto first = resources.PrepareDrawBindings(other, std::span(&moved, 1), &firstStatistics);
+        Require(first != nullptr && firstStatistics.copied == 1 && firstStatistics.reused == 0, "another recorder reused per-use word storage from the first recorder");
+        Statistics secondStatistics;
+        const auto second = resources.PrepareDrawBindings(other, std::span(&moved, 1), &secondStatistics);
+        Require(second != nullptr && secondStatistics.reused == 1 && second->snapshots.front().handle == first->snapshots.front().handle, "a recorder did not reuse its own word placement");
+        Require(first->snapshots.front().handle != replaced.handle, "separate recorders share a mutable word allocation");
+        take(1, true);
+        other.Sync();
+    }
     ShaderResources::SetMovedWordRing(false);
+}
+
+void WordOwnerTests(Fixture& fixture) {
+    auto& recorder = fixture.GetRecorder();
+    auto& arena = recorder.SnapshotArena();
+    const std::array<std::uint32_t, 4> words{1, 2, 3, 4};
+    const std::array patches{DrawSnapshotArena::DataPatch{0, 1, 0x7f}};
+    const auto owner = DrawSnapshotArena::NextWordKey();
+    const auto first = arena.PlaceWords(recorder, owner, 0, words, sizeof(words), patches, false);
+    Require(first.view.bytes[1] == std::byte{0x7f}, "word placement omitted a descriptor adjustment");
+    for (std::size_t index = 0; index < 256; ++index) {
+        const auto other = arena.PlaceWords(recorder, DrawSnapshotArena::NextWordKey(), 0, words, sizeof(words), {}, false);
+        Require(other.view.bytes[1] == std::byte{0}, "another template inherited the first template's descriptor adjustment");
+    }
+    const auto replaced = arena.PlaceWords(recorder, owner, 0, words, sizeof(words), patches, false);
+    Require(replaced.view.copied && first.view.buffer != replaced.view.buffer && first.view.bytes[1] == std::byte{0x7f}, "owner eviction overwrote a live draw's patched words");
+    bool rejected = false;
+    try {
+        static_cast<void>(arena.PlaceWords(recorder, owner, 0, words, sizeof(words) + 1, {}, false));
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    Require(rejected, "word placement read beyond the captured words");
 }
 
 void ContentTests(Fixture& fixture) {
@@ -433,7 +469,7 @@ void ContentTests(Fixture& fixture) {
     const auto e = fixture.Take(1024, 1024, &fifth);
     Require(fifth.arenaHits == 1 && e.handle == d.handle && e.offset == d.offset + 1024 && SameBytes(e, fixture.Bytes(1024)), "the recopied page did not serve a later range");
     std::memset(fixture.Bytes(1024), 0x33, 16);
-    GuestMemory::MarkWritten(fixture.Address() + 1024, 16);
+    GuestMemory::MarkWritten(fixture.Address() + 1024, 16, AgcDriver::GuestMemory::WriteExtent::Exact);
     Statistics sixth{};
     const auto f = fixture.Take(1024, 1024, &sixth);
     Require(sixth.arenaCopies == 1 && SameBytes(f, fixture.Bytes(1024)), "a driver store did not make the arena copy again");
@@ -709,7 +745,7 @@ void EpochDirtySetTests(Fixture& fixture) {
         Require(fourth.copied == 1 && SameBytes(d, fixture.Bytes(16384)), std::string("a CPU store before an ordering point did not make the snapshot again") + mode);
         Require(Holds(a, std::byte{0x61}), std::string("a new snapshot overwrote the bytes an earlier draw binds") + mode);
         std::memset(fixture.Bytes(16384 + 1024), 0x63, 16);
-        GuestMemory::MarkWritten(fixture.Address() + 16384 + 1024, 16);
+        GuestMemory::MarkWritten(fixture.Address() + 16384 + 1024, 16, AgcDriver::GuestMemory::WriteExtent::Exact);
         Statistics fifth{};
         const auto e = fixture.Take(16384, 4096, &fifth);
         Require(fifth.copied == 1 && SameBytes(e, fixture.Bytes(16384)), std::string("a driver store in the same epoch did not make the snapshot again") + mode);
@@ -774,7 +810,7 @@ void EpochDirtyOwnedRangeTests(const Context& context) {
         const auto tail = fixture.Take(blockBytes, smallBytes, &second);
         Require(second.arenaHits == 1 && tail.handle == prefix.handle && Holds(tail, std::byte{0x71}), std::string("the default arena extension did not own the later range") + mode);
         std::memset(fixture.Bytes(blockBytes), 0x72, smallBytes);
-        GuestMemory::MarkWritten(fixture.Address() + blockBytes, smallBytes);
+        GuestMemory::MarkWritten(fixture.Address() + blockBytes, smallBytes, AgcDriver::GuestMemory::WriteExtent::Exact);
         Statistics third{};
         const auto cleanPrefix = fixture.Take(0, smallBytes, &third);
         Require(third.arenaHits == 1 && Holds(cleanPrefix, std::byte{0x71}), std::string("a write outside the requested prefix prevented its reuse") + mode);
@@ -792,7 +828,7 @@ void EpochDirtyOwnedRangeTests(const Context& context) {
         std::memcpy(vertex->Bytes().data(), reinterpret_cast<const void*>(address), vertexBytes);
         recorder.KeepDrawSnapshot(address, vertexBytes, generation, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), vertex, Recorder::SnapshotUse::Vertex, 0, GuestMemory::DirtySerial());
         std::memset(fixture.Bytes(5 * blockBytes), 0x73, smallBytes);
-        GuestMemory::MarkWritten(address + blockBytes, smallBytes);
+        GuestMemory::MarkWritten(address + blockBytes, smallBytes, AgcDriver::GuestMemory::WriteExtent::Exact);
         Require(recorder.ReusableDrawSnapshot(address, smallBytes, Recorder::SnapshotUse::Vertex) == vertex, std::string("a write outside the smaller vertex request prevented its reuse") + mode);
         Require(recorder.ReusableDrawSnapshot(address, vertexBytes, Recorder::SnapshotUse::Vertex) == nullptr, std::string("a smaller vertex request hid a write in the larger owned snapshot") + mode);
         Require(vertex->Bytes()[blockBytes] == std::byte{0x71}, std::string("a vertex cache rejection overwrote an earlier draw's bytes") + mode);
@@ -848,7 +884,7 @@ void EpochDirtyReferenceTests(const Context& context) {
         Require(recorder.UnwrittenDrawSnapshot(address + blockBytes, snapshotBytes, unknownStamp) == unknown, "a valid generation failed the unknown-generation control");
         recorder.NoteUnwrittenDrawSnapshot(address + blockBytes, snapshotBytes, unknownStamp, 0, unknown);
         Require(recorder.UnwrittenDrawSnapshot(address + blockBytes, snapshotBytes, unknownStamp) == nullptr, "an unknown generation reused an unwritten snapshot at an equal serial");
-        Require(GuestMemory::MarkWritten(address, snapshotBytes) != 0, "the unknown-generation fixture could not advance the dirty serial");
+        Require(GuestMemory::MarkWritten(address, snapshotBytes, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "the unknown-generation fixture could not advance the dirty serial");
         Require(recorder.UnwrittenDrawSnapshot(address + blockBytes, snapshotBytes, stamp()) == nullptr, "an unknown generation reused an unwritten snapshot across serials");
         for (const auto offset : {snapshotBytes, std::size_t{4096}}) {
             GuestMemory::BumpCollectEpoch();
@@ -858,7 +894,7 @@ void EpochDirtyReferenceTests(const Context& context) {
             const auto captured = stamp();
             recorder.KeepDrawSnapshot(address, snapshotBytes, generation, captured[2], buffer, Recorder::SnapshotUse::Vertex, 0, captured[0]);
             recorder.NoteUnwrittenDrawSnapshot(address, snapshotBytes, captured, generation, buffer);
-            Require(GuestMemory::MarkWritten(address + offset, snapshotBytes) != 0, "a sibling driver store was not stamped");
+            Require(GuestMemory::MarkWritten(address + offset, snapshotBytes, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "a sibling driver store was not stamped");
             Require(recorder.ReusableDrawSnapshot(address, snapshotBytes, Recorder::SnapshotUse::Vertex) == nullptr, "a disjoint driver store in the reference block retained a vertex proof");
             Require(recorder.UnwrittenDrawSnapshot(address, snapshotBytes, stamp()) == nullptr, "a disjoint driver store in the reference block retained an unwritten proof");
             Require(buffer->Bytes().front() == std::byte{0x71}, "rejecting a sibling driver store changed an earlier snapshot");
@@ -870,9 +906,9 @@ void EpochDirtyReferenceTests(const Context& context) {
         const auto unrelatedStamp = stamp();
         recorder.KeepDrawSnapshot(address, snapshotBytes, unrelatedGeneration, unrelatedStamp[2], unrelated, Recorder::SnapshotUse::Vertex, 0, unrelatedStamp[0]);
         recorder.NoteUnwrittenDrawSnapshot(address, snapshotBytes, unrelatedStamp, unrelatedGeneration, unrelated);
-        Require(GuestMemory::MarkWritten(address + blockBytes + 4096, snapshotBytes) != 0, "a driver store in a distinct block was not stamped");
+        Require(GuestMemory::MarkWritten(address + blockBytes + 4096, snapshotBytes, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "a driver store in a distinct block was not stamped");
         Require(recorder.ReusableDrawSnapshot(address, snapshotBytes, Recorder::SnapshotUse::Vertex) == unrelated && recorder.UnwrittenDrawSnapshot(address, snapshotBytes, stamp()) == unrelated, "a store in a distinct 64 KiB block prevented snapshot reuse");
-        Require(GuestMemory::MarkWritten(address, snapshotBytes) != 0, "the serial-advancement store was not stamped");
+        Require(GuestMemory::MarkWritten(address, snapshotBytes, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "the serial-advancement store was not stamped");
         Require(recorder.ReusableDrawSnapshot(address, snapshotBytes, Recorder::SnapshotUse::Vertex) == nullptr && recorder.UnwrittenDrawSnapshot(address, snapshotBytes, stamp()) == nullptr, "advancing a reusable snapshot serial hid a later overlapping store");
         Require(unrelated->Bytes().front() == std::byte{0x71}, "advancing a reusable snapshot serial changed an earlier draw's bytes");
         GuestMemory::BumpCollectEpoch();
@@ -892,7 +928,7 @@ void EpochDirtyReferenceTests(const Context& context) {
             Require(staleGeneration != 0, "the stale-proof fixture was not collected");
             auto stale = snapshot();
             fixture.Bytes(0)[0] = std::byte{0x73};
-            Require(GuestMemory::MarkWritten(address, snapshotBytes) != 0, "the stale-proof store was not stamped");
+            Require(GuestMemory::MarkWritten(address, snapshotBytes, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "the stale-proof store was not stamped");
             recorder.KeepDrawSnapshot(address, snapshotBytes, staleGeneration, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), stale, Recorder::SnapshotUse::Vertex, 0, GuestMemory::DirtySerial());
             Require(recorder.ReusableDrawSnapshot(address, snapshotBytes, Recorder::SnapshotUse::Vertex) == nullptr, "verification accepted a stale snapshot with an incorrectly advanced dirty serial");
             Require(GuestMemory::DirtySetStatistics().verifyDisagreements == disagreementsBefore + 1, "a genuine stale snapshot disagreement was suppressed");
@@ -1028,6 +1064,7 @@ bool RunDrawSnapshotArenaTests(const Context& context) {
         PersistentSetTests(fixture);
         MovedWordTests(fixture, false);
         MovedWordTests(fixture, true);
+        WordOwnerTests(fixture);
         PendingWriteTests(fixture);
         GpuReadTests(fixture);
         DeviceTwinTests(fixture);

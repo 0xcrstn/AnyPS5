@@ -2,8 +2,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/EmitRecording.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -17,14 +21,20 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <functional>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -35,7 +45,6 @@ using AgcDriver::Graphics::Require;
 constexpr std::uint32_t Width = 64;
 constexpr std::uint32_t Height = 32;
 constexpr std::size_t Block = 65536;
-constexpr std::size_t ColorBytes = Width * Height * 4;
 constexpr std::uint32_t SetContextReg = 0x69u;
 constexpr std::uint32_t SetShReg = 0x76u;
 constexpr std::uint32_t SetUconfigReg = 0x79u;
@@ -53,12 +62,27 @@ alignas(256) constexpr std::array<std::uint32_t, 16> BufferPixelCode{
 alignas(16) std::array<std::array<float, 4>, 4> Vertices{{{-3.0f, -1.0f, 0.5f, 1.0f}, {1.0f, -1.0f, 0.5f, 1.0f}, {1.0f, 3.0f, 0.5f, 1.0f}, {1.0f, 3.0f, 0.5f, 1.0f}}};
 alignas(16) std::array<std::uint32_t, 4> VertexTable{};
 alignas(16) std::array<std::uint32_t, 4> FullTable{};
+alignas(16) std::array<std::uint32_t, 4> PredicateFullTable{};
 alignas(16) std::array<std::uint32_t, 4> ValueTable{};
 alignas(16) std::array<float, 4> Full{1.0f, 0.0f, 0.0f, 0.0f};
 alignas(16) std::array<float, 12> Values{};
 alignas(16) volatile std::uint32_t Condition = 1;
 bool NopBeforeCondition = false;
 bool WideStore = false;
+bool TableWrite = false;
+std::size_t ExtraDraws = 0;
+int PredicateValue = -1;
+bool ShaderPredicate = false;
+int CopyContextMask = -1;
+alignas(16) std::uint32_t CopyContextSource = 0;
+alignas(16) volatile std::uint32_t CopyRegisterOutput = 0;
+std::atomic<bool> DelayPredicateProducer{false};
+std::mutex predicateDelayMutex;
+std::condition_variable predicateDelayChanged;
+bool predicateProducerBlocked = false;
+bool predicateProducerReleased = false;
+alignas(16) volatile std::uint32_t Predicate = 0;
+alignas(16) std::array<std::uint32_t, 4> RegisterPairs{};
 alignas(64) volatile std::uint32_t EndOfPipe = 0;
 std::byte* ColorMemory = nullptr;
 
@@ -142,6 +166,7 @@ std::vector<std::uint32_t> Frame(bool writeData) {
     const auto vertexTable = reinterpret_cast<std::uintptr_t>(VertexTable.data());
     std::vector<std::uint32_t> words;
     for (const auto& [offset, value] : ContextBaseline) SetRegister(words, SetContextReg, offset, value);
+    if (ExtraDraws != 0) SetRegister(words, SetContextReg, 0x3b8, 0x0906c000u);
     SetRegister(words, SetContextReg, 0x318, static_cast<std::uint32_t>(colorAddress >> 8u));
     SetRegister(words, SetContextReg, 0x390, static_cast<std::uint32_t>(colorAddress >> 40u));
     SetRegister(words, SetContextReg, 0x3b0, ((Width - 1u) << 14u) | (Height - 1u));
@@ -158,7 +183,7 @@ std::vector<std::uint32_t> Frame(bool writeData) {
     SetRegister(words, SetShReg, 0x008, static_cast<std::uint32_t>(pixelAddress >> 8u));
     SetRegister(words, SetShReg, 0x009, static_cast<std::uint32_t>(pixelAddress >> 40u));
     SetRegister(words, SetShReg, 0x00b, 2u << 1u);
-    SetPixelTable(words, FullTable.data());
+    SetPixelTable(words, ShaderPredicate ? PredicateFullTable.data() : FullTable.data());
     SetRegister(words, SetShReg, 0x0c8, static_cast<std::uint32_t>(vertexAddress >> 8u));
     SetRegister(words, SetShReg, 0x0c9, static_cast<std::uint32_t>(vertexAddress >> 40u));
     SetRegister(words, SetShReg, 0x08b, 2u << 1u);
@@ -178,27 +203,59 @@ std::vector<std::uint32_t> Frame(bool writeData) {
         if (NopBeforeCondition) words.insert(words.end(), {0xc0001000u, 0u});
         words.insert(words.end(), {0xc0032200u, static_cast<std::uint32_t>(condition), static_cast<std::uint32_t>(static_cast<std::uint64_t>(condition) >> 32u), 0u, 9u});
     }
-    SetPixelTable(words, ValueTable.data());
-    words.insert(words.end(), {0xc0012d00u, 3u, 2u});
+    if (TableWrite) {
+        const auto value = reinterpret_cast<std::uintptr_t>(ValueTable.data());
+        const auto table = reinterpret_cast<std::uintptr_t>(RegisterPairs.data());
+        words.insert(words.end(), {0xc0063700u, 0x500u, static_cast<std::uint32_t>(table), static_cast<std::uint32_t>(static_cast<std::uint64_t>(table) >> 32u), 0x00cu, static_cast<std::uint32_t>(value), 0x00du, static_cast<std::uint32_t>(static_cast<std::uint64_t>(value) >> 32u)});
+        words.insert(words.end(), {0xc0036300u, static_cast<std::uint32_t>(table), static_cast<std::uint32_t>(static_cast<std::uint64_t>(table) >> 32u), 0x80000000u, 2u});
+    } else {
+        SetPixelTable(words, ValueTable.data());
+    }
+    if (CopyContextMask >= 0) {
+        const auto source = reinterpret_cast<std::uintptr_t>(&CopyContextSource);
+        words.insert(words.end(), {0xc0033700u, 0x500u, static_cast<std::uint32_t>(source), static_cast<std::uint32_t>(static_cast<std::uint64_t>(source) >> 32u), static_cast<std::uint32_t>(CopyContextMask)});
+        words.insert(words.end(), {0xc0044000u, 0x1u, static_cast<std::uint32_t>(source), static_cast<std::uint32_t>(static_cast<std::uint64_t>(source) >> 32u), 0xa08fu, 0u});
+    }
+    if (PredicateValue >= 0) {
+        const auto predicate = ShaderPredicate ? reinterpret_cast<std::uintptr_t>(ColorMemory) : reinterpret_cast<std::uintptr_t>(&Predicate);
+        if (!ShaderPredicate) words.insert(words.end(), {0xc0033700u, 0x500u, static_cast<std::uint32_t>(predicate), static_cast<std::uint32_t>(static_cast<std::uint64_t>(predicate) >> 32u), static_cast<std::uint32_t>(PredicateValue)});
+        words.insert(words.end(), {0xc0022000u, (4u << 16u) | 0x100u, static_cast<std::uint32_t>(predicate), static_cast<std::uint32_t>(static_cast<std::uint64_t>(predicate) >> 32u)});
+        words.insert(words.end(), {0xc0012d01u, 3u, 2u});
+        words.insert(words.end(), {0xc0022000u, 0u, 0u, 0u});
+    } else {
+        words.insert(words.end(), {0xc0012d00u, 3u, 2u});
+    }
+    for (std::size_t i = 0; i < ExtraDraws; ++i) words.insert(words.end(), {0xc0012d00u, 3u, 2u});
+    if (CopyContextMask >= 0) {
+        const auto destination = reinterpret_cast<std::uintptr_t>(&CopyRegisterOutput);
+        words.insert(words.end(), {0xc0044000u, 0x00100200u, 0xa08fu, 0u, static_cast<std::uint32_t>(destination), static_cast<std::uint32_t>(static_cast<std::uint64_t>(destination) >> 32u)});
+        SetRegister(words, SetContextReg, 0x8f, CopyContextMask == 0 ? 15u : 0u);
+    }
     ReleaseMemory(words, &EndOfPipe, 1u, 2u);
     return words;
 }
 
-std::uint32_t CentreRed(const std::string& what, bool writeData = false) {
-    std::fill_n(ColorMemory, ColorBytes, std::byte{0});
+std::uint32_t CentreRed(const std::string& what, bool writeData = false, const std::function<void()>& submitted = {}) {
+    const AgcDriver::Graphics::ColorTargetLayout layout(Width, Height, ExtraDraws != 0 ? AgcDriver::Graphics::ColorTileMode::RenderTarget : AgcDriver::Graphics::ColorTileMode::Linear);
+    std::fill_n(ColorMemory, layout.Bytes(), std::byte{0});
     EndOfPipe = 0;
     Values = {};
     Values[0] = 1.0f;
     Condition = 1;
+    CopyContextSource = 0xdeadbeefu;
+    CopyRegisterOutput = 0xdeadbeefu;
+    const auto full = reinterpret_cast<std::uintptr_t>(FullTable.data());
+    RegisterPairs = {0x00cu, static_cast<std::uint32_t>(full), 0x00du, static_cast<std::uint32_t>(static_cast<std::uint64_t>(full) >> 32u)};
     auto words = Frame(writeData);
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, what + ": the submission failed");
+    if (submitted) submitted();
     AgcDriverWaitIdle_nid_postfix();
     Require(EndOfPipe == 1u, what + ": the end-of-pipe label was not written");
     Require(Values[0] == 0.5f, what + ": the RELEASE_MEM label did not store its value");
-    std::vector<std::byte> colors(ColorBytes);
+    std::vector<std::byte> colors(layout.Bytes());
     AgcDriver::GuestMemory::Read(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(ColorMemory)), colors);
-    const auto center = ((Height / 2u) * Width + Width / 2u) * 4u;
+    const auto center = layout.Offset(Width / 2u, Height / 2u);
     return std::to_integer<std::uint32_t>(colors[center]);
 }
 
@@ -247,6 +304,19 @@ void DrawsSeeWideWriteData(bool jobs) {
     else Require(after.memoryPackets > before.memoryPackets, "no wide WRITE_DATA was recorded as an ordered memory job while draws were in flight");
 }
 
+void IndirectRegistersSeeWriteData() {
+    const auto before = AgcDriver::DriverDetail::Driver::DeferredRegisterLists();
+    TableWrite = true;
+    for (std::uint64_t frame = 0; frame < 4; ++frame) {
+        const auto name = "a SET_SH_REG_INDIRECT after a WRITE_DATA of its register list in the same command buffer, frame " + std::to_string(frame);
+        const auto red = CentreRed(name);
+        Require(red + 1u >= 128u && red <= 129u, name + ": the draw wrote red " + std::to_string(red) + ", expected 128 through the list the WRITE_DATA stored");
+    }
+    TableWrite = false;
+    const auto deferred = AgcDriver::DriverDetail::Driver::DeferredRegisterLists() - before;
+    Require(deferred == 4u, std::to_string(deferred) + " register lists were left for their packet over 4 command buffers that write them first, expected 4");
+}
+
 void ConditionsSeeWriteData() {
     for (std::uint64_t frame = 0; frame < 4; ++frame) {
         NopBeforeCondition = frame % 2 == 1;
@@ -255,6 +325,94 @@ void ConditionsSeeWriteData() {
         Require(red >= 254u, name + ": the draw wrote red " + std::to_string(red) + ", expected 255 because the COND_EXEC skips the second draw");
         Require(Condition == 0u, name + ": the WRITE_DATA did not clear the condition");
     }
+}
+
+void PredicatedDrawsSeeWriteData() {
+    for (std::uint64_t frame = 0; frame < 4; ++frame) {
+        PredicateValue = static_cast<int>(frame % 2);
+        Predicate = PredicateValue == 0 ? 1u : 0u;
+        const auto name = std::string("a draw predicated on a value a WRITE_DATA ") + (PredicateValue != 0 ? "set" : "cleared") + " just before, frame " + std::to_string(frame);
+        const auto red = CentreRed(name);
+        if (PredicateValue != 0) Require(red + 1u >= 128u && red <= 129u, name + ": the draw did not observe the set predicate");
+        else Require(red >= 254u, name + ": the draw did not skip on the cleared predicate");
+    }
+    PredicateValue = -1;
+}
+
+void CopyDataPreservesRegisterOrder() {
+    using namespace AgcDriver::DriverDetail;
+    for (const auto mode : {CommandProcessorReads::Drain, CommandProcessorReads::Overlap, CommandProcessorReads::Verify}) {
+        SetCommandProcessorReadsMode(mode);
+        for (const auto mask : {0, 15}) {
+            CopyContextMask = mask;
+            const auto red = CentreRed("a draw using a context mask loaded by COPY_DATA after its WRITE_DATA producer");
+            if (mask == 0) Require(red >= 254u, "COPY_DATA did not synchronously disable the following draw's color mask");
+            else Require(red + 1u >= 128u && red <= 129u, "COPY_DATA did not synchronously enable the following draw's color mask");
+            Require(CopyRegisterOutput == static_cast<std::uint32_t>(mask), "a register-source memory copy observed a later QueueState mask mutation");
+        }
+    }
+    CopyContextMask = -1;
+    SetCommandProcessorReadsMode(CommandProcessorReads::Overlap);
+}
+
+void PredicatedDrawSeesDelayedShaderWrite() {
+    ShaderPredicate = true;
+    PredicateValue = 1;
+    PredicateFullTable = FullTable;
+    DelayPredicateProducer.store(true, std::memory_order_release);
+    {
+        std::lock_guard lock(predicateDelayMutex);
+        predicateProducerBlocked = false;
+        predicateProducerReleased = false;
+    }
+    struct Restore {
+        ~Restore() {
+            AgcDriver::GuestMemory::SetReadGuard(nullptr);
+            DelayPredicateProducer.store(false, std::memory_order_release);
+            {
+                std::lock_guard lock(predicateDelayMutex);
+                predicateProducerReleased = true;
+            }
+            predicateDelayChanged.notify_all();
+            ShaderPredicate = false;
+            PredicateValue = -1;
+        }
+    } restore;
+    AgcDriver::GuestMemory::SetReadGuard([](std::uint64_t address, std::size_t bytes) {
+        const auto begin = reinterpret_cast<std::uint64_t>(PredicateFullTable.data());
+        if (address >= begin + sizeof(PredicateFullTable) || begin >= address + bytes || !DelayPredicateProducer.exchange(false, std::memory_order_acq_rel)) return;
+        std::unique_lock lock(predicateDelayMutex);
+        predicateProducerBlocked = true;
+        predicateDelayChanged.notify_all();
+        Require(predicateDelayChanged.wait_for(lock, std::chrono::seconds(2), [] { return predicateProducerReleased; }), "the delayed predicate producer was not released");
+    });
+    const auto red = CentreRed("a draw predicated on its delayed predecessor's color write", false, [] {
+        std::unique_lock lock(predicateDelayMutex);
+        const bool blocked = predicateDelayChanged.wait_for(lock, std::chrono::seconds(2), [] { return predicateProducerBlocked; });
+        if (blocked) predicateDelayChanged.wait_for(lock, std::chrono::milliseconds(20), [] { return predicateProducerReleased; });
+        predicateProducerReleased = true;
+        lock.unlock();
+        predicateDelayChanged.notify_all();
+        Require(blocked, "the predicate fixture did not delay the real draw producer's preparation");
+    });
+    Require(red + 1u >= 128u && red <= 129u, "a predicate read before its frozen draw producer was recorded skipped the second draw");
+}
+
+void EmitSlicesPreserveDrawOrder() {
+    using AgcDriver::Graphics::EmitRecording;
+    const auto before = EmitRecording::Statistics();
+    ExtraDraws = 260;
+    const auto red = CentreRed("draws spanning bounded emit units after an ordered label");
+    ExtraDraws = 0;
+    Require(red + 1u >= 128u && red <= 129u, "draws spanning emit units returned red " + std::to_string(red) + " instead of the preceding label's half-red value");
+    const auto after = EmitRecording::Statistics();
+    if (AgcDriver::Graphics::Recorder::EmitWorkers() == 0) {
+        Require(after.units == before.units && after.draws == before.draws, "draws were emitted with emit workers disabled");
+        return;
+    }
+    Require(after.draws >= before.draws + 261 && after.units >= before.units + 3, "the draw ledger emitted " + std::to_string(after.draws - before.draws) + " draws in " + std::to_string(after.units - before.units) + " units for its 261 requested draws");
+    Require(after.failures == before.failures, "an emit unit failed while recording the draw ledger");
+    if (EmitRecording::Verify()) Require(after.verified >= before.verified + 261, "the emitted draw ledger was not verified against its canonical commands");
 }
 
 void SetEnvironment(const char* name, const char* value) {
@@ -267,27 +425,43 @@ void SetEnvironment(const char* name, const char* value) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         ParsesTheSwitch();
         const bool jobs = AgcDriver::DriverDetail::ParseLabelRecordJobs(std::getenv("APS5_LABEL_RECORD_JOBS"));
         SetEnvironment("APS5_RECORD_THREAD", "1");
         SetEnvironment("APS5_PREPARE_AHEAD", "4");
-        SetEnvironment("APS5_PREPARE_WORKERS", "2");
+        const auto* testWorkers = std::getenv("APS5_TEST_PREPARE_WORKERS");
+        SetEnvironment("APS5_PREPARE_WORKERS", testWorkers != nullptr ? testWorkers : "2");
         SetEnvironment("APS5_BINDING_PLAN", "1");
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
         }
         ColorMemory = AllocateWatched(Block);
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(ColorMemory, Block, true, true, true);
+        }
         VertexTable = BufferDescriptor(Vertices.data(), sizeof(Vertices[0]), 3u, 0x01016facu);
         FullTable = BufferDescriptor(Full.data(), 0, 16u, 0x31016facu);
         ValueTable = BufferDescriptor(Values.data(), 0, 16u, 0x31016facu);
         Register(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Register(BufferPixelHeader, BufferPixelCode.data(), sizeof(BufferPixelCode), 1);
+        if (argc == 2 && std::string_view(argv[1]) == "--shader-predicate") {
+            PredicatedDrawSeesDelayedShaderWrite();
+            AgcDriverShutdown_nid_postfix();
+            std::cout << "The predicated draw observed its real shader producer's color write" << std::endl;
+            return 0;
+        }
         DrawsSeeEarlierLabels(jobs);
         ConditionsSeeWriteData();
+        IndirectRegistersSeeWriteData();
+        PredicatedDrawsSeeWriteData();
+        CopyDataPreservesRegisterOrder();
         DrawsSeeWideWriteData(AgcDriver::DriverDetail::ParseMemoryPacketJobs(std::getenv("APS5_MEMORY_PACKET_JOBS")));
+        EmitSlicesPreserveDrawOrder();
+        PredicatedDrawSeesDelayedShaderWrite();
         AgcDriverShutdown_nid_postfix();
         std::cout << "Draws on the preparation workers see the values earlier RELEASE_MEM labels stored " << (jobs ? "with labels recorded as ordered jobs" : "with labels recorded by queue 0") << " (" << AgcDriver::DriverDetail::LabelRecordJobTotals().endOfPipe << " end-of-pipe labels recorded as jobs)" << std::endl;
         return 0;

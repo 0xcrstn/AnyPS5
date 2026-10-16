@@ -104,6 +104,7 @@ void Run(VulkanDevice& device, bool enabled) {
     const auto late = Compile(device);
     Require(late.PipelineVariantId() != closing.PipelineVariantId(), "post-close fixture reused the closing pipeline identity");
     device.BuildComputePipelineAhead(closing, reinterpret_cast<std::uintptr_t>(Code.data()));
+    device.StopPipelinePreparation();
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         device.PrepareForReplacement();

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrawTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
@@ -44,18 +45,41 @@ void Driver::UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<I
 void Driver::AttachWindow(const PresentationWindow& window) {
     CheckFailure();
     std::unique_lock replacing(deviceReplacement);
+    if (const auto current = device.Load()) current->StopPipelinePreparation();
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
-    std::lock_guard lock(GuestMemory::GpuMutex());
-    if (device) {
-        require(device->Window() == nullptr, "a window is already attached to the device");
-        device->PrepareForReplacement();
-        replacedDevices.push_back(device);
+    std::shared_ptr<VulkanDevice> attached;
+    {
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        if (device) {
+            require(device->Window() == nullptr, "a window is already attached to the device");
+            device->PrepareForReplacement();
+            replacedDevices.push_back(device);
+        }
+        device = std::make_shared<VulkanDevice>(&window);
+        attached = device;
     }
-    device = std::make_shared<VulkanDevice>(&window);
+    attached->EnsurePipelinePreparation();
 }
 
 void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, bool opaque, void (*gpuReady)(void*), void* context) {
-    if (PerformanceTrace::Configured()) PerformanceTrace::Present(window.width, window.height, device.Load().get());
+    const bool performanceTraceConfigured = PerformanceTrace::Configured();
+    if (performanceTraceConfigured) PerformanceTrace::Present(window.width, window.height, device.Load().get());
+    const auto observedOrdinal = performanceTraceConfigured ? DrawTrace::LastPresentOrdinal() : std::nullopt;
+    const bool drawTraceEnabled = DrawTrace::Enabled();
+    auto drawTraceContext = drawTraceEnabled && window.timing ? window.timing->DrawTraceOrigin() : DrawTrace::Context{};
+    drawTraceContext.flip = drawTraceEnabled && window.timing ? window.timing->DrawTraceFlip() : 0;
+    drawTraceContext.present = drawTraceEnabled ? DrawTrace::NextId() : 0;
+    const DrawTrace::ContextScope drawTraceScope(drawTraceContext);
+    if (drawTraceContext.present != 0) {
+        DrawTrace::BoundaryReference(drawTraceContext.flip, "flip");
+        DrawTrace::BoundaryReference(drawTraceContext.submission, "submission");
+        DrawTrace::BoundaryReference(drawTraceContext.segment, "segment");
+        DrawTrace::BoundaryReference(drawTraceContext.packet, "packet");
+        DrawTrace::BoundaryReference(drawTraceContext.job, "job", "captured_flip_origin_before_window");
+        DrawTrace::RecordPresent(drawTraceContext.present, drawTraceContext.flip, observedOrdinal);
+        if (drawTraceContext.flip != 0) DrawTrace::Link(drawTraceContext.flip, drawTraceContext.present, "presents_flip");
+        DrawTrace::Note("present_has_buffer", static_cast<std::uint64_t>(buffer != nullptr));
+    }
     PerformanceContext timingContext(window.timing.get());
     PerformanceTimer timing("Driver.Present");
     static thread_local bool pinned = false;
@@ -69,12 +93,14 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     require(window.getDrawableSize != nullptr, "missing window drawable size query");
 
     static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr;
+    static const bool presyncDisplay = std::getenv("APS5_NO_DISPLAY_PRESYNC") == nullptr;
     static const std::size_t inFlight = VulkanDevice::FlipInFlight();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::shared_ptr<VulkanDevice> presenting;
     timing.Mark("validate");
     try {
         bool submitted = false;
+        bool recorded = false;
         bool presentable = false;
         bool trailing = false;
         double waitedMs = 0;
@@ -104,6 +130,10 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             presentable = presenting->AcquireImage();
             timing.Mark("acquire_image");
         }
+        if (presentable && buffer != nullptr && presyncDisplay) {
+            presenting->PresyncDisplayBuffer(*buffer);
+            timing.Mark("display_presync");
+        }
         if (presentable) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
             std::lock_guard lock(GuestMemory::GpuMutex());
@@ -119,6 +149,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 submitted = presenting->PresentClear(window.width, window.height, opaque);
                 timing.Mark("present_clear");
             }
+            recorded = submitted;
             if (submitted && syncFlip) {
                 waitedMs = presenting->FinishPresent();
                 timing.Mark("render_fence_wait");
@@ -145,13 +176,19 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             timing.Mark("queue_present");
         }
         gpuReady(context);
+        if (drawTraceContext.present != 0) {
+            DrawTrace::Note("present_commands_recorded", static_cast<std::uint64_t>(recorded));
+            DrawTrace::RecordPresent(drawTraceContext.present, drawTraceContext.flip, observedOrdinal, recorded ? DrawTrace::Status::Complete : DrawTrace::Status::Skipped);
+        }
         timing.Mark("release_and_callback");
         TracyZone::MarkFrame();
         if (profile) reportPresents(waitedMs, inFlight);
         CheckFailure();
     } catch (const ProcessShutdown&) {
+        if (drawTraceContext.present != 0) DrawTrace::RecordPresent(drawTraceContext.present, drawTraceContext.flip, observedOrdinal, DrawTrace::Status::Cancelled);
         throw;
     } catch (...) {
+        if (drawTraceContext.present != 0) DrawTrace::RecordPresent(drawTraceContext.present, drawTraceContext.flip, observedOrdinal, DrawTrace::Status::Failed);
         ReportFailure(std::current_exception());
         throw;
     }

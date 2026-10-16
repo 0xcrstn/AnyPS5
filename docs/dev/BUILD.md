@@ -196,6 +196,53 @@ Set `APS5_THREAD_PRIORITY=high` to raise the AGC driver's queue workers and the 
 
 The shader recompilation logic in [core/shader/recompiler](../../core/shader/recompiler) is isolated from the rest of the project and is a pure function of its input data, designed for integration into any other project. The current CMake target also includes cache support and links a supplied runtime target, glslang, and optionally SPIRV-Tools.
 
+`agc_shader_prepare` regenerates compiler-versioned artifacts from captured full requests without launching a title. Build it with `cmake --build build --target agc_shader_prepare` and use libraries from that same build. The examples below use Windows PowerShell from the repository root; replace `C:\path\to\relinked-title` and `title.exe` with the runtime directory and executable.
+
+The renderer captures shader inputs in `shader_inputs` beside the executable, or `ANYPS5_SHADER_INPUT_DIR`. `ANYPS5_NO_SHADER_INPUTS=1` disables capture. `ANYPS5_SHADER_INPUT_MAX_ENTRY_MB` limits each runtime capture (16 MiB by default, at most 64); `ANYPS5_SHADER_INPUT_QUEUE_MB` limits the asynchronous capture queue (32 MiB by default, at most 256). Let the title exit normally so queued captures can finish. Captured compiler configuration, including semantic options such as LoopGuard, must match preparation; a mismatch fails instead of changing environment settings. Keep captured inputs and recipe manifests outside generated output directories.
+
+Graphics recipe capture and replay use `pipeline_recipes` beside the shader-cache root, or `APS5_GRAPHICS_RECIPE_DIR`. The runtime adapter uses the existing priority compiler service. `APS5_PIPELINE_PREWARM=1` requires the priority scheduler and content deduplication; `0` disables the adapter. Capture into separate directories before selecting generated outputs:
+
+```powershell
+$runtime = 'C:\path\to\relinked-title'
+$build = (Resolve-Path .\build).Path
+$prepare = "$build\core\libs\prx\libSceAgcDriver\agc_shader_prepare.exe"
+$env:PATH = "$build\core\libs\libs\unpatched;$env:PATH"
+$env:ANYPS5_SHADER_INPUT_DIR = "$runtime\captures\shader_inputs"
+$env:ANYPS5_SHADER_CACHE_DIR = "$runtime\prepared\build-a\shader_cache"
+$env:APS5_GRAPHICS_RECIPE_DIR = "$runtime\captures\pipeline_recipes"
+$env:APS5_COMPILE_SCHEDULER = 'priority'
+$env:APS5_PIPELINE_CONTENT_DEDUP = '1'
+$env:APS5_PIPELINE_PREWARM = '1'
+& "$runtime\title.exe"
+```
+
+After collecting inputs, prepare with the current compiler for either the recorded target or the current Vulkan device. `--target recorded` preserves every captured target field. `--target current` reconstructs the renderer's complete production target, including compute wave selection; incompatible buffer-address or push-constant ABIs fail. Rebuild the tool and libraries together before preparing another compiler version.
+
+```powershell
+$env:ANYPS5_NO_SHADER_CACHE = '0'
+& $prepare --input "$runtime\captures\shader_inputs" --output "$runtime\prepared\recorded\shader_cache" --target recorded --jobs 2
+& $prepare --input "$runtime\captures\shader_inputs" --output "$runtime\prepared\build-b\shader_cache" --target current --jobs 2
+& $prepare --input "$runtime\captures\shader_inputs" --output "$runtime\prepared\build-b\shader_cache" --target current --pipeline-recipes "$runtime\captures\pipeline_recipes" --recipe-output "$runtime\prepared\build-b\pipeline_recipes" --native --jobs 2
+```
+
+The last command reads persistent recipe state and input identities from the preceding build, regenerates materialized stage programs and verifies the renderer's vertex/descriptor layouts. Only recognized renderer-generated rectangle-list tessellation and barycentric geometry stages can be regenerated without input identities. Unknown generated stages, missing ordinary stage inputs, incompatible runtime ABI or changed layouts fail and require new captures. A target that removes the need for a captured emulation stage also requires a new capture. Refreshed recipes use a distinct directory and do not evict previous outputs. For subsequent builds, use the latest selected recipe directory as input and a fresh sibling output directory.
+
+`--native` builds the renderer's exact graphics pipelines and requires a successful native-cache persistence checkpoint. The Vulkan cache is stored under `--output` with the production GPU/driver/UUID compatibility checks. `native_compiled` counts successfully prepared recipes; `native_ready` advances only after persistence succeeds. Shader-only runs report no native readiness. Neither count establishes unseen pipeline coverage, native compute preparation or a measured performance gain.
+
+Select both refreshed output directories for the next runtime launch:
+
+```powershell
+$env:ANYPS5_SHADER_CACHE_DIR = "$runtime\prepared\build-b\shader_cache"
+$env:APS5_GRAPHICS_RECIPE_DIR = "$runtime\prepared\build-b\pipeline_recipes"
+& "$runtime\title.exe"
+```
+
+The runtime's loading checkpoint waits for bounded stored-recipe batches outside `GpuMutex` at window attachment or first graphics/compute use. Inspect `[pipeline-preparation] loading checkpoint` ready/failed/cancelled/pending counters; background admission alone is not readiness. `PipelinePreparationCounters().incompleteInputs` counts recipes with missing stage identities that cannot be regenerated. Recognized generated-stage holes are excluded from that count.
+
+Read the final `[shader-prepare]` summary and the process exit code. `compiled` and `cache_hits` count base artifact work; every selected input also requires successful materialization. Current exact output hits skip backend compilation, and `--force` regenerates them. `failed`, `recipe_failed`, incomplete recipe coverage, cancellation, empty inventories and fully filtered inventories are unsuccessful even when some outputs were written. Exit codes are 0 for complete preparation, 1 for incomplete work, 2 for configuration/discovery errors and 130 for cancellation. Runtime preparation failures remain visible in checkpoint counters and retain exact on-demand compilation.
+
+`--stage` and `--id-prefix` restrict shader-only preparation. Recipe refresh requires an unfiltered current target. `--jobs` is bounded to 1–16; `--input-memory-mib` bounds serialized input bytes admitted concurrently (64 MiB by default), not compiler or driver RSS. `--max-entry-mib` defaults to 16; inventory and recipe stores enforce their own entry/count/total limits. Ctrl+C stops new admissions and waits for active compiler calls. Input records remain reusable when source-versioned outputs are invalidated. Requests, recipes and caches contain title data and must remain local unless distribution is authorized.
+
 ## Register context tests
 
 The x86-64 register capture and restore tests can be built separately on Linux and macOS, without submodules or the prx libraries. On macOS:

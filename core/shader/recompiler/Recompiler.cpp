@@ -69,6 +69,34 @@ using namespace Materialization;
 
 namespace {
 
+thread_local CompilerObservationContext compilerObserver;
+
+void observeCompiler(CompilerObservationKind kind, std::string_view key) noexcept {
+    if (compilerObserver.observer != nullptr) compilerObserver.observer(compilerObserver.state, kind, key);
+}
+
+std::shared_ptr<const ShaderTraceSourceIdentity> observedCompilerIdentity(const RecompileRequest& request, std::uint32_t subgroupSize) noexcept {
+    if (compilerObserver.observer == nullptr) return {};
+    try { return MakeShaderTraceSourceIdentity(request, subgroupSize); }
+    catch (...) { observeCompiler(CompilerObservationKind::ObservationLost, {}); return {}; }
+}
+
+class CompilerWorkObservation {
+public:
+    CompilerWorkObservation(bool plan, std::string_view key) : plan(plan), key(key), exceptions(std::uncaught_exceptions()) {
+        observeCompiler(plan ? CompilerObservationKind::PlanBegin : CompilerObservationKind::CompileBegin, key);
+    }
+    ~CompilerWorkObservation() {
+        const bool failed = std::uncaught_exceptions() > exceptions;
+        observeCompiler(plan ? failed ? CompilerObservationKind::PlanFailed : CompilerObservationKind::PlanComplete : failed ? CompilerObservationKind::CompileFailed : CompilerObservationKind::CompileComplete, key);
+    }
+
+private:
+    bool plan;
+    std::string_view key;
+    int exceptions;
+};
+
 ShaderStageKind toShaderStageKind(ShaderStage stage) {
     switch (stage) {
     case ShaderStage::Compute:
@@ -91,6 +119,10 @@ ShaderStageKind toShaderStageKind(ShaderStage stage) {
     throw std::runtime_error("ShaderRecompiler::Recompile: unsupported shader stage");
 }
 
+}
+
+CompilerObservationContext ExchangeCompilerObserver(CompilerObservationContext context) noexcept {
+    return std::exchange(compilerObserver, context);
 }
 
 namespace {
@@ -363,12 +395,14 @@ struct EmissionFailure {
     std::uint64_t codeAddress;
     BindingLayout layout;
     std::exception_ptr failure;
+    std::shared_ptr<const ShaderTraceSourceIdentity> traceIdentity;
 };
 
 struct MaterializedTemplate;
 
 struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::mutex mutex;
+    std::string tracePlanKey;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
     // accepted only when its code matches word for word. Owned here because the request's span
     // points into a registration the driver may replace while the entry lives on.
@@ -608,8 +642,20 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
     }
     {
         std::lock_guard lock(source->mutex);
+        if (compilerObserver.observer != nullptr && source->tracePlanKey.empty()) {
+            try {
+                TraceIdentityBuilder identity;
+                identity.Text("anyps5.resource-plan-key.v1");
+                for (const auto value : key) identity.Integer(value);
+                identity.Words(source->code);
+                source->tracePlanKey = identity.Finish();
+            } catch (...) { observeCompiler(CompilerObservationKind::ObservationLost, {}); }
+        }
         if (source->plan == nullptr && !source->planSpilled) {
-            if (FailureMemo() && source->planFailure) std::rethrow_exception(source->planFailure);
+            if (FailureMemo() && source->planFailure) {
+                observeCompiler(CompilerObservationKind::PlanFailureMemoHit, source->tracePlanKey);
+                std::rethrow_exception(source->planFailure);
+            }
             const bool disk = diskPlans();
             std::vector<std::byte> planKey;
             if (disk) {
@@ -624,15 +670,18 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                         if (!ShaderDiskCache::SamePlan(*fresh.plan, loaded)) throw std::runtime_error("APS5_VERIFY_SHADER_CACHE: the cached resource plan of shader 0x" + std::to_string(request.shader.codeAddress) + " differs from a fresh one (plan source version " + std::to_string(ShaderDiskCache::PlanSourceVersion()) + ")");
                     }
                     source->plan = std::make_shared<const IrResourcePlan>(std::move(loaded));
+                    observeCompiler(CompilerObservationKind::PlanDiskHit, source->tracePlanKey);
                     source->planBytes = countPlan(*source->plan);
                     source->planStored = true;
                 } else if (std::string refused; FailureMemo() && ShaderDiskCache::LoadPlanFailure(planKey, refused)) {
                     source->planFailure = std::make_exception_ptr(std::runtime_error(refused));
+                    observeCompiler(CompilerObservationKind::PlanFailureMemoHit, source->tracePlanKey);
                     std::rethrow_exception(source->planFailure);
                 }
             }
             if (source->plan == nullptr) {
                 try {
+                    CompilerWorkObservation observation(true, source->tracePlanKey);
                     ResourceProgram resource(request, preparation, reclaim);
                     source->plan = std::move(resource.plan);
                     source->program = std::move(resource.program);
@@ -660,7 +709,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                 source->planKey = std::move(planKey);
                 source->planCodeAddress = request.shader.codeAddress;
             }
-        }
+        } else observeCompiler(CompilerObservationKind::PlanMemoryHit, source->tracePlanKey);
     }
     return source;
 }
@@ -749,7 +798,8 @@ void VerifyEmission(const RecompileRequest& request, const IrProgram& program, c
     if (const auto difference = CompareSpirvInterfaces(resourceBuffers, sharedBuffers)) throw std::runtime_error("APS5_VERIFY_SHADER_EMISSION: shared formatted buffer helpers change the interface of shader 0x" + std::to_string(request.shader.codeAddress) + ": " + *difference);
 }
 
-CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program, bool consume = false) {
+CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program, bool consume = false, bool memoize = true) {
+    static_cast<void>(memoize);
     InFlightIr inFlight(estimateProgramBytes(program));
     PrepareRewriteVerification(program);
     const auto inputInfo = RequestInputInfo(request);
@@ -851,7 +901,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program,
     {
         ShaderCompileTrace::Event optimizeEvent("emit.validate_optimize");
         const auto wordsIn = result.spirv.size();
-        result.spirv = InternSpirv(ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded));
+        result.spirv = InternSpirv(ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded), memoize && SpirvInternEnabled());
         if (optimizeEvent.Active()) optimizeEvent.Hex("address", request.shader.codeAddress).Flag("optimized", !embedded).Number("spirv_words_in", wordsIn).Number("spirv_words", result.spirv.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(result.spirv.Words()));
     }
     if (embedded) {
@@ -864,17 +914,19 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program,
     }
 #endif
 
+    result.traceSourceIdentity = MakeShaderTraceSourceIdentity(request, result.hostSubgroupSize);
+    result.tracePreparationJob = compilerObserver.producerJob;
     return {request.layout, std::move(compiledInfo), std::move(static_cast<CompiledBindingLayout&>(bindings)), std::move(result)};
 }
 
-CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, std::exception_ptr* emissionFailure = nullptr) {
+CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, std::exception_ptr* emissionFailure = nullptr, bool memoize = true) {
     return recordEmissionFailure(emissionFailure, [&] {
         {
             ShaderCompileTrace::Event interfaceEvent("emit.interface");
             TraceRequest(interfaceEvent, request);
             prepareInterface(request, program);
         }
-        auto variant = emitVariant(request, program, true);
+        auto variant = emitVariant(request, program, true, memoize);
         return variant;
     });
 }
@@ -912,11 +964,15 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     for (const auto& candidate : source.variants) {
         if (sameLayout(candidate->layout, request.layout)) {
             cacheHit = true;
+            observeCompiler(CompilerObservationKind::VariantMemoryHit, candidate->artifact.traceSourceIdentity != nullptr ? candidate->artifact.traceSourceIdentity->recompileKeyIdentity : std::string_view{});
             return candidate;
         }
     }
     for (const auto& failure : source.emissionFailures) {
-        if (failure.codeAddress == request.shader.codeAddress && sameLayout(failure.layout, request.layout)) std::rethrow_exception(failure.failure);
+        if (failure.codeAddress == request.shader.codeAddress && sameLayout(failure.layout, request.layout)) {
+            observeCompiler(CompilerObservationKind::VariantFailureMemoHit, failure.traceIdentity != nullptr ? failure.traceIdentity->recompileKeyIdentity : std::string_view{});
+            std::rethrow_exception(failure.failure);
+        }
     }
     cacheHit = false;
     const bool disk = ShaderDiskCache::Enabled() && !DebugProbeActive();
@@ -929,6 +985,9 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         if (ShaderDiskCache::Load(diskKey, loaded)) {
             loaded.layout = request.layout;
             loaded.artifact.variantId = nextVariantId();
+            loaded.artifact.traceSourceIdentity = MakeShaderTraceSourceIdentity(request, loaded.artifact.hostSubgroupSize);
+            loaded.artifact.tracePreparationJob = compilerObserver.producerJob;
+            observeCompiler(CompilerObservationKind::VariantDiskHit, loaded.artifact.traceSourceIdentity != nullptr ? loaded.artifact.traceSourceIdentity->recompileKeyIdentity : std::string_view{});
             if (spill) loaded.artifact.spirv = loaded.artifact.spirv.Spill(diskKey, false);
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
             NoteShaderManifest(request, *variant, "disk");
@@ -937,7 +996,9 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     if (variant == nullptr) {
         static const bool layoutPair = std::getenv("APS5_NO_PERF_LAYOUT_PAIR") == nullptr;
         std::exception_ptr emissionFailure;
+        const auto traceIdentity = observedCompilerIdentity(request, HostSubgroupSize(request));
         try {
+            CompilerWorkObservation observation(false, traceIdentity != nullptr ? traceIdentity->recompileKeyIdentity : std::string_view{});
             if (layoutPair && preparation != nullptr) {
                 variant = std::make_shared<const CompiledVariant>(PreparedInterface::Compile(source, request, *preparation, &emissionFailure));
             } else {
@@ -948,7 +1009,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
                 variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), &emissionFailure));
             }
         } catch (...) {
-            if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
+            if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure, traceIdentity});
             throw;
         }
         NoteShaderManifest(request, *variant, "compiled");
@@ -999,10 +1060,14 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
     ResourceSnapshot snapshot;
     constexpr ResourceMaterializer materializer;
     if (!request.useCache) {
+        const auto traceIdentity = observedCompilerIdentity(request, HostSubgroupSize(request));
         auto program = PrepareResourceProgram(request);
         const auto plan = materializer.ExtractPlan(program);
         materializer.Materialize(plan, runtime, snapshot);
-        const auto variant = compileVariant(request, std::move(program));
+        const auto variant = [&] {
+            CompilerWorkObservation observation(false, traceIdentity != nullptr ? traceIdentity->recompileKeyIdentity : std::string_view{});
+            return compileVariant(request, std::move(program));
+        }();
         return materializeResult(variant, request, snapshot);
     }
     const auto source = getSource(request);
@@ -1160,6 +1225,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             source.memo.splice(source.memo.begin(), source.memo, found->second);
             counters.hits.fetch_add(1, std::memory_order_relaxed);
             if (memoHit != nullptr) *memoHit = true;
+            observeCompiler(CompilerObservationKind::MaterializationMemoryHit, variant->artifact.traceSourceIdentity != nullptr ? variant->artifact.traceSourceIdentity->recompileKeyIdentity : std::string_view{});
             reportResultMemo();
             return found->second->result;
         }
@@ -1218,8 +1284,12 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
 // the request over exactly the words the driver captured, so neither is repeated here.
 std::shared_ptr<const RecompileResult> RecompileImpl(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit) {
     if (!request.useCache || capture.source == nullptr) {
-        auto program = PrepareResourceProgram(request);
-        const auto variant = compileVariant(request, std::move(program));
+        const auto traceIdentity = observedCompilerIdentity(request, HostSubgroupSize(request));
+        const auto variant = [&] {
+            CompilerWorkObservation observation(false, traceIdentity != nullptr ? traceIdentity->recompileKeyIdentity : std::string_view{});
+            auto program = PrepareResourceProgram(request);
+            return compileVariant(request, std::move(program));
+        }();
         return std::make_shared<const RecompileResult>(materializeResult(variant, request, capture.snapshot));
     }
     if (!ResultMemo()) return std::make_shared<const RecompileResult>(materializeVariant(*capture.source, request, capture.snapshot));
@@ -1287,6 +1357,8 @@ SharedSpirv SharedSpirv::Spill(std::vector<std::byte> key, bool pinned) const {
     }
     SharedSpirv result;
     result.spilled = std::move(source);
+    result.contentHash = contentHash;
+    result.traceDigest = traceDigest;
     return result;
 }
 
@@ -1300,6 +1372,8 @@ void SharedSpirv::Unpin() const {
 SharedSpirv SharedSpirv::Resolved() const {
     if (words != nullptr || spilled == nullptr) return *this;
     SharedSpirv result;
+    result.contentHash = contentHash;
+    result.traceDigest = traceDigest;
     std::lock_guard lock(spilled->mutex);
     result.words = spilled->pinned != nullptr ? spilled->pinned : spilled->cached.lock();
     if (result.words != nullptr) return result;
@@ -1311,6 +1385,8 @@ SharedSpirv SharedSpirv::Resolved() const {
     CompiledVariant loaded;
     if (!ShaderDiskCache::Reload(spilled->key, loaded) || loaded.artifact.spirv.WordCount() != spilled->wordCount) throw std::runtime_error("SPIR-V kept in the shader disk cache could not be read back from it");
     result = std::move(loaded.artifact.spirv);
+    result.contentHash = contentHash;
+    result.traceDigest = traceDigest;
     spilled->cached = result.words;
     spilled->mappedOwner = result.owner;
     spilled->mappedView = result.view;
@@ -1474,6 +1550,61 @@ std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& reques
     return PrepareShader(request, nullptr);
 }
 
+std::shared_ptr<const CompiledVariant> CompileShaderUncached(const RecompileRequest& request, ShaderPreparationContext* preparation, OfflineCompileTimings* timings) {
+    return recompileReporting(request, [&] {
+        static_cast<void>(RequestInputInfo(request));
+        using Clock = std::chrono::steady_clock;
+        const auto start = timings ? Clock::now() : Clock::time_point{};
+        auto program = PrepareResourceProgram(request, preparation);
+        const auto middle = timings ? Clock::now() : Clock::time_point{};
+        if (timings) timings->frontendSeconds = std::chrono::duration<double>(middle - start).count();
+        auto variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), nullptr, false));
+        if (timings) timings->backendSeconds = std::chrono::duration<double>(Clock::now() - middle).count();
+        return variant;
+    });
+}
+
+RecompileResult MaterializeShaderUncached(const RecompileRequest& request, const CompiledVariant& variant, std::span<const std::byte> artifactKey) {
+    return recompileReporting(request, [&] {
+        static_cast<void>(RequestInputInfo(request));
+        std::vector<std::byte> expectedKey;
+        ShaderDiskCache::BuildKey(request, HostSubgroupSize(request), expectedKey);
+        if (!std::ranges::equal(artifactKey, expectedKey)) throw std::runtime_error("offline shader artifact key does not match its request");
+        if (!sameLayout(variant.layout, request.layout) || variant.artifact.hostSubgroupSize != HostSubgroupSize(request)) throw std::runtime_error("offline shader artifact interface does not match its request");
+        RuntimeAbi::RequireVersion(variant.artifact.runtimeAbiVersion);
+        if (variant.artifact.bdaAbiVersion != 0u && variant.artifact.bdaAbiVersion != request.target.bdaAbiVersion) throw std::runtime_error("offline shader artifact BDA ABI does not match its request");
+        auto program = PrepareResourceProgram(request);
+        if (variant.info.stage != program.Resources().stage) throw std::runtime_error("offline shader artifact stage does not match its request");
+        constexpr ResourceMaterializer materializer;
+        const auto plan = materializer.ExtractPlan(program);
+        RequestMemoryView memory(request.context.memory);
+        struct ReadStatus {
+            SrtRuntime original;
+            bool incomplete = false;
+        } reads{memory.MakeRuntime(request.context.userData, request.shader.codeAddress)};
+        auto runtime = reads.original;
+        runtime.userContext = &reads;
+        runtime.readMemory = [](void* context, std::uint64_t address, std::uint32_t* value) {
+            auto& status = *static_cast<ReadStatus*>(context);
+            const bool available = status.original.readMemory(status.original.userContext, address, value);
+            status.incomplete |= !available;
+            return available;
+        };
+        runtime.readSpecializationMemory = runtime.readMemory;
+        runtime.accessible = [](void* context, std::uint64_t address, std::uint64_t bytes) {
+            const auto& status = *static_cast<const ReadStatus*>(context);
+            return status.original.accessible(status.original.userContext, address, bytes);
+        };
+        ResourceSnapshot snapshot;
+        materializer.Materialize(plan, runtime, snapshot);
+        if (reads.incomplete || !snapshot.srtPoison.empty() || snapshot.nullRootReads != 0u) throw std::runtime_error("offline shader input snapshot is incomplete");
+        auto result = materializeResult(variant, request, snapshot, false, false);
+        if (result.poisonedSrtReads != 0u || result.imageTableFaults != 0u) throw std::runtime_error("offline shader input snapshot has unresolved resource reads");
+        if (result.variantId == 0u) result.variantId = nextVariantId();
+        return result;
+    });
+}
+
 std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& request, ShaderPreparationContext* preparation) {
     return recompileReporting(request, [&]() -> std::shared_ptr<const SourceHandle> {
         static_cast<void>(RequestInputInfo(request));
@@ -1556,14 +1687,24 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(con
     return result;
 }
 
-std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::CaptureValues(const SrtRuntime& runtime) const {
+bool SameResourceTrace(const ResourceCapture& a, const ResourceCapture& b) {
+    const auto& left = a.userDataUse;
+    const auto& right = b.userDataUse;
+    return left.asBase == right.asBase && left.asValue == right.asValue && left.reads == right.reads && left.readBases == right.readBases && left.readInstructions == right.readInstructions && left.operandReads == right.operandReads && left.sourceLeads == right.sourceLeads && a.readTrace.leaves == b.readTrace.leaves && a.readTrace.otherReads == b.readTrace.otherReads && a.baseSlots == b.baseSlots && std::equal(a.bufferBaseWords.begin(), a.bufferBaseWords.end(), b.bufferBaseWords.begin(), b.bufferBaseWords.end(), [](const BufferBaseWord& left, const BufferBaseWord& right) { return left.buffer == right.buffer && left.address == right.address && left.flatOffset == right.flatOffset; });
+}
+
+std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::CaptureValues(const SrtRuntime& runtime, bool trace) const {
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle->source;
     capture->plan = usePlan(*handle->source);
     SrtRuntime values = runtime;
+    values.compiledWalk = true;
+    if (trace) {
+        materializeCapture(*capture, values);
+        return capture;
+    }
     values.userDataUse = nullptr;
     values.readTrace = nullptr;
-    values.compiledWalk = true;
     ResourceMaterializer{}.Materialize(*capture->plan, values, capture->snapshot);
     return capture;
 }
@@ -1761,6 +1902,7 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeValu
         }
     }
     if (found != nullptr) {
+        observeCompiler(CompilerObservationKind::MaterializationMemoryHit, variant.artifact.traceSourceIdentity != nullptr ? variant.artifact.traceSourceIdentity->recompileKeyIdentity : std::string_view{});
         auto result = materializeTemplateValues(found, variant, request, capture.snapshot);
         materializeValuesCounters().templateHits.fetch_add(1, std::memory_order_relaxed);
         if (templateHit != nullptr) *templateHit = true;

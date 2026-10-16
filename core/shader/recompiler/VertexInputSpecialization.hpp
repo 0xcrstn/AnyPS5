@@ -14,8 +14,7 @@
 
 namespace ShaderRecompiler {
 
-inline SharedSpirv SpecializeVertexInputTypes(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes) {
-    auto spirv = artifact.spirv.Resolved();
+inline SharedSpirv SpecializeVertexInputTypes(const CompiledShaderArtifact& artifact, SharedSpirv spirv, std::span<const std::uint32_t> classes) {
     if (artifact.vertexInputPatches.empty()) return spirv;
     auto words = spirv.Copy();
     for (const auto& patch : artifact.vertexInputPatches) {
@@ -23,6 +22,10 @@ inline SharedSpirv SpecializeVertexInputTypes(const CompiledShaderArtifact& arti
         words[patch.word] = patch.values[classes[patch.location]];
     }
     return SharedSpirv(std::move(words));
+}
+
+inline SharedSpirv SpecializeVertexInputTypes(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes) {
+    return SpecializeVertexInputTypes(artifact, artifact.spirv.Resolved(), classes);
 }
 
 inline void PrepareVertexInputSpecialization(CompiledShaderArtifact& artifact) {

@@ -1,4 +1,5 @@
 #include "Optimization/DenormalFreeProof.hpp"
+#include <algorithm>
 #include <deque>
 #include <vector>
 
@@ -21,6 +22,42 @@ bool nanOrQuietedNan(const IrValue* arm, const IrValue* tested) {
 
 bool unitOrLarger(const IrValue* value) {
     return value->HasImmediate() && (value->ImmediateU32() & 0x7f800000u) >= 0x3f800000u;
+}
+
+bool mayBeDenormalFree(const IrValue& value) {
+    if (value.HasImmediate() || DenormalFlushSource(value) != nullptr) return true;
+    switch (value.Opcode()) {
+        case IrOpcode::ConvertIToF32:
+        case IrOpcode::ConvertUToF32:
+        case IrOpcode::ConvertF32S32:
+        case IrOpcode::ConvertF32U32:
+        case IrOpcode::ConvertF32F16:
+        case IrOpcode::FPFloor32:
+        case IrOpcode::FPCeil32:
+        case IrOpcode::FPTrunc32:
+        case IrOpcode::FPRoundEven32:
+        case IrOpcode::BitCastU32F32:
+        case IrOpcode::BitCastF32U32:
+        case IrOpcode::FPAbs32:
+        case IrOpcode::FPNeg32:
+        case IrOpcode::FPSaturate32:
+        case IrOpcode::FPSqrt:
+        case IrOpcode::FPRecipSqrt32:
+        case IrOpcode::FPMul32:
+        case IrOpcode::BitwiseXor32:
+        case IrOpcode::BitwiseAnd32:
+        case IrOpcode::SelectU32:
+        case IrOpcode::SelectF32:
+        case IrOpcode::FPMin32:
+        case IrOpcode::FPMax32:
+        case IrOpcode::FPMinTri32:
+        case IrOpcode::FPMaxTri32:
+        case IrOpcode::FPMedTri32:
+        case IrOpcode::Phi:
+            return true;
+        default:
+            return false;
+    }
 }
 
 }
@@ -47,21 +84,30 @@ bool DenormalFreeConstant(std::uint32_t bits) {
 }
 
 DenormalFreeProof::DenormalFreeProof(IrProgram& program) {
+    std::size_t bound = 0;
+    for (auto* block : program.BlockOrder()) {
+        for (auto* inst : block->Instructions()) bound = std::max(bound, static_cast<std::size_t>(inst->Id()) + 1u);
+    }
+    state.resize(bound);
     std::deque<const IrValue*> pending;
     for (auto* block : program.BlockOrder()) {
         for (auto* inst : block->Instructions()) {
             if (inst->Resolve() != inst) continue;
-            state.emplace(inst, true);
-            pending.push_back(inst);
+            if (mayBeDenormalFree(*inst)) {
+                state[inst->Id()] = {inst, State::Free};
+                pending.push_back(inst);
+            } else {
+                state[inst->Id()] = {inst, State::NotFree};
+            }
         }
     }
+    std::vector<const IrValue*> users;
     while (!pending.empty()) {
         const IrValue* value = pending.front();
         pending.pop_front();
-        auto found = state.find(value);
-        if (found == state.end() || !found->second || evaluate(*value)) continue;
-        found->second = false;
-        std::vector<const IrValue*> users(value->Uses().begin(), value->Uses().end());
+        if (stateOf(value) != State::Free || evaluate(*value)) continue;
+        state[value->Id()].state = State::NotFree;
+        users.assign(value->Uses().begin(), value->Uses().end());
         while (!users.empty()) {
             const IrValue* user = users.back();
             users.pop_back();
@@ -69,16 +115,20 @@ DenormalFreeProof::DenormalFreeProof(IrProgram& program) {
                 users.insert(users.end(), user->Uses().begin(), user->Uses().end());
                 continue;
             }
-            if (const auto entry = state.find(user); entry != state.end() && entry->second) pending.push_back(user);
+            if (stateOf(user) == State::Free) pending.push_back(user);
         }
     }
+}
+
+DenormalFreeProof::State DenormalFreeProof::stateOf(const IrValue* value) const {
+    const auto id = value->Id();
+    return id < state.size() && state[id].value == value ? state[id].state : State::Untracked;
 }
 
 bool DenormalFreeProof::Contains(const IrValue* value) const {
     value = value->Resolve();
     if (value->HasImmediate()) return DenormalFreeConstant(value->ImmediateU32());
-    const auto found = state.find(value);
-    return found != state.end() && found->second;
+    return stateOf(value) == State::Free;
 }
 
 bool DenormalFreeProof::evaluate(const IrValue& value) const {

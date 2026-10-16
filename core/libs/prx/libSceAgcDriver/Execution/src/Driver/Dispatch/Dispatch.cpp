@@ -1,6 +1,10 @@
+#include "prx/libSceAgcDriver/Execution/include/DrawTraceIdentity.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderTraceObserver.hpp"
+#include <optional>
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DispatchFreeze.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "ShaderInputInventory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CompileService.hpp"
@@ -202,9 +206,21 @@ bool Driver::staleDispatchInputs(const DispatchInputs& adopted, const DispatchIn
 }
 
 void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    const bool resolving = resolvingAhead();
+    std::optional<DrawTrace::Operation> traceOperation;
+    if (!resolving && frozenSink() == nullptr && DrawTrace::Current().operation == 0) traceOperation.emplace("dispatch");
     PerformanceTimer timing("Driver.Dispatch");
+    DrawTrace::Note("prepare_only", static_cast<std::uint64_t>(resolving || frozenSink() != nullptr));
+    DrawTrace::Note("dispatch_indirect", static_cast<std::uint64_t>(indirectArguments != 0));
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
-    if (address == SkippedShader() && address != 0) return;
+    if (address == SkippedShader() && address != 0) {
+        if (!resolving) PerformanceTrace::WorkloadOutcome(MeasurementWorkload::Outcome::Skipped);
+        if (traceOperation) traceOperation->Outcome(DrawTrace::Status::Skipped);
+        else if (!resolving) DrawTrace::SetOperationOutcome(DrawTrace::Status::Skipped);
+        DrawTrace::Note("skip_reason", "selected_shader");
+        return;
+    }
+    DrawTrace::Note("guest_shader_address", address);
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
     auto* const sink = frozenSink();
     const auto refuse = [&](FrozenFallback reason) {
@@ -223,7 +239,6 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
         userData.push_back(readUserData(queue.shader, 0x240 + i));
     }
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
-    const bool resolving = resolvingAhead();
     std::vector<ShaderRecompiler::MemoryRegion> memory{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}};
     if (!snapshot.header.empty()) memory.push_back({snapshot.headerAddress, snapshot.header});
 
@@ -238,10 +253,13 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (localDevice == nullptr) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+        DrawTrace::Span lockWait("Driver.DeviceSetupMutexWait");
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        lockWait.Finish();
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
         localDevice = device;
     }
+    if (!resolving && sink == nullptr && !GuestMemory::GpuMutex().HeldByThisThread()) localDevice->EnsurePipelinePreparation();
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;
@@ -265,6 +283,7 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         resolved = Pm4::ReadDispatchArguments(indirectArguments, packet[4]);
+        DrawTrace::RecordCounter("indirect_argument_records_read", 1, "records");
         countIndirect(IndirectFillKernel, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
         packet = resolved;
         indirectArguments = 0;
@@ -290,6 +309,7 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
                 drawRecordState().settled = true;
                 finishDrawRecords();
             }
+            DrawTrace::Note("dispatch_path", "fill_hle");
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
@@ -298,6 +318,7 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
                 drawRecordState().settled = true;
                 finishDrawRecords();
             }
+            DrawTrace::Note("dispatch_path", "copy_hle");
             pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
             return;
         }
@@ -472,6 +493,9 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
         lookupDispatch(address, submission, key, keyParts, registeredShader, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
     }
     timing.Mark("lookup_cache");
+    DrawTrace::Note("dispatch_cache_outcome", noDispatchCache ? "disabled" : cached ? "hit" : "miss");
+    DrawTrace::Note("dispatch_cache_validated", static_cast<std::uint64_t>(validated));
+    DrawTrace::Note("dispatch_preparation_outcome", fromAhead ? "adopted_ahead" : "current_packet");
     if (cached) {
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
         captureMs += phaseTiming.Elapsed();
@@ -486,11 +510,30 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
 
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             forgetAtCapture = GuestMemory::ForgetSerial();
+            ShaderMemory::PlanInstance* planInstance = nullptr;
+            ShaderMemory::PlanCapture planCapture;
+            if (incrementalPlans() && invocation.Handle() != nullptr && !ShaderRecompiler::DebugProbeActive() && !dumpShaders) planInstance = &resourcePlanInstance(invocation.Handle(), 0, invocation.Request().context.userData);
             capture = [&] {
                 const SampledReadScope sampling(evidenceReads);
+                if (planInstance != nullptr) {
+                    planCapture = ShaderMemory::CapturePlannedOwned(invocation, *planInstance, shaderMemory, captured, registeredShader, verifyIncrementalPlans(), !stampValidate() && (!noDispatchCache || verifyIncrementalPlans()));
+                    return planCapture.values;
+                }
                 return shaderMemory->Capture(invocation);
             }();
-            captured = shaderMemory->Regions();
+            const bool planned = planInstance != nullptr && capture->plan != nullptr && !ShaderMemory::UsesImageTables(*capture->plan);
+            if (planInstance != nullptr && !planned) {
+                *planInstance = {};
+                planInstance = nullptr;
+                const SampledReadScope sampling(evidenceReads);
+                capture = shaderMemory->Capture(invocation);
+            }
+            if (!planned) captured = shaderMemory->Regions();
+            if (DrawTrace::Enabled()) {
+                std::uint64_t bytes = 0;
+                for (const auto& region : captured) bytes += region.bytes.size();
+                DrawTrace::RecordCounter("shader_capture_bytes", bytes, "bytes");
+            }
             request.context.memory = captured;
             if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
             captureMs += phaseTiming.Elapsed();
@@ -500,7 +543,37 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
 
 
             timing.Mark("capture_resources");
-            compiledResult = invocation.Materialize(*capture);
+            {
+                ShaderTraceObserver compilerObservation;
+                compiledResult = planned ? invocation.MaterializeValues(*capture) : invocation.Materialize(*capture);
+            }
+            if (planInstance != nullptr) {
+                const bool verified = verifyIncrementalPlans();
+                bool stale = false;
+                if (verified) {
+                    auto reference = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+                    const auto fresh = reference->Capture(invocation);
+                    const auto freshResult = invocation.Materialize(*fresh);
+                    const bool traceMismatch = planInstance->traced && !ShaderRecompiler::SameResourceTrace(*fresh, *capture);
+                    if (!SameSnapshot(fresh->snapshot, capture->snapshot) || !SameStageResult(*freshResult, *compiledResult) || traceMismatch) {
+                        stale = !ShaderMemory::PlanReadsCurrent(*planInstance);
+                        if (!stale) {
+                            notePlanInstance(planCapture, true, false);
+                            if (traceMismatch) throw std::runtime_error("AGC driver: incremental dispatch plan read tracing differs from the full capture");
+                            ThrowPlanInstanceMismatch(submission.queue, submission.serial, currentPacketOffset(), 0, address, planCapture, fresh->snapshot, capture->snapshot);
+                        }
+                        shaderMemory = std::move(reference);
+                        capture = fresh;
+                        compiledResult = freshResult;
+                        captured = shaderMemory->Regions();
+                        *planInstance = {};
+                    }
+                }
+                notePlanInstance(planCapture, verified, stale);
+            }
+            auto inputRequest = invocation.Request();
+            inputRequest.context.memory = captured;
+            static_cast<void>(ShaderRecompiler::CaptureShaderInput(inputRequest, compiledResult));
             timing.Mark("materialize");
             if (compiledResult->cacheHit) ++cacheHits;
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -540,28 +613,48 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
         parked.cached = cached;
         parked.validated = validated;
         parked.resolvedAt = std::chrono::steady_clock::now();
+        DrawTrace::Note("preparation_outcome", "ready_for_later_dispatch");
         ++groupStats.resolved;
         if (cached) ++groupStats.resolvedHits;
         return;
     }
     if (verifyDataHits() && cached && !liveWords.empty()) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
+    if (DrawTrace::Enabled()) {
+        const auto identity = DrawTrace::RegisterShaderIdentity(ShaderRecompiler::ShaderStage::Compute, *compiledResult);
+        DrawTrace::AssociateMetadata(DrawTrace::Current().operation, identity, "shader_stage");
+    }
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
+        DrawTrace::Note("dispatch_retry", "labels_changed_after_capture");
         dispatch(queue, packet, submission, indirectArguments);
         return;
     }
     phaseTiming.Phase(PhaseQueuedLabels);
     const auto& compiled = *compiledResult;
+    ShaderTraceObserver::LinkProducer(compiled);
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     for (const auto& region : captured) snapshots.push_back({region.guestAddress, region.bytes});
     if (drawRecordState().active && !settleDrawRecords(snapshots, true)) return;
     std::array<std::uint32_t, 3> groups{packet[1], packet[2], packet[3]};
+    DrawTrace::Note("dispatch_dimensions", indirectArguments != 0 ? "gpu_indirect_unknown" : (packet[4] & 0x20u) != 0 ? "thread_counts" : "group_counts");
+    if (indirectArguments == 0) {
+        DrawTrace::Note("dispatch_argument_x", static_cast<std::uint64_t>(packet[1]));
+        DrawTrace::Note("dispatch_argument_y", static_cast<std::uint64_t>(packet[2]));
+        DrawTrace::Note("dispatch_argument_z", static_cast<std::uint64_t>(packet[3]));
+    }
     if (indirectArguments == 0 && (packet[4] & 0x20u) != 0) {
 
         for (std::uint32_t axis = 0; axis < 3; ++axis) {
             const auto threads = std::max(readRegister(queue.shader, 0x207 + axis) & 0xffffu, 1u);
             groups[axis] = (groups[axis] + threads - 1) / threads;
         }
+    }
+    if (indirectArguments == 0) {
+        DrawTrace::Note("dispatch_groups_x", static_cast<std::uint64_t>(groups[0]));
+        DrawTrace::Note("dispatch_groups_y", static_cast<std::uint64_t>(groups[1]));
+        DrawTrace::Note("dispatch_groups_z", static_cast<std::uint64_t>(groups[2]));
+    } else {
+        DrawTrace::Note("indirect_count", "gpu_resolved_unknown");
     }
     const std::uint64_t dispatchThreads = indirectArguments != 0 ? 0 : std::uint64_t{groups[0]} * groups[1] * groups[2] * compute.numThreads[0] * compute.numThreads[1] * compute.numThreads[2];
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
@@ -580,6 +673,7 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
 
     const auto rethrow = [&](const std::exception& error) {
         if (fromAhead) {
+            DrawTrace::Note("dispatch_retry", "ahead_preparation_rejected");
             ++groupStats.deviceRejects;
             dispatch(queue, packet, submission, indirectArguments);
             return true;
@@ -652,7 +746,10 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
             sink->dispatchInputs = std::move(inputs);
             return;
         }
-        postDrawRecord(localDevice, submission.queue, recordIdentity(submission, indirectArguments != 0 ? "indirect dispatch" : "dispatch", address), [inputs, localDevice](DrawRecordResult&) { recordDispatchInputs(*inputs, localDevice); });
+        postDrawRecord(localDevice, submission.queue, recordIdentity(submission, indirectArguments != 0 ? "indirect dispatch" : "dispatch", address), [inputs, localDevice](DrawRecordResult&) { recordDispatchInputs(*inputs, localDevice); }, "dispatch");
+        if (traceOperation) traceOperation->Outcome(DrawTrace::Status::Unknown);
+        else DrawTrace::SetOperationOutcome(DrawTrace::Status::Unknown);
+        DrawTrace::Note("dispatch_path", "deferred_record");
     }
     for (; !deferred;) {
 
@@ -681,7 +778,9 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
             }
         }
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
+        DrawTrace::Span lockWait("Driver.DispatchGpuMutexWait");
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        lockWait.Finish();
         phaseTiming.Phase(PhaseLockWait);
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
@@ -696,11 +795,13 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
                 VulkanDevice::IndirectOutcome outcome{0, 0};
                 const auto result = localDevice->DispatchRecipe(compiled, groups[0], groups[1], groups[2], indirectArguments, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
                 if (result == RecipeOutcome::Rebuild) {
+                    DrawTrace::Note("dispatch_recipe_outcome", "rebuild");
 
                     recipeHit = nullptr;
                     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, indirectArguments != 0);
                     continue;
                 }
+                DrawTrace::Note("dispatch_recipe_outcome", "recorded");
                 if (indirectArguments != 0) countIndirect(outcome.cpuReason, outcome.argumentReadMs);
             } else if (indirectArguments != 0) {
                 armFreeze(address, request, captured);

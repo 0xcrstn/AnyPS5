@@ -264,7 +264,14 @@ ShaderMemory::PlanInstance& Driver::resourcePlanInstance(const std::shared_ptr<c
         if (victim->instance.handle != nullptr && way.used < victim->used) victim = &way;
         if (way.instance.handle != handle || way.pushOffset != pushOffset) continue;
         std::size_t same = 0;
-        for (std::size_t index = 0; index < way.instance.userData.size() && index < userData.size(); ++index) same += way.instance.userData[index] == userData[index] ? 1u : 0u;
+        if (way.instance.rootsPlan != nullptr && !way.instance.allRoots) {
+            for (const auto root : way.instance.roots) {
+                if (root < way.instance.userData.size() && root < userData.size() && way.instance.userData[root] == userData[root]) ++same;
+            }
+            if (way.instance.roots.empty()) same = 1u;
+        } else {
+            for (std::size_t index = 0; index < way.instance.userData.size() && index < userData.size(); ++index) same += way.instance.userData[index] == userData[index] ? 1u : 0u;
+        }
         if (chosen == nullptr || same > best) {
             chosen = &way;
             best = same;

@@ -13,10 +13,38 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
+#include <algorithm>
 #include <functional>
+#include <exception>
 #include <shared_mutex>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+class TraceOutcome {
+public:
+    TraceOutcome(DrawTrace::EventKind kind, DrawTrace::Id id) : kind(kind), id(id), exceptions(std::uncaught_exceptions()) {
+        DrawTrace::Record(kind, id);
+    }
+    ~TraceOutcome() noexcept {
+        try {
+            DrawTrace::Record(kind, id, 0, 0, std::uncaught_exceptions() > exceptions ? DrawTrace::Status::Failed : status);
+        } catch (...) {}
+    }
+    void Outcome(DrawTrace::Status value) { status = value; }
+    void Skip(const char* reason) {
+        status = DrawTrace::Status::Skipped;
+        DrawTrace::Note("skip_reason", reason);
+    }
+private:
+    DrawTrace::EventKind kind;
+    DrawTrace::Id id;
+    int exceptions;
+    DrawTrace::Status status = DrawTrace::Status::Complete;
+};
+
+}
 
 template <typename TWork>
 void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
@@ -33,6 +61,17 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 }
 
 void Driver::execute(const Submission& submission) {
+    auto executionOrigin = submission.traceContext;
+    if (submission.traceJobManagedByWorker) executionOrigin.job = DrawTrace::Current().job;
+    DrawTrace::ContextScope traceContext(executionOrigin);
+    std::optional<DrawTrace::JobScope> traceJob;
+    if (!submission.traceJobManagedByWorker && submission.traceJob.id != 0) traceJob.emplace(submission.traceJob);
+    DrawTrace::Span executionScope("Driver.ExecuteSubmission");
+    DrawTrace::BoundaryReference(submission.traceContext.driver, "driver");
+    DrawTrace::BoundaryReference(submission.traceContext.submission, "submission");
+    TraceOutcome segmentTrace(DrawTrace::EventKind::Segment, submission.traceContext.segment);
+    DrawTrace::Link(submission.traceContext.submission, submission.traceContext.segment, "contains");
+    DrawTrace::Link(DrawTrace::Current().job, submission.traceContext.segment, "executes");
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;
@@ -121,8 +160,20 @@ void Driver::execute(const Submission& submission) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
         const auto header = submission.commands[cursor];
-        if (Pm4::FillerPacket(header)) { ++cursor; continue; }
+        auto packetOrigin = submission.TraceAt(cursor);
+        packetOrigin.job = DrawTrace::Current().job;
+        DrawTrace::ContextScope packetContext(packetOrigin);
+        TraceOutcome packetTrace(DrawTrace::EventKind::Packet, DrawTrace::Current().packet);
+        DrawTrace::Link(submission.traceContext.segment, DrawTrace::Current().packet, "contains");
+        DrawTrace::Link(DrawTrace::Current().job, DrawTrace::Current().packet, "executes");
+        DrawTrace::Note("packet_header", static_cast<std::uint64_t>(header));
+        if (Pm4::FillerPacket(header)) {
+            packetTrace.Skip("filler");
+            ++cursor;
+            continue;
+        }
         const auto count = Pm4::PacketWords(header);
+        DrawTrace::Note("packet_words", static_cast<std::uint64_t>(count));
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         const SlowReport slowPacket([&] {
@@ -141,16 +192,23 @@ void Driver::execute(const Submission& submission) {
         timing.Mark("device_lock");
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
-        if (deferDrawRecords(submission.queue) && !OverlapsDrawRecords(header == FlipPacketHeader || header == RenderingWaitPacketHeader ? 0u : opcode, Pm4::Predicated(header) && queue.predication.operation != 0, deferDispatchRecords(submission.queue)) && (header == FlipPacketHeader || header == RenderingWaitPacketHeader || (Pm4::Predicated(header) && queue.predication.operation != 0) || (!overlapCommandProcessorRead(packet) && (submission.flips.contains(cursor) || !deferredLabelPacket(packet)) && !memoryPacketJob(submission.queue, packet)))) waitDrawRecordsAt(header == FlipPacketHeader ? 0x100u : header == RenderingWaitPacketHeader ? 0x101u : opcode);
+        if (deferDrawRecords(submission.queue)) {
+            const bool special = header == FlipPacketHeader || header == RenderingWaitPacketHeader;
+            const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+            const bool overlaps = !special && (OverlapsDrawRecords(opcode, false, deferDispatchRecords(submission.queue)) || overlapCommandProcessorRead(packet) || (!submission.flips.contains(cursor) && deferredLabelPacket(packet)) || memoryPacketJob(submission.queue, packet));
+            if (!overlaps || (predicated && !overlapPredicationRead(queue.predication.address, queue.predication.operation == 3 ? 8u : 4u))) waitDrawRecordsAt(header == FlipPacketHeader ? 0x100u : header == RenderingWaitPacketHeader ? 0x101u : opcode);
+        }
         if (Pm4::Predicated(header) && queue.predication.operation != 0) {
             landPendingWaits(submission.queue);
-            recordQueuedLabelsBeforeRead(submission.queue);
+            if (!freezeLabels(submission.queue, false)) recordQueuedLabelsBeforeRead(submission.queue);
             if (!Pm4::PredicationPasses(queue)) {
+                packetTrace.Skip("predication_false");
                 cursor = opcode == 0x3f ? submission.conditionalEnds.at(cursor) : nextCursor;
                 continue;
             }
         }
         if (opcode == 0x3f) {
+            packetTrace.Skip("copied_indirect_buffer_control");
             cursor = nextCursor;
             continue;
         }
@@ -194,7 +252,8 @@ void Driver::execute(const Submission& submission) {
         if (profilePackets) packetProfile.flushMs += std::chrono::duration<double, std::milli>(packetTimer.start - flushStart).count();
 
         bool wroteOnGpu = false, endOfPipeInterrupt = false, interruptDeferred = false, drawPacket = false, sampleDump = false;
-        const bool drains = preparePacketMemory(submission, queue, packet, header, opcode, wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump);
+        std::vector<DrawTrace::Id> flipDependencies;
+        const bool drains = preparePacketMemory(submission, queue, packet, header, opcode, wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump, DrawTrace::Enabled() && submission.flips.contains(cursor) ? &flipDependencies : nullptr);
         traceLabel(packet, submission.queue);
         timing.Mark("prepare_memory");
 
@@ -236,6 +295,12 @@ void Driver::execute(const Submission& submission) {
                 if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
                 if (localDevice != nullptr) {
                     localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
+                    if (DrawTrace::Enabled()) {
+                        try {
+                            const auto dependencies = localDevice->CollectTraceDependencies();
+                            flipDependencies.insert(flipDependencies.end(), dependencies.begin(), dependencies.end());
+                        } catch (...) { DrawTrace::ReportObservationLoss(); }
+                    }
                     const auto queueId = submission.queue;
                     flipInterruptDeferred = localDevice->AfterRecordedWork([queueId] { AgcDriverDeliverEopInterrupt(queueId); }, false);
                 }
@@ -255,10 +320,26 @@ void Driver::execute(const Submission& submission) {
             frame->SetFlip(submission.serial, cursor, APS5_ENABLE_TIMING_LOG ? submission.receivedAt : now, now);
             if (APS5_ENABLE_TIMING_LOG) frame->CollectBackground();
             frame->NoteFlipBatches(batchesAtFlip, unsignaledAtFlip);
+            if (DrawTrace::Enabled()) {
+                const auto flip = DrawTrace::NextId();
+                auto origin = DrawTrace::Current();
+                origin.flip = flip;
+                frame->SetDrawTraceOrigin(flip, origin);
+                DrawTrace::ContextScope flipContext(origin);
+                DrawTrace::Record(DrawTrace::EventKind::Flip, flip, origin.packet, 0, DrawTrace::Status::Complete);
+                DrawTrace::Link(origin.packet, flip, "packet_flip");
+                std::sort(flipDependencies.begin(), flipDependencies.end());
+                flipDependencies.erase(std::unique(flipDependencies.begin(), flipDependencies.end()), flipDependencies.end());
+                for (const auto batch : flipDependencies) DrawTrace::Link(batch, flip, "flip_depends_on_batch");
+                DrawTrace::Note("flip_dependency_scope", drains ? "open_and_inflight_before_drain" : "open_and_inflight_at_flip");
+                DrawTrace::Note("batches_at_flip", batchesAtFlip);
+                DrawTrace::Note("unsignaled_at_flip", unsignaledAtFlip);
+            }
             CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
             flipHold.Release();
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15 || opcode == 0x16) {
+            PerformanceTrace::WorkloadScope workload(MeasurementWorkload::Kind::Dispatch);
             landPendingWaits(submission.queue);
             currentPacketOffset() = cursor;
             if (gateOpened()) {
@@ -290,6 +371,7 @@ void Driver::execute(const Submission& submission) {
                 }
             }
         } else if (drawPacket) {
+            PerformanceTrace::WorkloadScope workload(MeasurementWorkload::Kind::Draw);
             landPendingWaits(submission.queue);
             bool drawn = false;
             timed(&WorkerProfile::drawMs, [&] {
@@ -304,12 +386,15 @@ void Driver::execute(const Submission& submission) {
                 try {
                     std::string rejected;
                     const auto verdict = draw(queue, packet, submission, rejected);
+                    workload.Outcome(verdict == DrawVerdict::Rejected ? MeasurementWorkload::Outcome::Rejected : verdict == DrawVerdict::Nothing ? MeasurementWorkload::Outcome::Skipped : MeasurementWorkload::Outcome::Complete);
                     drawn = verdict == DrawVerdict::Drawn;
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {
+                        packetTrace.Outcome(DrawTrace::Status::Rejected);
                         countSkip(Graphics::DrawSkip::Prechecked);
                         throw std::runtime_error(rejected);
                     } else if (verdict == DrawVerdict::Nothing) {
+                        packetTrace.Skip("draw_has_no_work");
                         countSkip(Graphics::DrawSkip::Nothing);
                     } else if (traceDraws) {
                         std::fprintf(stderr, "[draw] target 0x%llx mask 0x%x ok\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e));
@@ -331,11 +416,22 @@ void Driver::execute(const Submission& submission) {
             landPendingWaits(submission.queue);
             recordQueuedLabelsBeforeRead(submission.queue);
             Pm4::Execute(packet, queue);
+        } else if (opcode == 0x40 && Pm4::CopyDataToRegister(packet)) {
+            landPendingWaits(submission.queue);
+            recordQueuedLabelsBeforeRead(submission.queue);
+            Pm4::Execute(packet, queue);
         } else if (sampleDump && !wroteOnGpu) {
             dumpSampleCounters(Pm4::SampleDumpAddress(packet));
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
-                if (Pm4::IndirectRegisterOpcode(opcode)) Pm4::ExecuteIndirectRegisters(packet, submission.registerLists.at(cursor), queue);
+                if (Pm4::IndirectRegisterOpcode(opcode)) {
+                    if (deferDrawRecords(submission.queue) && recordsInFlight()) waitDrawRecordsAt(opcode);
+                    landPendingWaits(submission.queue);
+                    recordQueuedLabelsBeforeRead(submission.queue);
+                    const auto list = submission.registerLists.find(cursor);
+                    if (list != submission.registerLists.end()) Pm4::ExecuteIndirectRegisters(packet, list->second.Resolve(packet), queue);
+                    else Pm4::ExecuteIndirectRegisters(packet, Pm4::ReadIndirectRegisters(packet), queue);
+                }
                 else Pm4::Execute(packet, queue);
                 if (opcode == 0x49 || opcode == 0x37) {
                     if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelStore(label->address, label->Bytes(), ++eventSerial, submission.queue);

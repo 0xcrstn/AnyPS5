@@ -685,7 +685,7 @@ bool ShaderMemory::readDirect(std::uint64_t address, std::uint32_t* value) {
     std::uint32_t word = 0;
     if (kind == PageWhole) {
         GuestMemory::CheckReadGuard(address, sizeof(word));
-        std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+        GuestMemory::CopyDriverMemory(&word, reinterpret_cast<const void*>(address), sizeof(word));
         if (allocationBefore != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || provider != pendingGenerationProvider.load(std::memory_order_acquire) || (provider != nullptr && pendingBefore != provider())) {
             word = fetchWord(address, pendingWrite != nullptr);
             ++directHooked;
@@ -858,7 +858,7 @@ std::uint32_t ShaderMemory::fetchWord(std::uint64_t address, bool wordwise) {
             word = waited;
         }
     } else if (policy == PendingWrite::Raw || policy == PendingWrite::VerifyRaw) {
-        std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+        GuestMemory::CopyDriverMemory(&word, reinterpret_cast<const void*>(address), sizeof(word));
         ++CaptureTotals().wordsRaw;
         if (policy == PendingWrite::VerifyRaw) {
             std::uint32_t waited = 0;
@@ -872,7 +872,7 @@ std::uint32_t ShaderMemory::fetchWord(std::uint64_t address, bool wordwise) {
     } else {
         const bool observed = wordwise && policy == PendingWrite::Sync && self.observe != nullptr && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word));
         std::uint32_t before = 0;
-        if (observed) std::memcpy(&before, reinterpret_cast<const void*>(address), sizeof(before));
+        if (observed) GuestMemory::CopyDriverMemory(&before, reinterpret_cast<const void*>(address), sizeof(before));
         const auto waitsBefore = observed ? hookWaits() : 0;
         const auto started = wordwise ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         GuestMemory::Read(address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
@@ -1286,7 +1286,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureVa
     return capture(invocation.Request(), nullptr, &invocation, true);
 }
 
-std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation, IncrementalState& state) {
+std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation, IncrementalState& state, bool trace) {
     enableDirect();
     const auto allocation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     stableSince = direct && state.allocation == allocation ? state.generation : 0;
@@ -1309,7 +1309,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::CaptureVa
     } reset{*this};
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> result;
     try {
-        result = capture(invocation.Request(), nullptr, &invocation, true);
+        result = capture(invocation.Request(), nullptr, &invocation, true, trace);
     } catch (...) {
         state = {};
         throw;
@@ -1388,7 +1388,7 @@ bool ShaderMemory::PlanReadsCurrent(const PlanInstance& instance) {
     for (const auto& [address, word] : instance.reads) {
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) return false;
         std::uint32_t now = 0;
-        std::memcpy(&now, reinterpret_cast<const void*>(address), sizeof(now));
+        GuestMemory::CopyDriverMemory(&now, reinterpret_cast<const void*>(address), sizeof(now));
         if (now != word) return false;
     }
     return true;
@@ -1414,14 +1414,15 @@ ShaderMemory::PlanFallback ShaderMemory::planFallback(const PlanInstance& instan
     return PlanFallback::None;
 }
 
-ShaderMemory::PlanCapture ShaderMemory::CapturePlanned(const ShaderRecompiler::PreparedShaderInvocation& invocation, PlanInstance& instance, bool keepReads) {
+ShaderMemory::PlanCapture ShaderMemory::CapturePlanned(const ShaderRecompiler::PreparedShaderInvocation& invocation, PlanInstance& instance, bool keepReads, bool trace) {
     PlanCapture result;
     const auto& request = invocation.Request();
     const auto userData = request.context.userData;
     const auto shaderBase = request.shader.codeAddress;
-    if (instance.handle != invocation.Handle()) {
+    if (instance.handle != invocation.Handle() || instance.traced != trace) {
         instance = PlanInstance{};
         instance.handle = invocation.Handle();
+        instance.traced = trace;
     }
     result.fallback = planFallback(instance, userData, shaderBase);
     if (result.fallback == PlanFallback::None) {
@@ -1447,7 +1448,7 @@ ShaderMemory::PlanCapture ShaderMemory::CapturePlanned(const ShaderRecompiler::P
     const auto readsBefore = recentReads.size();
     const auto* tapeBefore = instance.nodes.instance != nullptr ? instance.nodes.instance->tape : nullptr;
     const auto runsBefore = instance.nodes.instance != nullptr ? instance.nodes.instance->runs : 0;
-    auto values = CaptureValues(invocation, instance.nodes);
+    auto values = CaptureValues(invocation, instance.nodes, trace);
     const auto* tape = instance.nodes.instance.get();
     const bool served = tape != nullptr && tape->tape != nullptr && (tape->tape != tapeBefore || tape->runs != runsBefore);
     if (tape != nullptr) {
@@ -1468,11 +1469,13 @@ ShaderMemory::PlanCapture ShaderMemory::CapturePlanned(const ShaderRecompiler::P
         auto handle = std::move(instance.handle);
         instance = PlanInstance{};
         instance.handle = std::move(handle);
+        instance.traced = trace;
         std::vector<ShaderRecompiler::MemoryRegion> code;
         code.reserve(initial.size());
         for (const auto& [address, bytes] : initial) code.push_back({address, bytes});
-        ShaderMemory full(code, pendingWrite, observe, hookWaits);
-        result.values = full.CaptureValues(invocation);
+        result.memory = std::make_shared<ShaderMemory>(code, pendingWrite, observe, hookWaits);
+        result.memory->enableDirect();
+        result.values = result.memory->capture(invocation.Request(), nullptr, &invocation, true, trace);
         result.fallback = PlanFallback::Specialization;
         result.outcome = PlanOutcome::Full;
         result.nodesKept = 0;
@@ -1492,7 +1495,34 @@ ShaderMemory::PlanCapture ShaderMemory::CapturePlanned(const ShaderRecompiler::P
     return result;
 }
 
-std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation, bool valuesOnly) {
+ShaderMemory::PlanCapture ShaderMemory::CapturePlannedOwned(const ShaderRecompiler::PreparedShaderInvocation& invocation, PlanInstance& instance, std::shared_ptr<ShaderMemory>& memory, std::vector<ShaderRecompiler::MemoryRegion>& regions, std::shared_ptr<const void> memoryOwner, bool keepReads, bool trace) {
+    if (memory == nullptr) throw std::invalid_argument("an owned plan capture requires shader memory");
+    auto result = memory->CapturePlanned(invocation, instance, keepReads, trace);
+    const auto reused = [&] { return result.outcome == PlanOutcome::Reused || result.outcome == PlanOutcome::Patched; };
+    if (reused() && instance.memory == nullptr) {
+        instance.values.reset();
+        result = memory->CapturePlanned(invocation, instance, keepReads, trace);
+    }
+    if (reused()) {
+        memory = instance.memory;
+        regions = instance.regions;
+        result.memory = memory;
+        return result;
+    }
+    if (result.memory != nullptr) memory = result.memory;
+    memory->initialOwner = std::move(memoryOwner);
+    regions = memory->Regions();
+    if (instance.values != nullptr) {
+        instance.memory = memory;
+        instance.regions = regions;
+    } else {
+        instance.memory.reset();
+        instance.regions.clear();
+    }
+    return result;
+}
+
+std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation, bool valuesOnly, bool trace) {
     // The capture's word and page reads (through `read`) are attributed to it ([hooksync], [guestmem]).
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
     const bool profile = CaptureProfiled();
@@ -1513,7 +1543,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
         runtime.tapeInstance = tapeInstance;
         runtime.stableWord = &stable;
     }
-    auto capture = invocation != nullptr ? (valuesOnly ? invocation->CaptureValues(runtime) : invocation->Capture(runtime)) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+    auto capture = invocation != nullptr ? (valuesOnly ? invocation->CaptureValues(runtime, trace) : invocation->Capture(runtime)) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);
         totals.resolveNanoseconds += capture->sourceNanoseconds;

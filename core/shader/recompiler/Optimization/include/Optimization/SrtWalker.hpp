@@ -59,9 +59,9 @@ struct SrtRuntime {
     SrtTapeInstance* tapeInstance = nullptr;
 };
 
-enum class SrtCompiledWalkRefusal : std::uint8_t { None, IncompletePlan, Opcode, Phi, VoidHandle, WideSource, Cycle, FlatOffset, UserData, IndirectImage, Count };
+enum class SrtCompiledWalkRefusal : std::uint8_t { None, IncompletePlan, Opcode, Phi, VoidHandle, WideSource, Cycle, FlatOffset, UserData, IndirectImage, Tracing, Count };
 inline constexpr std::size_t SrtCompiledWalkRefusals = static_cast<std::size_t>(SrtCompiledWalkRefusal::Count);
-inline constexpr const char* SrtCompiledWalkRefusalNames[SrtCompiledWalkRefusals] = {"none", "incomplete plan", "unsupported opcode", "variant phi", "void handle", "wide source", "cycle", "flat offset", "user data register", "indirect image"};
+inline constexpr const char* SrtCompiledWalkRefusalNames[SrtCompiledWalkRefusals] = {"none", "incomplete plan", "unsupported opcode", "variant phi", "void handle", "wide source", "cycle", "flat offset", "user data register", "indirect image", "unsupported tracing shape"};
 
 struct SrtCompiledWalkCounts {
     std::uint64_t runs = 0;

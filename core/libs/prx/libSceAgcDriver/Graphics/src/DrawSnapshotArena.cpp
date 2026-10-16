@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <stdexcept>
 
 namespace AgcDriver::Graphics {
 
@@ -179,6 +180,9 @@ void DrawSnapshotArena::ReportActive(double elapsedSeconds) {
     std::size_t busy = 0;
     std::size_t chunkCount = 0;
     std::size_t entryCount = 0;
+    std::size_t wordOwners = 0;
+    std::size_t wordEntries = 0;
+    std::uint64_t wordBytes = 0;
     {
         std::lock_guard lock(arena->mutex);
         for (const auto& chunk : arena->chunks) {
@@ -187,8 +191,17 @@ void DrawSnapshotArena::ReportActive(double elapsedSeconds) {
         }
         chunkCount = arena->chunks.size();
         entryCount = arena->entries.size();
+        wordOwners = arena->wordCaches.size();
+        for (const auto& [owner, cache] : arena->wordCaches) {
+            wordEntries += cache.entries.size();
+            for (const auto& entry : cache.entries) {
+                wordBytes += entry.words.capacity() * sizeof(std::uint32_t);
+                if (entry.buffer != nullptr) wordBytes += entry.buffer->AllocationBytes();
+            }
+        }
     }
     std::fprintf(stderr, "[draw-arena] (%.3f s) %llu takes (%.1f MiB requested): %llu hits (%.1f%%), %llu stale, %llu copies (%.1f MiB copied, %llu exact, %llu unindexed); partial %llu copies (%llu extended in place, %.1f MiB left uncopied); refused: size %llu, budget %llu; chunks %zu (%zu in flight, %.0f MiB, %llu created, %llu recycled), %zu entries; verify %llu checked, %llu differing; device twins%s: %llu views, %llu prologue copies (%.1f MiB), %llu refused; placed words: %llu (%.1f KiB), %llu reused, %llu refused\n", elapsedSeconds, static_cast<unsigned long long>(taken.takes), static_cast<double>(taken.requestedBytes) / 1048576.0, static_cast<unsigned long long>(taken.hits), 100.0 * static_cast<double>(taken.hits) / takes, static_cast<unsigned long long>(taken.stale), static_cast<unsigned long long>(taken.copies), static_cast<double>(taken.copiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.exactSegments), static_cast<unsigned long long>(taken.unindexed), static_cast<unsigned long long>(taken.partialCopies), static_cast<unsigned long long>(taken.extendedCopies), static_cast<double>(taken.uncopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.refusedSize), static_cast<unsigned long long>(taken.refusedBudget), chunkCount, busy, static_cast<double>(heldBytes) / 1048576.0, static_cast<unsigned long long>(taken.chunksCreated), static_cast<unsigned long long>(taken.chunksRecycled), entryCount, static_cast<unsigned long long>(taken.verified), static_cast<unsigned long long>(taken.verifyDiffering), DeviceTwins() ? "" : " (off)", static_cast<unsigned long long>(taken.twinViews), static_cast<unsigned long long>(taken.twinCopies), static_cast<double>(taken.twinCopiedBytes) / 1048576.0, static_cast<unsigned long long>(taken.twinsRefused), static_cast<unsigned long long>(taken.placed), static_cast<double>(taken.placedBytes) / 1024.0, static_cast<unsigned long long>(taken.placedReuses), static_cast<unsigned long long>(taken.placeRefused));
+    if (wordOwners != 0) std::fprintf(stderr, "[draw-arena] word cache: %zu templates, %zu entries, %.1f MiB retained payload\n", wordOwners, wordEntries, static_cast<double>(wordBytes) / 1048576.0);
     if (WorkerCopies()) std::fprintf(stderr, "[draw-arena] worker copies: %llu prefilled (%.1f MiB), %llu already served, %llu adopted at the encode, %llu refused there; worker hits: %llu adopted at the encode, %llu verified\n", static_cast<unsigned long long>(taken.prefilled), static_cast<double>(taken.prefilledBytes) / 1048576.0, static_cast<unsigned long long>(taken.prefillsServed), static_cast<unsigned long long>(taken.adopted), static_cast<unsigned long long>(taken.adoptRefused), static_cast<unsigned long long>(taken.workerHits), static_cast<unsigned long long>(taken.workerHitsVerified));
 }
 
@@ -326,7 +339,7 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::lookup(Recorder& recor
         ++counters.hits;
         if (Verify()) {
             ++counters.verified;
-            const bool same = ranges == nullptr ? std::memcmp(result.bytes.data(), reinterpret_cast<const void*>(address), bytes) == 0 : std::all_of(ranges->begin(), ranges->end(), [&](const auto& range) { return std::memcmp(result.bytes.data() + range.first, reinterpret_cast<const void*>(address + range.first), static_cast<std::size_t>(range.second - range.first)) == 0; });
+            const bool same = ranges == nullptr ? GuestMemory::CompareDriverMemory(result.bytes.data(), reinterpret_cast<const void*>(address), bytes) : std::all_of(ranges->begin(), ranges->end(), [&](const auto& range) { return GuestMemory::CompareDriverMemory(result.bytes.data() + range.first, reinterpret_cast<const void*>(address + range.first), static_cast<std::size_t>(range.second - range.first)); });
             if (!same) ++counters.verifyDiffering;
         }
         return result;
@@ -363,7 +376,7 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::extend(Recorder& recor
     auto& chunk = *chunks[entry.chunk];
     std::size_t copiedBytes = 0;
     for (const auto& [from, to] : missing) {
-        std::memcpy(chunk.buffer->Bytes().data() + entry.offset + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
+        GuestMemory::CopyDriverMemory(chunk.buffer->Bytes().data() + entry.offset + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
         copiedBytes += static_cast<std::size_t>(to - from);
     }
     CopyRanges sorted;
@@ -409,6 +422,60 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::Reuse(Recorder& record
     return view(recorder, placed.chunk, placed.offset, placed.bytes, false, 0);
 }
 
+std::uint64_t DrawSnapshotArena::NextWordKey() {
+    static std::atomic<std::uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+DrawSnapshotArena::WordView DrawSnapshotArena::PlaceWords(Recorder& recorder, std::uint64_t owner, std::size_t allocation, std::span<const std::uint32_t> words, std::size_t bytes, std::span<const DataPatch> patches, bool ring) {
+    if (bytes == 0 || bytes > words.size_bytes()) throw std::invalid_argument("moved-word buffer exceeds its captured data");
+    std::lock_guard lock(mutex);
+    constexpr std::size_t OwnerLimit = 256;
+    constexpr std::size_t Slots = 8;
+    auto found = wordCaches.find(owner);
+    if (found == wordCaches.end()) {
+        if (wordCaches.size() == OwnerLimit) {
+            const auto oldest = std::min_element(wordCaches.begin(), wordCaches.end(), [](const auto& left, const auto& right) { return left.second.used < right.second.used; });
+            wordCaches.erase(oldest);
+        }
+        found = wordCaches.try_emplace(owner).first;
+    }
+    auto& cache = found->second;
+    cache.used = ++wordUse;
+    const auto held = std::find_if(cache.entries.begin(), cache.entries.end(), [&](const WordEntry& entry) { return entry.allocation == allocation && entry.bytes == bytes && std::equal(entry.words.begin(), entry.words.end(), words.begin(), words.end()); });
+    const auto keep = [&](WordEntry entry) {
+        if (held != cache.entries.end()) *held = std::move(entry);
+        else if (cache.entries.size() < Slots) cache.entries.push_back(std::move(entry));
+        else cache.entries[cache.next++ % Slots] = std::move(entry);
+    };
+    const auto fill = [&](std::span<std::byte> target) {
+        std::memcpy(target.data(), words.data(), bytes);
+        for (const auto& patch : patches) {
+            if (patch.allocation == allocation && patch.byte < bytes) target[patch.byte] = static_cast<std::byte>(patch.adjustment);
+        }
+    };
+    if (ring) {
+        if (held != cache.entries.end() && held->buffer == nullptr && held->placed.arena == identity && held->placed.chunk < chunks.size() && chunks[held->placed.chunk]->serial == held->placed.serial) {
+            ++counters.placedReuses;
+            return {view(recorder, held->placed.chunk, held->placed.offset, bytes, false, 0), nullptr};
+        }
+        Placed placed;
+        if (const auto target = reserve(bytes, &placed)) {
+            fill(*target);
+            keep(WordEntry{allocation, std::vector<std::uint32_t>(words.begin(), words.end()), bytes, nullptr, placed});
+            return {view(recorder, placed.chunk, placed.offset, bytes, true, bytes, bytes), nullptr};
+        }
+    }
+    const bool reused = held != cache.entries.end() && held->buffer != nullptr;
+    auto buffer = reused ? held->buffer : std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    if (!reused) {
+        fill(buffer->Bytes());
+        keep(WordEntry{allocation, std::vector<std::uint32_t>(words.begin(), words.end()), bytes, buffer});
+    }
+    const View result{buffer->Handle(), 0, buffer->Bytes().first(bytes), !reused, reused ? 0 : bytes};
+    return {result, std::move(buffer)};
+}
+
 bool DrawSnapshotArena::served(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration, const CopyRanges* ranges) const {
     return servedEntry(address, bytes, registryGeneration, ranges).has_value();
 }
@@ -442,7 +509,7 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::adoptHit(Recorder& rec
     ++counters.workerHits;
     if (VerifyWorkerHits()) {
         ++counters.workerHitsVerified;
-        const bool same = !prefill.ranges.has_value() ? std::memcmp(result.bytes.data(), reinterpret_cast<const void*>(address), bytes) == 0 : std::all_of(prefill.ranges->begin(), prefill.ranges->end(), [&](const auto& range) { return std::memcmp(result.bytes.data() + range.first, reinterpret_cast<const void*>(address + range.first), static_cast<std::size_t>(range.second - range.first)) == 0; });
+        const bool same = !prefill.ranges.has_value() ? GuestMemory::CompareDriverMemory(result.bytes.data(), reinterpret_cast<const void*>(address), bytes) : std::all_of(prefill.ranges->begin(), prefill.ranges->end(), [&](const auto& range) { return GuestMemory::CompareDriverMemory(result.bytes.data() + range.first, reinterpret_cast<const void*>(address + range.first), static_cast<std::size_t>(range.second - range.first)); });
         if (!same) {
             char what[192];
             std::snprintf(what, sizeof(what), "APS5_VERIFY_WORKER_ARENA_HITS: the arena hit a worker found for 0x%llx+0x%zx no longer matches guest memory at the encode", static_cast<unsigned long long>(address), bytes);
@@ -517,11 +584,11 @@ std::optional<DrawSnapshotArena::Prefill> DrawSnapshotArena::PrepareCopy(std::ui
     }
     if (ranges.has_value()) {
         for (const auto& [from, to] : *ranges) {
-            std::memcpy(target.data() + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
+            GuestMemory::CopyDriverMemory(target.data() + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
             prefill.copiedBytes += static_cast<std::size_t>(to - from);
         }
     } else {
-        std::memcpy(target.data(), reinterpret_cast<const void*>(prefill.first), target.size());
+        GuestMemory::CopyDriverMemory(target.data(), reinterpret_cast<const void*>(prefill.first), target.size());
         prefill.copiedBytes = target.size();
     }
     prefill.ranges = std::move(ranges);
@@ -546,7 +613,7 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::adopt(Recorder& record
     auto& chunk = *chunks[prefill.chunk];
     const auto bytes = chunk.buffer->Bytes().subspan(prefill.offset, segmentBytes);
     if (VerifyWorkerCopies()) {
-        const bool same = !prefill.ranges.has_value() ? std::memcmp(bytes.data(), reinterpret_cast<const void*>(prefill.first), segmentBytes) == 0 : std::all_of(prefill.ranges->begin(), prefill.ranges->end(), [&](const auto& range) { return std::memcmp(bytes.data() + range.first, reinterpret_cast<const void*>(prefill.address + range.first), static_cast<std::size_t>(range.second - range.first)) == 0; });
+        const bool same = !prefill.ranges.has_value() ? GuestMemory::CompareDriverMemory(bytes.data(), reinterpret_cast<const void*>(prefill.first), segmentBytes) : std::all_of(prefill.ranges->begin(), prefill.ranges->end(), [&](const auto& range) { return GuestMemory::CompareDriverMemory(bytes.data() + range.first, reinterpret_cast<const void*>(prefill.address + range.first), static_cast<std::size_t>(range.second - range.first)); });
         Require(same, "APS5_VERIFY_WORKER_SNAPSHOT_COPIES: a worker's snapshot copy differs from the guest memory its write generation reports unchanged");
     }
     if (!prefill.ranges.has_value() && chunk.twin != nullptr && !chunk.containsPartial) chunk.pending.push_back({prefill.offset, prefill.offset, segmentBytes});
@@ -620,11 +687,11 @@ std::optional<DrawSnapshotArena::View> DrawSnapshotArena::copy(Recorder& recorde
     auto& chunk = *chunks[placement->chunk];
     if (limited) {
         chunk.containsPartial = true;
-        for (const auto& [from, to] : *ranges) std::memcpy(chunk.buffer->Bytes().data() + placement->offset + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
+        for (const auto& [from, to] : *ranges) GuestMemory::CopyDriverMemory(chunk.buffer->Bytes().data() + placement->offset + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
         ++counters.partialCopies;
         counters.uncopiedBytes += bytes - copiedBytes;
     } else {
-        std::memcpy(chunk.buffer->Bytes().data() + placement->offset, reinterpret_cast<const void*>(first), segmentBytes);
+        GuestMemory::CopyDriverMemory(chunk.buffer->Bytes().data() + placement->offset, reinterpret_cast<const void*>(first), segmentBytes);
         copiedBytes = segmentBytes;
         if (chunk.twin != nullptr && !chunk.containsPartial) chunk.pending.push_back({placement->offset, placement->offset, segmentBytes});
     }

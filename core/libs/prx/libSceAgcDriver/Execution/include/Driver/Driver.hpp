@@ -42,6 +42,7 @@
 #include <span>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -59,6 +60,7 @@ struct DeferredLabel;
 class Driver {
 public:
     static Driver& Get();
+    static std::uint64_t DeferredRegisterLists();
     void ParkPacket(ParkedOp op);
     QueueScheduler& Scheduler() { return queueScheduler; }
     static std::uint64_t GpuMapImportThreads();
@@ -82,7 +84,7 @@ public:
     void SettleShaderPreparations(std::span<const Shader* const> stages);
     static void FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, const DrawProgram& program, Pm4::DrawParameters& parameters);
     static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
-    static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request);
+    static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, std::string_view suffix = {});
     DrawEntryCounters DrawCacheCounters();
     BindingPlanCounters PlanCounters();
     std::uint64_t FrozenIndirectRedos();
@@ -247,8 +249,9 @@ private:
     void waitDrawRecords();
     void waitDrawRecordsAt(std::uint32_t opcode);
     bool overlapCommandProcessorRead(std::span<const std::uint32_t> packet);
+    bool overlapPredicationRead(std::uint64_t address, std::size_t bytes);
     bool recordsInFlight();
-    void postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::string identity, std::function<void(DrawRecordResult&)> record);
+    void postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::string identity, std::function<void(DrawRecordResult&)> record, const char* operationKind);
     static void noteDrawRecordRecipe(DrawRecordResult& result, std::shared_ptr<const DrawRecipe> built, std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void reportDrawRecords();
     struct DrawInputs;
@@ -441,7 +444,7 @@ private:
         bool wroteOnGpu = false;
         bool interruptDeferred = false;
     };
-    EndOfPipeOutcome recordEndOfPipe(VulkanDevice* localDevice, std::uint32_t queue, std::span<const std::uint32_t> packet);
+    EndOfPipeOutcome recordEndOfPipe(VulkanDevice* localDevice, std::uint32_t queue, std::span<const std::uint32_t> packet, std::vector<DrawTrace::Id>* flipDependencies = nullptr);
     bool freezeEndOfPipe(std::uint32_t queue, std::span<const std::uint32_t> packet);
     bool storeMemoryPacket(std::uint32_t queueId, std::span<const std::uint32_t> packet, const std::function<std::optional<Pm4::StoreWrite>(std::size_t)>& resolveStore, bool& wroteOnGpu, bool& orderedAlready);
     bool memoryPacketJob(std::uint32_t queue, std::span<const std::uint32_t> packet);
@@ -456,7 +459,7 @@ private:
     void recordQueuedLabelsByTry(std::uint32_t queue, std::atomic<std::uint64_t>& counter);
     static void recordQueuedLabelsFromHook();
     void flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket);
-    bool preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump);
+    bool preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump, std::vector<DrawTrace::Id>* flipDependencies);
     void dumpSampleCounters(std::uint64_t address);
     template <typename TWork>
     static void timed(double WorkerProfile::*bucket, TWork&& work);

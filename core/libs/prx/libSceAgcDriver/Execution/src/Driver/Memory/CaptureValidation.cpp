@@ -196,7 +196,7 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
                 std::vector<std::byte> copy;
                 if (GuestMemory::Accessible(reinterpret_cast<const void*>(region.guestAddress), region.bytes.size())) {
                     copy.resize(region.bytes.size());
-                    std::memcpy(copy.data(), reinterpret_cast<const void*>(region.guestAddress), copy.size());
+                    GuestMemory::CopyDriverMemory(copy.data(), reinterpret_cast<const void*>(region.guestAddress), copy.size());
                 }
                 before.push_back(std::move(copy));
             }

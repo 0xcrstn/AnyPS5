@@ -715,16 +715,19 @@ void PrepareBdaProvenance(SpirvEmitterState& state) {
         }
     }
     std::map<BdaRoot, std::size_t> common;
+    std::vector<BdaRoot> roots;
     for (const IrBlock* block : order) {
         const auto position = index.at(block);
         for (const IrValue* inst : block->Instructions()) {
             const IrValue* handle = BdaRootHandle(state, *inst);
             if (handle == nullptr) continue;
             const auto [found, inserted] = common.emplace(BdaRootOf(*handle), position);
-            if (!inserted) found->second = intersect(found->second, position);
+            if (inserted) roots.push_back(found->first);
+            else found->second = intersect(found->second, position);
         }
     }
-    for (const auto& [root, position] : common) {
+    for (const auto& root : roots) {
+        const auto position = common.at(root);
         const IrBlock* block = order[position];
         const IrValue* firstAccess = nullptr;
         const IrValue* lastArgument = nullptr;

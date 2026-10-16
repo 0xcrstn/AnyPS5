@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 
@@ -41,7 +42,7 @@ DccKeys CurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes, st
 // Stores "uncompressed" keys over the surface's metadata on the CPU (a guest memory write: it waits
 // for recorded GPU work that writes the keys first).
 void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
-void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount);
+void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount, const std::function<void()>& validate = {});
 // The same after a write-back recorded under GuestMemory::GpuMutex: when the keys are in host-imported
 // memory and a recorder is active, the store is a fill recorded into the open batch (ordered behind
 // the title's key-writing kernels like the write-back itself, nothing waits on the CPU) and the range

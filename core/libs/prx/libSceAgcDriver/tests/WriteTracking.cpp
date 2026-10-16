@@ -70,7 +70,7 @@ void CheckSharedBlock() {
     const auto synced = CollectWrites(base, 3 * Block);
     Require(synced != 0, "the test block is not collected");
 
-    Require(MarkWritten(firstBegin, static_cast<std::size_t>(boundary - firstBegin)) != 0, "a driver store into watched memory is not stamped");
+    Require(MarkWritten(firstBegin, static_cast<std::size_t>(boundary - firstBegin), AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "a driver store into watched memory is not stamped");
     std::array<std::uint64_t, 2> generations{synced, synced};
     std::array<std::uint8_t, 2> changed{};
     Require(ChangedBlocks(base + Block, 2 * Block, generations, changed) && changed[0] == BlockWritten && changed[1] == BlockUnchanged, "the shared block does not read as written");
@@ -78,19 +78,19 @@ void CheckSharedBlock() {
     Require(StoredOver(base + Block, static_cast<std::size_t>(sharedFirst), synced), "the first surface's own store is not seen over its part of the shared block");
     Require(!StoredOver(boundary, static_cast<std::size_t>(secondEnd - boundary), synced), "the second surface reads as stored over");
 
-    const auto touched = MarkWritten(boundary + 0x100, 4);
+    const auto touched = MarkWritten(boundary + 0x100, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(StoredOver(boundary, static_cast<std::size_t>(sharedSecond), synced), "a store over the second surface's bytes is not seen");
     Require(!StoredOver(boundary, static_cast<std::size_t>(sharedSecond), touched), "a store older than the generation is seen");
 
     const auto whole = TrackerGeneration();
-    MarkWritten(base + Block, Block);
+    MarkWritten(base + Block, Block, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(StoredOver(boundary, static_cast<std::size_t>(sharedSecond), whole), "a store over the whole block is not seen");
     const auto afterWhole = TrackerGeneration();
-    MarkWritten(base + Block, static_cast<std::size_t>(sharedFirst));
+    MarkWritten(base + Block, static_cast<std::size_t>(sharedFirst), AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(!StoredOver(boundary, static_cast<std::size_t>(sharedSecond), afterWhole), "a partial store after a whole-block store is taken for the whole block");
 
     const auto many = TrackerGeneration();
-    for (int store = 0; store < 6; ++store) MarkWritten(base + Block + static_cast<std::uint64_t>(store) * 64, 4);
+    for (int store = 0; store < 6; ++store) MarkWritten(base + Block + static_cast<std::uint64_t>(store) * 64, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(StoredOver(boundary, static_cast<std::size_t>(sharedSecond), many), "forgotten driver stores are taken as missing the range");
 
     const auto beforeCpu = CollectWrites(base, 3 * Block);
@@ -105,6 +105,14 @@ void CheckSharedBlock() {
 
 void CheckOwnStore() {
     void* memory = AllocateWatched(2 * Block);
+#ifdef _WIN32
+    GuestArena::GuestArenaReset_nid_postfix(memory, 2 * Block);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, 2 * Block, nullptr);
+    Require(section != nullptr, "cannot allocate the shared own-store section");
+    try { GuestArena::GuestArenaMap_nid_postfix(memory, 2 * Block, section, 0, PAGE_READWRITE); }
+    catch (...) { CloseHandle(section); throw; }
+    CloseHandle(section);
+#endif
     const auto base = reinterpret_cast<std::uint64_t>(memory);
     const auto second = base + Block;
     std::memset(memory, 0x11, 2 * Block);
@@ -191,7 +199,7 @@ void CheckUnwatch() {
     Require(CollectWrites(base, 3 * Block) == 0 && CollectWritesUncached(imported, Block) == 0, "unwatch did not invalidate a cached collect");
     Require(Watched(base, Block) && Watched(base + 2 * Block, Block), "unwatch disabled unrelated memory");
     const auto beforeDriverWrite = TrackerGeneration();
-    Require(MarkWritten(imported, Block) == 0, "an unwatched import still produces trusted stamps");
+    Require(MarkWritten(imported, Block, AgcDriver::GuestMemory::WriteExtent::Exact) == 0, "an unwatched import still produces trusted stamps");
     Require(TrackerGeneration() > beforeDriverWrite, "an unwatched driver write did not invalidate byte comparisons");
     const auto beforeOwnWrite = TrackerGeneration();
     StoreOwnBytes(imported, 1, [&] { *reinterpret_cast<std::uint8_t*>(imported) = 0x42; });
@@ -218,7 +226,7 @@ void CheckNewestStamp() {
     Unwatch(first, 2 * Block);
     const auto firstBefore = NewestStamp(first, Block);
     const auto secondBefore = NewestStamp(second, Block);
-    MarkWritten(second + 16, 4);
+    MarkWritten(second + 16, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(NewestStamp(second, Block) > secondBefore, "a driver store into unwatched memory did not advance its stamp");
     Require(NewestStamp(first, Block) == firstBefore, "a driver store advanced the stamp of other unwatched memory");
     const auto generation = TrackerGeneration();
@@ -250,7 +258,7 @@ void CheckAliasStamps() {
     CollectWritesUncached(a, bytes);
     const auto synced = CollectWritesUncached(b, bytes);
     Require(synced != 0 && UnchangedSince(b + 64, 32, synced), "the second mapping did not collect clean");
-    Require(MarkWritten(a + 64, 32) != 0, "a driver store through the first mapping was not stamped");
+    Require(MarkWritten(a + 64, 32, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "a driver store through the first mapping was not stamped");
     Require(WrittenSince(b + 64, 32, synced) && StoredOver(b + 64, 32, synced), "a driver store through one mapping did not stamp the other mapping of the same pages");
     GuestArena::GuestArenaReset_nid_postfix(second, bytes);
     GuestArena::GuestArenaRelease_nid_postfix(second, bytes);
@@ -273,7 +281,7 @@ void CheckDeferredSharedImports() {
     };
     Require(ImportWatched(base, bytes, [] { return true; }), "fresh shared import failed");
     Require(protection(0) == PAGE_READWRITE && protection(bytes - 1) == PAGE_READWRITE, "fresh import armed shared pages");
-    const auto gpu = MarkWritten(base + 4096, 4);
+    const auto gpu = MarkWritten(base + 4096, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(gpu != 0 && protection(0) == PAGE_READONLY && protection(Block) == PAGE_READWRITE, "GPU write did not activate only its block");
     CollectWritesUncached(base, Block);
     Require(!WrittenSince(base + 4096, 4, gpu) && !StoredOver(base + 4096, 4, gpu), "first collect overwrote a GPU generation");
@@ -283,7 +291,7 @@ void CheckDeferredSharedImports() {
 
     const auto second = base + Block;
     const auto before = CollectWritesUncached(second, 4096);
-    Require(MarkWritten(second, 4) != 0, "GPU write next to fresh pages failed");
+    Require(MarkWritten(second, 4, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "GPU write next to fresh pages failed");
     Require(UnchangedSinceCollected(second, 4, before), "fresh neighbors were stamped as new CPU writes over a collected page");
     Require(StoredOver(second + 8 * 4096, 4096, before), "fresh neighbor history was lost");
     const std::array<std::uint64_t, 1> generations{before};
@@ -291,7 +299,7 @@ void CheckDeferredSharedImports() {
     std::array<std::uint8_t, 1> cpu{};
     Require(ChangedBlocks(second, Block, generations, changed, cpu) && changed[0] == BlockWritten && cpu[0] == 0, "fresh collection set the block's CPU stamp");
     const auto generation = TrackerGeneration();
-    Require(MarkWritten(second, 4) == generation + 1, "an already collected GPU block advanced twice");
+    Require(MarkWritten(second, 4, AgcDriver::GuestMemory::WriteExtent::Exact) == generation + 1, "an already collected GPU block advanced twice");
 
     const auto third = base + 2 * Block;
     const auto cached = CollectWritesUncached(third, Block);
@@ -307,7 +315,7 @@ void CheckDeferredSharedImports() {
     GuestArena::GuestArenaReset_nid_postfix(memory + 3 * Block, 16384);
     const auto edge = base + 3 * Block + 16384;
     Require(ImportWatched(edge, Block - 16384, [] { return true; }), "unaligned shared import failed");
-    const auto edgeGpu = MarkWritten(edge, 4);
+    const auto edgeGpu = MarkWritten(edge, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(edgeGpu != 0, "fresh collection rejected an unmapped block neighbor");
     CollectWritesUncached(edge, Block - 16384);
     Require(!WrittenSince(edge, 4, edgeGpu), "edge block collection overwrote GPU results");
@@ -486,7 +494,7 @@ void CheckHostHole() {
     const std::array queries{UnchangedQuery{hole, bytes, before}};
     Require(!UnchangedSinceAll(queries), "an arena host hole reads as unchanged in a batch");
     Require(!UnchangedSinceCollected(hole, bytes, before), "an arena host hole reads as unchanged since a collect");
-    Require(MarkWritten(hole, bytes) == 0, "a driver store into an arena host hole is stamped");
+    Require(MarkWritten(hole, bytes, AgcDriver::GuestMemory::WriteExtent::Exact) == 0, "a driver store into an arena host hole is stamped");
     Require(StoreOwnBytes(hole, bytes, [] {}) == 0, "an own store into an arena host hole is stamped");
     Require(!WrittenSince(hole, bytes, before), "an arena host hole reads its stamps as written");
     std::array<std::uint64_t, 1> generations{before};
@@ -541,7 +549,7 @@ void CheckVersionRanges() {
         if (step % 3 == 0) {
             memory[block * Block + 9] ^= 1;
             generation = CollectWritesUncached(base + block * Block, Block);
-        } else generation = MarkWritten(base + block * Block + 13, 4);
+        } else generation = MarkWritten(base + block * Block + 13, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
         Require(generation > checkpoints.back(), "version range write did not advance the tracker");
         history.push_back({block, generation});
         checkpoints.push_back(generation);
@@ -597,7 +605,7 @@ void CheckCollectBoundaries() {
         const auto observed = TrackerGeneration();
         memory[offset + 1] ^= 1;
         Require(CollectWritesUncached(base + offset, 16) > observed && !UnchangedSince(base + offset, 16, observed), "an uncached observation reused an epoch result");
-        const auto stored = MarkWritten(base + offset + 2, 1);
+        const auto stored = MarkWritten(base + offset + 2, 1, AgcDriver::GuestMemory::WriteExtent::Exact);
         Require(CollectWrites(base + offset, 16) >= stored && !UnchangedSince(base + offset, 16, observed), "a memoized observation hid a driver write");
     }
 #ifndef _WIN32
@@ -868,7 +876,7 @@ void CheckEpochDirtyUnstampedBatch() {
         {base + 2 * Block, base + 2 * Block},
         {base + 2 * Block + 64, base + 2 * Block},
     }};
-    const auto marked = MarkWrittenUnlessStored(ranges, generation);
+    const auto marked = MarkWrittenUnlessStored(ranges, generation, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(marked.generation == 0 && marked.storedOver, "a mixed write batch changed its unstamped result");
     Require(!UnchangedSinceDirtySerial(base, 64, serial), "a mixed write batch hid its watched range from the dirty log");
     Require(!UnchangedSinceDirtySerial(base + Block, 64, serial), "a mixed write batch hid its unwatched range from the dirty log");
@@ -901,7 +909,7 @@ void CheckEpochDirtyBlockGranularity() {
         const auto generation = CollectWritesUncached(base, 3 * Block);
         Require(generation != 0, "the block-granularity range is not collected");
         const auto serial = DirtySerial();
-        Require(MarkWritten(begin, static_cast<std::size_t>(end - begin)) != 0, "the block-granularity driver store is not stamped");
+        Require(MarkWritten(begin, static_cast<std::size_t>(end - begin), AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "the block-granularity driver store is not stamped");
         for (const auto& [first, last] : queries) {
             const auto bytes = static_cast<std::size_t>(last - first);
             Require(UnchangedSinceDirtySerial(first, bytes, serial) == UnchangedSince(first, bytes, generation), "a dirty proof disagreed with the block stamps after an adjacent, disjoint or crossing driver store");
@@ -911,7 +919,7 @@ void CheckEpochDirtyBlockGranularity() {
     constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
     constexpr auto tail = maximum - (Block - 1);
     const auto beforeTail = DirtySerial();
-    Require(MarkWritten(maximum - 7, 7) == 0, "an address outside the watched arena was stamped");
+    Require(MarkWritten(maximum - 7, 7, AgcDriver::GuestMemory::WriteExtent::Exact) == 0, "an address outside the watched arena was stamped");
     Require(!UnchangedSinceDirtySerial(tail, 1, beforeTail), "rounding the final block wrapped its dirty range");
     Require(UnchangedSinceDirtySerial(tail - Block, 1, beforeTail), "rounding the final block invalidated its predecessor");
     SetEpochDirtySet(false);
@@ -935,13 +943,13 @@ void CheckEpochDirtySampleOrder() {
     std::memset(range.Data(), 0x22, Block);
     const auto lateGeneration = CollectWritesUncached(base, Block);
     Require(lateGeneration != 0, "the sample-order range is not collected");
-    Require(MarkWritten(base + 64, 16) != 0, "the sample-order driver store is not stamped");
+    Require(MarkWritten(base + 64, 16, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "the sample-order driver store is not stamped");
     const auto lateSerial = DirtySerial();
     Require(UnchangedSinceDirtySerial(base, Block, lateSerial) && !UnchangedSince(base, Block, lateGeneration), "a serial sampled after the generation did not reproduce the dirty-set verify disagreement");
     const auto serial = DirtySerial();
     const auto generation = CollectWritesUncached(base, Block);
     Require(generation != 0, "the sample-order range is not collected again");
-    Require(MarkWritten(base + 64, 16) != 0, "the second sample-order driver store is not stamped");
+    Require(MarkWritten(base + 64, 16, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "the second sample-order driver store is not stamped");
     Require(!UnchangedSinceDirtySerial(base, Block, serial) && !UnchangedSince(base, Block, generation), "a serial sampled before the generation missed a later store");
     const auto quietSerial = DirtySerial();
     const auto quietGeneration = CollectWritesUncached(base, Block);
@@ -998,7 +1006,7 @@ void CheckEpochDirtyConcurrentPublication() {
     std::exception_ptr failure;
     std::jthread writer([&] {
         try {
-            for (std::size_t index = 0; index < 512; ++index) Require(MarkWritten(base + 4096 + 8, 16) != 0, "a concurrent driver store is not stamped");
+            for (std::size_t index = 0; index < 512; ++index) Require(MarkWritten(base + 4096 + 8, 16, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "a concurrent driver store is not stamped");
         } catch (...) {
             failure = std::current_exception();
         }
@@ -1043,7 +1051,7 @@ void CheckEpochDirtySet() {
     Require(UnchangedSinceDirtySerial(base + 2 * Block, Block, clean, &through) && through == DirtySerial(), "a store in one block dirtied another");
     Require(UnchangedSinceDirtySerial(base + Block, Block, through), "a range reads as dirty after the serial it was checked through");
     const auto beforeDriver = DirtySerial();
-    Require(MarkWritten(base + 2 * Block + 16, 4) != 0, "a driver store into the dirty set block is not stamped");
+    Require(MarkWritten(base + 2 * Block + 16, 4, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "a driver store into the dirty set block is not stamped");
     Require(!UnchangedSinceDirtySerial(base + 2 * Block, 64, beforeDriver), "a driver store is not in the dirty log");
     Require(UnchangedSinceDirtySerial(base + 3 * Block, Block, beforeDriver), "a driver store dirtied another block");
     const auto beforeWrite = DirtySerial();
@@ -1054,7 +1062,7 @@ void CheckEpochDirtySet() {
     Unwatch(base, Block);
     Require(!UnchangedSinceDirtySerial(base, Block, beforeUnwatch), "an unwatch is not in the dirty log");
     const auto beforeOverflow = DirtySerial();
-    for (int repeat = 0; repeat < 5000; ++repeat) MarkWritten(base + 2 * Block, 4);
+    for (int repeat = 0; repeat < 5000; ++repeat) MarkWritten(base + 2 * Block, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(!UnchangedSinceDirtySerial(base + 3 * Block, Block, beforeOverflow), "an overflowed dirty log answered unchanged");
     Require(UnchangedSinceDirtySerial(base + 3 * Block, Block, DirtySerial()), "the current serial reads as dirty");
     const auto beforeStore = DirtySerial();
@@ -1071,7 +1079,7 @@ void CheckEpochDirtySet() {
     Require(UnchangedSince(base + 2 * Block + 40000, 64, exact), "a collect with the dirty set off walked beyond its range");
     BumpCollectEpoch();
     Require(CollectWrites(base + 2 * Block + 40000, 64) != 0 && !UnchangedSince(base + 2 * Block + 40000, 64, exact), "the exact collect of the stored page did not stamp the store");
-    Require(MarkWritten(base + 2 * Block + 16, 4) != 0, "a driver store with the dirty set off was not stamped");
+    Require(MarkWritten(base + 2 * Block + 16, 4, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "a driver store with the dirty set off was not stamped");
     Write(base + 3 * Block, zeros);
     Unwatch(base + 3 * Block, Block);
     Require(DirtySerial() == beforeExact, "writes with the dirty set off updated the dirty log");
@@ -1098,7 +1106,7 @@ void CheckCommittedRanges() {
     range.Data()[8] = 0x22;
     const auto written = CollectCommitted(range, runs);
     Require(written > synced && runs == first && !UnchangedCommittedSince(runs, synced) && UnchangedCommittedSince(runs, written), "a CPU write to the committed part was missed");
-    Require(MarkWritten(base + 16, 4) != 0 && !UnchangedCommittedSince(first, written), "a driver store into the committed part was missed");
+    Require(MarkWritten(base + 16, 4, AgcDriver::GuestMemory::WriteExtent::Exact) != 0 && !UnchangedCommittedSince(first, written), "a driver store into the committed part was missed");
     Require(UnchangedCommittedSince(first, CollectCommitted(range, runs)), "a collect after a driver store reads the committed part as changed");
 
     const auto beforeCommit = CollectCommitted(range, runs);

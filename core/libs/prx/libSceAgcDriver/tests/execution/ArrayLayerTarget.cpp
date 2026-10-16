@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -20,12 +21,21 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <functional>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -81,7 +91,7 @@ std::string Hex(std::uint32_t value) {
 
 class GuestBlock {
 public:
-    GuestBlock() {
+    explicit GuestBlock(std::size_t registeredBytes = SurfaceBytes, std::size_t registeredOffset = 0) : registeredOffset(registeredOffset) {
 #ifdef _WIN32
         block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(SurfaceBytes, LayerBytes));
         if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, SurfaceBytes, PAGE_READWRITE, SurfaceBytes);
@@ -97,11 +107,11 @@ public:
         }
 #endif
         Require(block != nullptr, "array layer target: cannot allocate the guest block");
-        GuestAllocations::Mutation().Add(block, SurfaceBytes, true, true, true);
+        GuestAllocations::Mutation().Add(block + registeredOffset, registeredBytes, true, true, true);
     }
 
     ~GuestBlock() {
-        GuestAllocations::Mutation().Remove(block);
+        if (registered) GuestAllocations::Mutation().Remove(block + registeredOffset);
 #ifdef _WIN32
         GuestArena::GuestArenaReset_nid_postfix(block, SurfaceBytes);
         GuestArena::GuestArenaRelease_nid_postfix(block, SurfaceBytes);
@@ -115,9 +125,15 @@ public:
     GuestBlock& operator=(const GuestBlock&) = delete;
 
     std::uint8_t* Data() { return block; }
+    void Unregister() {
+        GuestAllocations::Mutation().Remove(block + registeredOffset);
+        registered = false;
+    }
 
 private:
     std::uint8_t* block = nullptr;
+    std::size_t registeredOffset = 0;
+    bool registered = true;
 };
 
 std::array<std::uint32_t, 8> SurfaceDescriptor(std::uint64_t address, std::uint32_t swizzleMode, std::uint32_t type, std::uint32_t lastLayer) {
@@ -263,6 +279,164 @@ void DrawSlice(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint
     device.WaitIdle();
 }
 
+#ifdef _WIN32
+class SharedMutationSurface {
+public:
+    SharedMutationSurface() {
+        data = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(2 * SurfaceBytes, LayerBytes));
+        Require(data != nullptr, "guarded image mutation: cannot allocate shared views");
+        try {
+            section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(SurfaceBytes), nullptr);
+            Require(section != nullptr, "guarded image mutation: cannot create the original section");
+            Require(DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS) != 0, "guarded image mutation: cannot duplicate the original section");
+            replacement = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(SurfaceBytes), nullptr);
+            Require(replacement != nullptr, "guarded image mutation: cannot create the replacement section");
+            auto* initialized = static_cast<std::uint32_t*>(MapViewOfFile(replacement, FILE_MAP_WRITE, 0, 0, SurfaceBytes));
+            Require(initialized != nullptr, "guarded image mutation: cannot initialize the replacement section");
+            std::fill_n(initialized, SurfaceBytes / sizeof(std::uint32_t), Replacement);
+            UnmapViewOfFile(initialized);
+            GuestArena::GuestArenaMap_nid_postfix(data, SurfaceBytes, section, 0, PAGE_READWRITE);
+            GuestArena::GuestArenaMap_nid_postfix(data + SurfaceBytes, SurfaceBytes, duplicate, 0, PAGE_READWRITE);
+            GuestAllocations::Mutation().Add(data, SurfaceBytes, true, true, true);
+            registered[0] = true;
+            GuestAllocations::Mutation().Add(data + SurfaceBytes, SurfaceBytes, true, true, false);
+            registered[1] = true;
+        } catch (...) { release(); throw; }
+    }
+
+    ~SharedMutationSurface() { release(); }
+    SharedMutationSurface(const SharedMutationSurface&) = delete;
+    SharedMutationSurface& operator=(const SharedMutationSurface&) = delete;
+    std::uint8_t* Data() const { return data; }
+
+    void Mutate(bool alias, bool remap, const std::function<void()>& beforePhysical) {
+        const auto index = alias ? 1u : 0u;
+        auto* changed = data + index * SurfaceBytes;
+        GuestAllocations::Mutation mutation;
+        if (remap) {
+            mutation.Protect(changed, SurfaceBytes, true, true, !alias, [&] {
+                beforePhysical();
+                GuestArena::GuestArenaReset_nid_postfix(changed, SurfaceBytes);
+                GuestArena::GuestArenaMap_nid_postfix(changed, SurfaceBytes, replacement, 0, PAGE_READWRITE);
+            });
+        } else {
+            mutation.Unmap(changed, SurfaceBytes, [&](const void* first, std::size_t bytes, const void*, bool) {
+                Require(first == changed && bytes == SurfaceBytes, "guarded image mutation: the registry split an unexpected physical range");
+                beforePhysical();
+                GuestArena::GuestArenaReset_nid_postfix(changed, SurfaceBytes);
+            });
+            registered[index] = false;
+        }
+    }
+
+    static constexpr std::uint32_t Replacement = 0x26262626u;
+
+private:
+    void release() noexcept {
+        if (data != nullptr) {
+            for (std::size_t index = 0; index < registered.size(); ++index) {
+                if (registered[index]) {
+                    try { GuestAllocations::Mutation().Remove(data + index * SurfaceBytes); } catch (...) {}
+                    registered[index] = false;
+                }
+            }
+            try {
+                GuestArena::GuestArenaReset_nid_postfix(data, 2 * SurfaceBytes);
+                GuestArena::GuestArenaRelease_nid_postfix(data, 2 * SurfaceBytes);
+            } catch (...) {}
+            data = nullptr;
+        }
+        for (auto* handle : {&replacement, &duplicate, &section}) {
+            if (*handle == nullptr) continue;
+            try { GuestArena::GuestArenaForgetSection_nid_postfix(*handle); } catch (...) {}
+            CloseHandle(*handle);
+            *handle = nullptr;
+        }
+    }
+    std::uint8_t* data = nullptr;
+    HANDLE section = nullptr;
+    HANDLE duplicate = nullptr;
+    HANDLE replacement = nullptr;
+    std::array<bool, 2> registered{};
+};
+
+bool MutationPixels(const std::vector<std::uint32_t>& values) {
+    constexpr std::uint32_t slice = 2;
+    const auto first = values.begin() + slice * LayerBytes / sizeof(std::uint32_t);
+    const auto last = first + LayerBytes / sizeof(std::uint32_t);
+    const auto drawn = std::bit_cast<std::uint32_t>(Drawn);
+    return std::count(first, last, drawn) == ScissorWidth * Side
+        && std::all_of(first, last, [&](std::uint32_t value) { return value == Initial || value == drawn; })
+        && std::all_of(values.begin(), first, [](std::uint32_t value) { return value == Initial; })
+        && std::all_of(last, values.end(), [](std::uint32_t value) { return value == Initial; });
+}
+
+void GuardedImageMutation(AgcDriver::VulkanDevice& device, bool alias, bool remap) {
+    SharedMutationSurface surface;
+    auto* data = surface.Data();
+    const auto address = AddressOf(data);
+    Require(AgcDriver::Coherence::FaultOwnership(), "guarded image mutation: fault ownership is disabled");
+    std::fill_n(reinterpret_cast<std::uint32_t*>(data), SurfaceBytes / sizeof(std::uint32_t), Initial);
+    AgcDriver::GuestMemory::CollectWritesUncached(address, SurfaceBytes);
+    AgcDriver::GuestMemory::CollectWritesUncached(address + SurfaceBytes, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        DrawSlice(device, address, 2u, TileR64KBX, false);
+        const auto pending = StorageTexture::FindPending(address, SurfaceBytes);
+        Require(pending != nullptr && pending->Descriptor().baseAddress == address && pending->Descriptor().dimension == TextureDimension::k2DArray, "guarded image mutation: the drawn array is not the pending GPU image");
+        Require(GuestArena::GuestArenaMappingProtected_nid_postfix(address, SurfaceBytes) && GuestArena::GuestArenaMappingProtected_nid_postfix(address + SurfaceBytes, SurfaceBytes), "guarded image mutation: original and duplicate-handle alias are not guarded");
+        std::vector<std::uint32_t> before(SurfaceBytes / sizeof(std::uint32_t));
+        GuestArena::GuestArenaCopyDriverMemory_nid_postfix(before.data(), data, SurfaceBytes);
+        Require(std::all_of(before.begin(), before.end(), [](std::uint32_t value) { return value == Initial; }), "guarded image mutation: GPU pixels were already published before the mutation");
+        std::array<std::weak_ptr<const GuestAllocations::Range>, 2> ranges;
+        {
+            const auto live = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
+            for (const auto& range : live) {
+                if (range->address == address) ranges[0] = range;
+                if (range->address == address + SurfaceBytes) ranges[1] = range;
+            }
+        }
+        Require(ranges[0].use_count() == 1 && ranges[1].use_count() == 1, "guarded image mutation: a remaining range lease would mask the unpinned mutation path");
+    }
+    std::vector<std::uint32_t> published(SurfaceBytes / sizeof(std::uint32_t));
+    std::atomic<bool> completed{false};
+    std::exception_ptr failure;
+    bool physicalReached = false;
+    std::thread mutation([&] {
+        try {
+            surface.Mutate(alias, remap, [&] {
+                GuestArena::GuestArenaCopyDriverMemory_nid_postfix(published.data(), data + (alias ? 0 : SurfaceBytes), SurfaceBytes);
+                Require(MutationPixels(published), "guarded image mutation: old GPU pixels were not published before physical replacement");
+                Require(!GuestArena::GuestArenaMappingProtected_nid_postfix(address, SurfaceBytes) && !GuestArena::GuestArenaMappingProtected_nid_postfix(address + SurfaceBytes, SurfaceBytes), "guarded image mutation: the physical callback still owns a pending native guard");
+                physicalReached = true;
+            });
+        } catch (...) { failure = std::current_exception(); }
+        completed.store(true, std::memory_order_release);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!completed.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (!completed.load(std::memory_order_acquire)) {
+        std::fputs("guarded image mutation deadlocked before completing the native mapping change\n", stderr);
+        std::_Exit(1);
+    }
+    mutation.join();
+    if (failure) std::rethrow_exception(failure);
+    Require(physicalReached, "guarded image mutation: no physical mapping change occurred");
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Require(StorageTexture::FindPending(address, SurfaceBytes) == nullptr, "guarded image mutation: the materialized image remained pending");
+        AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    }
+    GuestArena::GuestArenaCopyDriverMemory_nid_postfix(published.data(), data + (alias ? 0 : SurfaceBytes), SurfaceBytes);
+    Require(MutationPixels(published), "guarded image mutation: surviving backing lost the published GPU pixels");
+    if (remap) {
+        GuestArena::GuestArenaCopyDriverMemory_nid_postfix(published.data(), data + (alias ? SurfaceBytes : 0), SurfaceBytes);
+        Require(std::all_of(published.begin(), published.end(), [](std::uint32_t value) { return value == SharedMutationSurface::Replacement; }), "guarded image mutation: stale GPU pixels overwrote the replacement section");
+    }
+}
+#endif
+
 void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std::uint32_t swizzleMode, bool collapsed = false, std::uint32_t slice = 1) {
     const auto surface = AddressOf(texels);
     std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
@@ -309,16 +483,151 @@ void SampleSliceZero(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std:
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
 }
 
+void UnregisteredUnusedLayer(AgcDriver::VulkanDevice& device, std::uint32_t slice) {
+    GuestBlock block(LayerBytes, slice * LayerBytes);
+    auto* texels = block.Data();
+    const auto surface = AddressOf(texels);
+    const auto active = surface + slice * LayerBytes;
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
+    AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    DrawSlice(device, surface, slice, TileR64KBX, false);
+    Require(StorageTexture::FindPending(surface, SurfaceBytes) != nullptr, "the registered slice was not pending before its CPU write-back");
+    StorageTexture::FlushPending(active, LayerBytes, nullptr, "test");
+    device.WaitIdle();
+    const auto* first = reinterpret_cast<std::uint32_t*>(active);
+    const auto* last = reinterpret_cast<std::uint32_t*>(active + LayerBytes);
+    const auto unchanged = [](std::uint32_t value) { return value == Initial; };
+    const auto drawn = std::count(first, last, std::bit_cast<std::uint32_t>(Drawn));
+    const bool untouched = std::all_of(reinterpret_cast<const std::uint32_t*>(texels), first, unchanged) && std::all_of(last, reinterpret_cast<const std::uint32_t*>(texels + SurfaceBytes), unchanged);
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    Require(drawn == ScissorWidth * Side, "CPU write-back discarded the registered slice because an unused array slice was unregistered");
+    Require(untouched, "CPU write-back modified an unregistered unused slice");
 }
 
-int main() {
+void RetiredArrayLayer(AgcDriver::VulkanDevice& device) {
+    GuestBlock block(LayerBytes);
+    auto* texels = block.Data();
+    const auto surface = AddressOf(texels);
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
+    AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    DrawSlice(device, surface, 0u, TileR64KBX, false);
+    Require(StorageTexture::FindPending(surface, SurfaceBytes) != nullptr, "the retired slice was not pending before it was unregistered");
+    block.Unregister();
+    StorageTexture::FlushPending(surface, LayerBytes, nullptr, "test");
+    device.WaitIdle();
+    const bool untouched = std::all_of(reinterpret_cast<const std::uint32_t*>(texels), reinterpret_cast<const std::uint32_t*>(texels + SurfaceBytes), [](std::uint32_t value) { return value == Initial; });
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    Require(untouched, "CPU write-back stored results over a retired allocation");
+}
+
+class ExtraRegistration {
+public:
+    ExtraRegistration(void* address, std::size_t bytes) : address(address) { GuestAllocations::Mutation().Add(address, bytes, true, true, true); }
+    ~ExtraRegistration() { if (address != nullptr) GuestAllocations::Mutation().Remove(address); }
+    void Remove() {
+        GuestAllocations::Mutation().Remove(address);
+        address = nullptr;
+    }
+
+private:
+    void* address;
+};
+
+void MixedRetiredLayers(AgcDriver::VulkanDevice& device, std::uint32_t survivor, std::uint32_t retired) {
+    GuestBlock block(LayerBytes, survivor * LayerBytes);
+    auto* texels = block.Data();
+    ExtraRegistration registration(texels + retired * LayerBytes, LayerBytes);
+    const auto surface = AddressOf(texels);
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
+    AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    DrawSlice(device, surface, retired, TileR64KBX, false);
+    DrawSlice(device, surface, survivor, TileR64KBX, false);
+    Require(StorageTexture::FindPending(surface, SurfaceBytes) != nullptr, "mixed array slices were not pending before retirement");
+    registration.Remove();
+    StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
+    device.WaitIdle();
+    const auto* first = reinterpret_cast<const std::uint32_t*>(texels + survivor * LayerBytes);
+    const auto* last = reinterpret_cast<const std::uint32_t*>(texels + (survivor + 1u) * LayerBytes);
+    const auto drawn = std::bit_cast<std::uint32_t>(Drawn);
+    const bool pixels = std::count(first, last, drawn) == ScissorWidth * Side;
+    const bool padding = std::all_of(first, last, [&](std::uint32_t value) { return value == Initial || value == drawn; });
+    const auto untouched = [](std::uint32_t value) { return value == Initial; };
+    const bool otherSlices = std::all_of(reinterpret_cast<const std::uint32_t*>(texels), first, untouched) && std::all_of(last, reinterpret_cast<const std::uint32_t*>(texels + SurfaceBytes), untouched);
+    const bool settled = StorageTexture::FindPending(surface, SurfaceBytes) == nullptr;
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    Require(pixels && padding, "mixed retirement discarded or corrupted the still-registered array slice");
+    Require(otherSlices, "mixed retirement wrote a retired or unused array slice");
+    Require(settled, "mixed retirement left settled array slices pending");
+}
+
+void PartiallyRegisteredLayer(AgcDriver::VulkanDevice& device) {
+    GuestBlock block(LayerBytes / 2u);
+    auto* texels = block.Data();
+    const auto surface = AddressOf(texels);
+    std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
+    AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    DrawSlice(device, surface, 0u, TileR64KBX, false);
+    const auto pending = StorageTexture::FindPending(surface, SurfaceBytes);
+    Require(pending != nullptr, "partially registered slice was not pending");
+    bool refused = false;
     try {
+        StorageTexture::FlushPending(surface, LayerBytes, nullptr, "test");
+    } catch (const std::exception& error) {
+        refused = std::string(error.what()).find("partially registered pending unit") != std::string::npos;
+    }
+    Require(refused, "partially registered pending slice publication was not refused");
+    Require(StorageTexture::FindPending(surface, SurfaceBytes) == pending, "partial registration refusal lost the pending GPU image");
+    Require(std::all_of(reinterpret_cast<const std::uint32_t*>(texels), reinterpret_cast<const std::uint32_t*>(texels + SurfaceBytes), [](std::uint32_t value) { return value == Initial; }), "partial registration refusal modified guest bytes");
+    ExtraRegistration registration(texels + LayerBytes / 2u, LayerBytes / 2u);
+    StorageTexture::FlushPending(surface, LayerBytes, nullptr, "test");
+    device.WaitIdle();
+    const auto* first = reinterpret_cast<const std::uint32_t*>(texels);
+    const auto* last = reinterpret_cast<const std::uint32_t*>(texels + LayerBytes);
+    const auto drawn = std::bit_cast<std::uint32_t>(Drawn);
+    const bool survived = std::count(first, last, drawn) == ScissorWidth * Side && std::all_of(first, last, [&](std::uint32_t value) { return value == Initial || value == drawn; });
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    Require(survived, "partial registration refusal failed to retain the GPU pixels for later publication");
+}
+
+}
+
+int main(int argc, char** argv) {
+    try {
+        if (argc > 1) {
+            const std::string_view mode(argv[1]);
+            Require(mode == "--guarded-unmap" || mode == "--guarded-remap" || mode == "--guarded-alias-unmap" || mode == "--guarded-alias-remap", "unknown array layer target test mode");
+#ifdef _WIN32
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            GuardedImageMutation(*device, mode == "--guarded-alias-unmap" || mode == "--guarded-alias-remap", mode == "--guarded-remap" || mode == "--guarded-alias-remap");
+            std::puts("guarded image mutation tests passed");
+            return 0;
+#else
+            return VulkanTestSkipped;
+#endif
+        }
         GuestBlock block;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Run(*device, block.Data(), TileR64KBX);
         Run(*device, block.Data(), static_cast<std::uint32_t>(AgcDriver::Graphics::ColorTileMode::D64KBX));
         for (std::uint32_t slice = 1; slice < Layers; ++slice) Run(*device, block.Data(), TileR64KBX, true, slice);
+        UnregisteredUnusedLayer(*device, 0u);
+        UnregisteredUnusedLayer(*device, Layers - 1u);
+        RetiredArrayLayer(*device);
+        MixedRetiredLayers(*device, 0u, Layers - 1u);
+        MixedRetiredLayers(*device, Layers - 1u, 0u);
+        MixedRetiredLayers(*device, 1u, 2u);
+        MixedRetiredLayers(*device, 2u, 1u);
+        PartiallyRegisteredLayer(*device);
         std::puts("array layer target tests passed");
         return 0;
     } catch (const std::exception& error) {

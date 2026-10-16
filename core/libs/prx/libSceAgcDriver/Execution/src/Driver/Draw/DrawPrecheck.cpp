@@ -12,19 +12,27 @@ bool Driver::drawPrecheck() {
 }
 
 std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
-    if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
+    if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) {
+        DrawTrace::Note("skip_reason", "empty_direct_draw");
+        return DrawVerdict::Nothing;
+    }
     if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
         if (auto* sink = frozenSink(); sink != nullptr && sink->Refuse(FrozenFallback::MetadataPass)) return DrawVerdict::Nothing;
+        if (const auto current = device.Load(); current != nullptr && !GuestMemory::GpuMutex().HeldByThisThread()) current->EnsurePipelinePreparation();
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
         const std::shared_ptr<VulkanDevice> localDevice = device;
         recordLabelsForPacket(localDevice.get(), submission.queue);
         localDevice->ColorMetadataPass(*pass);
+        DrawTrace::Note("draw_path", "color_metadata_pass");
         return DrawVerdict::Drawn;
     }
-    if (Graphics::DepthResummarizeDrawsNothing(queue)) return DrawVerdict::Nothing;
+    if (Graphics::DepthResummarizeDrawsNothing(queue)) {
+        DrawTrace::Note("skip_reason", "depth_resummarize_no_work");
+        return DrawVerdict::Nothing;
+    }
     rejected = Graphics::DepthMaintenanceRejection(queue);
     if (!rejected.empty()) return DrawVerdict::Rejected;
     static const bool traceIndirectEnabled = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
@@ -36,7 +44,10 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
         const bool colorWrites = targetMask != queue.context.end() && shaderMask != queue.context.end() && Graphics::ColorWriteMask(queue.context) != 0;
         if (!colorWrites && !queue.shader.contains(0x8)) {
             const auto word = [&](std::uint32_t offset) { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0u : it->second; };
-            if ((word(0x200) & 3u) == 0 || ((word(0x010) & 3u) == 0 && (word(0x011) & 1u) == 0)) return DrawVerdict::Nothing;
+            if ((word(0x200) & 3u) == 0 || ((word(0x010) & 3u) == 0 && (word(0x011) & 1u) == 0)) {
+                DrawTrace::Note("skip_reason", "no_color_or_depth_work");
+                return DrawVerdict::Nothing;
+            }
         }
     }
     if (drawParameters.indexed) {

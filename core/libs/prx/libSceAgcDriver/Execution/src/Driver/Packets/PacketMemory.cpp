@@ -16,7 +16,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-Driver::EndOfPipeOutcome Driver::recordEndOfPipe(VulkanDevice* localDevice, std::uint32_t queue, std::span<const std::uint32_t> packet) {
+Driver::EndOfPipeOutcome Driver::recordEndOfPipe(VulkanDevice* localDevice, std::uint32_t queue, std::span<const std::uint32_t> packet, std::vector<DrawTrace::Id>* flipDependencies) {
     EndOfPipeOutcome outcome;
     const auto label = Pm4::DecodeLabelWrite(packet);
     const bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
@@ -36,6 +36,12 @@ Driver::EndOfPipeOutcome Driver::recordEndOfPipe(VulkanDevice* localDevice, std:
         ++noOpLabels;
     }
     if (reason == 0 || reason == 5) {
+        if (flipDependencies != nullptr) {
+            try {
+                const auto dependencies = localDevice->CollectTraceDependencies();
+                flipDependencies->insert(flipDependencies->end(), dependencies.begin(), dependencies.end());
+            } catch (...) { DrawTrace::ReportObservationLoss(); }
+        }
         outcome.interruptDeferred = localDevice->AfterRecordedWork([queue] { AgcDriverDeliverEopInterrupt(queue); }, queue == 0);
         if (outcome.interruptDeferred && workOpen) localDevice->SubmitRecorded(queue == 0);
         outcome.wroteOnGpu = true;
@@ -153,7 +159,14 @@ bool Driver::storeMemoryPacket(std::uint32_t queueId, std::span<const std::uint3
     return drained;
 }
 
-bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
+bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump, std::vector<DrawTrace::Id>* flipDependencies) {
+    const auto observeFlipDependencies = [&](const std::shared_ptr<VulkanDevice>& localDevice) {
+        if (flipDependencies == nullptr || localDevice == nullptr) return;
+        try {
+            auto dependencies = localDevice->CollectTraceDependencies();
+            flipDependencies->insert(flipDependencies->end(), dependencies.begin(), dependencies.end());
+        } catch (...) { DrawTrace::ReportObservationLoss(); }
+    };
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     wroteOnGpu = false;
@@ -184,7 +197,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
                 const auto localDevice = device.Load();
                 recordDeferredLabels(localDevice.get(), submission.queue);
-                const auto outcome = recordEndOfPipe(localDevice.get(), submission.queue, packet);
+                const auto outcome = recordEndOfPipe(localDevice.get(), submission.queue, packet, flipDependencies);
                 wroteOnGpu = outcome.wroteOnGpu;
                 interruptDeferred = outcome.interruptDeferred;
             }
@@ -239,7 +252,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     }
 
     static const bool cpuStores = std::getenv("APS5_CPU_STORES") != nullptr;
-    if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
+    if (!drainAll && CommandProcessorReadsMode() != CommandProcessorReads::Drain && opcode == 0x40 && Pm4::CopyDataToRegister(packet)) orderedAlready = true;
+    if (!drainAll && !cpuStores && ((opcode == 0x40 && !Pm4::CopyDataToRegister(packet)) || opcode == 0x50 || opcode == 0x83)) {
         static_cast<void>(storeMemoryPacket(submission.queue, packet, [&](std::size_t limit) { return Pm4::ResolveStore(packet, queue, limit); }, wroteOnGpu, orderedAlready));
     }
 
@@ -286,6 +300,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
             recordDeferredLabels(draining.get(), submission.queue);
             if (draining != nullptr) {
+                observeFlipDependencies(draining);
                 if (unlockedDrain && draining->CanWaitUnlocked()) epoch = draining->SubmitAndEpoch();
                 else draining->WaitIdle();
             }

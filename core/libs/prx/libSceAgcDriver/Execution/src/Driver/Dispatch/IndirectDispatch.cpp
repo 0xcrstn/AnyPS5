@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/IndirectDispatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
+#include <optional>
 
 namespace AgcDriver::DriverDetail {
 
@@ -24,6 +25,9 @@ void Driver::countIndirect(int path, double readMs) {
 }
 
 void Driver::dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission) {
+    std::optional<DrawTrace::Operation> traceOperation;
+    if (!resolvingAhead() && frozenSink() == nullptr && DrawTrace::Current().operation == 0) traceOperation.emplace("dispatch");
+    DrawTrace::Span argumentScope("Driver.ResolveIndirectDispatch");
     static const bool gpuIndirect = std::getenv("APS5_NO_GPU_INDIRECT") == nullptr;
     const auto arguments = Pm4::DispatchArgumentAddress(packet, queue);
     const auto initiator = packet.back();
@@ -31,6 +35,7 @@ void Driver::dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> 
     if (!gpuIndirect) path = IndirectDisabled;
     else if ((initiator & 0x20u) != 0) path = IndirectThreadDimensions;
     else if (arguments % 4 != 0) path = IndirectMisaligned;
+    DrawTrace::Note("indirect_argument_path", static_cast<std::uint64_t>(path));
     if (path != IndirectGpu) {
         if (!resolvingAhead()) {
             const auto& resolved = resolvedAhead();
@@ -44,12 +49,14 @@ void Driver::dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> 
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto direct = Pm4::ReadDispatchArguments(arguments, initiator);
+        DrawTrace::RecordCounter("indirect_argument_records_read", 1, "records");
         countIndirect(path, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
         dispatch(queue, direct, submission);
         return;
     }
 
     const std::array<std::uint32_t, 5> unresolved{0xc0031500u, 0, 0, 0, initiator};
+    DrawTrace::Note("indirect_arguments", "gpu_only_not_read_by_host");
     dispatch(queue, unresolved, submission, arguments);
 }
 

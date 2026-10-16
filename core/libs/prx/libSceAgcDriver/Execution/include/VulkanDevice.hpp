@@ -5,11 +5,13 @@
 #include <vulkan/vulkan.h>
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrawTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ComputePipelineCapture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelinePreparation.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <chrono>
 #include <functional>
@@ -50,7 +52,9 @@ public:
     std::string DeviceName() const;
     std::string DriverInfo() const;
     std::string DescribeMemoryHeaps() const;
-    bool CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const;
+    bool CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu, std::uint64_t* deviationNs = nullptr, DrawTrace::CalibrationSample* sample = nullptr) const;
+    std::uint32_t TimestampValidBits() const;
+    double TimestampPeriod() const;
     ShaderRecompiler::SpirvTarget Target() const;
     std::optional<ShaderRecompiler::GeometryStageLimits> GeometryLimits() const;
     const std::uint32_t* WorkGroupCountLimit() const;
@@ -59,6 +63,7 @@ public:
     // Distinguishes this device from every earlier one in the process (a memo keyed by the device
     // cannot rely on the pointer, which a replacement may reuse).
     std::uint64_t Serial() const { return serial; }
+    DrawTrace::Id TraceId() const { return traceId; }
     // The Vulkan device handle (a Recipe names the device it was built on).
     VkDevice Device() const;
     // Drains everything under the caller's GpuMutex: recorder Sync plus vkDeviceWaitIdle. For suspend,
@@ -89,6 +94,7 @@ public:
     // mutex through the flush hook, so a thread submitting on another queue's behalf (a WAIT_REG_MEM
     // poller, a compute worker's between-packet flush) passes false: it must only submit, never wait.
     void SubmitRecorded(bool reapFirst = true);
+    std::vector<DrawTrace::Id> CollectTraceDependencies() const;
     void StoreIdleResults(bool reapFirst = true);
     // Unlocked drain: SubmitAndEpoch (under the mutex) returns the serial covering every recorded
     // batch (0: nothing in flight); WaitRecorded(serial) waits for it WITHOUT the mutex (the caller
@@ -248,6 +254,8 @@ public:
     bool PresentClear(std::uint32_t width, std::uint32_t height, bool opaque);
     void PresentPixels(std::uint32_t width, std::uint32_t height, std::span<const std::byte> pixels);
     bool PresentDisplayBuffer(const DisplayBuffer& buffer);
+    void PresyncDisplayBuffer(const DisplayBuffer& buffer);
+    static void PresyncDisplayBuffer(const Graphics::Context& context, const DisplayBuffer& buffer, bool allowResident);
     double FinishPresent();
     void QueuePresent();
     // At the flip packet (under the mutex): the recorder's submissions so far and, under
@@ -359,6 +367,17 @@ public:
     bool ArmCompileWait(const std::shared_ptr<CompileTicket>& ticket, std::function<void()> wake);
     std::shared_ptr<CompileTicket> TryComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress);
 
+    void ConfigurePipelinePreparation(std::shared_ptr<Graphics::PipelineRecipeStore> store, Graphics::PipelinePreparation::Schedule schedule, Graphics::PipelinePreparation::Limits limits = {});
+    bool PrepareGraphicsPipeline(const Graphics::PipelineRecipe& recipe);
+    bool RefreshGraphicsPipelineRecipe(Graphics::PipelineRecipe& recipe);
+    std::size_t PrepareGraphicsPipelines(std::size_t maximum = 128);
+    Graphics::PipelinePreparation::Statistics PipelinePreparationCheckpoint();
+    Graphics::PipelinePreparation::Statistics PipelinePreparationCounters() const;
+    void StopPipelinePreparation();
+    bool FlushPreparedPipelines();
+
+    void EnsurePipelinePreparation();
+
 private:
     VulkanDevice(const PresentationWindow* window, bool compileOnly);
     friend struct VulkanDeviceTestAccess;
@@ -389,6 +408,7 @@ private:
     struct State;
     std::unique_ptr<State> state;
     std::uint64_t serial;
+    DrawTrace::Id traceId = 0;
 };
 
 }

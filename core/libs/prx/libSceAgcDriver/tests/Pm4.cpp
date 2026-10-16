@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -518,6 +519,11 @@ void testCopies() {
     execute(state, registerCopy(0x00100200, 0xa010));
     check(fromRegister[0] == 0xabc, "COPY_DATA from a context register failed");
     check(!AgcDriver::Pm4::ResolveStore(registerCopy(0x00100200, 0x2e0c), state, 64).has_value(), "COPY_DATA from a register resolved before its turn");
+    const auto capturedRegisters = AgcDriver::Pm4::CaptureRegisterCopy(registerCopy(0x00110200, 0x2e0c), state);
+    execute(state, makePacket(0x76, {0x20c, 0xdeadbeef, 0xbeefdead}));
+    std::array<std::uint32_t, 2> capturedWords{};
+    std::memcpy(capturedWords.data(), capturedRegisters.Bytes().data(), sizeof(capturedWords));
+    check(capturedWords[0] == 0x02754800 && capturedWords[1] == 2 && capturedRegisters.address == reinterpret_cast<std::uintptr_t>(fromRegister.data()), "a captured register copy followed later QueueState mutations");
     AgcDriver::Pm4::NoteDispatchRegisters(makePacket(0x15, {4, 2, 1, 0x8041}), state);
     execute(state, registerCopy(0x00100200, 0x2e00));
     check(fromRegister[0] == 0x8041, "COPY_DATA did not read the last dispatch initiator");
@@ -540,6 +546,15 @@ void testCopies() {
     const auto toGds = makePacket(0x50, {0x60100000 | cachePolicies, low(source.data()), high(source.data()), 0x100, 0, 16});
     const auto gdsStore = AgcDriver::Pm4::ResolveStore(toGds, state, 64);
     check(gdsStore.has_value() && gdsStore->address == AgcDriver::Pm4::GdsAddress() + 0x100 && gdsStore->Bytes().size() == 16 && std::memcmp(gdsStore->Bytes().data(), source.data(), 16) == 0, "DMA_DATA to GDS did not resolve as a store into the GDS");
+    const auto immediateGds = makePacket(0x50, {0x40100000u, 0x5eed1234u, 0, 0xfff0u, 0, 16});
+    AgcDriver::Pm4::Validate(immediateGds, 0);
+    const auto ownedGds = AgcDriver::Pm4::ResolveStore(immediateGds, state, 64);
+    const auto gdsEffects = AgcDriver::Pm4::DecodeStores(immediateGds);
+    check(ownedGds.has_value() && ownedGds->address == AgcDriver::Pm4::GdsAddress() + 0xfff0 && ownedGds->Bytes().size() == 16, "immediate GDS data was not captured in the validated range");
+    check(gdsEffects.size() == 1 && gdsEffects[0].address == ownedGds->address && gdsEffects[0].bytes == 16, "immediate GDS DMA omitted its destination from command processor effects");
+    std::array<std::uint32_t, 4> ownedGdsWords{};
+    std::memcpy(ownedGdsWords.data(), ownedGds->Bytes().data(), sizeof(ownedGdsWords));
+    check(std::all_of(ownedGdsWords.begin(), ownedGdsWords.end(), [](auto word) { return word == 0x5eed1234u; }), "immediate GDS capture lost its repeated dword pattern");
     execute(state, toGds);
     std::size_t flexibleAfter = 0;
     check(sceKernelAvailableFlexibleMemorySize(&flexibleAfter) == 0 && flexibleAfter == flexibleBefore, "the GDS was charged to the flexible memory budget");

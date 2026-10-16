@@ -278,6 +278,7 @@ public:
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
     // once the work completed.
     void MarkGpuWrites(Recorder& recorder);
+    void PrepareGpuWrites() const;
     void WriteBackBuffers();
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return (bda != nullptr && faultChecks) || guestMemory.HasCopiedWrites(); }
@@ -287,6 +288,7 @@ public:
     bool UsesAddressTable() const { return usesBda; }
     bool KnownAddressWrites() const { return usesBda && bdaReadOnly && !guestMemory.HasCopiedWrites(); }
     bool HasPlacements() const;
+    bool HoldsUnusableMirror() const;
     bool DispatchEffectsKnown() const { return tableStages.empty() && !guestMemory.HasCopiedWrites() && !HasPlacements(); }
     bool WritesThroughPointers() const { return usesBda && !bdaReadOnly; }
     void UseMirrors(Recorder& recorder) const;
@@ -447,11 +449,7 @@ private:
         std::optional<ReadAnalysis> readAnalysis;
         std::shared_ptr<ResidentMirror> mirror;
     };
-    struct DataPatch {
-        std::size_t allocation;
-        std::uint32_t byte;
-        std::uint32_t adjustment;
-    };
+    using DataPatch = DrawSnapshotArena::DataPatch;
     void writeDataWords(VkCommandBuffer commands, std::size_t allocation, std::span<const std::uint32_t> words) const;
     struct MovedDispatchCandidate {
         std::size_t allocation;
@@ -681,15 +679,7 @@ private:
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
     std::vector<VkWriteDescriptorSet> descriptorWrites;
-    struct MovedWordBuffer {
-        std::size_t allocation;
-        std::vector<std::uint32_t> words;
-        std::size_t size;
-        std::shared_ptr<Buffer> buffer;
-        DrawSnapshotArena::Placed placed{};
-    };
-    mutable std::mutex movedWordMutex;
-    mutable std::vector<MovedWordBuffer> movedWordBuffers;
+    const std::uint64_t wordCacheKey = DrawSnapshotArena::NextWordKey();
     struct PersistentDrawSet {
         std::vector<std::array<std::uint64_t, 4>> key;
         std::shared_ptr<const DrawBindings> bindings;
@@ -697,7 +687,6 @@ private:
     mutable std::mutex persistentDrawSetMutex;
     mutable std::vector<PersistentDrawSet> persistentDrawSets;
     mutable std::size_t persistentDrawSetNext = 0;
-    mutable std::size_t movedWordBufferNext = 0;
     struct DrawSetShape {
         std::array<std::vector<VkDescriptorPoolSize>, 2> sizes;
         std::array<std::optional<std::uint32_t>, 2> variable;

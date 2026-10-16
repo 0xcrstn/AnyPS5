@@ -2,6 +2,7 @@
 #include <spirv/unified1/spirv.hpp>
 #undef SPV_ENABLE_UTILITY_CODE
 #include "SpirvBackend/SpirvSpecialization.hpp"
+#include "IntermediateRepresentation/IrSmallVector.hpp"
 #include <algorithm>
 #include <initializer_list>
 #include <map>
@@ -13,7 +14,7 @@
 namespace ShaderRecompiler {
 namespace {
 
-using Instruction = std::vector<std::uint32_t>;
+using Instruction = IrSmallVector<std::uint32_t, 8>;
 
 spv::Op Opcode(const Instruction& instruction) {
     return instruction.empty() ? spv::OpNop : static_cast<spv::Op>(instruction[0] & 0xffffu);

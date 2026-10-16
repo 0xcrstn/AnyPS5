@@ -701,6 +701,52 @@ void RunAnisoOverrideTests(AgcDriver::VulkanDevice& device) {
     }
 }
 
+void RunDescriptorPhiTests(AgcDriver::VulkanDevice& device) {
+    Fill();
+    SetClassRecords();
+    const auto floatImage = Image(FloatTexels.data(), Format32Float);
+    const auto control = RunDirect(device, PointClamp, floatImage);
+    Require(!Faulted(control), "descriptor table Phi: direct control faulted");
+    SetRecord(0u, PointClamp, {0x1234u, 0x5678u, 0x9abcu, 0x0000ffacu});
+    const auto branchCode = [] {
+        std::array<std::uint32_t, 35> code{};
+        std::copy_n(TableDirectSamplerCode.begin(), 12u, code.begin());
+        const std::array<std::uint32_t, 5> branch{0xf4080900u, 0xfa000040u, 0xbf8cc07fu, 0xbf068002u, 0xbf850002u};
+        std::copy(branch.begin(), branch.end(), code.begin() + 12u);
+        std::copy(TableDirectSamplerCode.begin() + 12u, TableDirectSamplerCode.end(), code.begin() + 17u);
+        return code;
+    }();
+    Keys = {};
+    Keys[1] = 1u;
+    const auto branch = RunDirectCode(device, branchCode, PointClamp, floatImage);
+    Require(!Faulted(branch) && branch.imageTableCount != 0u, "descriptor table Phi: an unchosen poisoned table arm faulted:\n" + branch.log);
+    Require(Group(branch, 0u) == Group(control, 0u), "descriptor table Phi: an unchosen table arm changed direct samples");
+    const auto branchBoth = Run(device, branchCode, 2u, Lanes, 64u);
+    Require(!Faulted(branchBoth), "descriptor table Phi: a chosen valid table arm faulted:\n" + branchBoth.log);
+    Require(Group(branchBoth, 0u) == Group(control, 0u), "descriptor table Phi: the direct branch sampled another image");
+    RequireRed(branchBoth, 1u, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "descriptor table Phi: chosen table branch");
+    Keys[1] = 0u;
+    const auto poisoned = Run(device, branchCode, 2u, Lanes, 64u);
+    Require(Faulted(poisoned), "descriptor table Phi: a chosen poisoned table arm did not fault");
+    const auto loopCode = [] {
+        std::array<std::uint32_t, 39> code{};
+        auto at = std::copy_n(TableDirectSamplerCode.begin(), 12u, code.begin());
+        const std::array<std::uint32_t, 4> initialize{0xf4080900u, 0xfa000040u, 0xbf8cc07fu, 0xbea80380u};
+        at = std::copy(initialize.begin(), initialize.end(), at);
+        at = std::copy_n(TableDirectSamplerCode.begin() + 14u, 7u, at);
+        at = std::copy_n(TableDirectSamplerCode.begin() + 21u, 8u, at);
+        at = std::copy_n(TableDirectSamplerCode.begin() + 11u, 3u, at);
+        const std::array<std::uint32_t, 5> tail{0x80118111u, 0x80288128u, 0xbf0a8228u, 0xbf85fff1u, 0xbf810000u};
+        std::copy(tail.begin(), tail.end(), at);
+        return code;
+    }();
+    Keys[0] = 1u;
+    const auto carried = Run(device, loopCode, 1u, Lanes, 64u);
+    Require(!Faulted(carried) && carried.imageTableCount != 0u, "descriptor table Phi: a loop-carried table key faulted:\n" + carried.log);
+    RequireRed(carried, 0u, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, "descriptor table Phi: previous iteration's descriptor after its key changed");
+    SetClassRecords();
+}
+
 void RunTests(AgcDriver::VulkanDevice& device) {
     Fill();
     const auto floatImage = Image(FloatTexels.data(), Format32Float);
@@ -713,6 +759,28 @@ void RunTests(AgcDriver::VulkanDevice& device) {
     const auto classes = Run(device, TableCode, 6, Lanes, 64);
     Require(!Faulted(classes), "image table: valid entries faulted:\n" + classes.log);
     Require(classes.imageTableCount == 3u, "image table: the table binding does not hold one element per distinct T# (" + std::to_string(classes.imageTableCount) + ")");
+
+    const auto invariantPhiCode = [] {
+        std::array<std::uint32_t, 39> code{};
+        std::copy_n(TableCode.begin(), 19, code.begin());
+        code[19] = 0xbea80380u;
+        std::copy_n(TableCode.begin() + 19, 8, code.begin() + 20);
+        const std::array<std::uint32_t, 11> tail{0xbf068028u, 0xbf850003u, 0xf42c0802u, 0x24000000u, 0xbf820002u, 0xf42c0802u, 0x24000000u, 0x80288128u, 0xbf0a8228u, 0xbf85ffeeu, 0xbf810000u};
+        std::copy(tail.begin(), tail.end(), code.begin() + 28);
+        return code;
+    }();
+    const auto controlPhiCode = [&] {
+        std::array<std::uint32_t, 32> code{};
+        std::copy_n(invariantPhiCode.begin(), 28, code.begin());
+        const std::array<std::uint32_t, 4> tail{0x80288128u, 0xbf0a8228u, 0xbf85fff5u, 0xbf810000u};
+        std::copy(tail.begin(), tail.end(), code.begin() + 28);
+        return code;
+    }();
+    const auto controlPhi = Run(device, controlPhiCode, 6, Lanes, 64);
+    const auto invariantPhi = Run(device, invariantPhiCode, 6, Lanes, 64);
+    Require(!Faulted(invariantPhi) && !Faulted(controlPhi), "image table: invariant descriptor Phis faulted");
+    Require(invariantPhi.imageTableCount == classes.imageTableCount, "image table: invariant descriptor Phis changed the distinct table elements");
+    Require(invariantPhi.words == controlPhi.words, "image table: invariant descriptor Phis changed GPU sample results");
     for (std::uint32_t group = 0; group < 6; ++group) {
         if (group == 4u) continue;
         const auto* words = Table.data() + group * (Stride / 4u);
@@ -1320,6 +1388,7 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         RunTests(*device);
+        RunDescriptorPhiTests(*device);
         RunBorderSwizzleTests(*device);
         RunAnisoOverrideTests(*device);
         RunReadTests(*device);

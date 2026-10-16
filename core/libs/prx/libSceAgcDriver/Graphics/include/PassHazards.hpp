@@ -15,6 +15,8 @@ namespace AgcDriver::Graphics {
 
 using GuestRangeList = std::span<const std::pair<std::uint64_t, std::uint64_t>>;
 
+bool ResolvePassRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
+
 struct PassAccess {
     GuestRangeList reads;
     GuestRangeList writes;

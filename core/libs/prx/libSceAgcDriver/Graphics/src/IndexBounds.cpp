@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -64,7 +65,7 @@ std::optional<std::uint32_t> LowestDrawIndex(std::span<const std::byte> indices,
     return lowest;
 }
 
-std::optional<std::uint32_t> KnownLowestDrawIndex(std::uint64_t address, std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart, std::uint64_t generation) {
+std::optional<std::uint32_t> KnownLowestDrawIndex(std::uint64_t address, std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart, std::uint64_t generation, bool driverMemory) {
     auto& cache = TheCache();
     const Key key{address, indices.size(), indexSize, skipRestart};
     const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
@@ -79,6 +80,12 @@ std::optional<std::uint32_t> KnownLowestDrawIndex(std::uint64_t address, std::sp
             cache.recency.erase(found->second.recent);
             cache.entries.erase(found);
         }
+    }
+    std::vector<std::byte> snapshot;
+    if (driverMemory) {
+        snapshot.resize(indices.size());
+        GuestMemory::CopyDriverMemory(snapshot.data(), indices.data(), indices.size());
+        indices = snapshot;
     }
     const auto lowest = LowestDrawIndex(indices, indexSize, skipRestart);
     std::lock_guard lock(cache.mutex);

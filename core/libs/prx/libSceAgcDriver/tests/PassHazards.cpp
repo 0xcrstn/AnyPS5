@@ -1,4 +1,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -235,6 +242,80 @@ void testKnownAddressWrites() {
     Expect(passes.Check(depthPass.View(), false) == PassHazard::Image, "a later pass writing the same depth image needs the barrier");
 }
 
+void testBackingRanges() {
+    Ranges empty{{7, 7}};
+    Expect(ResolvePassRanges(empty) && empty.empty(), "empty backing ranges need no memory identity");
+    Ranges invalid{{9, 8}};
+    Expect(!ResolvePassRanges(invalid) && invalid.empty(), "invalid backing ranges cannot prove independence");
+#ifdef _WIN32
+    struct Mapping {
+        static constexpr std::size_t PageBytes() { return 0x4000; }
+        static constexpr std::size_t Bytes() { return PageBytes() * 19; }
+        void* base = GuestArena::GuestArenaAllocate_nid_postfix(Bytes(), 0x10000);
+        HANDLE first = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, 0x10000, nullptr);
+        HANDLE second = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, 0x10000, nullptr);
+        HANDLE duplicate = nullptr;
+        Mapping() {
+            if (base == nullptr || first == nullptr || second == nullptr || !DuplicateHandle(GetCurrentProcess(), first, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) throw std::runtime_error("cannot create pass backing fixture");
+        }
+        ~Mapping() {
+            GuestArena::GuestArenaReset_nid_postfix(base, Bytes());
+            GuestArena::GuestArenaRelease_nid_postfix(base, Bytes());
+            for (const auto section : {first, second, duplicate}) {
+                GuestArena::GuestArenaForgetSection_nid_postfix(section);
+                CloseHandle(section);
+            }
+        }
+        std::uint64_t Address(std::size_t page, std::size_t offset = 0) const { return reinterpret_cast<std::uintptr_t>(base) + page * PageBytes() + offset; }
+        void Map(std::size_t page, HANDLE section, std::size_t offset = 0, DWORD protection = PAGE_READWRITE) const {
+            GuestArena::GuestArenaMap_nid_postfix(reinterpret_cast<void*>(Address(page)), PageBytes(), section, offset, protection);
+        }
+    } mapping;
+    mapping.Map(0, mapping.first);
+    mapping.Map(1, mapping.first);
+    mapping.Map(2, mapping.second);
+    const auto resolve = [&](std::size_t page, bool write, std::size_t offset = 128) {
+        Use access;
+        auto& ranges = write ? access.writes : access.reads;
+        ranges.emplace_back(mapping.Address(page, offset), mapping.Address(page, offset + 16));
+        const bool known = ResolvePassRanges(ranges);
+        if (write) access.anyWrites = !known;
+        else access.anyReads = !known;
+        return access;
+    };
+    auto reader = resolve(0, false);
+    auto writer = resolve(1, true);
+    Expect(!reader.anyReads && !writer.anyWrites && reader.reads == writer.writes, "two real shared views resolve to the same backing bytes");
+    PassHazards hazards;
+    hazards.Add(reader.View());
+    Expect(hazards.Check(writer.View(), false) == PassHazard::WriteAfterRead, "a write through another virtual alias orders earlier reads");
+    Expect(hazards.Check(resolve(1, true, 256).View(), false) == PassHazard::None, "disjoint offsets in shared backing remain independent");
+    Expect(hazards.Check(resolve(2, true).View(), false) == PassHazard::None, "separate real sections remain independent");
+    mapping.Map(1, mapping.duplicate);
+    writer = resolve(1, true);
+    Expect(!writer.anyWrites && writer.writes == reader.reads && hazards.Check(writer.View(), false) == PassHazard::WriteAfterRead, "duplicated section handles cannot bypass backing hazards");
+    mapping.Map(1, mapping.second);
+    Expect(hazards.Check(resolve(1, true).View(), false) == PassHazard::None, "remapped virtual memory uses its current backing identity");
+    mapping.Map(1, mapping.first);
+    Expect(hazards.Check(resolve(1, true).View(), false) == PassHazard::WriteAfterRead, "restoring a shared backing retains its original hazard");
+    GuestArena::GuestArenaReset_nid_postfix(reinterpret_cast<void*>(mapping.Address(1)), Mapping::PageBytes());
+    Ranges hole{{mapping.Address(0, 128), mapping.Address(2, 144)}};
+    Expect(!ResolvePassRanges(hole) && hole.empty(), "a hole inside a mapped range refuses a partial independence proof");
+    Ranges mixed{{mapping.Address(0, 128), mapping.Address(0, 144)}, {mapping.Address(1, 128), mapping.Address(1, 144)}};
+    Expect(!ResolvePassRanges(mixed) && mixed == reader.reads, "an unknown range remains unknown alongside a successfully resolved range");
+    mapping.Map(1, mapping.first, 0, PAGE_WRITECOPY);
+    writer = resolve(1, true);
+    Expect(writer.anyWrites && hazards.Check(writer.View(), false) == PassHazard::UnknownWrite, "private-copy ambiguity conservatively orders memory accesses");
+    for (std::size_t page = 2; page < 19; ++page) mapping.Map(page, mapping.first, (page % 2) * Mapping::PageBytes());
+    Ranges fragmented{{mapping.Address(2), mapping.Address(19)}};
+    Expect(!ResolvePassRanges(fragmented) && fragmented.empty(), "an oversized backing proof refuses elision instead of truncating ranges");
+#else
+    std::uint32_t storage = 0;
+    Ranges unsupported{{reinterpret_cast<std::uintptr_t>(&storage), reinterpret_cast<std::uintptr_t>(&storage) + sizeof(storage)}};
+    Expect(!ResolvePassRanges(unsupported) && unsupported.empty(), "an unsupported backing query refuses independence");
+#endif
+}
+
 int main() {
     testRangeSet();
     testRanges();
@@ -242,6 +323,7 @@ int main() {
     testImages();
     testAttachments();
     testKnownAddressWrites();
+    testBackingRanges();
     if (failures != 0) {
         std::fprintf(stderr, "%d pass hazard checks failed\n", failures);
         return 1;

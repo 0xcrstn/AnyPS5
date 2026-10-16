@@ -3168,6 +3168,7 @@ struct MockVulkan {
     std::map<VkDeviceMemory, VkDeviceSize> allocationSizes;
     VkDeviceSize allocatedBytes = 0;
     std::optional<VkDeviceSize> memoryLimit;
+    std::optional<VkDeviceSize> allocationLimit;
     std::uint64_t allocationAttempts = 0;
     std::uint32_t bufferMemoryTypeBits = 1;
     std::vector<std::uint32_t> allocationTypes;
@@ -3242,6 +3243,7 @@ std::span<std::byte> mockMemoryBytes(VkDeviceMemory memory) {
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
     ++mock.allocationAttempts;
     mock.allocationTypes.push_back(info->memoryTypeIndex);
+    if (mock.allocationLimit.has_value() && info->allocationSize > *mock.allocationLimit) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     if (mock.memoryLimit.has_value() && mock.allocatedBytes + info->allocationSize > *mock.memoryLimit) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     *memory = makeHandle<VkDeviceMemory>();
     mock.memories[*memory] = std::vector<std::byte>(info->allocationSize);
@@ -4891,7 +4893,8 @@ void pipelineLibraryConcurrencyTests() {
     ShaderRecompiler::RecompileResult vertex, first, second;
     vertex.spirv = makeModule({});
     first.spirv = makeModule({.fragment = true});
-    second.spirv = makeModule({.fragment = true});
+    second.spirv = makeModule({.fragment = true, .fragmentMode = spv::ExecutionModeEarlyFragmentTests});
+    Require(first.spirv != second.spirv, "the concurrent fragment pipelines require distinct SPIR-V content");
     vertex.variantId = 301;
     first.variantId = 302;
     second.variantId = 303;
@@ -4967,6 +4970,7 @@ void pipelineLibrarySetTests() {
         fragment.variantId = 2;
         for (std::uint32_t set = 0; set < 2; ++set) {
             ShaderRecompiler::DescriptorBinding binding{};
+            binding.count = 1;
             binding.descriptorSet = set;
             if ((mask & (1u << set)) != 0u) fragment.bindings.push_back(binding);
             else vertex.bindings.push_back(binding);
@@ -5124,6 +5128,18 @@ void barycentricEmulationTests() {
     expectFailure([&] { static_cast<void>(BuildBarycentricGeometryShader(vertex, fragment, target, limits)); }, "not exported by the vertex shader");
 }
 
+class ComparedHostImports {
+public:
+    explicit ComparedHostImports(const AgcDriver::Graphics::Context& context) : gpu(AgcDriver::GuestMemory::GpuMutex()), context(context), watch(AgcDriver::Graphics::PrepareImportWatch(context)) {
+        AgcDriver::Graphics::SetImportWatch(context, AgcDriver::Graphics::ImportWatch::Unwatch);
+    }
+    ~ComparedHostImports() { AgcDriver::Graphics::SetImportWatch(context, watch); }
+private:
+    std::unique_lock<AgcDriver::GuestMemory::GpuMutexType> gpu;
+    const AgcDriver::Graphics::Context& context;
+    AgcDriver::Graphics::ImportWatch watch;
+};
+
 void copiedWriterIndirectOverlapTests() {
     using namespace ShaderRecompiler;
     using namespace AgcDriver::Graphics;
@@ -5149,6 +5165,7 @@ void copiedWriterIndirectOverlapTests() {
     context.hostImportAlignment = half;
     context.limits.minStorageBufferOffsetAlignment = 16;
     context.limits.maxStorageBufferRange = 1u << 27;
+    const ComparedHostImports imports(context);
 
     {
         GuestBufferMemory memory(context);
@@ -7199,24 +7216,29 @@ int main(int argc, char** argv) {
         auto bdaContext = mockContext();
         bdaContext.bufferDeviceAddress = true;
         bdaContext.limits.maxStorageBufferRange = 1u << 27;
-        RunBdaResourceTests(bdaContext, {
-            [](VkBuffer buffer) -> std::span<std::byte> { return mockBufferMemory(buffer); },
-            [](std::uint32_t binding) {
-                for (auto it = mock.writes.rbegin(); it != mock.writes.rend(); ++it) {
-                    if (it->binding == binding) return it->buffers.at(0);
-                }
-                throw std::runtime_error("missing BDA test descriptor");
-            },
-            [](VkDeviceAddress address) {
-                const auto offset = address - 0x100000000000ULL;
-                const auto buffer = reinterpret_cast<VkBuffer>(offset / 0x10000);
-                return mockBufferMemory(buffer).subspan(offset % 0x10000);
-            },
-            [](std::optional<VkDeviceSize> headroom) {
-                mock.memoryLimit = headroom.has_value() ? std::optional<VkDeviceSize>(mock.allocatedBytes + *headroom) : std::nullopt;
-            },
-            [] { return mock.allocationAttempts; }
-        });
+        {
+            const ComparedHostImports imports(bdaContext);
+            RunBdaResourceTests(bdaContext, {
+                [](VkBuffer buffer) -> std::span<std::byte> { return mockBufferMemory(buffer); },
+                [](std::uint32_t binding) {
+                    for (auto it = mock.writes.rbegin(); it != mock.writes.rend(); ++it) {
+                        if (it->binding == binding) return it->buffers.at(0);
+                    }
+                    throw std::runtime_error("missing BDA test descriptor");
+                },
+                [](VkDeviceAddress address) {
+                    const auto offset = address - 0x100000000000ULL;
+                    const auto buffer = reinterpret_cast<VkBuffer>(offset / 0x10000);
+                    return mockBufferMemory(buffer).subspan(offset % 0x10000);
+                },
+                [](std::optional<VkDeviceSize> headroom) {
+                    mock.memoryLimit = headroom.has_value() ? std::optional<VkDeviceSize>(mock.allocatedBytes + *headroom) : std::nullopt;
+                },
+                [] { return mock.allocationAttempts; },
+                [](std::optional<VkDeviceSize> bytes) { mock.allocationLimit = bytes; }
+            });
+        }
+        bdaContext.bufferPool.reset();
         Require(mock.live == 0, "BDA resources leaked Vulkan objects");
         RunGuestAllocationTests();
         RunUnmappedGapTests();

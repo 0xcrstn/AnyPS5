@@ -1,11 +1,14 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrawTraceIdentity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderTraceObserver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
+#include "ShaderInputInventory.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -86,6 +89,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         phaseTiming.Phase(DrawRowCaptureRegions);
         bool templateHit = false;
         try {
+            ShaderTraceObserver compilerObservation;
             stageCapture.compiled = invocation.MaterializeValues(*values, &templateHit);
         } catch (const std::exception& error) {
             throw named(error);
@@ -106,7 +110,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
                 if (!SameSnapshot(fresh->snapshot, values->snapshot) || !SameStageResult(*freshResult, *stageCapture.compiled)) {
                     stale = std::any_of(kept.begin(), kept.end(), [](const std::pair<std::uint64_t, std::uint32_t>& word) {
                         std::uint32_t now = 0;
-                        std::memcpy(&now, reinterpret_cast<const void*>(word.first), sizeof(now));
+                        GuestMemory::CopyDriverMemory(&now, reinterpret_cast<const void*>(word.first), sizeof(now));
                         return now != word.second;
                     });
                     if (!stale) {
@@ -151,6 +155,13 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         }
         notePlannedStage(verifyBindingPlan(), mismatch, part, templateHit, ShaderRecompiler::CountSpecializationWords(values->snapshot));
         if (mismatch) ThrowStageMismatch(submission.queue, submission.serial, currentPacketOffset(), i, program.binary.codeAddress, part);
+        if (ShaderRecompiler::ShouldCaptureShaderInput(stageCapture.compiled)) {
+            auto inputRequest = invocation.Request();
+            const bool complete = planInstance == nullptr || (planCapture.outcome != ShaderMemory::PlanOutcome::Reused && planCapture.outcome != ShaderMemory::PlanOutcome::Patched);
+            const auto inputMemory = complete ? (planCapture.memory != nullptr ? planCapture.memory->Regions() : shaderMemory.Regions()) : std::vector<ShaderRecompiler::MemoryRegion>{};
+            inputRequest.context.memory = inputMemory;
+            static_cast<void>(ShaderRecompiler::CaptureShaderInput(inputRequest, stageCapture.compiled, complete));
+        }
         return stageCapture.compiled;
     }
     const auto capture = [&] {
@@ -164,6 +175,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     phaseTiming.Phase(DrawRowCapture);
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
+    if (DrawTrace::Enabled()) {
+        std::uint64_t bytes = 0;
+        for (const auto& region : stageCapture.regions) bytes += region.bytes.size();
+        DrawTrace::RecordCounter("shader_capture_bytes", bytes, "bytes");
+    }
     stageCapture.userDataUse = capture->userDataUse;
     stageCapture.prepared = invocation.Handle();
     stageCapture.bufferBaseWords = capture->bufferBaseWords;
@@ -209,11 +225,20 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 
     timing.Mark("capture_resources");
     try {
+        ShaderTraceObserver compilerObservation;
         stageCapture.compiled = invocation.Materialize(*capture);
+        auto inputRequest = invocation.Request();
+        inputRequest.context.memory = memory;
+        static_cast<void>(ShaderRecompiler::CaptureShaderInput(inputRequest, stageCapture.compiled));
     } catch (const std::exception& error) {
         throw named(error);
     }
     stageCapture.capture = capture;
+    if (DrawTrace::Enabled()) {
+        const auto identity = DrawTrace::RegisterShaderIdentity(program.binary.stage, *stageCapture.compiled);
+        DrawTrace::AssociateMetadata(DrawTrace::Current().operation, identity, "shader_stage");
+        DrawTrace::Note("guest_shader_address", program.binary.codeAddress);
+    }
     timing.Mark("materialize");
     phaseTiming.Phase(DrawRowRecompile);
     return stageCapture.compiled;

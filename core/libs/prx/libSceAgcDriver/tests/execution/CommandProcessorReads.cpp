@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -17,14 +19,18 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <future>
 #include <iostream>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -210,6 +216,9 @@ void DescribesTheReads() {
     const std::array<std::uint32_t, 4> attributes{0xc0029100u, 0x1000u, 0u, 2u};
     const auto attributeRead = AgcDriver::Pm4::CommandProcessorReadOf(attributes);
     Require(attributeRead.has_value() && attributeRead->address == 0x1020u && attributeRead->bytes == 16u, "INDEX_ATTRIBUTES_INDIRECT does not read its 16-byte record");
+    const std::array<std::uint32_t, 6> copy{0xc0044000u, 0x10001u, 0x1000u, 2u, 0xa010u, 0u};
+    const auto copyRead = AgcDriver::Pm4::CommandProcessorReadOf(copy);
+    Require(copyRead.has_value() && copyRead->address == 0x200001000ull && copyRead->bytes == 8, "COPY_DATA to context registers does not describe its source memory");
     const std::array<std::uint32_t, 3> draw{0xc0012d00u, 3u, 2u};
     Require(!AgcDriver::Pm4::CommandProcessorReadOf(draw).has_value(), "DRAW_INDEX_AUTO was taken for a command processor read");
 }
@@ -229,10 +238,233 @@ void DrawsSeeTheIndirectRegisters(CommandProcessorReads mode, const std::string&
         return;
     }
     Require(after.syncDrains - before.syncDrains == after.syncsDeferred - before.syncsDeferred && after.syncsDeferred - before.syncsDeferred <= 2u, name + ": " + std::to_string(after.syncsDeferred - before.syncsDeferred) + " EVENT_WRITE syncs were deferred but " + std::to_string(after.syncDrains - before.syncDrains) + " drained at the next SET_SH_REG_INDIRECT");
-    Require(after.reads - before.reads + after.syncDrains - before.syncDrains == 2u, name + ": " + std::to_string(after.reads - before.reads) + " SET_SH_REG_INDIRECT packets read without a drain and " + std::to_string(after.syncDrains - before.syncDrains) + " drained for a deferred sync, expected 2 in all");
+    Require(after.reads - before.reads + after.syncDrains - before.syncDrains + after.unknownDrains - before.unknownDrains == 2u, name + ": indirect reads were not accounted for as overlap, deferred sync or unknown-writer drain");
     Require(after.registerState == before.registerState + 2u, name + ": " + std::to_string(after.registerState - before.registerState) + " NOP packets taken without a drain, expected 2");
     if (mode == CommandProcessorReads::Verify) Require(after.verified - before.verified == after.ahead - before.ahead, name + ": " + std::to_string(after.verified - before.verified) + " of " + std::to_string(after.ahead - before.ahead) + " reads ahead of pending records were verified");
     else Require(after.verified == before.verified, name + ": reads were verified with verification off");
+}
+
+void SnapshotsSurviveCpuReuseAndObserveDriverStores() {
+    using AgcDriver::DriverDetail::RegisterListSnapshot;
+    const auto address = reinterpret_cast<std::uintptr_t>(RegisterPairs.data());
+    const std::array<std::uint32_t, 5> packet{0xc0036300u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(static_cast<std::uint64_t>(address) >> 32u), 0x80000000u, 2u};
+    RegisterPairs = {0x00cu, 11u, 0x00du, 22u};
+    const auto original = RegisterPairs;
+    const auto captured = RegisterListSnapshot::Capture(packet);
+    RegisterPairs[1] = 33u;
+    Require(captured.Resolve(packet) == std::vector<std::uint32_t>(original.begin(), original.end()), "CPU reuse after Submit replaced the captured register list");
+    alignas(16) std::array<std::uint32_t, 4> unrelated{};
+    AgcDriver::GuestMemory::MarkWritten(reinterpret_cast<std::uintptr_t>(unrelated.data()), sizeof(unrelated), AgcDriver::GuestMemory::WriteExtent::Exact);
+    Require(captured.Resolve(packet) == captured.values, "an unrelated driver store discarded the register-list snapshot");
+    const std::array<std::uint32_t, 4> written{0x00cu, 44u, 0x00du, 55u};
+    std::thread producer([&] {
+        AgcDriver::GuestMemory::Write(address, std::as_bytes(std::span(written)), 4);
+    });
+    producer.join();
+    Require(captured.Resolve(packet) == std::vector<std::uint32_t>(written.begin(), written.end()), "a driver store on another thread after the snapshot was ignored");
+    const auto beforePending = RegisterListSnapshot::Capture(packet);
+    struct FlushReset {
+        ~FlushReset() { AgcDriver::GuestMemory::SetFlushHook(nullptr); }
+    } flushReset;
+    AgcDriver::GuestMemory::SetFlushHook([](std::uint64_t begin, std::size_t bytes) {
+        if (begin != reinterpret_cast<std::uintptr_t>(RegisterPairs.data()) || bytes != sizeof(RegisterPairs)) return;
+        AgcDriver::GuestMemory::SetFlushHook(nullptr);
+        const std::array<std::uint32_t, 4> pending{0x00cu, 66u, 0x00du, 77u};
+        AgcDriver::GuestMemory::StoreOwnBytes(begin, std::as_bytes(std::span(pending)));
+    });
+    Require(beforePending.Resolve(packet) == std::vector<std::uint32_t>({0x00cu, 66u, 0x00du, 77u}), "a pending store published by the consumption flush was ignored");
+    const auto beforeOverflow = RegisterListSnapshot::Capture(packet);
+    RegisterPairs[1] = 88u;
+    for (std::size_t i = 0; i <= 65536; ++i) AgcDriver::GuestMemory::MarkWritten(reinterpret_cast<std::uintptr_t>(unrelated.data()), sizeof(unrelated), AgcDriver::GuestMemory::WriteExtent::Exact);
+    Require(beforeOverflow.Resolve(packet) == beforeOverflow.values, "driver-store history eviction discarded the CPU submit-time register-list snapshot");
+    const std::array<std::uint32_t, 4> afterOverflow{0x00cu, 99u, 0x00du, 111u};
+    AgcDriver::GuestMemory::Write(address, std::as_bytes(std::span(afterOverflow)), 4);
+    Require(beforeOverflow.Resolve(packet) == std::vector<std::uint32_t>(afterOverflow.begin(), afterOverflow.end()), "driver-store history eviction lost an active register-list watch");
+    std::promise<void> copying;
+    auto copyingStarted = copying.get_future();
+    std::promise<void> releaseCopy;
+    auto mayCopy = releaseCopy.get_future();
+    std::thread delayed([&] {
+        AgcDriver::GuestMemory::StoreOwnBytes(address, sizeof(RegisterPairs), [&] {
+            copying.set_value();
+            mayCopy.wait();
+            RegisterPairs[1] = 123u;
+        });
+    });
+    copyingStarted.wait();
+    auto duringCopy = std::async(std::launch::async, [&] { return RegisterListSnapshot::Capture(packet); });
+    const auto captureBlocked = duringCopy.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
+    releaseCopy.set_value();
+    delayed.join();
+    const auto afterCopy = duringCopy.get();
+    Require(captureBlocked && afterCopy.values[1] == 123u, "a snapshot did not serialize its copy with an unfinished driver store");
+    RegisterPairs[1] = 456u;
+    Require(afterCopy.Resolve(packet)[1] == 123u, "a serialized snapshot lost its CPU submit-time contents");
+    bool refused = false;
+    try {
+        static_cast<void>(captured.Resolve({}));
+    } catch (const std::runtime_error&) {
+        refused = true;
+    }
+    Require(refused, "a malformed register-list packet reused a snapshot");
+}
+
+void CowAliasesPreserveFrozenRegisterSnapshots() {
+#ifdef _WIN32
+    using AgcDriver::DriverDetail::RegisterListSnapshot;
+    struct Mapping {
+        HANDLE section = nullptr;
+        std::byte* memory = nullptr;
+        Mapping() {
+            section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, Block, nullptr);
+            Require(section != nullptr, "COW register snapshot section allocation failed");
+            memory = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(3 * Block, Block));
+            if (memory == nullptr) {
+                CloseHandle(section);
+                throw std::runtime_error("COW register snapshot arena allocation failed");
+            }
+            try {
+                GuestArena::GuestArenaMap_nid_postfix(memory, Block, section, 0, PAGE_WRITECOPY);
+                GuestArena::GuestArenaMap_nid_postfix(memory + Block, Block, section, 0, PAGE_READWRITE);
+                GuestArena::GuestArenaMap_nid_postfix(memory + 2 * Block, Block, section, 0, PAGE_READWRITE);
+            } catch (...) {
+                Release();
+                throw;
+            }
+        }
+        void Release() {
+            if (memory != nullptr) {
+                GuestArena::GuestArenaReset_nid_postfix(memory, 3 * Block);
+                GuestArena::GuestArenaRelease_nid_postfix(memory, 3 * Block);
+                memory = nullptr;
+            }
+            if (section != nullptr) {
+                GuestArena::GuestArenaForgetSection_nid_postfix(section);
+                CloseHandle(section);
+                section = nullptr;
+            }
+        }
+        ~Mapping() { Release(); }
+    } mapping;
+    const auto packetAt = [](const void* pointer) {
+        const auto address = reinterpret_cast<std::uint64_t>(pointer);
+        return std::array<std::uint32_t, 5>{0xc0036300u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0x80000000u, 2u};
+    };
+    const std::array<std::uint32_t, 4> original{0x00cu, 11u, 0x00du, 22u};
+    AgcDriver::GuestMemory::CopyDriverMemory(mapping.memory + Block, original.data(), sizeof(original));
+    const auto cowPacket = packetAt(mapping.memory);
+    const auto frozen = RegisterListSnapshot::Capture(cowPacket);
+    auto* cowWords = reinterpret_cast<volatile std::uint32_t*>(mapping.memory);
+    cowWords[1] = 33u;
+    const std::array<std::uint32_t, 4> sharedWritten{0x00cu, 44u, 0x00du, 55u};
+    AgcDriver::GuestMemory::StoreOwnBytes(reinterpret_cast<std::uint64_t>(mapping.memory + Block), std::as_bytes(std::span(sharedWritten)));
+    Require(cowWords[1] == 33u && frozen.values == std::vector<std::uint32_t>(original.begin(), original.end()), "a shared driver write changed detached COW or frozen register words");
+    const auto refusesUnknown = [&] {
+        bool refused = false;
+        try { static_cast<void>(frozen.Resolve(cowPacket)); }
+        catch (const std::runtime_error& error) { refused = std::string_view(error.what()).find("alias provenance is unknown") != std::string_view::npos; }
+        Require(refused, "an uncertain COW driver alias silently refreshed frozen CPU register words");
+    };
+    refusesUnknown();
+    const auto sharedPacket = packetAt(mapping.memory + Block);
+    const auto sharedSnapshot = RegisterListSnapshot::Capture(sharedPacket);
+    reinterpret_cast<volatile std::uint32_t*>(mapping.memory + Block)[1] = 66u;
+    Require(sharedSnapshot.Resolve(sharedPacket) == std::vector<std::uint32_t>(sharedWritten.begin(), sharedWritten.end()), "CPU reuse changed shared submit-time register words");
+    const std::array<std::uint32_t, 4> laterWritten{0x00cu, 77u, 0x00du, 88u};
+    AgcDriver::GuestMemory::StoreOwnBytes(reinterpret_cast<std::uint64_t>(mapping.memory + 2 * Block), std::as_bytes(std::span(laterWritten)));
+    Require(sharedSnapshot.Resolve(sharedPacket) == std::vector<std::uint32_t>(laterWritten.begin(), laterWritten.end()), "a proven shared driver alias failed to refresh register words");
+    refusesUnknown();
+#endif
+}
+
+void SnapshotPayloadsPreserveUnwrittenAndReusedWords() {
+    using namespace AgcDriver::GuestMemory;
+    using AgcDriver::DriverDetail::RegisterListSnapshot;
+    const auto address = reinterpret_cast<std::uintptr_t>(RegisterPairs.data());
+    const std::array<std::uint32_t, 5> packet{0xc0036300u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(static_cast<std::uint64_t>(address) >> 32u), 0x80000000u, 2u};
+    RegisterPairs = {0x00cu, 11u, 0x00du, 22u};
+    const auto frozen = RegisterListSnapshot::Capture(packet);
+    RegisterPairs[3] = 777u;
+    const std::uint32_t written = 44u;
+    StoreOwnBytes(address + sizeof(std::uint32_t), std::as_bytes(std::span(&written, 1)));
+    RegisterPairs[1] = 999u;
+    Require(frozen.Resolve(packet) == std::vector<std::uint32_t>({0x00cu, 44u, 0x00du, 22u}), "a partial driver payload reread CPU-reused written or untouched words");
+    const auto beforeSourceReuse = RegisterListSnapshot::Capture(packet);
+    std::uint32_t source = 55u;
+    StoreOwnBytes(address + sizeof(std::uint32_t), std::as_bytes(std::span(&source, 1)), [&](std::span<const std::byte> bytes) {
+        source = 666u;
+        CopyDriverMemory(RegisterPairs.data() + 1, bytes.data(), bytes.size());
+    });
+    Require(RegisterPairs[1] == 55u && beforeSourceReuse.Resolve(packet)[1] == 55u, "the driver store and retained payload used different source contents");
+    bool copiedDirectly = false;
+    alignas(8) std::uint64_t unobserved = 0;
+    const std::uint64_t source64 = 123u;
+    StoreOwnBytes(reinterpret_cast<std::uintptr_t>(&unobserved), std::as_bytes(std::span(&source64, 1)), [&](std::span<const std::byte> bytes) {
+        copiedDirectly = bytes.data() == reinterpret_cast<const std::byte*>(&source64);
+        CopyDriverMemory(&unobserved, bytes.data(), bytes.size());
+    });
+    Require(copiedDirectly && unobserved == source64, "an unobserved driver store copied its source for snapshot retention");
+    std::array<std::byte, 8> labelSaved{};
+    const auto labelWatch = ReadDriverSnapshot(reinterpret_cast<std::uintptr_t>(&unobserved), labelSaved, 8);
+    AgcDriverStoreGuestLabel_nid_postfix(&unobserved, 456u);
+    unobserved = 789u;
+    ApplyDriverSnapshot(*labelWatch, labelSaved);
+    std::uint64_t labelPayload = 0;
+    CopyDriverMemory(&labelPayload, labelSaved.data(), labelSaved.size());
+    Require(labelPayload == 456u, "an atomic label payload was replaced by later CPU reuse");
+    const auto beforeGpuIntent = RegisterListSnapshot::Capture(packet);
+    MarkWritten(address + sizeof(std::uint32_t), sizeof(std::uint32_t), WriteExtent::Exact);
+    bool refused = false;
+    try { static_cast<void>(beforeGpuIntent.Resolve(packet)); }
+    catch (const std::runtime_error& error) { refused = std::string_view(error.what()).find("bounded payload") != std::string_view::npos; }
+    Require(refused, "a GPU intent without an actual payload refreshed a frozen register word");
+    RegisterPairs = {11u, 22u, 0u, 0u};
+    auto contiguous = packet;
+    contiguous[3] = 0x00cu;
+    const auto contiguousSnapshot = RegisterListSnapshot::Capture(contiguous);
+    Require(contiguousSnapshot.Resolve(contiguous) == std::vector<std::uint32_t>({0x00cu, 11u, 0x00du, 22u}), "an unchanged contiguous register snapshot lost its register indices");
+    RegisterPairs[1] = 777u;
+    StoreOwnBytes(address, std::as_bytes(std::span(&written, 1)));
+    RegisterPairs[0] = 999u;
+    Require(contiguousSnapshot.Resolve(contiguous) == std::vector<std::uint32_t>({0x00cu, 44u, 0x00du, 22u}), "a contiguous register snapshot mixed payload offsets with parsed register indices");
+}
+
+void SnapshotPayloadLimitsRefuseWithoutWidening() {
+    using namespace AgcDriver::GuestMemory;
+    alignas(8) std::uint64_t word = 0;
+    std::array<std::byte, 8> saved{};
+    auto watch = ReadDriverSnapshot(reinterpret_cast<std::uintptr_t>(&word), saved, 8);
+    const auto beforeRanges = DriverStoreWatch::LimitTotals();
+    for (std::uint64_t value = 1; value <= DriverStoreWatch::MaximumRanges; ++value) StoreOwnBytes(reinterpret_cast<std::uintptr_t>(&word), std::as_bytes(std::span(&value, 1)));
+    ApplyDriverSnapshot(*watch, saved);
+    std::uint64_t last = 0;
+    CopyDriverMemory(&last, saved.data(), saved.size());
+    Require(last == DriverStoreWatch::MaximumRanges, "the last bounded register payload was not retained");
+    const std::uint64_t overflow = 999u;
+    StoreOwnBytes(reinterpret_cast<std::uintptr_t>(&word), std::as_bytes(std::span(&overflow, 1)));
+    Require(watch->State() == DriverStoredSince::Unknown && DriverStoreWatch::LimitTotals().ranges == beforeRanges.ranges + 1, "register payload range overflow did not explicitly refuse and count");
+    bool refused = false;
+    try { ApplyDriverSnapshot(*watch, saved); }
+    catch (const std::runtime_error&) { refused = true; }
+    Require(refused, "range overflow silently widened the snapshot refresh");
+    std::vector<std::byte> storage(32768, std::byte{1}), source(storage.size(), std::byte{2}), snapshot(storage.size());
+    watch = ReadDriverSnapshot(reinterpret_cast<std::uintptr_t>(storage.data()), snapshot);
+    const auto beforeBytes = DriverStoreWatch::LimitTotals();
+    StoreOwnBytes(reinterpret_cast<std::uintptr_t>(storage.data()), source);
+    Require(watch->State() == DriverStoredSince::Stored, "one cross-page store retained duplicate payloads for each page");
+    source.front() = std::byte{3};
+    StoreOwnBytes(reinterpret_cast<std::uintptr_t>(storage.data()), source);
+    ApplyDriverSnapshot(*watch, snapshot);
+    Require(snapshot == source && watch->State() == DriverStoredSince::Stored, "two payloads within the byte limit were not retained");
+    StoreOwnBytes(reinterpret_cast<std::uintptr_t>(storage.data()), source);
+    Require(watch->State() == DriverStoredSince::Unknown && DriverStoreWatch::LimitTotals().bytes == beforeBytes.bytes + 1, "register payload byte overflow did not explicitly refuse and count");
+    storage.resize(DriverStoreWatch::MaximumBytes + 8);
+    source.resize(storage.size(), std::byte{4});
+    snapshot.resize(storage.size());
+    watch = ReadDriverSnapshot(reinterpret_cast<std::uintptr_t>(storage.data()), snapshot);
+    const auto beforeLarge = DriverStoreWatch::LimitTotals();
+    StoreOwnBytes(reinterpret_cast<std::uintptr_t>(storage.data()), source);
+    Require(storage == source && watch->State() == DriverStoredSince::Unknown && DriverStoreWatch::LimitTotals().bytes == beforeLarge.bytes + 1, "an oversized actual store was truncated into a valid register payload");
 }
 
 void SetEnvironment(const char* name) {
@@ -243,16 +475,36 @@ void SetEnvironment(const char* name) {
 #endif
 }
 
+void CpuCopiesRetainRegisterPayloads(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::DriverDetail::RegisterListSnapshot;
+    const auto address = reinterpret_cast<std::uintptr_t>(RegisterPairs.data());
+    const std::array<std::uint32_t, 5> packet{0xc0036300u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(static_cast<std::uint64_t>(address) >> 32u), 0x80000000u, 2u};
+    RegisterPairs = {0x00cu, 11u, 0x00du, 22u};
+    const auto frozen = RegisterListSnapshot::Capture(packet);
+    const std::uint32_t source = 44u;
+    RegisterPairs[3] = 777u;
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto outcome = device.CopyBuffer(address + sizeof(std::uint32_t), reinterpret_cast<std::uintptr_t>(&source), sizeof(source), sizeof(source), sizeof(source), 0, 0, 0, [](std::span<const std::byte>, std::uint64_t) {});
+    Require(outcome.path == 0 && RegisterPairs[1] == source, "the register payload CPU-copy fixture did not take the actual CPU copy path");
+    RegisterPairs[1] = 999u;
+    Require(frozen.Resolve(packet) == std::vector<std::uint32_t>({0x00cu, 44u, 0x00du, 22u}), "an actual CPU DMA copy lost its payload or reread CPU-reused register words");
+}
+
 }
 
 int main() {
     try {
         ParsesTheSwitch();
         DescribesTheReads();
+        SnapshotsSurviveCpuReuseAndObserveDriverStores();
+        CowAliasesPreserveFrozenRegisterSnapshots();
+        SnapshotPayloadsPreserveUnwrittenAndReusedWords();
+        SnapshotPayloadLimitsRefuseWithoutWidening();
         SetEnvironment("APS5_RECORD_THREAD");
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
+            CpuCopiesRetainRegisterPayloads(*device);
         }
         ColorMemory = AllocateWatched(Block);
         VertexTable = BufferDescriptor(Vertices.data(), sizeof(Vertices[0]), 3u, 0x01016facu);

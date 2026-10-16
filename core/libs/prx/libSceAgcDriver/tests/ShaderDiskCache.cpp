@@ -1,4 +1,5 @@
 #include "ShaderDiskCache.hpp"
+#include "SpirvIntern.hpp"
 #include "CacheKey.hpp"
 #include "ShaderCachePack.hpp"
 #include "VertexInputSpecialization.hpp"
@@ -392,6 +393,39 @@ void verifyEntryRoundTrip() {
     incompatible.artifact.runtimeAbiVersion = RuntimeAbi::Version + 1u;
     const auto incompatibleFile = ShaderDiskCache::EncodeEntry(key, incompatible);
     require(ShaderDiskCache::DecodeEntry(incompatibleFile, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "an entry with an incompatible runtime ABI loads");
+}
+
+void verifyOfflineEntryHelpers() {
+    SampleRequest sample;
+    const auto key = sample.Key();
+    const auto variant = sampleVariant();
+    const auto file = ShaderDiskCache::EncodeEntry(key, variant);
+    const auto entryKey = ShaderDiskCache::EntryKey(file);
+    require(entryKey.size() == key.size() && std::equal(entryKey.begin(), entryKey.end(), key.begin()), "the encoded entry key does not round trip");
+    require(ShaderDiskCache::EntryKey(std::span(file).first(ShaderDiskCache::EntryHeaderBytes)).empty(), "a header-only entry yields a key");
+    auto damagedKey = file;
+    damagedKey[ShaderDiskCache::EntryHeaderBytes] ^= std::byte{1};
+    require(ShaderDiskCache::EntryKey(damagedKey).empty(), "an entry with a damaged key yields a key");
+    if ((ShaderDiskCache::EntryHeaderBytes + key.size()) % 8 != 0) {
+        auto damagedPadding = file;
+        damagedPadding[ShaderDiskCache::EntryHeaderBytes + key.size()] ^= std::byte{1};
+        require(ShaderDiskCache::EntryKey(damagedPadding).empty(), "an entry with nonzero padding yields a key");
+        CompiledVariant partial;
+        require(ShaderDiskCache::DecodeEntry(damagedPadding, key, partial) == ShaderDiskCache::LoadStatus::Rejected, "an entry with nonzero padding decodes");
+    }
+    require(ShaderDiskCache::IsCurrentEntryHeader(std::span(file).first(ShaderDiskCache::EntryHeaderBytes), file.size()), "a current entry header is not recognized");
+    require(!ShaderDiskCache::IsCurrentEntryHeader(std::span(file).first(ShaderDiskCache::EntryHeaderBytes), file.size() - 1), "a header with the wrong file size is recognized");
+    require(!ShaderDiskCache::IsCurrentEntryHeader(std::span(file).first(8), file.size()), "a short header is recognized");
+
+    const auto before = ShaderDiskCache::Totals();
+    OfflineCompileTimings timings;
+    const auto first = CompileShaderUncached(sample.request, nullptr, &timings);
+    const auto second = CompileShaderUncached(sample.request);
+    require(first && second, "the uncached compile entry point returned no variant");
+    require(timings.frontendSeconds >= 0 && timings.backendSeconds >= 0, "the uncached compile timings were not filled");
+    require(ShaderDiskCache::EncodeEntry(key, *first) == ShaderDiskCache::EncodeEntry(key, *second), "the uncached compile entry point is not deterministic");
+    const auto after = ShaderDiskCache::Totals();
+    require(after.hits == before.hits && after.misses == before.misses && after.writes == before.writes && after.bytesRead == before.bytesRead && after.bytesWritten == before.bytesWritten, "the uncached compile entry point used the disk cache");
 }
 
 std::vector<std::byte> packBytes(const std::vector<std::pair<std::vector<std::byte>, std::vector<std::byte>>>& entries) {
@@ -890,6 +924,47 @@ struct ComputeRequest {
         request.useCache = useCache;
     }
 };
+
+void verifyUncachedMaterialization() {
+    ComputeRequest fixture(false);
+    const auto variant = CompileShaderUncached(fixture.request);
+    std::vector<std::byte> key;
+    ShaderDiskCache::BuildKey(fixture.request, variant->artifact.hostSubgroupSize, key);
+    const auto materialized = MaterializeShaderUncached(fixture.request, *variant, key);
+    requireSameResult(Recompile(fixture.request), materialized, "uncached materialization");
+    fixture.userData[0] += 1u;
+    const auto specialized = MaterializeShaderUncached(fixture.request, *variant, key);
+    requireSameResult(Recompile(fixture.request), specialized, "uncached descriptor specialization");
+    fixture.userData[0] -= 1u;
+    auto corrupt = key;
+    corrupt.back() ^= std::byte{1};
+    bool rejected = false;
+    try { static_cast<void>(MaterializeShaderUncached(fixture.request, *variant, corrupt)); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "offline materialization accepted a mismatched artifact key");
+    auto otherLayout = fixture.request;
+    ++otherLayout.layout.firstBinding;
+    ShaderDiskCache::BuildKey(otherLayout, variant->artifact.hostSubgroupSize, corrupt);
+    rejected = false;
+    try { static_cast<void>(MaterializeShaderUncached(otherLayout, *variant, corrupt)); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "offline materialization accepted another artifact's layout");
+    const auto entry = ShaderDiskCache::EncodeEntry(key, *variant);
+    CompiledVariant decoded;
+    require(ShaderDiskCache::DecodeEntry(entry, key, decoded) == ShaderDiskCache::LoadStatus::Loaded, "offline materialization fixture did not decode");
+    decoded.layout = fixture.request.layout;
+    const auto restored = MaterializeShaderUncached(fixture.request, decoded, key);
+    require(restored.PipelineVariantId() != 0u, "offline decoded artifact did not receive a process identity");
+    requireSameResult(materialized, restored, "offline decoded artifact materialization");
+    const auto before = GetRetainedShaderMemory();
+    const auto internedBefore = SpirvInternTotals();
+    const auto independent = CompileShaderUncached(fixture.request);
+    requireSameResult(materialized, MaterializeShaderUncached(fixture.request, *independent, key), "independent offline materialization");
+    const auto after = GetRetainedShaderMemory();
+    const auto internedAfter = SpirvInternTotals();
+    require(before.sources == after.sources && before.plans == after.plans && before.variants == after.variants && before.bindingPlans == after.bindingPlans && before.specializedModules == after.specializedModules && before.registrationModules == after.registrationModules, "offline materialization retained processwide compiler entries");
+    require(internedBefore.lookups == internedAfter.lookups && internedBefore.entries == internedAfter.entries, "offline materialization used processwide SPIR-V interning");
+}
 
 int runLoadingProcess() {
     ComputeRequest cached(true);
@@ -1552,6 +1627,29 @@ std::vector<PlanFixture> planFixtures() {
     fragment.pixel = pixel;
     fixtures.push_back(std::move(fragment));
     return fixtures;
+}
+
+void verifyUncachedReadClosure() {
+    auto fixtures = planFixtures();
+    const auto found = std::find_if(fixtures.begin(), fixtures.end(), [](const PlanFixture& fixture) { return fixture.name == "descriptor through a pointer"; });
+    require(found != fixtures.end(), "offline read closure fixture is missing");
+    auto request = found->Request(false);
+    const auto variant = CompileShaderUncached(request);
+    std::vector<std::byte> key;
+    ShaderDiskCache::BuildKey(request, variant->artifact.hostSubgroupSize, key);
+    const auto complete = MaterializeShaderUncached(request, *variant, key);
+    requireSameResult(Recompile(request), complete, "offline captured pointer descriptor");
+    request.context.memory = {};
+    bool rejected = false;
+    try { static_cast<void>(MaterializeShaderUncached(request, *variant, key)); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "offline materialization accepted a missing descriptor root");
+    require(found->memory.size() > 1u, "offline nested read fixture has no dependent region");
+    request.context.memory = std::span(found->memory).first(1u);
+    rejected = false;
+    try { static_cast<void>(MaterializeShaderUncached(request, *variant, key)); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "offline materialization accepted an uncaptured nested descriptor");
 }
 
 IrResourcePlan handBuiltPlan() {
@@ -2228,6 +2326,13 @@ void verifyDefaultDirectory(const char* self) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--offline-materialize") {
+            verifyOfflineEntryHelpers();
+            verifyUncachedMaterialization();
+            verifyUncachedReadClosure();
+            std::cout << "offline materialization tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--resource-plan-codec") {
             verifyResultRoundTrip();
             verifyEntryRoundTrip();
@@ -2253,6 +2358,7 @@ int main(int argc, char** argv) {
         verifyAtomicReplacement(directory);
         verifyResultRoundTrip();
         verifyEntryRoundTrip();
+        verifyOfflineEntryHelpers();
         verifyPrebuiltPack(directory / "packs");
         verifyArtifactStorageIsolation();
         verifyKeySensitivity();

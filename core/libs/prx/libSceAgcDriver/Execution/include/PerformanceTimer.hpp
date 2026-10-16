@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrawTrace.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
@@ -119,6 +120,22 @@ public:
         return flipReached;
     }
 
+    void SetDrawTraceOrigin(DrawTrace::Id flip, DrawTrace::Context origin) {
+        std::lock_guard lock(mutex);
+        drawTraceFlip = flip;
+        drawTraceOrigin = origin;
+    }
+
+    DrawTrace::Context DrawTraceOrigin() const {
+        std::lock_guard lock(mutex);
+        return drawTraceOrigin;
+    }
+
+    DrawTrace::Id DrawTraceFlip() const {
+        std::lock_guard lock(mutex);
+        return drawTraceFlip;
+    }
+
     // Recorder batches at the flip packet (after its submit) and how many had not signaled.
     void NoteFlipBatches(std::uint64_t atFlip, std::uint64_t unsignaled) {
         std::lock_guard lock(mutex);
@@ -206,7 +223,9 @@ private:
         return std::chrono::duration<double, std::milli>(elapsed).count();
     }
 
-    std::mutex mutex;
+    mutable std::mutex mutex;
+    DrawTrace::Id drawTraceFlip = 0;
+    DrawTrace::Context drawTraceOrigin;
     bool localMetrics = false;
     std::map<std::pair<std::string_view, std::string_view>, Metric> metrics;
     std::map<std::pair<std::string_view, std::string_view>, Metric> asyncMetrics;
@@ -260,7 +279,7 @@ private:
 
 class PerformanceTimer {
 public:
-    explicit PerformanceTimer(const char* scope) : frame(PerformanceContext::Current()), trace(PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr), scope(scope) {
+    explicit PerformanceTimer(const char* scope, bool detailDrain = true) : frame(PerformanceContext::Current()), trace(PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr), scope(scope), detail(scope, detailDrain) {
         if (frame != nullptr) {
             total = frame->Get(scope, "total");
         }
@@ -276,6 +295,7 @@ public:
     }
 
     void Finish() {
+        detail.Finish();
         zone.End();
         if (frame == nullptr && trace == nullptr) return;
         const auto end = Clock::now();
@@ -287,12 +307,17 @@ public:
         frame = nullptr;
     }
 
+    void FinishDetail() {
+        detail.Finish();
+    }
+
     void FinishPacket(std::uint64_t serial, std::size_t offset, std::uint32_t opcode, std::size_t words) {
         if (frame != nullptr) frame->NotePacket(serial, offset, opcode, words, Clock::now() - start);
         Finish();
     }
 
     void Mark(const char* stage, std::uint64_t bytes = 0) {
+        detail.Mark(stage);
         if (frame == nullptr && trace == nullptr) return;
         const auto now = Clock::now();
         if (trace != nullptr) trace->Add(scope, stage, previous, now);
@@ -309,6 +334,7 @@ private:
     FrameTiming* frame;
     TraceThread* trace;
     const char* scope;
+    DrawTrace::HostSpan detail;
     [[no_unique_address]] TracyZone zone{scope};
     FrameTiming::Metric* total = nullptr;
     FrameTiming::Metric* tail = nullptr;

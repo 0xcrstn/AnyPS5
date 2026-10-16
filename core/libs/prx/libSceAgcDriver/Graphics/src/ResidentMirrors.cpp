@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LinearSpace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
@@ -42,7 +43,10 @@ struct ResidentMirror {
     const Recorder* usedBy = nullptr;
     std::uint64_t usedBatch = 0;
     std::uint32_t churn = 0;
+    std::uint32_t quietBatches = 0;
     bool retired = false;
+    std::atomic<bool> gpuWritten{false};
+    std::atomic<bool> readDenied{false};
     ResidentMirror() = default;
     ResidentMirror(const ResidentMirror&) = delete;
     ResidentMirror& operator=(const ResidentMirror&) = delete;
@@ -56,6 +60,7 @@ namespace {
 constexpr std::uint64_t BlockBytes = 65536;
 
 constexpr std::uint64_t DeniedBatches = 256;
+constexpr std::uint32_t ChurnQuietBatches = 32;
 constexpr std::uint64_t VerifyBytesPerBatch = 64ull << 20u;
 
 struct Statistics {
@@ -63,6 +68,7 @@ struct Statistics {
     std::atomic<std::uint64_t> collectNs{0};
     std::atomic<std::uint64_t> deferred{0}, denied{0}, deniedUses{0}, verified{0}, verifiedBytes{0}, verifyDiffering{0};
     std::atomic<std::uint64_t> placedBuilds{0};
+    std::atomic<std::uint64_t> gpuWrittenRetired{0}, gpuWrittenRefused{0}, gpuWrittenSyncs{0};
 };
 
 struct Seen {
@@ -84,6 +90,8 @@ struct Registry {
     std::vector<std::tuple<const Recorder*, std::uint64_t, std::uint64_t>> pointerWrites;
     std::uint64_t bytes = 0;
     std::atomic<bool> any{false};
+    GuestRangeSet gpuWritten;
+    std::uint64_t submitEpoch = 0;
 };
 
 Registry& Mirrors() {
@@ -285,6 +293,8 @@ void reportMirrors() {
     AgcDriver::ProfilePrint_nid_no_patch("[mirrors] reuse gate (after %u batches, churn limit %u): %llu deferred, %llu denied for churn, %llu uses refused while denied; verify%s: %llu checked (%llu MiB), %llu blocks differing\n", MirrorAfterBatches(), ChurnLimit(), take(Stats().deferred, deferred), take(Stats().denied, denied), take(Stats().deniedUses, deniedUses), VerifyMirrors() ? "" : " (off)", take(Stats().verified, verified), take(Stats().verifiedBytes, verifiedBytes) >> 20u, take(Stats().verifyDiffering, verifyDiffering));
     AgcDriver::ProfilePrint_nid_no_patch("[mirrors] resident read mirrors%s: %llu live (%.0f MiB), last 10 s: %llu made, %llu refused, %llu uses, %llu batch refreshes (%llu blocks, %.1f MiB copied in prologues, collect %.1f ms), %llu mid-batch syncs (%.1f MiB), %llu blocks invalidated by GPU writes\n", ResidentMirrorsEnabled() ? "" : " (off)", static_cast<unsigned long long>(totals.live), static_cast<double>(totals.liveBytes) / 1048576.0, static_cast<unsigned long long>(totals.made - previous.made), static_cast<unsigned long long>(totals.refused - previous.refused), static_cast<unsigned long long>(totals.uses - previous.uses), static_cast<unsigned long long>(totals.refreshes - previous.refreshes), static_cast<unsigned long long>(totals.refreshedBlocks - previous.refreshedBlocks), static_cast<double>(totals.refreshedBytes - previous.refreshedBytes) / 1048576.0, totals.collectMs - previous.collectMs, static_cast<unsigned long long>(totals.midBatchSyncs - previous.midBatchSyncs), static_cast<double>(totals.midBatchBytes - previous.midBatchBytes) / 1048576.0, static_cast<unsigned long long>(totals.invalidatedBlocks - previous.invalidatedBlocks));
     previous = totals;
+    static std::uint64_t gpuRetired = 0, gpuRefused = 0, gpuSyncs = 0;
+    AgcDriver::ProfilePrint_nid_no_patch("[mirrors] GPU-written ranges: %llu mirrors retired by a GPU write, %llu mirrors refused over GPU-written memory, %llu whole syncs of retired mirrors still bound\n", take(Stats().gpuWrittenRetired, gpuRetired), take(Stats().gpuWrittenRefused, gpuRefused), take(Stats().gpuWrittenSyncs, gpuSyncs));
     static LinearSpaceCounters linearPrevious{};
     const auto linear = LinearSpaceTotals();
     AgcDriver::ProfilePrint_nid_no_patch("[mirrors] linear address space (APS5_LINEAR_ADDRESS_SPACE): %llu pages bound (%.0f MiB), %llu in use; last 10 s: %llu pages bound, %llu unbound, %llu ranges refused; %llu linear BDA tables built (%llu linear pages)\n", static_cast<unsigned long long>(linear.boundPages), static_cast<double>(linear.boundPages * LinearPageBytes) / 1048576.0, static_cast<unsigned long long>(linear.usedPages), static_cast<unsigned long long>(linear.binds - linearPrevious.binds), static_cast<unsigned long long>(linear.unbinds - linearPrevious.unbinds), static_cast<unsigned long long>(linear.refused - linearPrevious.refused), static_cast<unsigned long long>(linear.tables - linearPrevious.tables), static_cast<unsigned long long>(linear.codedPages - linearPrevious.codedPages));
@@ -296,15 +306,15 @@ void reportMirrors() {
 bool ResidentMirrorsEnabled() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_RESIDENT_MIRRORS");
-        if (text == nullptr || std::string_view(text) == "1") return ConfiguredBudget().value_or(1) != 0;
-        if (std::string_view(text) == "0") return false;
+        if (text == nullptr || std::string_view(text) == "0") return false;
+        if (std::string_view(text) == "1") return ConfiguredBudget().value_or(1) != 0;
         throw std::runtime_error("APS5_RESIDENT_MIRRORS must be 0 or 1");
     }();
     return enabled;
 }
 
 bool BufferMirrorsEnabled() {
-    static const bool enabled = SwitchOn("APS5_RESIDENT_BUFFER_MIRRORS") && ConfiguredBudget().value_or(1) != 0;
+    static const bool enabled = std::getenv("APS5_RESIDENT_BUFFER_MIRRORS") != nullptr && SwitchOn("APS5_RESIDENT_BUFFER_MIRRORS") && ConfiguredBudget().value_or(1) != 0;
     return enabled;
 }
 
@@ -331,12 +341,20 @@ std::shared_ptr<ResidentMirror> mirrorOf(const Context& context, const HostImpor
     const auto budget = BudgetBytes(context);
     if (!enabled || budget == 0 || import.bytes == 0 || import.unwatched || import.dmaBuf || !context.bufferDeviceAddress) return {};
     if (!GuestMemory::Watched(import.base, static_cast<std::size_t>(import.bytes))) return {};
+    {
+        auto& written = Mirrors();
+        std::lock_guard lock(written.mutex);
+        if (!writable && written.gpuWritten.Overlaps(import.base, import.base + import.bytes)) {
+            Stats().gpuWrittenRefused.fetch_add(1, std::memory_order_relaxed);
+            return {};
+        }
+    }
     auto& registry = Mirrors();
     const auto* recorder = Recorder::Current();
     const auto batch = recorder != nullptr ? recorder->Submissions() + 1 : 0;
     std::lock_guard lock(registry.mutex);
     auto& seen = registry.seen[import.base];
-    if (batch != 0 && batch < seen.deniedUntil) {
+    if (registry.submitEpoch < seen.deniedUntil) {
         Stats().deniedUses.fetch_add(1, std::memory_order_relaxed);
         if (const auto found = registry.byBase.find(import.base); found != registry.byBase.end() && found->second.use_count() == 1) {
             found->second->retired = true;
@@ -349,9 +367,15 @@ std::shared_ptr<ResidentMirror> mirrorOf(const Context& context, const HostImpor
         seen.lastBatch = batch;
         if (seen.batches < MirrorAfterBatches()) ++seen.batches;
     }
+    if (const auto found = registry.byBase.find(import.base); found != registry.byBase.end() && found->second->readDenied.load(std::memory_order_acquire) && found->second.use_count() == 1) {
+        found->second->retired = true;
+        registry.bytes -= Footprint(*found->second);
+        registry.byBase.erase(found);
+    }
     if (const auto found = registry.byBase.find(import.base); found != registry.byBase.end()) {
         auto& existing = found->second;
         if (existing->device == context.device && existing->source == import.buffer && existing->bytes == import.bytes) {
+            if (!writable && existing->readDenied.load(std::memory_order_acquire)) return {};
             if (existing->placedBy != nullptr && existing->placedBy != recorder) return {};
             if (!writable) return existing;
             if (existing->usedBy != nullptr && existing->usedBy != recorder) return {};
@@ -484,15 +508,37 @@ VkDeviceSize MirrorBufferOffset(const ResidentMirror& mirror) {
 }
 
 void NoteMirroredWrite(std::uint64_t begin, std::uint64_t end) {
+    if (end <= begin) return;
     auto& registry = Mirrors();
-    if (!registry.any.load(std::memory_order_acquire) || end <= begin) return;
     std::lock_guard lock(registry.mutex);
-    auto it = registry.byBase.upper_bound(begin);
-    if (it != registry.byBase.begin()) --it;
-    for (; it != registry.byBase.end() && it->first < end; ++it) markBlocks(*it->second, begin, end);
-    for (const auto& mirror : registry.used) {
-        if (registry.byBase.find(mirror->base) == registry.byBase.end() || registry.byBase.find(mirror->base)->second != mirror) markBlocks(*mirror, begin, end);
+    registry.gpuWritten.Insert(begin, end);
+    if (!registry.any.load(std::memory_order_acquire)) return;
+    const auto overlaps = [&](const ResidentMirror& mirror) { return mirror.base < end && begin < mirror.base + mirror.bytes; };
+    const auto poison = [&](ResidentMirror& mirror) {
+        markBlocks(mirror, begin, end);
+        if (!mirror.gpuWritten.exchange(true, std::memory_order_acq_rel)) Stats().gpuWrittenRetired.fetch_add(1, std::memory_order_relaxed);
+    };
+    for (auto it = registry.byBase.begin(); it != registry.byBase.end() && it->first < end;) {
+        if (!overlaps(*it->second)) {
+            ++it;
+            continue;
+        }
+        poison(*it->second);
+        it->second->retired = true;
+        registry.bytes -= Footprint(*it->second);
+        it = registry.byBase.erase(it);
     }
+    for (const auto& mirror : registry.used) {
+        if (overlaps(*mirror)) poison(*mirror);
+    }
+}
+
+bool MirrorGpuWritten(const ResidentMirror& mirror) {
+    return mirror.gpuWritten.load(std::memory_order_acquire);
+}
+
+bool MirrorReusable(const ResidentMirror& mirror) {
+    return !mirror.gpuWritten.load(std::memory_order_acquire) && !mirror.readDenied.load(std::memory_order_acquire);
 }
 
 void NotePointerWrite(const Recorder& recorder, std::uint64_t begin, std::uint64_t end) {
@@ -505,7 +551,25 @@ void NotePointerWrite(const Recorder& recorder, std::uint64_t begin, std::uint64
 
 void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirror>> mirrors) {
     if (mirrors.empty()) return;
+    GuestMemory::AssertGpuLockHeld("UseMirrors");
     auto& registry = Mirrors();
+    std::vector<const Recorder*> previousOwners;
+    {
+        std::lock_guard lock(registry.mutex);
+        for (const auto& mirror : mirrors) {
+            if (mirror->usedBy != nullptr && mirror->usedBy != &recorder && std::find(previousOwners.begin(), previousOwners.end(), mirror->usedBy) == previousOwners.end()) previousOwners.push_back(mirror->usedBy);
+        }
+    }
+    for (const auto* previous : previousOwners) static_cast<void>(Recorder::SyncIfLive(previous));
+    if (!previousOwners.empty()) {
+        std::lock_guard lock(registry.mutex);
+        for (const auto& mirror : mirrors) {
+            if (mirror->usedBy == nullptr || mirror->usedBy == &recorder) continue;
+            mirror->usedBy = nullptr;
+            mirror->usedBatch = 0;
+            std::fill(mirror->generations.begin(), mirror->generations.end(), std::uint64_t{0});
+        }
+    }
     std::vector<ResidentMirror*> unsynced;
     std::vector<ResidentMirror*> fresh;
     for (const auto& mirror : mirrors) {
@@ -530,7 +594,13 @@ void UseMirrors(Recorder& recorder, std::span<const std::shared_ptr<ResidentMirr
                 mirror->usedBatch = batch;
                 registry.used.push_back(mirror);
             }
-            if (mirror->anyUnsynced && !mirror->retired) unsynced.push_back(mirror.get());
+            if (mirror->gpuWritten.load(std::memory_order_acquire)) {
+                markBlocks(*mirror, mirror->base, mirror->base + mirror->bytes);
+                Stats().gpuWrittenSyncs.fetch_add(1, std::memory_order_relaxed);
+                unsynced.push_back(mirror.get());
+            } else if (mirror->anyUnsynced && !mirror->retired) {
+                unsynced.push_back(mirror.get());
+            }
         }
     }
     Stats().uses.fetch_add(1, std::memory_order_relaxed);
@@ -577,6 +647,7 @@ void SubmitMirrors(Recorder& recorder) {
     std::vector<std::shared_ptr<ResidentMirror>> used;
     {
         std::lock_guard lock(registry.mutex);
+        ++registry.submitEpoch;
         for (auto& mirror : registry.used) {
             if (mirror->usedBy == &recorder && mirror->usedBatch == batch) used.push_back(mirror);
         }
@@ -588,7 +659,7 @@ void SubmitMirrors(Recorder& recorder) {
     std::vector<const ResidentMirror*> verified;
     std::uint64_t verifyBytes = 0;
     for (const auto& mirror : used) {
-        if (mirror->retired) continue;
+        if (mirror->retired && !mirror->gpuWritten.load(std::memory_order_acquire)) continue;
         const auto started = std::chrono::steady_clock::now();
         const auto generation = GuestMemory::CollectWrites(mirror->base, static_cast<std::size_t>(mirror->bytes));
         changed.assign(mirror->generations.size(), GuestMemory::BlockWritten);
@@ -616,14 +687,21 @@ void SubmitMirrors(Recorder& recorder) {
         std::fill(mirror->generations.begin(), mirror->generations.end(), generation);
         recorder.Keep(mirror);
         Stats().refreshes.fetch_add(1, std::memory_order_relaxed);
-        if (ChurnLimit() != 0) {
-            mirror->churn = copiedBytes(copies) * 2 > mirror->bytes ? mirror->churn + 1 : 0;
+        if (ChurnLimit() != 0 && mirror->pristine == nullptr && !mirror->readDenied.load(std::memory_order_acquire)) {
+            if (copiedBytes(copies) * 2 > mirror->bytes) {
+                ++mirror->churn;
+                mirror->quietBatches = 0;
+            } else if (++mirror->quietBatches >= ChurnQuietBatches) {
+                mirror->churn = 0;
+                mirror->quietBatches = 0;
+            }
             if (mirror->churn >= ChurnLimit()) {
                 mirror->churn = 0;
                 std::lock_guard lock(registry.mutex);
                 auto& seen = registry.seen[mirror->base];
-                seen.deniedUntil = batch + DeniedBatches;
+                seen.deniedUntil = registry.submitEpoch + DeniedBatches;
                 seen.batches = 0;
+                mirror->readDenied.store(true, std::memory_order_release);
                 Stats().denied.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -733,6 +811,8 @@ ResidentMirrorCounters MirrorTotals() {
     totals.denied = stats.denied.load(std::memory_order_relaxed);
     totals.verified = stats.verified.load(std::memory_order_relaxed);
     totals.verifyDiffering = stats.verifyDiffering.load(std::memory_order_relaxed);
+    totals.gpuWrittenRetired = stats.gpuWrittenRetired.load(std::memory_order_relaxed);
+    totals.gpuWrittenRefused = stats.gpuWrittenRefused.load(std::memory_order_relaxed);
     totals.collectMs = static_cast<double>(stats.collectNs.load(std::memory_order_relaxed)) / 1e6;
     return totals;
 }

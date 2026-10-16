@@ -244,7 +244,7 @@ std::uint64_t publishPieces(Recorder& recorder, const std::vector<Piece>& taken,
     recorder.EndGpuTiming(timing, total);
     if (!ranges.empty()) {
         recorder.NotePendingWrites(ranges);
-        for (const auto& [begin, end] : ranges) static_cast<void>(GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin)));
+        for (const auto& [begin, end] : ranges) static_cast<void>(GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin), AgcDriver::GuestMemory::WriteExtent::Exact));
     }
     std::vector<std::shared_ptr<Guarded>> guards;
     for (const auto& piece : taken) {

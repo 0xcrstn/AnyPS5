@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -9,6 +10,14 @@
 #include <string>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <chrono>
+#include <semaphore>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -216,14 +225,18 @@ std::vector<FakeGuard> guards;
 std::vector<Interval> materialized;
 std::uint64_t nextGuard = 0;
 bool refuseProtection = false;
+bool throwProtection = false;
+std::atomic<std::uint64_t> fakeReleaseCalls{0};
 
 std::uint64_t FakeProtect(std::uintptr_t address, std::size_t bytes, bool (*resolve)(std::uint64_t, void*), void* context, void (*releaseContext)(void*)) {
+    if (throwProtection) throw std::runtime_error("native guard backend fixture");
     if (refuseProtection) return 0;
     guards.push_back({++nextGuard, address, bytes, resolve, context, releaseContext});
     return nextGuard;
 }
 
 void FakeRelease(std::uint64_t token) {
+    ++fakeReleaseCalls;
     for (auto it = guards.begin(); it != guards.end(); ++it) {
         if (it->token != token) continue;
         const auto guard = *it;
@@ -255,7 +268,7 @@ void FaultTests() {
     SetFaultsModeForTests(Mode::New);
     Require(ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 1) == 0 && !FaultOwnership() && !InputLeases() && !Residency() && !LazyRelease(), "native ownership was active without a protection backend");
     SetProtectionBackend({&FakeProtect, &FakeRelease});
-    SetMaterializer([](Interval range) { materialized.push_back(range); });
+    SetMaterializer([](Interval range) { if (ClaimFaultService()) materialized.push_back(range); });
     const auto image = ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 3);
     Require(image != 0 && guards.size() == 1 && guards[0].address == 0x10000 && guards[0].bytes == 0x10000, "a whole-page device range was not protected as it is");
     const auto trimmed = ProtectDeviceOwned({0x30010, 0x32008}, Source::ShadowUnit, 4);
@@ -290,6 +303,36 @@ void FaultTests() {
 
 std::vector<Interval> waited;
 
+void ThrowingBackendTests() {
+    guards.clear();
+    materialized.clear();
+    waited.clear();
+    refuseProtection = false;
+    throwProtection = false;
+    Reset(Mode::Reference, Mode::Reference);
+    SetFaultsModeForTests(Mode::New);
+    SetInputLeasesModeForTests(Mode::New);
+    SetProtectionBackend({&FakeProtect, &FakeRelease});
+    SetMaterializer(+[](Interval range) { if (ClaimFaultService()) materialized.push_back(range); });
+    const auto existing = ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 1);
+    Require(existing != 0 && ProtectionLive(existing), "the throwing-backend fixture did not retain its successful guard");
+    throwProtection = true;
+    Require(Throws([] { static_cast<void>(ProtectDeviceOwned({0x30000, 0x40000}, Source::ShadowUnit, 2)); }) == "native guard backend fixture", "a failed protection replaced the original backend exception");
+    Require(Throws([] { static_cast<void>(AcquireReadLease({0x50000, 0x51000}, 3)); }) == "native guard backend fixture", "a failed read lease replaced the original backend exception");
+    const auto failed = CurrentCounters();
+    Require(guards.size() == 1 && failed.liveProtections == 1 && failed.protections == 1 && failed.leases == 0 && ProtectionLive(existing), "throwing guard installation leaked ownership or removed an earlier guard");
+    throwProtection = false;
+    Require(FakeFault(0x10000) && guards.empty() && CurrentCounters().liveProtections == 0 && materialized.size() == 1, "an earlier guard did not resolve after failed guard installation");
+    const auto retried = AcquireReadLease({0x50000, 0x51000}, 4);
+    Require(retried != 0 && ProtectionLive(retried), "a guard could not be installed after a backend exception");
+    RetireReadLease(retried);
+    Require(guards.empty() && CurrentCounters().liveProtections == 0, "a retried guard left failed ownership behind");
+    SetFaultsModeForTests(Mode::Reference);
+    SetInputLeasesModeForTests(Mode::Reference);
+    SetProtectionBackend({});
+    SetMaterializer(nullptr);
+}
+
 void LeaseTests() {
     guards.clear();
     waited.clear();
@@ -298,8 +341,8 @@ void LeaseTests() {
     Reset(Mode::Reference, Mode::Reference);
     SetInputLeasesModeForTests(Mode::Reference);
     SetProtectionBackend({&FakeProtect, &FakeRelease});
-    SetMaterializer([](Interval range) { materialized.push_back(range); });
-    SetLeaseWaiter([](Interval range) { waited.push_back(range); });
+    SetMaterializer([](Interval range) { if (ClaimFaultService()) materialized.push_back(range); });
+    SetLeaseWaiter([](Interval range) { if (ClaimFaultService()) waited.push_back(range); });
     Require(AcquireReadLease({0x10010, 0x10020}, 1) == 0 && guards.empty(), "the reference path leased guest memory");
     SetInputLeasesModeForTests(Mode::New);
     const auto lease = AcquireReadLease({0x10010, 0x12020}, 1);
@@ -317,6 +360,43 @@ void LeaseTests() {
     SetInputLeasesModeForTests(Mode::Verify);
     Require(Throws([] { static_cast<void>(AcquireReadLease({0x30000, 0x30010}, 4)); }).find("APS5_COHERENCE_INPUT_LEASES=verify") != std::string::npos, "input leases verify accepted a refused lease");
     refuseProtection = false;
+    SetInputLeasesModeForTests(Mode::Reference);
+    SetProtectionBackend({});
+    SetMaterializer(nullptr);
+    SetLeaseWaiter(nullptr);
+}
+
+void OverlappingFaultTests() {
+    guards.clear();
+    waited.clear();
+    materialized.clear();
+    refuseProtection = false;
+    Reset(Mode::Reference, Mode::Reference);
+    SetFaultsModeForTests(Mode::New);
+    SetInputLeasesModeForTests(Mode::New);
+    SetProtectionBackend({&FakeProtect, &FakeRelease});
+    SetMaterializer([](Interval range) { if (ClaimFaultService()) materialized.push_back(range); });
+    SetLeaseWaiter([](Interval range) { if (ClaimFaultService()) waited.push_back(range); });
+    const auto lease = AcquireReadLease({0x10000, 0x11000}, 1);
+    const auto image = ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 2);
+    Require(lease != 0 && image != 0 && FakeFault(0x10008), "the overlapping lease and image found no guard");
+    Require(waited.empty() && materialized.size() == 1 && materialized[0].begin == 0x10000 && materialized[0].end == 0x20000, "a lease fault released overlapping image ownership without materializing its whole range");
+    Require(guards.empty() && !ProtectionLive(lease) && !ProtectionLive(image), "an overlapping native resolution left a guard live");
+    materialized.clear();
+    const auto left = ProtectDeviceOwned({0x30000, 0x40000}, Source::ShadowUnit, 3);
+    const auto middle = ProtectDeviceOwned({0x38000, 0x48000}, Source::ResidentStaging, 4);
+    const auto right = ProtectDeviceOwned({0x44000, 0x50000}, Source::PendingImage, 5);
+    Require(left != 0 && middle != 0 && right != 0 && FakeFault(0x4a000), "the transitive overlapping images found no guard");
+    Require(materialized.size() == 1 && materialized[0].begin == 0x30000 && materialized[0].end == 0x50000, "a native fault released a partially overlapping guard outside its materialized range");
+    Require(guards.empty() && !ProtectionLive(left) && !ProtectionLive(middle) && !ProtectionLive(right), "a native resolution did not cover the whole overlapping guard component");
+    const auto other = ProtectDeviceOwned({0x60000, 0x61000}, Source::PendingImage, 6);
+    const auto firstLease = AcquireReadLease({0x70000, 0x72000}, 7);
+    const auto secondLease = AcquireReadLease({0x71000, 0x74000}, 8);
+    Require(other != 0 && firstLease != 0 && secondLease != 0 && FakeFault(0x70100), "the overlapping input leases found no guard");
+    Require(waited.size() == 1 && waited[0].begin == 0x70000 && waited[0].end == 0x74000 && materialized.size() == 1, "a lease-only component did not wait for its whole extent");
+    Require(guards.size() == 1 && ProtectionLive(other), "resolving an overlap released a disjoint guard");
+    ReleaseDeviceOwned(other);
+    SetFaultsModeForTests(Mode::Reference);
     SetInputLeasesModeForTests(Mode::Reference);
     SetProtectionBackend({});
     SetMaterializer(nullptr);
@@ -364,28 +444,70 @@ void PriorityTests() {
     SetProtectionBackend({&FakeProtect, &FakeRelease});
     static std::atomic<int> stage{0};
     static std::atomic<int> materializations{0};
+    static std::atomic<int> waiterChecks{0};
     static thread_local bool priority = false;
     stage = 0;
     materializations = 0;
     SetMaterializer([](Interval) {
+        if (!priority) {
+            stage = 1;
+            while (stage.load() != 2) std::this_thread::yield();
+        }
+        if (!ClaimFaultService()) return;
+        Require(ClaimFaultService(), "the same service invocation lost its claim");
         ++materializations;
-        if (priority) return;
-        stage = 1;
-        while (stage.load() != 2) std::this_thread::yield();
     });
-    SetFaultPriority([] { return priority; });
+    SetFaultPriority([] { if (!priority) ++waiterChecks; return priority; });
     const auto protection = ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 1);
     Require(protection != 0 && guards.size() == 1, "the priority test range was not protected");
     const auto guard = guards[0];
+    const auto releasesBefore = fakeReleaseCalls.load();
     std::thread owner([guard] { Require(guard.resolve(guard.token, guard.context), "the owning resolver refused"); });
     while (stage.load() != 1) std::this_thread::yield();
     priority = true;
     Require(guard.resolve(guard.token, guard.context), "the priority resolver refused");
     priority = false;
-    Require(guards.empty() && materializations == 2, "a priority fault waited for the resolution it overlapped instead of materializing and releasing it");
+    Require(guards.empty() && materializations == 1, "a priority fault did not claim exactly one materialization");
+    Require(guard.resolve(guard.token, guard.context), "a repeated completed resolver refused");
+    Require(materializations == 1, "a repeated completed resolver materialized again");
     stage = 2;
     owner.join();
-    Require(guards.empty() && CurrentCounters().liveProtections == 0, "the owning resolution left a guard after a priority fault finished it");
+    Require(guards.empty() && CurrentCounters().liveProtections == 0 && materializations == 1, "the owning resolution repeated work after a priority fault finished it");
+    Require(fakeReleaseCalls == releasesBefore + 1, "priority and repeated resolvers released the same backend guard more than once");
+    static FakeGuard recursiveGuard;
+    SetMaterializer([](Interval) {
+        if (!ClaimFaultService()) return;
+        ++materializations;
+        Require(!recursiveGuard.resolve(recursiveGuard.token, recursiveGuard.context), "a reentrant resolver released or waited on its own materialization");
+        Require(ClaimFaultService(), "nested fault handling did not restore the outer service invocation");
+    });
+    Require(ProtectDeviceOwned({0x30000, 0x40000}, Source::PendingImage, 2) != 0, "the recursive priority range was not protected");
+    recursiveGuard = guards[0];
+    priority = true;
+    Require(recursiveGuard.resolve(recursiveGuard.token, recursiveGuard.context), "the recursive outer materializer refused");
+    priority = false;
+    Require(materializations == 2 && guards.empty() && fakeReleaseCalls == releasesBefore + 2, "a reentrant priority resolver duplicated materialization or backend release");
+    stage = 0;
+    SetMaterializer([](Interval) {
+        if (!ClaimFaultService()) return;
+        ++materializations;
+        stage = 1;
+        while (stage.load() != 2) std::this_thread::yield();
+    });
+    Require(ProtectDeviceOwned({0x50000, 0x60000}, Source::PendingImage, 3) != 0, "the in-progress priority range was not protected");
+    const auto busyGuard = guards[0];
+    std::thread busyOwner([busyGuard] { Require(busyGuard.resolve(busyGuard.token, busyGuard.context), "the busy owner refused"); });
+    while (stage.load() != 1) std::this_thread::yield();
+    priority = true;
+    Require(!busyGuard.resolve(busyGuard.token, busyGuard.context), "a priority resolver waited for already running work that may need its service lock");
+    priority = false;
+    waiterChecks = 0;
+    std::thread waiter([busyGuard] { Require(busyGuard.resolve(busyGuard.token, busyGuard.context), "the ordinary repeated waiter refused"); });
+    while (waiterChecks.load() == 0) std::this_thread::yield();
+    stage = 2;
+    busyOwner.join();
+    waiter.join();
+    Require(materializations == 3 && guards.empty() && fakeReleaseCalls == releasesBefore + 3, "joined waiters repeated already running service or its release");
     SetFaultPriority(nullptr);
     SetFaultsModeForTests(Mode::Reference);
     SetProtectionBackend({});
@@ -399,7 +521,7 @@ void DriverAccessTests() {
     Reset(Mode::Reference, Mode::Reference);
     SetFaultsModeForTests(Mode::New);
     SetProtectionBackend({&FakeProtect, &FakeRelease});
-    SetMaterializer([](Interval range) { materialized.push_back(range); });
+    SetMaterializer([](Interval range) { if (ClaimFaultService()) materialized.push_back(range); });
     Require(!InDriverAccess(), "a guest thread was in driver access");
     const auto image = ProtectDeviceOwned({0x10000, 0x20000}, Source::PendingImage, 1);
     const auto overlapping = ProtectDeviceOwned({0x18000, 0x28000}, Source::ShadowUnit, 2);
@@ -408,14 +530,17 @@ void DriverAccessTests() {
         const DriverAccessScope outer;
         const DriverAccessScope inner;
         Require(InDriverAccess(), "a driver access scope was not entered");
-        Require(FakeFault(0x14000), "a driver fault found no guard");
+        Require(Throws([] { static_cast<void>(FakeFault(0x14000)); }).find("resolver refused") != std::string::npos, "a raw driver fault was permitted to release ownership");
     }
     Require(!InDriverAccess(), "a driver access scope outlived its thread body");
     Require(materialized.empty(), "a driver thread materialized device-owned memory inside its fault");
-    Require(guards.empty() && CurrentCounters().liveProtections == 0 && CurrentCounters().driverReleases == 1 && CurrentCounters().faultsResolved == 0, "a driver fault did not release every overlapping protection: " + Report());
+    Require(guards.size() == 2 && CurrentCounters().liveProtections == 2 && CurrentCounters().driverReleases == 0 && CurrentCounters().driverFaults == 1 && CurrentCounters().faultsResolved == 0, "a rejected driver fault changed overlapping ownership: " + Report());
+    ReleaseDeviceOwned(image);
+    ReleaseDeviceOwned(overlapping);
     static std::atomic<int> stage{0};
     stage = 0;
     SetMaterializer([](Interval) {
+        if (!ClaimFaultService()) return;
         stage = 1;
         while (stage.load() != 2) std::this_thread::yield();
     });
@@ -426,10 +551,10 @@ void DriverAccessTests() {
     while (stage.load() != 1) std::this_thread::yield();
     std::thread worker([guard] {
         const DriverAccessScope driverAccess;
-        Require(guard.resolve(guard.token, guard.context), "the driver resolver refused");
+        Require(!guard.resolve(guard.token, guard.context), "a raw driver fault released a pending native resolution");
     });
     worker.join();
-    Require(stage.load() == 1 && CurrentCounters().driverReleases == 2, "a driver fault waited for a guest resolution it overlapped");
+    Require(stage.load() == 1 && CurrentCounters().driverReleases == 0 && CurrentCounters().driverFaults == 2, "a driver fault changed a pending native resolution");
     stage = 2;
     owner.join();
     Require(guards.empty() && CurrentCounters().liveProtections == 0, "the guest resolution left a guard after a driver fault");
@@ -437,6 +562,72 @@ void DriverAccessTests() {
     SetProtectionBackend({});
     SetMaterializer(nullptr);
 }
+
+#ifdef _WIN32
+struct NativeReadFixture {
+    std::binary_semaphore entered{0};
+    std::binary_semaphore resume{0};
+};
+
+NativeReadFixture* nativeReadFixture = nullptr;
+
+void NativeReadersTests() {
+    using namespace std::chrono_literals;
+    if (GetProcAddress(GetModuleHandleW(L"KernelBase.dll"), "CompareObjectHandles") == nullptr) return;
+    struct Eligibility {
+        Eligibility() { SetOwnershipEligibility([](std::uint64_t, std::size_t) { return true; }); }
+        ~Eligibility() { SetOwnershipEligibility(nullptr); }
+    } eligibility;
+    constexpr std::size_t bytes = 0x4000;
+    void* section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(section != nullptr, "cannot create the native reader test backing");
+    auto* memory = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes * 2, 0x10000));
+    Require(memory != nullptr, "cannot allocate the native reader test views");
+    GuestArena::GuestArenaMap_nid_postfix(memory, bytes, section, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(memory + bytes, bytes, section, 0, PAGE_READWRITE);
+    const auto address = reinterpret_cast<std::uintptr_t>(memory);
+    const std::uint32_t original = 0x11111111u;
+    GuestArena::GuestArenaCopyDriverMemory_nid_postfix(memory, &original, sizeof(original));
+    NativeReadFixture fixture;
+    nativeReadFixture = &fixture;
+    SetFaultsModeForTests(Mode::New);
+    SetProtectionBackend({&GuestArena::GuestArenaTryProtectAccess_nid_postfix, &GuestArena::GuestArenaReleaseAccess_nid_postfix, &GuestArena::GuestArenaOpenAccessForRead_nid_postfix, &GuestArena::GuestArenaTryProtectMapping_nid_postfix});
+    SetMaterializer([](Interval range) {
+        if (!ClaimFaultService()) return;
+        nativeReadFixture->entered.release();
+        if (!nativeReadFixture->resume.try_acquire_for(4s)) std::abort();
+        const std::uint32_t value = 0x22222222u;
+        GuestArena::GuestArenaCopyDriverMemory_nid_postfix(reinterpret_cast<void*>(range.begin), &value, sizeof(value));
+    });
+    const auto protection = ProtectDeviceOwned({address, address + bytes}, Source::PendingImage, 1);
+    Require(protection != 0, "the native reader test backing refused protection");
+    std::uint32_t first = 0, second = 0;
+    std::binary_semaphore secondFinished(0);
+    std::thread firstReader([&] { first = *reinterpret_cast<const volatile std::uint32_t*>(memory); });
+    if (!fixture.entered.try_acquire_for(2s)) std::abort();
+    MEMORY_BASIC_INFORMATION held{};
+    const bool queried = VirtualQuery(memory + bytes, &held, sizeof(held)) == sizeof(held);
+    std::thread secondReader([&] {
+        second = *reinterpret_cast<const volatile std::uint32_t*>(memory + bytes);
+        secondFinished.release();
+    });
+    const bool returnedEarly = secondFinished.try_acquire_for(20ms);
+    fixture.resume.release();
+    firstReader.join();
+    secondReader.join();
+    Require(queried && held.Protect == PAGE_NOACCESS, "a materialization opened native guest views before publication completed");
+    Require(!returnedEarly && first == 0x22222222u && second == first, "a second native reader observed stale bytes while publication was pending");
+    Require(!ProtectionLive(protection), "native publication retained its ownership guard");
+    SetMaterializer(nullptr);
+    SetProtectionBackend({});
+    SetFaultsModeForTests(Mode::Reference);
+    nativeReadFixture = nullptr;
+    GuestArena::GuestArenaReset_nid_postfix(memory, bytes * 2);
+    GuestArena::GuestArenaRelease_nid_postfix(memory, bytes * 2);
+    GuestArena::GuestArenaForgetSection_nid_postfix(section);
+    CloseHandle(section);
+}
+#endif
 
 void LifetimeTests() {
     Reset(Mode::New, Mode::Reference);
@@ -534,9 +725,14 @@ int main() {
         DirectoryTests();
         ReleaseTests();
         FaultTests();
+        ThrowingBackendTests();
         LeaseTests();
+        OverlappingFaultTests();
         PriorityTests();
         DriverAccessTests();
+#ifdef _WIN32
+        NativeReadersTests();
+#endif
         ResidencyTests();
         LazyReleaseTests();
         LifetimeTests();

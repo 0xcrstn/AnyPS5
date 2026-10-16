@@ -84,7 +84,7 @@ public:
         std::uint64_t allocation = 0;
         std::vector<std::uint64_t> pages;
     };
-    std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation, IncrementalState& state);
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureValues(const ShaderRecompiler::PreparedShaderInvocation& invocation, IncrementalState& state, bool trace = false);
     std::vector<std::pair<std::uint64_t, std::uint32_t>> TakeKeptWords();
     enum class PlanFallback : std::uint8_t { None, First, Inputs, Memory, Unrecorded, ImageTables, Specialization, Count };
     static constexpr std::size_t PlanFallbacks = static_cast<std::size_t>(PlanFallback::Count);
@@ -104,6 +104,9 @@ public:
         std::uint64_t shaderBase = 0;
         std::uint64_t forgetSerial = 0;
         std::vector<std::pair<std::uint64_t, std::uint32_t>> reads;
+        std::shared_ptr<ShaderMemory> memory;
+        std::vector<ShaderRecompiler::MemoryRegion> regions;
+        bool traced = false;
     };
     struct PlanCapture {
         std::shared_ptr<const ShaderRecompiler::ResourceCapture> values;
@@ -111,8 +114,10 @@ public:
         PlanFallback fallback = PlanFallback::None;
         std::uint64_t nodesKept = 0;
         std::uint64_t nodesFresh = 0;
+        std::shared_ptr<ShaderMemory> memory;
     };
-    PlanCapture CapturePlanned(const ShaderRecompiler::PreparedShaderInvocation& invocation, PlanInstance& instance, bool keepReads);
+    PlanCapture CapturePlanned(const ShaderRecompiler::PreparedShaderInvocation& invocation, PlanInstance& instance, bool keepReads, bool trace = false);
+    static PlanCapture CapturePlannedOwned(const ShaderRecompiler::PreparedShaderInvocation& invocation, PlanInstance& instance, std::shared_ptr<ShaderMemory>& memory, std::vector<ShaderRecompiler::MemoryRegion>& regions, std::shared_ptr<const void> memoryOwner, bool keepReads, bool trace = false);
     static bool PlanReadsCurrent(const PlanInstance& instance);
     static bool SameSpecializationWords(const ShaderRecompiler::ResourceSnapshot& a, const ShaderRecompiler::ResourceSnapshot& b);
     static void PlanRoots(const ShaderRecompiler::IrResourcePlan& plan, std::vector<std::uint32_t>& roots, bool& allRoots);
@@ -142,7 +147,8 @@ public:
     };
 
 private:
-    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation, bool valuesOnly = false);
+    std::shared_ptr<const void> initialOwner;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation, bool valuesOnly = false, bool trace = false);
     static constexpr std::size_t PageBytes = 4096;
     static constexpr std::size_t PageWords = PageBytes / sizeof(std::uint32_t);
 

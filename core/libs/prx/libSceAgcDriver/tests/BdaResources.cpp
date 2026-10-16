@@ -59,6 +59,47 @@ void addressTableKeyTests() {
     Require(AddressTableKey(ownAsWrites, {}) != plain, "written ranges and own regions with the same words give one BDA table key");
 }
 
+void writtenPageExtentTests(const Context& context, const BdaTestAccess& access) {
+#ifdef _WIN32
+    using namespace AgcDriver::GuestMemory;
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) return;
+    constexpr std::size_t bytes = 65536;
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
+    Require(block != nullptr, "cannot allocate BDA page extent fixture");
+    struct Release {
+        void* block;
+        ~Release() { GuestArena::GuestArenaReset_nid_postfix(block, bytes); GuestArena::GuestArenaRelease_nid_postfix(block, bytes); }
+    } release{block};
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    std::array<std::byte, 4096> original;
+    original.fill(std::byte{0x31});
+    StoreOwnBytes(address, original);
+    const auto before = CollectWritesUncached(address, original.size());
+    Require(before != 0, "BDA written-page fixture is not watched");
+    std::array<std::byte, 8> saved{};
+    const auto watch = ReadDriverSnapshot(address + 128, saved, 4);
+    BdaResources resources(context);
+    const auto fault = access.bytes(resources.Fault().buffer);
+    auto* words = reinterpret_cast<std::uint32_t*>(fault.data());
+    words[Abi::WrittenCountWord] = 1;
+    words[Abi::WrittenListWord] = 0;
+    words[Abi::WrittenSlotsWord] = Abi::WrittenChunkKey(address);
+    words[Abi::WrittenSlotsWord + 1] = 1u << ((address >> Abi::WrittenPageShift) & (Abi::WrittenChunkPages - 1u));
+    const std::uint32_t changed = 0x74747474u;
+    CopyDriverMemory(block, &changed, sizeof(changed));
+    resources.CheckFault();
+    Require(watch->State() == DriverStoredSince::Unknown, "BDA page metadata falsely proved exact overlap with untouched register words");
+    Require(StoresSince(address, original.size(), before) == StoreProvenance::Unknown, "BDA written-page completion fabricated full-page overwrite coverage");
+    reject([&] { static_cast<void>(ProvenStoredOver(address, original.size(), before)); }, "unknown provenance");
+    Require(words[Abi::WrittenCountWord] == 0 && std::all_of(saved.begin(), saved.end(), [](auto value) { return value == std::byte{0x31}; }), "BDA written-page processing lost its reset or frozen register payload");
+#else
+    static_cast<void>(context);
+    static_cast<void>(access);
+#endif
+}
+
 void snapshotTableTests(const Context& context, const BdaTestAccess& access) {
     constexpr std::size_t piece = 65536;
     void* block = ::operator new(piece, std::align_val_t{piece});
@@ -918,7 +959,18 @@ void importedHeapMirrorTests(const Context& context, const BdaTestAccess& access
     constexpr std::size_t bytes = 1u << 20u;
     void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
 #ifdef _WIN32
-    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    if (section == nullptr) {
+        GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        throw std::runtime_error("cannot allocate the imported heap mirror shared section");
+    }
+    try { GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE); }
+    catch (...) {
+        CloseHandle(section);
+        GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        throw;
+    }
+    CloseHandle(section);
 #endif
     std::memset(block, 0x11, bytes);
     const auto address = reinterpret_cast<std::uintptr_t>(block);
@@ -989,7 +1041,7 @@ void importedFreshTests(const Context& context) {
     if (HostImportFor(importing, base, blockBytes) == nullptr) {
         std::cout << "the never-collected block was not imported: imported never-collected pages not tested\n";
     } else {
-        const auto gpuWrite = AgcDriver::GuestMemory::MarkWritten(base, 4);
+        const auto gpuWrite = AgcDriver::GuestMemory::MarkWritten(base, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
         Require(gpuWrite != 0, "a GPU write into an imported never-collected block was not stamped");
         reinterpret_cast<volatile std::uint8_t*>(base)[5 * 4096 + 8] = 0x66;
         static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(base, blockBytes));
@@ -1036,7 +1088,7 @@ void importWatchTests() {
     const auto imported = aligned + 4096;
     GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(imported), bytes);
     Require(AgcDriver::GuestMemory::ImportWatched(imported, bytes, [] { return true; }), "importing a fresh range failed");
-    const auto gpuWrite = AgcDriver::GuestMemory::MarkWritten(imported + 4096, 4096);
+    const auto gpuWrite = AgcDriver::GuestMemory::MarkWritten(imported + 4096, 4096, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(gpuWrite != 0, "a GPU write into the imported range was not stamped");
     static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(imported, bytes));
     Require(!AgcDriver::GuestMemory::WrittenSince(imported + 4096, 4096, gpuWrite), "a collect after a GPU write into an uncollected import read as a CPU write over the GPU's results");
@@ -1054,7 +1106,7 @@ void importWatchTests() {
     words[0] = 1;
     static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(label, 4));
     const auto before = AgcDriver::GuestMemory::TrackerGeneration();
-    Require(AgcDriver::GuestMemory::MarkWritten(label, 4) != 0, "a GPU write next to never-collected pages was not stamped");
+    Require(AgcDriver::GuestMemory::MarkWritten(label, 4, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "a GPU write next to never-collected pages was not stamped");
     Require(AgcDriver::GuestMemory::UnchangedSinceCollected(label, 4, before), "a GPU write next to never-collected pages read as a CPU write of its block");
     Require(AgcDriver::GuestMemory::StoredOver(label + 8 * 4096, 4096, before), "a never-collected page a GPU write collected is not reported as possibly stored");
     const std::array<std::uint64_t, 1> since{before};
@@ -1062,7 +1114,7 @@ void importWatchTests() {
     std::array<std::uint8_t, 1> cpu{};
     Require(AgcDriver::GuestMemory::ChangedBlocks(label, blockBytes, since, changed, cpu) && changed[0] == AgcDriver::GuestMemory::BlockWritten && cpu[0] == 0, "collecting never-collected pages at a GPU write stamped their block as written by the CPU");
     const auto now = AgcDriver::GuestMemory::TrackerGeneration();
-    Require(AgcDriver::GuestMemory::MarkWritten(label, 4) == now + 1, "a GPU write into a block with nothing left to collect advanced the generation more than once");
+    Require(AgcDriver::GuestMemory::MarkWritten(label, 4, AgcDriver::GuestMemory::WriteExtent::Exact) == now + 1, "a GPU write into a block with nothing left to collect advanced the generation more than once");
     words[1] = 2;
     Require(!AgcDriver::GuestMemory::UnchangedSinceCollected(label, 4, before), "a CPU write next to a GPU write was not seen");
     void* awaitedArea = mmap(nullptr, 2 * blockBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1073,7 +1125,7 @@ void importWatchTests() {
     static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(awaitedBlock, 4));
     const auto closed = AgcDriver::GuestMemory::TrackerGeneration();
     *reinterpret_cast<volatile std::uint32_t*>(awaited) = 7;
-    Require(AgcDriver::GuestMemory::MarkWritten(awaitedBlock, 4) != 0, "a GPU write into the awaited block was not stamped");
+    Require(AgcDriver::GuestMemory::MarkWritten(awaitedBlock, 4, AgcDriver::GuestMemory::WriteExtent::Exact) != 0, "a GPU write into the awaited block was not stamped");
     Require(!AgcDriver::GuestMemory::UnchangedSinceCollected(awaited, 4, closed), "a CPU store to a never-collected page that a GPU write elsewhere in its block collected was not seen");
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<void*>(awaitedBlock), blockBytes);
     munmap(awaitedArea, 2 * blockBytes);
@@ -1327,6 +1379,7 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
         const auto swept = MirrorCounters();
         Require(swept.heapMirrors == one.heapMirrors && swept.heapBytes == one.heapBytes, "the expired heap mirror was not swept before the allocation");
         access.limitMemory(small - 1);
+        access.limitAllocation(small - 1);
         change({2}, {});
         char expected[64];
         std::snprintf(expected, sizeof(expected), "heap mirror of 0x%llx+0x%llx: ", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(heaps[2])), static_cast<unsigned long long>(small));
@@ -1339,9 +1392,10 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
             refused = what.find(expected) != std::string::npos && what.find("Vulkan result -2") != std::string::npos;
         }
         Require(refused, "a heap mirror the memory cannot hold did not fail its build with the Vulkan result");
-        Require(access.allocationAttempts() == attempts + 1, "a refused heap mirror was allocated again");
+        Require(access.allocationAttempts() > attempts && access.allocationAttempts() <= attempts + 2, "a refused heap mirror exceeded its bounded reclamation retry");
         Require(MirrorCounters().heapMirrors == swept.heapMirrors && MirrorCounters().heapBytes == swept.heapBytes, "a refused heap mirror was registered");
         access.limitMemory(std::nullopt);
+        access.limitAllocation(std::nullopt);
         Require(mirrored(2) == std::byte{0x23} && MirrorCounters().heapMirrors == swept.heapMirrors + 1, "a heap mirror was not made once the memory was free again");
         change({}, {1, 2});
         sweep();
@@ -1912,6 +1966,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     }
     importCrossingTests(context, access);
     addressTableKeyTests();
+    writtenPageExtentTests(context, access);
     snapshotTableTests(context, access);
     importSpanTests(context);
     failedImportRemapTests(context, access);

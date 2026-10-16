@@ -19,7 +19,7 @@ public:
         bool immediate = false;
         std::uint64_t value = 0;
     };
-    enum class Step : std::uint8_t { UserData, ShaderBase, Operation, Extract64, AddCarry, RawAddress, RawBuffer };
+    enum class Step : std::uint8_t { UserData, ShaderBase, Forward, Operation, Extract64, AddCarry, RawAddress, RawBuffer };
     struct Instruction {
         Step step = Step::Operation;
         IrOpcode opcode = IrOpcode::Void;
@@ -29,15 +29,21 @@ public:
         std::uint32_t index = 0;
         std::int64_t immediate = 0;
         std::array<Operand, 5> arguments{};
+        const IrValue* read = nullptr;
+        const IrValue* baseRead = nullptr;
+        std::int32_t origin = -1;
     };
     struct Source {
         std::uint32_t index = 0;
         std::uint32_t dwordCount = 0;
         std::array<Operand, 8> dwords{};
+        const IrValue* lead = nullptr;
     };
     struct FlatRoot {
         std::uint32_t flatOffset = 0;
         Operand value;
+        const IrValue* leaf = nullptr;
+        bool pure = false;
     };
     struct Block {
         bool conditional = false;
@@ -52,6 +58,7 @@ public:
     static std::shared_ptr<const SrtTape> For(const IrResourcePlan& plan);
     bool Compiled() const { return refusal == SrtCompiledWalkRefusal::None; }
     SrtCompiledWalkRefusal Refusal() const { return refusal; }
+    bool SupportsTracing() const { return tracing; }
     Outcome Run(const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::uint32_t& nullRootReads) const;
     std::size_t Instructions() const { return instructions.size(); }
     std::size_t Reads() const { return reads; }
@@ -69,6 +76,7 @@ private:
     std::uint32_t userDataBase = 0;
     std::size_t reads = 0;
     bool requiresCleanMemory = false;
+    bool tracing = true;
     SrtCompiledWalkRefusal refusal = SrtCompiledWalkRefusal::None;
 };
 

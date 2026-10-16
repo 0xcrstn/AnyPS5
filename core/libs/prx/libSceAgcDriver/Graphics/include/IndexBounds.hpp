@@ -9,7 +9,7 @@
 namespace AgcDriver::Graphics {
 
 std::optional<std::uint32_t> LowestDrawIndex(std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart);
-std::optional<std::uint32_t> KnownLowestDrawIndex(std::uint64_t address, std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart, std::uint64_t generation);
+std::optional<std::uint32_t> KnownLowestDrawIndex(std::uint64_t address, std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart, std::uint64_t generation, bool driverMemory = false);
 
 struct LowestIndexCounters {
     std::uint64_t hits = 0;

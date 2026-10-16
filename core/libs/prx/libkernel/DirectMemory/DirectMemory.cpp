@@ -315,7 +315,7 @@ public:
 
     void Map(std::uintptr_t address, std::size_t bytes, std::uint64_t offset, int protection) const {
 #ifdef _WIN32
-        GuestArena::GuestArenaMapDirect_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
+        GuestArena::GuestArenaMap_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
 #else
         if (::mmap(reinterpret_cast<void*>(address), bytes, protection, MAP_SHARED | MAP_FIXED, file, static_cast<off_t>(fileOffset + offset)) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map direct memory backing");
 #endif
@@ -607,7 +607,7 @@ void RequireAliasesUnpinned(GuestAllocations::Mutation& mutation, std::uint64_t 
             if (first < last) aliases.emplace_back(base + (first - mapping.phys), last - first);
         }
     }
-    for (const auto& [address, bytes] : aliases) RequireResidentUnpinned(mutation, address, bytes);
+    for (const auto& [address, bytes] : aliases) mutation.RequireUnpinned(reinterpret_cast<const void*>(address), bytes);
 #else
     static_cast<void>(mutation);
     static_cast<void>(phys);

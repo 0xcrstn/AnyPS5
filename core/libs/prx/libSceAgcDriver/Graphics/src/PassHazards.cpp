@@ -1,11 +1,51 @@
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace AgcDriver::Graphics {
+
+bool ResolvePassRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    bool known = true;
+    for (std::size_t index = 0; index < ranges.size();) {
+        const auto [begin, end] = ranges[index];
+        if (begin == end) {
+            ranges.erase(ranges.begin() + static_cast<std::ptrdiff_t>(index));
+            continue;
+        }
+        std::array<std::uintptr_t, 16> begins{}, ends{};
+        std::array<std::uint64_t, 16> canonicals{};
+        std::size_t count = 0;
+        bool translated = end > begin && GuestArena::GuestArenaTryBackingRuns_nid_postfix(begin, static_cast<std::size_t>(end - begin), begins.data(), ends.data(), canonicals.data(), begins.size(), &count) && count != 0 && count <= begins.size();
+        auto expected = begin;
+        if (translated) {
+            for (std::size_t run = 0; run < count; ++run) {
+                if (begins[run] != expected || ends[run] <= begins[run] || ends[run] > end || ends[run] - begins[run] > std::numeric_limits<std::uint64_t>::max() - canonicals[run]) {
+                    translated = false;
+                    break;
+                }
+                expected = ends[run];
+            }
+            translated = translated && expected == end;
+        }
+        if (!translated) {
+            known = false;
+            ranges.erase(ranges.begin() + static_cast<std::ptrdiff_t>(index));
+            continue;
+        }
+        ranges[index] = {canonicals[0], canonicals[0] + ends[0] - begins[0]};
+        for (std::size_t run = 1; run < count; ++run) {
+            ranges.insert(ranges.begin() + static_cast<std::ptrdiff_t>(index + run), {canonicals[run], canonicals[run] + ends[run] - begins[run]});
+        }
+        index += count;
+    }
+    return known;
+}
 
 ReadOnlyAddressPasses ParseReadOnlyAddressPasses(const char* text) {
     if (text == nullptr || std::strcmp(text, "1") == 0) return ReadOnlyAddressPasses::On;

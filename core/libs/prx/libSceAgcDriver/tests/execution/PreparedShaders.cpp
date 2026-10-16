@@ -1,11 +1,13 @@
 #include "VulkanTestDevice.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrawTrace.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include <spirv/unified1/spirv.hpp>
@@ -27,6 +29,7 @@
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <set>
 #include <thread>
 
 namespace {
@@ -194,8 +197,10 @@ void FailureCapture(AgcDriver::VulkanDevice& device) {
     const auto expected = failure([&] { static_cast<void>(PrepareShader(request)); });
     const char* previous = std::getenv("APS5_DUMP_SHADERS");
     const std::string saved = previous != nullptr ? previous : "";
-    const std::string path = "shader_12345cafe.req";
+    const std::string path = "shader_12345cafe.prepare.req";
+    const std::string capturePath = "shader_12345cafe.req";
     std::remove(path.c_str());
+    std::remove(capturePath.c_str());
 #ifdef _WIN32
     Require(_putenv_s("APS5_DUMP_SHADERS", "") == 0, "cannot disable shader capture");
 #else
@@ -216,6 +221,14 @@ void FailureCapture(AgcDriver::VulkanDevice& device) {
     std::ostringstream dumpedPrefix;
     dumpedPrefix << "shader 0x" << std::hex << request.shader.codeAddress << " stage " << static_cast<unsigned>(request.shader.stage) << " (" << path << "): ";
     Require(actual == dumpedPrefix.str() + expected, "enabled shader capture changed the diagnosed failure");
+    Require(!std::ifstream(capturePath, std::ios::binary).is_open(), "a preparation failure was dumped as a dispatch request");
+    Require(AgcDriver::DriverDetail::Driver::dumpRequest(request.shader.codeAddress, request) == capturePath, "a dispatch request dump has the wrong name");
+    std::ifstream capture(capturePath, std::ios::binary);
+    std::ostringstream captureText;
+    captureText << capture.rdbuf();
+    capture.close();
+    std::remove(capturePath.c_str());
+    Require(captureText.str() == RequestSerializer{}.Serialize(request), "an earlier preparation failure dump suppressed the dispatch request dump");
 #ifdef _WIN32
     Require(_putenv_s("APS5_DUMP_SHADERS", saved.c_str()) == 0, "cannot restore shader capture");
 #else
@@ -680,10 +693,87 @@ void DeferredUndecodableRegistration() {
     ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "unsupported MIMG opcode");
 }
 
+void RegistrationLimit(std::string_view value) {
+#ifdef _WIN32
+    Require(_putenv_s("APS5_REGISTRATION_PREPARE_LIMIT", std::string(value).c_str()) == 0, "cannot set registration preparation limit");
+    Require(_putenv_s("APS5_REGISTRATION_PREPARE_COMMIT_GB", "0") == 0, "cannot disable background registration budget");
+#else
+    Require(setenv("APS5_REGISTRATION_PREPARE_LIMIT", std::string(value).c_str(), 1) == 0, "cannot set registration preparation limit");
+    Require(setenv("APS5_REGISTRATION_PREPARE_COMMIT_GB", "0", 1) == 0, "cannot disable background registration budget");
+#endif
+    const bool valid = value.empty() || value == "0" || value == "1" || value == "18446744073709551615";
+    const std::size_t expectedJobs = value == "0" ? 0u : value == "1" ? 1u : 2u;
+    alignas(256) static std::array<std::uint32_t, 128> code{};
+    code[0] = code[64] = 0xbf810000u;
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 7> registers{};
+        ShaderSpecialRegs specials{};
+    } headers[2];
+    for (std::size_t index = 0; index < 2u; ++index) {
+        auto& header = headers[index];
+        const auto* words = code.data() + index * 64u;
+        const auto address = reinterpret_cast<std::uintptr_t>(words);
+        header.shader.file_header = 0x34333231u;
+        header.shader.version = 0x18;
+        header.shader.header_size = sizeof(Header);
+        header.shader.shader_size = sizeof(std::uint32_t);
+        header.shader.code = words;
+        header.shader.sh_registers = header.registers.data();
+        header.shader.num_sh_registers = header.registers.size();
+        header.shader.specials = &header.specials;
+        header.specials.dispatch_modifier = 0x8000;
+        header.registers = {{{0x20c, static_cast<std::uint32_t>(address >> 8u)}, {0x20d, static_cast<std::uint32_t>(address >> 40u)}, {0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 0}}};
+    }
+    if (!valid) {
+        ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&headers[0].shader); }, "APS5_REGISTRATION_PREPARE_LIMIT must be an unsigned 64-bit integer");
+        AgcDriverShutdown_nid_postfix();
+        return;
+    }
+    Require(std::getenv("APS5_TRACE_DETAIL") == nullptr, "registration limit fixture requires no global detail session");
+    AgcDriver::DrawTrace::Options options;
+    options.runId = "11111111-1111-4111-8111-111111111111";
+    options.captureId = "22222222-2222-4222-8222-222222222222";
+    AgcDriver::DrawTrace::Session session(options);
+    {
+        AgcDriver::DrawTrace::SessionScope scope(session);
+        session.Boundary(0u, AgcDriver::DrawTrace::Clock::now());
+        for (const auto& header : headers) AgcDriverRegisterShader_nid_postfix(&header.shader);
+        AgcDriver::DriverDetail::AwaitRegistrationPreparation();
+        session.RequestStop("synthetic registration limit observation", AgcDriver::DrawTrace::Clock::now());
+        session.Freeze(AgcDriver::DrawTrace::Clock::now());
+    }
+    const auto json = session.Json();
+    const auto begin = json.find("\"events\":[");
+    const auto end = json.find("\"traceEvents\":[", begin);
+    Require(begin != std::string::npos && end != std::string::npos, "registration scheduling observation is missing");
+    const std::string_view events(json.data() + begin, end - begin);
+    constexpr std::string_view marker = "\"name\":\"Shader.RegistrationPrepare\"";
+    std::set<std::string> jobs;
+    for (auto position = events.find(marker); position != std::string_view::npos; position = events.find(marker, position + marker.size())) {
+        const auto record = events.rfind("{\"id\":", position);
+        Require(record != std::string_view::npos, "scheduled registration job has no event record");
+        const auto subject = events.find("\"subject\":\"", record);
+        Require(subject != std::string_view::npos && subject < position, "scheduled registration job has no identity");
+        const auto first = subject + std::string_view("\"subject\":\"").size();
+        const auto last = events.find('"', first);
+        Require(last != std::string_view::npos && last < position, "scheduled registration job identity is unclosed");
+        jobs.emplace(events.substr(first, last - first));
+    }
+    Require(jobs.size() == expectedJobs, "registration preparation exceeded or underfilled its eager admission limit");
+    Registration(false);
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 3 && std::string_view(argv[1]) == "--registration-limit") {
+            if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
+            RegistrationLimit(argv[2]);
+            std::cout << "registration preparation limit tests passed\n";
+            return 0;
+        }
         Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup")), "invalid test arguments");
         if (argc == 2 && std::string_view(argv[1]) == "--registered-workgroup") {
             const auto device = OpenVulkanTestDevice();

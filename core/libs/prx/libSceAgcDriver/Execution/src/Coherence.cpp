@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -112,6 +114,8 @@ struct Ledger {
     std::uint64_t leases = 0;
     std::uint64_t leaseWaits = 0;
     std::uint64_t driverReleases = 0;
+    std::uint64_t driverFaults = 0;
+    std::chrono::steady_clock::time_point lastProfile{};
     std::map<std::uint64_t, std::shared_ptr<struct Resolution>> resolving;
     std::condition_variable settled;
     FaultPriority priority = nullptr;
@@ -136,6 +140,25 @@ struct Resolution {
     bool lease = false;
     std::vector<std::uint64_t> tokens;
     bool done = false;
+    std::atomic<const void*> serviceOwner{nullptr};
+    std::atomic<bool> finishing{false};
+};
+
+struct FaultInvocation {
+    Resolution& resolution;
+    bool checked = false;
+    bool claimed = false;
+};
+
+thread_local FaultInvocation* currentFaultInvocation = nullptr;
+thread_local unsigned char faultThreadToken = 0;
+
+class FaultInvocationScope {
+public:
+    explicit FaultInvocationScope(FaultInvocation& invocation) : previous(std::exchange(currentFaultInvocation, &invocation)) {}
+    ~FaultInvocationScope() { currentFaultInvocation = previous; }
+private:
+    FaultInvocation* previous;
 };
 
 std::atomic<bool> backendInstalled{false};
@@ -154,9 +177,11 @@ bool ResolveProtection(std::uint64_t token, void* context) {
     ProtectionBackend backend;
     bool live = false;
     bool lease = false;
+    FaultPriority initialPriority = nullptr;
+    std::unique_lock claim(ledger.mutex);
     {
-        std::lock_guard lock(ledger.mutex);
         backend = ledger.backend;
+        initialPriority = ledger.priority;
         const auto found = ledger.live.find(id);
         if (found != ledger.live.end()) {
             live = true;
@@ -165,15 +190,20 @@ bool ResolveProtection(std::uint64_t token, void* context) {
             materializer = lease ? ledger.waiter : ledger.materializer;
         }
     }
-    const auto materialize = [&](const Resolution& resolution) {
+    const auto materialize = [&](Resolution& resolution) {
+        FaultInvocation invocation{resolution};
+        const FaultInvocationScope scope(invocation);
         try {
             if (resolution.materializer == nullptr) throw std::runtime_error(resolution.lease ? "no lease waiter is installed" : "no materializer is installed");
             resolution.materializer(resolution.range);
+            if (!invocation.checked) throw std::runtime_error("the fault materializer did not claim its service work");
+            return invocation.claimed;
         } catch (const std::exception& error) {
             AbortInFault(resolution.lease ? "a native access to guest memory under a read lease could not wait for its readers" : "native access to device-owned guest memory could not be materialized", resolution.range, error.what());
         }
     };
     const auto finish = [&](const std::shared_ptr<Resolution>& resolution) {
+        if (resolution->finishing.exchange(true, std::memory_order_acq_rel)) return;
         if (backend.release != nullptr) {
             for (const auto held : resolution->tokens) backend.release(held);
         }
@@ -187,6 +217,13 @@ bool ResolveProtection(std::uint64_t token, void* context) {
         }
         ledger.settled.notify_all();
     };
+    const auto wait = [&](const std::shared_ptr<Resolution>& resolution, bool priority) {
+        std::unique_lock lock(ledger.mutex);
+        if (resolution->done) return true;
+        if (priority || resolution->serviceOwner.load(std::memory_order_acquire) == &faultThreadToken) return false;
+        ledger.settled.wait(lock, [&] { return resolution->done; });
+        return true;
+    };
     if (live && driverAccessDepth == 0) {
         auto resolution = std::make_shared<Resolution>();
         resolution->range = range;
@@ -194,70 +231,55 @@ bool ResolveProtection(std::uint64_t token, void* context) {
         resolution->lease = lease;
         resolution->tokens.push_back(token);
         {
-            std::lock_guard lock(ledger.mutex);
-            for (auto it = ledger.live.begin(); it != ledger.live.end();) {
-                if (it->first == id || (it->second.token != 0 && it->second.range.begin < range.end && range.begin < it->second.range.end)) {
-                    if (it->second.token != 0 && it->second.token != token) resolution->tokens.push_back(it->second.token);
-                    it = ledger.live.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-            ++(lease ? ledger.leaseWaits : ledger.resolved);
-            for (const auto held : resolution->tokens) ledger.resolving[held] = resolution;
-        }
-        if (backend.open != nullptr) {
-            for (const auto held : resolution->tokens) static_cast<void>(backend.open(held));
-        } else if (backend.release != nullptr) {
-            for (const auto held : resolution->tokens) backend.release(held);
-        }
-        materialize(*resolution);
-        finish(resolution);
-        return true;
-    }
-    if (driverAccessDepth != 0) {
-        std::vector<std::uint64_t> released{token};
-        {
-            std::lock_guard lock(ledger.mutex);
-            if (live) {
+            bool expanded;
+            do {
+                expanded = false;
                 for (auto it = ledger.live.begin(); it != ledger.live.end();) {
-                    if (it->first == id || (it->second.token != 0 && it->second.range.begin < range.end && range.begin < it->second.range.end)) {
-                        if (it->second.token != 0 && it->second.token != token) released.push_back(it->second.token);
+                    const auto& protection = it->second;
+                    if (it->first == id || (protection.token != 0 && protection.range.begin < resolution->range.end && resolution->range.begin < protection.range.end)) {
+                        if (protection.token != 0 && protection.token != token) resolution->tokens.push_back(protection.token);
+                        resolution->range.begin = std::min(resolution->range.begin, protection.range.begin);
+                        resolution->range.end = std::max(resolution->range.end, protection.range.end);
+                        resolution->lease = resolution->lease && protection.source == Source::ReadLease;
                         it = ledger.live.erase(it);
+                        expanded = true;
                     } else {
                         ++it;
                     }
                 }
-                ++ledger.driverReleases;
-            } else if (const auto found = ledger.resolving.find(token); found != ledger.resolving.end()) {
-                released = found->second->tokens;
-                ++ledger.driverReleases;
-            }
+            } while (expanded);
+            resolution->materializer = resolution->lease ? ledger.waiter : ledger.materializer;
+            ++(resolution->lease ? ledger.leaseWaits : ledger.resolved);
+            for (const auto held : resolution->tokens) ledger.resolving[held] = resolution;
         }
-        if (backend.release != nullptr) {
-            for (const auto held : released) backend.release(held);
+        claim.unlock();
+        if (materialize(*resolution)) {
+            finish(resolution);
+            return true;
         }
-        return true;
+        return wait(resolution, initialPriority != nullptr && initialPriority());
+    }
+    if (driverAccessDepth != 0) {
+        ++ledger.driverFaults;
+        if (ledger.driverFaults <= 8) std::fprintf(stderr, "[coherence-guards] raw driver fault refused; ownership remains guarded (%llu since start)\n", static_cast<unsigned long long>(ledger.driverFaults));
+        claim.unlock();
+        return false;
     }
     std::shared_ptr<Resolution> pending;
     FaultPriority priority = nullptr;
     {
-        std::lock_guard lock(ledger.mutex);
         const auto found = ledger.resolving.find(token);
         if (found != ledger.resolving.end()) pending = found->second;
         priority = ledger.priority;
     }
-    if (pending != nullptr && priority != nullptr && priority()) {
-        materialize(*pending);
+    claim.unlock();
+    if (pending == nullptr) return true;
+    const bool prioritized = priority != nullptr && priority();
+    if (prioritized && materialize(*pending)) {
         finish(pending);
         return true;
     }
-    if (pending != nullptr) {
-        std::unique_lock lock(ledger.mutex);
-        ledger.settled.wait(lock, [&] { return pending->done; });
-    }
-    if (backend.release != nullptr) backend.release(token);
-    return true;
+    return wait(pending, prioritized);
 }
 
 void ReleaseResolverContext(void* context) {
@@ -296,7 +318,30 @@ Mode EnvironmentResidency() {
     return residency;
 }
 
-std::uint64_t Guard(Interval range, Source source, Version version, bool outward, bool verify, const char* variable) {
+std::atomic<bool (*)(std::uint64_t, std::size_t)> ownershipEligibility{nullptr};
+
+class NativeOwnershipScope {
+public:
+    NativeOwnershipScope(Interval range, Source source) {
+#ifdef _WIN32
+        required = source != Source::ReadLease && GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(range.begin), static_cast<std::size_t>(range.end - range.begin));
+        if (required) held = GuestArena::GuestArenaBeginMappingExclusion_nid_postfix(2);
+#else
+        static_cast<void>(range);
+        static_cast<void>(source);
+#endif
+    }
+    ~NativeOwnershipScope() { if (held) GuestArena::GuestArenaEndMappingExclusion_nid_postfix(); }
+    bool Eligible(Interval range) const {
+        const auto eligible = ownershipEligibility.load(std::memory_order_acquire);
+        return !required || (held && eligible != nullptr && eligible(range.begin, static_cast<std::size_t>(range.end - range.begin)));
+    }
+private:
+    bool held = false;
+    bool required = false;
+};
+
+std::uint64_t Guard(Interval range, Source source, Version version, bool outward, bool verify, const char* variable, std::span<const GuestArena::MappingSpan> expected = {}) {
     const auto begin = outward ? range.begin & ~(ProtectionGranule - 1) : (range.begin + ProtectionGranule - 1) & ~(ProtectionGranule - 1);
     const auto end = outward ? (range.end + ProtectionGranule - 1) & ~(ProtectionGranule - 1) : range.end & ~(ProtectionGranule - 1);
     const bool whole = begin == range.begin && end == range.end;
@@ -315,13 +360,28 @@ std::uint64_t Guard(Interval range, Source source, Version version, bool outward
         throw std::runtime_error(text);
     }
     if (begin >= end) return 0;
+    const NativeOwnershipScope ownership({begin, end}, source);
+    const bool eligible = ownership.Eligible({begin, end});
     {
         std::lock_guard lock(ledger.mutex);
         id = ++ledger.next;
         ledger.live.emplace(id, Protection{0, {begin, end}, source, version});
     }
-    auto context = std::make_unique<ResolverContext>(ResolverContext{id});
-    const auto token = backend.protect(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin), &ResolveProtection, context.get(), &ReleaseResolverContext);
+    std::unique_ptr<ResolverContext> context;
+    std::uint64_t token = 0;
+    try {
+        if (eligible) {
+            context = std::make_unique<ResolverContext>(ResolverContext{id});
+            if (!expected.empty()) {
+                if (backend.protectMapping == nullptr) throw std::runtime_error("guest output mapping incarnation protection backend is unavailable");
+                token = backend.protectMapping(expected.data(), expected.size(), static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin), &ResolveProtection, context.get(), &ReleaseResolverContext);
+            } else token = backend.protect(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin), &ResolveProtection, context.get(), &ReleaseResolverContext);
+        }
+    } catch (...) {
+        std::lock_guard lock(ledger.mutex);
+        ledger.live.erase(id);
+        throw;
+    }
     if (token != 0) static_cast<void>(context.release());
     std::unique_lock lock(ledger.mutex);
     if (token == 0) {
@@ -539,10 +599,26 @@ void SetProtectionBackend(ProtectionBackend backend) {
     backendInstalled.store(backend.protect != nullptr && backend.release != nullptr, std::memory_order_release);
 }
 
+ProtectionBackend CurrentProtectionBackend() {
+    auto& ledger = Protections();
+    std::lock_guard lock(ledger.mutex);
+    return ledger.backend;
+}
+
 void SetFaultPriority(FaultPriority priority) {
     auto& ledger = Protections();
     std::lock_guard lock(ledger.mutex);
     ledger.priority = priority;
+}
+
+bool ClaimFaultService() {
+    auto* invocation = currentFaultInvocation;
+    if (invocation == nullptr) return true;
+    if (invocation->checked) return invocation->claimed;
+    invocation->checked = true;
+    const void* expected = nullptr;
+    invocation->claimed = invocation->resolution.serviceOwner.compare_exchange_strong(expected, &faultThreadToken, std::memory_order_acq_rel);
+    return invocation->claimed;
 }
 
 void SetMaterializer(Materializer materializer) {
@@ -551,10 +627,26 @@ void SetMaterializer(Materializer materializer) {
     ledger.materializer = materializer;
 }
 
+Materializer CurrentMaterializer() {
+    auto& ledger = Protections();
+    std::lock_guard lock(ledger.mutex);
+    return ledger.materializer;
+}
+
+void SetOwnershipEligibility(bool (*eligible)(std::uint64_t, std::size_t)) {
+    ownershipEligibility.store(eligible, std::memory_order_release);
+}
+
 std::uint64_t ProtectDeviceOwned(Interval range, Source source, Version version) {
     if (!FaultOwnership() || range.end <= range.begin) return 0;
     if (source == Source::ReadLease) throw std::runtime_error("coherence: a read lease is not device-owned memory");
     return Guard(range, source, version, false, FaultsMode() == Mode::Verify, "APS5_COHERENCE_FAULTS");
+}
+
+std::uint64_t ProtectDeviceOwned(Interval range, Source source, Version version, std::span<const GuestArena::MappingSpan> expected) {
+    if (!FaultOwnership() || range.end <= range.begin) return 0;
+    if (source == Source::ReadLease || expected.empty()) throw std::runtime_error("guest output mapping incarnation witness is unavailable");
+    return Guard(range, source, version, false, FaultsMode() == Mode::Verify, "APS5_COHERENCE_FAULTS", expected);
 }
 
 Mode InputLeasesMode() {
@@ -579,6 +671,21 @@ void SetLeaseWaiter(Materializer waiter) {
 std::uint64_t AcquireReadLease(Interval range, Version version) {
     if (!InputLeases() || range.end <= range.begin) return 0;
     return Guard(range, Source::ReadLease, version, true, InputLeasesMode() == Mode::Verify, "APS5_COHERENCE_INPUT_LEASES");
+}
+
+std::uint64_t AcquireReadLease(Interval range, Version version, std::span<const GuestArena::MappingSpan> expected) {
+    if (!InputLeases() || range.end <= range.begin) return 0;
+    if (range.end > std::numeric_limits<std::uint64_t>::max() - (ProtectionGranule - 1)) throw std::runtime_error("guest read lease mapping incarnation range overflow");
+    const auto begin = range.begin & ~(ProtectionGranule - 1);
+    const auto end = (range.end + ProtectionGranule - 1) & ~(ProtectionGranule - 1);
+    auto covered = begin;
+    for (const auto& span : expected) {
+        if (span.identity == 0 || span.end <= span.begin || span.begin > covered) break;
+        covered = std::max<std::uint64_t>(covered, span.end);
+        if (covered >= end) break;
+    }
+    if (covered < end) throw std::runtime_error("guest read lease mapping incarnation witness does not cover its protection pages");
+    return Guard(range, Source::ReadLease, version, true, InputLeasesMode() == Mode::Verify, "APS5_COHERENCE_INPUT_LEASES", expected);
 }
 
 void RetireReadLease(std::uint64_t lease) {
@@ -928,6 +1035,17 @@ std::vector<std::pair<std::uint32_t, Version>> QueueFrontier(std::uint32_t queue
     return {found->second.begin(), found->second.end()};
 }
 
+void ProfileProtections() {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!enabled) return;
+    auto& ledger = Protections();
+    std::lock_guard lock(ledger.mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - ledger.lastProfile < std::chrono::seconds(10)) return;
+    ledger.lastProfile = now;
+    std::fprintf(stderr, "[coherence-guards] modes faults=%u leases=%u residency=%u lazy-release=%u; protections %llu (refused %llu, partial %llu, live %zu, resolving %zu), resolved %llu, locked %llu, leases %llu, lease waits %llu, driver releases %llu, raw driver faults %llu\n", static_cast<unsigned>(FaultsMode()), static_cast<unsigned>(InputLeasesMode()), static_cast<unsigned>(ResidencyMode()), static_cast<unsigned>(LazyReleaseMode()), static_cast<unsigned long long>(ledger.protections), static_cast<unsigned long long>(ledger.refused), static_cast<unsigned long long>(ledger.partial), ledger.live.size(), ledger.resolving.size(), static_cast<unsigned long long>(ledger.resolved), static_cast<unsigned long long>(ledger.locked), static_cast<unsigned long long>(ledger.leases), static_cast<unsigned long long>(ledger.leaseWaits), static_cast<unsigned long long>(ledger.driverReleases), static_cast<unsigned long long>(ledger.driverFaults));
+}
+
 Counters CurrentCounters() {
     auto& state = Directory();
     std::lock_guard lock(state.mutex);
@@ -945,6 +1063,7 @@ Counters CurrentCounters() {
     counters.leases = ledger.leases;
     counters.leaseWaits = ledger.leaseWaits;
     counters.driverReleases = ledger.driverReleases;
+    counters.driverFaults = ledger.driverFaults;
     return counters;
 }
 
@@ -953,7 +1072,7 @@ std::string Report() {
     char text[768];
     std::snprintf(text, sizeof(text), "[coherence] reservations %llu, completions %llu, abandoned %llu, active %llu, publications checked %llu, stale publications %llu, stale reads %llu, undrained releases %llu, remapped completions %llu, committed %llu, evicted %llu", static_cast<unsigned long long>(c.reservations), static_cast<unsigned long long>(c.completions), static_cast<unsigned long long>(c.abandoned), static_cast<unsigned long long>(c.activeWriters), static_cast<unsigned long long>(c.publicationsChecked), static_cast<unsigned long long>(c.stalePublications), static_cast<unsigned long long>(c.staleReads), static_cast<unsigned long long>(c.undrainedReleases), static_cast<unsigned long long>(c.remappedCompletions), static_cast<unsigned long long>(c.committedIntervals), static_cast<unsigned long long>(c.evictedIntervals));
     std::string line = text;
-    std::snprintf(text, sizeof(text), "; protections %llu (refused %llu, partial %llu, live %llu), faults resolved %llu, locked faults %llu, leases %llu, lease waits %llu, driver releases %llu, uncovered releases %llu", static_cast<unsigned long long>(c.protections), static_cast<unsigned long long>(c.refusedProtections), static_cast<unsigned long long>(c.partialProtections), static_cast<unsigned long long>(c.liveProtections), static_cast<unsigned long long>(c.faultsResolved), static_cast<unsigned long long>(c.lockedFaults), static_cast<unsigned long long>(c.leases), static_cast<unsigned long long>(c.leaseWaits), static_cast<unsigned long long>(c.driverReleases), static_cast<unsigned long long>(c.uncoveredReleases));
+    std::snprintf(text, sizeof(text), "; protections %llu (refused %llu, partial %llu, live %llu), faults resolved %llu, locked faults %llu, leases %llu, lease waits %llu, driver releases %llu, uncovered releases %llu, raw driver faults %llu", static_cast<unsigned long long>(c.protections), static_cast<unsigned long long>(c.refusedProtections), static_cast<unsigned long long>(c.partialProtections), static_cast<unsigned long long>(c.liveProtections), static_cast<unsigned long long>(c.faultsResolved), static_cast<unsigned long long>(c.lockedFaults), static_cast<unsigned long long>(c.leases), static_cast<unsigned long long>(c.leaseWaits), static_cast<unsigned long long>(c.driverReleases), static_cast<unsigned long long>(c.uncoveredReleases), static_cast<unsigned long long>(c.driverFaults));
     line += text;
     return line;
 }
@@ -990,6 +1109,8 @@ void ResetForTests() {
     ledger.leases = 0;
     ledger.leaseWaits = 0;
     ledger.driverReleases = 0;
+    ledger.driverFaults = 0;
+    ledger.lastProfile = {};
 }
 
 }

@@ -70,12 +70,26 @@ void SrtWalker::EvaluateDescriptorSources(const IrResourcePlan& program, std::sp
 }
 
 void SrtWalker::EvaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads) const {
-    if (runtime.compiledWalk && Detail::CompiledWalkEnabled() && poison != nullptr && nullRootReads != nullptr && runtime.userDataUse == nullptr && runtime.readTrace == nullptr && sources.data() == program.materializationSources.data() && sources.size() == program.materializationSources.size() && cleanFlatSlots.data() == program.cleanFlatSlots.data() && cleanFlatSlots.size() == program.cleanFlatSlots.size()) {
+    if (runtime.compiledWalk && Detail::CompiledWalkEnabled() && poison != nullptr && nullRootReads != nullptr && sources.data() == program.materializationSources.data() && sources.size() == program.materializationSources.size() && cleanFlatSlots.data() == program.cleanFlatSlots.data() && cleanFlatSlots.size() == program.cleanFlatSlots.size()) {
         const auto tape = Detail::SrtTape::For(program);
         if (tape != nullptr && tape->Refusal() == SrtCompiledWalkRefusal::IndirectImage) compiledWalkIndirectImages.fetch_add(1, std::memory_order_relaxed);
-        if (tape != nullptr && tape->Compiled()) {
-            const auto outcome = tape->Run(runtime, results, flat, activeSources, *nullRootReads);
+        const bool traced = runtime.userDataUse != nullptr || runtime.readTrace != nullptr;
+        if (tape != nullptr && tape->Compiled() && (!traced || tape->SupportsTracing())) {
+            auto compiledRuntime = runtime;
+            SrtUserDataUse use;
+            SrtReadTrace trace;
+            if (runtime.userDataUse != nullptr) {
+                use = *runtime.userDataUse;
+                compiledRuntime.userDataUse = &use;
+            }
+            if (runtime.readTrace != nullptr) {
+                trace = *runtime.readTrace;
+                compiledRuntime.readTrace = &trace;
+            }
+            const auto outcome = tape->Run(compiledRuntime, results, flat, activeSources, *nullRootReads);
             if (outcome == Detail::SrtTape::Outcome::Served) {
+                if (runtime.userDataUse != nullptr) *runtime.userDataUse = std::move(use);
+                if (runtime.readTrace != nullptr) *runtime.readTrace = std::move(trace);
                 poison->clear();
                 compiledWalkRuns.fetch_add(1, std::memory_order_relaxed);
                 return;
@@ -84,7 +98,7 @@ void SrtWalker::EvaluateRuntimeSources(const IrResourcePlan& program, std::span<
             if (outcome == Detail::SrtTape::Outcome::Inaccessible) compiledWalkFallbacksInaccessible.fetch_add(1, std::memory_order_relaxed);
         } else {
             compiledWalkUncompiled.fetch_add(1, std::memory_order_relaxed);
-            const auto reason = tape != nullptr ? static_cast<std::size_t>(tape->Refusal()) : static_cast<std::size_t>(SrtCompiledWalkRefusal::IncompletePlan);
+            const auto reason = tape != nullptr ? static_cast<std::size_t>(tape->Compiled() && traced ? SrtCompiledWalkRefusal::Tracing : tape->Refusal()) : static_cast<std::size_t>(SrtCompiledWalkRefusal::IncompletePlan);
             compiledWalkRefusals[reason < SrtCompiledWalkRefusals ? reason : 0].fetch_add(1, std::memory_order_relaxed);
         }
     }

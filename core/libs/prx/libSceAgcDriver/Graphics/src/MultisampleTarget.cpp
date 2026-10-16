@@ -321,7 +321,9 @@ MultisampleTarget& createFilled(const Context& context, const GuestTextureResour
     RequireNoMultisampleTarget(use.address, static_cast<std::size_t>(bytes), "sampling a multisampled texture no draw rendered to");
     GuestMemory::FlushGpuWrites(use.address, static_cast<std::size_t>(bytes));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(use.address), static_cast<std::size_t>(bytes))) refuse(std::string("whose color memory ") + range + " is not mapped");
-    const auto* memory = reinterpret_cast<const std::byte*>(use.address);
+    std::vector<std::byte> copied(static_cast<std::size_t>(bytes));
+    GuestMemory::CopyDriverMemory(copied.data(), reinterpret_cast<const void*>(use.address), copied.size());
+    const auto* memory = copied.data();
     std::uint32_t value = 0;
     std::memcpy(&value, memory, sizeof(value));
     char held[16];
@@ -452,9 +454,11 @@ bool TakeMultisampledClear(MultisampledCmask& cmask, MultisampledColorFill& colo
     return true;
 }
 
-VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target) {
+VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target, VkImage* image) {
     std::lock_guard lock(targetsMutex());
-    return acquire(context, target).view;
+    const auto& acquired = acquire(context, target);
+    if (image != nullptr) *image = acquired.image;
+    return acquired.view;
 }
 
 std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const GuestTextureResource& resource, VkComponentMapping components) {
@@ -483,6 +487,7 @@ void MaterializeMultisampleTargetClear(const Context& context, const ColorTarget
 }
 
 void ResolveMultisampleTarget(const Context& context, const ColorTarget& source, StorageTexture& destination, VkImageView destinationView) {
+    destination.PrepareWrite();
     std::lock_guard lock(targetsMutex());
     auto& target = acquire(context, source);
     const std::array<VkImageView, 2> views{target.view, destinationView};

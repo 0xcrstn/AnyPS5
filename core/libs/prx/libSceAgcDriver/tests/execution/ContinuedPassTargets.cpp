@@ -5,11 +5,13 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/tests/ProducerMappingIncarnation.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -26,6 +28,7 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -329,15 +332,25 @@ void DriverStore(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
     Reset(device, texels);
     const auto before = Now();
     DrawStrip(device, surface, 1, 0);
-    AgcDriver::GuestMemory::MarkWritten(surface + LayerBytes, 4);
+    const std::array<std::uint32_t, 1> stored{Stored};
+    const auto* equation = AgcDriver::Graphics::FindTextureSwizzleEquation(TileR64KBX, sizeof(Stored));
+    Require(equation != nullptr, "the continued target has no slice swizzle equation");
+    std::uint64_t texelOffset = LayerBytes;
+    for (std::uint32_t bit = 0; bit < equation->bits.size(); ++bit) texelOffset |= static_cast<std::uint64_t>(std::popcount(equation->bits[bit] & (1u << 24u)) & 1u) << bit;
+    AgcDriver::Graphics::StorageTexture::FlushPending(surface + texelOffset, sizeof(stored), nullptr, "packet store", AgcDriver::Graphics::PublishScope::PartialUnits);
+    AgcDriver::GuestMemory::Write(surface + texelOffset, std::as_bytes(std::span(stored)), 1);
     DrawStrip(device, surface, 1, 1);
     RequireCounts(before, 2, 0, "a draw after a store into the target in the same epoch");
+    RequireLayer(device, surface, 1, [](std::uint32_t x) { return x == 0 ? Stored : Value(x < 2 * Strip, Initial); }, "driver store between draws");
 }
 
 }
 
 int main() {
     try {
+#ifdef _WIN32
+        std::optional<ProducerMappingIncarnationTests::NativeMode> native;
+#endif
         GuestBlock block;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
@@ -345,6 +358,9 @@ int main() {
             std::puts("skipped, the target memory is not write-watched");
             return VulkanTestSkipped;
         }
+#ifdef _WIN32
+        native.emplace();
+#endif
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         Continued(*device, block.Data());
         SliceChange(*device, block.Data());

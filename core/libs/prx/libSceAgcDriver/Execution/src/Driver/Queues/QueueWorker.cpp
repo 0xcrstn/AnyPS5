@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 
 namespace AgcDriver::DriverDetail {
 
@@ -80,6 +81,7 @@ void Driver::run(std::uint32_t id) noexcept {
     onWorkerThread() = true;
     char role[32];
     std::snprintf(role, sizeof role, "queue worker 0x%x", id);
+    DrawTrace::BindThread(role);
     PinWorkerThread(role);
 
     GuestMemory::TagGpuLockThread(id);
@@ -91,6 +93,7 @@ void Driver::run(std::uint32_t id) noexcept {
         if (PerformanceTrace::Configured()) PerformanceTrace::BindThread(role);
         for (;;) {
             submission = Submission{};
+            std::optional<DrawTrace::JobScope> traceJob;
             struct Running {
                 std::atomic<std::uint32_t>& count;
                 std::atomic<std::uint64_t>& idleEpoch;
@@ -112,7 +115,8 @@ void Driver::run(std::uint32_t id) noexcept {
             static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
             {
                 PerformanceContext timingContext(id == 0 ? frameTiming() : FrameTiming::Async());
-                PerformanceTimer timing("Driver.WorkerWait");
+                PerformanceTimer timing("Driver.WorkerWait", false);
+                DrawTrace::Note("wait_reason", "worker_queue_or_completion_service");
                 std::unique_lock lock(mutex);
                 timing.Mark("mutex_wait");
                 auto& worker = workers.at(id);
@@ -177,18 +181,30 @@ void Driver::run(std::uint32_t id) noexcept {
                     lock.lock();
                 }
                 timing.Mark("idle_and_completion_poll");
+                DrawTrace::Note("wait_outcome", failure != nullptr ? "failed" : stopping || shutdownToken.stop_requested() ? "cancelled" : pending.empty() ? "unknown" : "satisfied");
                 rethrowFailure();
                 if (stopping || shutdownToken.stop_requested() || pending.empty()) {
                     break;
                 }
                 submission = std::move(pending.front());
                 pending.pop_front();
+                timing.FinishDetail();
+                traceJob.emplace(submission.traceJob);
+                submission.traceJobManagedByWorker = true;
                 if (APS5_ENABLE_TIMING_LOG) submission.dequeuedAt = std::chrono::steady_clock::now();
                 if (id == 0) queue0Executing = submission.suspend ? 0 : submission.received;
                 if (submission.waitFree) {
+                    auto orderOrigin = submission.traceContext;
+                    orderOrigin.job = DrawTrace::Current().job;
+                    DrawTrace::ContextScope orderContext(orderOrigin);
+                    DrawTrace::Span orderWait("Driver.SubmissionOrderWait");
+                    DrawTrace::Note("wait_reason", "queue_zero_prior_submission_order");
+                    DrawTrace::Note("wait_received_serial", submission.received);
+                    DrawTrace::Note("wait_dependency", "order_predicate_not_gpu_completion");
                     orderHolders.fetch_add(1, std::memory_order_acq_rel);
                     const auto released = [&] { return failure || stopping || orderReleased(id, submission.received); };
                     while (!released()) poll(released);
+                    DrawTrace::Note("wait_outcome", failure != nullptr ? "failed" : stopping ? "cancelled" : "satisfied");
                     orderHolders.fetch_sub(1, std::memory_order_acq_rel);
                     rethrowFailure();
                 }
@@ -207,6 +223,9 @@ void Driver::run(std::uint32_t id) noexcept {
                 }
                 if (drain) waitDrawRecords();
             }
+            auto completionContextOrigin = submission.traceContext;
+            completionContextOrigin.job = DrawTrace::Current().job;
+            DrawTrace::ContextScope completionOrigin(completionContextOrigin);
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             PerformanceContext completionContext(id == 0 ? frameTiming() : FrameTiming::Async());
@@ -221,6 +240,8 @@ void Driver::run(std::uint32_t id) noexcept {
 
                 notify = idleWaiters != 0 || orderHolders.load(std::memory_order_acquire) != 0;
             }
+            DrawTrace::Note("completion_domain", "host_submission_release");
+            DrawTrace::Record(DrawTrace::EventKind::Submission, submission.traceContext.submission, 0, submission.serial, DrawTrace::Status::Complete);
             if (notify) changed.notify_all();
             else ++costs.notifiesSkipped;
             if (profile) costs.completeNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - completeStart).count());

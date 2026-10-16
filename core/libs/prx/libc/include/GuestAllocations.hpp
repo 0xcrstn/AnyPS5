@@ -56,6 +56,7 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation);
 void GuestAllocationsRegisterImage_nid_postfix(void* mutation, const void* image);
 void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* image);
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept;
+void GuestAllocationsAfterMutation_nid_postfix(std::function<void()> callback);
 void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu);
 void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
 void GuestAllocationsRequireAvailable_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);

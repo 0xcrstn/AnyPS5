@@ -1,9 +1,11 @@
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <string>
 #include <thread>
 #include <limits>
@@ -68,10 +70,21 @@ void require(bool condition, const char* reason) {
 // invalidator once the generation has moved on, so a cache that observed the old state meanwhile
 // notices either way.
 struct MutationState {
+    struct Exclusion {
+        bool owned = GuestArena::GuestArenaBeginMappingExclusion_nid_postfix(0);
+        ~Exclusion() { if (owned) GuestArena::GuestArenaEndMappingExclusion_nid_postfix(); }
+        void Unlock() { if (owned) GuestArena::GuestArenaEndMappingExclusion_nid_postfix(); owned = false; }
+        void Lock() { owned = GuestArena::GuestArenaBeginMappingExclusion_nid_postfix(0); }
+    } exclusion;
     std::unique_lock<std::mutex> lock;
     std::vector<std::pair<std::uintptr_t, std::size_t>> changed;
     std::vector<std::pair<std::uintptr_t, std::size_t>> gpuMapped;
+    std::vector<std::function<void()>> after;
+    MutationState* previous;
+    explicit MutationState(MutationState* previous) : lock(registry().mutex), previous(previous) {}
 };
+
+thread_local MutationState* currentMutation = nullptr;
 
 void recordChange(void* mutation, const void* pointer, std::size_t bytes) {
     if (mutation != nullptr && bytes != 0) static_cast<MutationState*>(mutation)->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
@@ -112,7 +125,9 @@ bool backWritableImageAnonymously() {
 }
 
 void* GuestAllocationsBegin_nid_postfix() {
-    auto* state = new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}};
+    require(currentMutation == nullptr || !currentMutation->lock.owns_lock(), "nested guest allocation mutation is not implemented");
+    auto* state = new MutationState(currentMutation);
+    currentMutation = state;
     registry().readableLease.reset();
     registry().allLease.reset();
     return state;
@@ -145,9 +160,19 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     const bool noted = !state->gpuMapped.empty();
     registry().readableLease.reset();
     registry().allLease.reset();
+    auto after = std::move(state->after);
+    currentMutation = state->previous;
     delete state;
+    try { for (auto& callback : after) callback(); }
+    catch (const std::exception& error) { std::fprintf(stderr, "guest allocation post-mutation notification failed: %s\n", error.what()); std::terminate(); }
+    catch (...) { std::fprintf(stderr, "guest allocation post-mutation notification failed\n"); std::terminate(); }
     if (!weak.empty()) observer(weak, ended);
     if (noted) gpuMapObserverCalls.fetch_sub(1);
+}
+
+void GuestAllocationsAfterMutation_nid_postfix(std::function<void()> callback) {
+    if (currentMutation != nullptr && currentMutation->lock.owns_lock()) currentMutation->after.push_back(std::move(callback));
+    else callback();
 }
 
 std::uint64_t GuestAllocationsGeneration_nid_postfix() {
@@ -367,14 +392,26 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
                 break;
             }
         }
-        if (!pinned) return;
+        const bool protectedMapping = GuestArena::GuestArenaMappingProtected_nid_postfix(address, bytes);
+        if (!pinned && !protectedMapping) return;
         if (std::chrono::steady_clock::now() >= deadline) PinnedFailure(address, bytes, ("waited " + std::to_string(pinWait().count()) + " ms for the lease (APS5_PIN_WAIT_MS)").c_str());
         const auto waiter = pinWaiter.load(std::memory_order_acquire);
         bool progressed = false;
         if (state != nullptr && state->lock.owns_lock()) {
             state->lock.unlock();
-            if (waiter != nullptr) progressed = waiter(address, bytes);
-            else std::this_thread::yield();
+            state->exclusion.Unlock();
+            try {
+#ifdef _WIN32
+                if (protectedMapping && !GuestArena::GuestArenaResolveAccess_nid_postfix(address, bytes)) throw std::runtime_error("guest mapping changed during allocation native preflight");
+#endif
+                if (pinned && waiter != nullptr) progressed = waiter(address, bytes);
+                else if (pinned) std::this_thread::yield();
+            } catch (...) {
+                state->exclusion.Lock();
+                state->lock.lock();
+                throw;
+            }
+            state->exclusion.Lock();
             state->lock.lock();
         } else {
             std::this_thread::yield();
@@ -389,9 +426,10 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     }
 }
 
-void GuestAllocationsRequireAvailable_nid_postfix(void*, const void* pointer, std::size_t bytes) {
+void GuestAllocationsRequireAvailable_nid_postfix(void* mutation, const void* pointer, std::size_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid fixed guest mapping");
+    GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
     for (const auto& [base, range] : registry().ranges) {
         if (base >= address + bytes) break;
         if (base + range->bytes > address) {

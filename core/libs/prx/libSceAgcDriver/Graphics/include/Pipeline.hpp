@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/EmitUnit.hpp"
 #include <mutex>
 #include <set>
+#include <string>
 
 namespace AgcDriver::Graphics {
 
@@ -49,6 +50,9 @@ public:
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
     VkPipelineLayout Layout() const;
+    const std::string& TraceIdentity() const { return traceIdentity; }
+    std::uint64_t TraceMetadata() const;
+    std::uint64_t TraceInstanceId() const { return traceInstance; }
     std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers = 1, std::span<const std::uint8_t> persistent = {});
     std::shared_ptr<Framebuffer> FindFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers = 1);
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
@@ -104,6 +108,10 @@ private:
     bool sampleLocationsEnabled = false;
     std::mutex framebufferMutex;
     std::vector<CachedFramebuffer> framebuffers;
+    std::string traceIdentity;
+    std::uint64_t traceMetadata = 0;
+    std::uint64_t traceMetadataEpoch = 0;
+    std::uint64_t traceInstance = 0;
 };
 
 // The pipeline for this configuration, shared across draws and frames: keyed by the stages' variant
@@ -132,6 +140,11 @@ struct PipelineCacheProbeStatistics {
 };
 PipelineCacheProbeStatistics GraphicsPipelineCacheProbes();
 void ClearCachedPipelines(VkDevice device);
+struct PipelineCreationCounters {
+    std::uint64_t duplicateBuilds = 0;
+    std::uint64_t buildsUnderGpuMutex = 0;
+};
+PipelineCreationCounters PipelineCreationTotals();
 bool HasStencil(VkFormat format);
 // Device limit checks of the viewport, which is dynamic state and so no longer checked by Pipeline.
 void ValidateViewport(const Context& context, const VkViewport& viewport);

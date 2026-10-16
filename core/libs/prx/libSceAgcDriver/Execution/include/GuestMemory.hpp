@@ -1,10 +1,13 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
+#include "prx/libc/include/GuestArena.hpp"
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -29,6 +32,9 @@ struct Commitment {
 };
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable = false);
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment = 1);
+void CopyDriverMemory(void* destination, const void* source, std::size_t bytes);
+bool CompareDriverMemory(const void* first, const void* second, std::size_t bytes);
+std::uint64_t LoadDriverAtomic(std::uint64_t address, std::size_t bytes);
 // Variants for resources in heaps the guest commits on demand (partially resident textures, GPU
 // scratch heaps): uncommitted pages read as zeros, are not compared, and are never stored.
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination);
@@ -47,11 +53,11 @@ Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes);
 // `out` (Equal), or Unmapped as CompareMapped answers it (the dispatch-cache validation's masked
 // re-read of a differing run).
 Compare CopyMapped(std::uint64_t address, std::span<std::byte> out);
-void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
-void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment = 1);
+void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, const std::function<void()>& validate = {});
+void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment = 1, const std::function<void()>& validate = {});
 // Stores the parts of `current` that differ from `original` (the guest bytes the GPU started from), so
 // guest writes made meanwhile to untouched bytes survive. Compares in 256-byte blocks.
-void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
+void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, const std::function<void()>& validate = {});
 
 // Write tracking. The guest arena is reserved with page write watching, so CollectWrites learns which
 // pages of a range the CPU wrote since they were last collected, stamps their 64 KiB blocks with a new
@@ -62,7 +68,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 // UnchangedSince is always false, so callers fall back to comparing bytes.
 bool WriteWatched();
 void Unwatch(std::uint64_t address, std::size_t bytes);
-bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true);
+bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true, bool requireWatched = false);
 void SetUnwatchHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
@@ -79,21 +85,113 @@ std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, s
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);
 // Returns the generation the blocks were stamped with (0 when the arena is not write-watched):
 // UnchangedSince(range, it) holds until the next store over the range.
-std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes);
+enum class WriteExtent : std::uint8_t { Exact, Possible };
+std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes, WriteExtent extent);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source);
+std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source, const std::function<void(std::span<const std::byte>)>& store);
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+enum class StoreProvenance : std::uint8_t { Unchanged, Written, Unknown };
+StoreProvenance StoresSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+bool ProvenStoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool DriverStoresSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 struct MarkedWrites {
     std::uint64_t generation;
     bool storedOver;
 };
-MarkedWrites MarkWrittenUnlessStored(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t since);
+MarkedWrites MarkWrittenUnlessStored(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t since, WriteExtent extent);
 void LogDriverStores(std::vector<std::pair<std::uint64_t, std::uint64_t>>* log);
 enum class DriverStoredSince : std::uint8_t { No, Stored, Unknown };
 void EnableDriverStoreLog();
 std::uint64_t DriverStoreSequence();
 DriverStoredSince DriverStoresSinceSequence(std::uint64_t sequence, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+bool DriverStoreEvidenceLost() noexcept;
+class DriverGpuWrite;
+class DriverStoreWatch {
+public:
+    static constexpr std::size_t MaximumRanges = 128;
+    static constexpr std::size_t MaximumBytes = 65536;
+    struct Limits { std::uint64_t ranges, bytes; };
+    static Limits LimitTotals();
+    DriverStoreWatch(std::uint64_t begin, std::uint64_t end) : begin(begin), end(end) {}
+    DriverStoredSince State() const {
+        const auto observed = state.load(std::memory_order_acquire);
+        return DriverStoreEvidenceLost() ? DriverStoredSince::Unknown : observed;
+    }
+    bool Stored() const { return State() != DriverStoredSince::No; }
+    bool Overlaps(std::uint64_t first, std::uint64_t last) const { return first < end && begin < last; }
+    std::uint64_t FirstPage(std::uint64_t first) const { return (first > begin ? first : begin) / 4096; }
+    void NoteStore(std::uint64_t first, std::uint64_t last, DriverStoredSince source = DriverStoredSince::Stored, std::span<const std::byte> payload = {});
+    void Apply(std::span<std::byte> snapshot) const;
+
+private:
+    friend class DriverGpuWrite;
+    friend std::shared_ptr<DriverGpuWrite> PrepareDriverGpuWrite(std::uint64_t, std::size_t);
+    friend std::shared_ptr<DriverStoreWatch> ReadDriverSnapshot(std::uint64_t, std::span<std::byte>, std::size_t);
+    friend bool DriverSnapshotUnchanged(const DriverStoreWatch&);
+    enum class UnknownReason : std::uint8_t { None, Source, Payload, Ranges, Bytes, Allocation };
+    struct UnknownStore {
+        UnknownReason reason = UnknownReason::None;
+        DriverStoredSince source = DriverStoredSince::No;
+        const char* operation = nullptr;
+        std::uint64_t originBegin = 0, originEnd = 0;
+        unsigned long long caller = 0, callerOffset = 0;
+        bool alias = false;
+        std::uint64_t begin = 0, end = 0;
+        std::size_t payload = 0, ranges = 0, retainedBytes = 0;
+        std::uint32_t opcode = 0xffffffffu, queue = 0xffffffffu;
+        std::array<unsigned long long, 8> frames{};
+        std::size_t frameCount = 0;
+    };
+    struct Update { std::size_t offset; std::vector<std::byte> bytes; };
+    std::uint64_t begin;
+    std::uint64_t end;
+    std::atomic<DriverStoredSince> state{DriverStoredSince::No};
+    mutable std::mutex mutex;
+    std::vector<Update> updates;
+    std::size_t payloadBytes = 0;
+    std::vector<std::byte> baseline;
+    std::vector<GuestArena::MappingSpan> mappings;
+    std::uint64_t revision = 0;
+    bool gpuPending = false;
+    UnknownStore unknown;
+    static std::atomic<std::uint64_t> rangeOverflow;
+    static std::atomic<std::uint64_t> bytesOverflow;
+};
+class DriverGpuWrite {
+public:
+    ~DriverGpuWrite();
+    DriverGpuWrite(const DriverGpuWrite&) = delete;
+    DriverGpuWrite& operator=(const DriverGpuWrite&) = delete;
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& Ranges() const;
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& WatchedRanges() const;
+    void Complete(std::span<const std::byte> payload);
+    void Recorded();
+    bool Finished() const;
+    bool Prepared() const;
+    void Cancel() noexcept;
+    bool AcceptIntent(const DriverStoreWatch& watch, std::uint64_t first, std::uint64_t last) const;
+    void CheckLive() const;
+private:
+    friend std::shared_ptr<DriverGpuWrite> PrepareDriverGpuWrite(std::uint64_t, std::size_t);
+    struct State;
+    DriverGpuWrite();
+    std::unique_ptr<State> state;
+};
+class DriverGpuWriteScope {
+public:
+    explicit DriverGpuWriteScope(const DriverGpuWrite* write);
+    ~DriverGpuWriteScope();
+    DriverGpuWriteScope(const DriverGpuWriteScope&) = delete;
+    DriverGpuWriteScope& operator=(const DriverGpuWriteScope&) = delete;
+private:
+    const DriverGpuWrite* previous;
+};
+std::shared_ptr<DriverGpuWrite> PrepareDriverGpuWrite(std::uint64_t address, std::size_t bytes);
+std::shared_ptr<DriverStoreWatch> WatchDriverStores(std::uint64_t address, std::size_t bytes);
+std::shared_ptr<DriverStoreWatch> ReadDriverSnapshot(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment = 1);
+void ApplyDriverSnapshot(const DriverStoreWatch& writes, std::span<std::byte> snapshot);
+bool DriverSnapshotUnchanged(const DriverStoreWatch& writes);
 std::uint64_t ExchangeCollectEpoch(std::uint64_t epoch);
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
 // returns the current generation instead. A guest write landing between two collects of the same
@@ -197,7 +295,7 @@ std::uint32_t GpuLockThreadTag();
 // as acquisitions; the hold they start is timed under "try". Holds are timed per site as well (the
 // outermost acquisition of a thread until its unlock; APS5_NO_HOLD_PROFILE=1 turns that off), so
 // the line shows who holds the mutex, not only who waits for it.
-enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hook, Wait, Label, Flush, Present, Fill, Copy, End, Try, Count };
+enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hook, Wait, Label, Flush, Present, Fill, Copy, End, Try, Fault, Unwatch, Leases, Images, Depth, Presync, Count };
 void TagGpuLockSite(GpuLockSite site);
 // A GPU wait (a fence or timeline wait that found its work unfinished) made while the calling
 // thread holds GpuMutex: counted on the thread's [lock] line as 'locked GPU waits' (APS5_PROFILE_DRAW).

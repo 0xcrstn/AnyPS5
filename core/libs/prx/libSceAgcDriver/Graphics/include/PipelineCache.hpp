@@ -19,7 +19,7 @@ public:
     static constexpr int SaveIntervalSeconds = 10;
     static constexpr int BusyRetryMilliseconds = 100;
 
-    PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties);
+    PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool background = true);
     ~PipelineCache();
 
     PipelineCache(const PipelineCache&) = delete;
@@ -27,6 +27,7 @@ public:
     VkPipelineCache Handle() const { return cache; }
     PipelineCacheSynchronization& Synchronization() { return synchronization; }
     bool TrySave() { return save(false); }
+    bool Flush();
 
 private:
     struct FileHeader {
@@ -49,7 +50,7 @@ private:
     std::optional<FileHeader> readHeader() const;
     void load(std::vector<std::byte>& initialData);
     void adoptEarlierDriverFile(const std::filesystem::path& directory, const std::string& uuid);
-    bool save(bool final);
+    bool save(bool final, bool force = false);
     bool snapshot(bool final, std::vector<std::byte>* data, std::size_t& liveBytes);
     void run();
 

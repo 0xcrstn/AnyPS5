@@ -1,9 +1,12 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -21,18 +24,35 @@ namespace {
 template<typename TNode>
 class IdIndex {
 public:
+    IdIndex() : owned(acquireStorage()), storage(*owned) {
+        if (++storage.generation == 0u) {
+            std::fill(storage.stamps.begin(), storage.stamps.end(), 0u);
+            storage.generation = 1u;
+        }
+    }
+    ~IdIndex() {
+        auto& available = poolStorage();
+        std::lock_guard lock(available.mutex);
+        if (available.count < available.idle.size()) available.idle[available.count++] = std::move(owned);
+    }
+    IdIndex(const IdIndex&) = delete;
+    IdIndex& operator=(const IdIndex&) = delete;
+
     bool emplace(const TNode* node, std::size_t index) {
         const auto id = static_cast<std::size_t>(node->Id());
-        if (id >= nodes.size()) {
-            nodes.resize(id + 1u, nullptr);
-            indices.resize(id + 1u, 0u);
+        if (id >= storage.stamps.size()) {
+            const auto size = std::max(id + 1u, storage.stamps.size() * 2u);
+            storage.nodes.resize(size, nullptr);
+            storage.indices.resize(size, 0u);
+            storage.stamps.resize(size, 0u);
         }
-        if (nodes[id] == nullptr) {
-            nodes[id] = node;
-            indices[id] = index;
+        if (storage.stamps[id] != storage.generation) {
+            storage.stamps[id] = storage.generation;
+            storage.nodes[id] = node;
+            storage.indices[id] = index;
             return true;
         }
-        if (nodes[id] == node) {
+        if (storage.nodes[id] == node) {
             return false;
         }
         return others.emplace(node, index).second;
@@ -43,17 +63,41 @@ public:
     }
 
     [[nodiscard]] std::size_t at(const TNode* node) const {
-        return owns(node) ? indices[node->Id()] : others.at(node);
+        return owns(node) ? storage.indices[node->Id()] : others.at(node);
     }
 
 private:
-    [[nodiscard]] bool owns(const TNode* node) const {
-        const auto id = static_cast<std::size_t>(node->Id());
-        return id < nodes.size() && nodes[id] == node;
+    struct Storage {
+        std::vector<std::uint32_t> stamps;
+        std::vector<const TNode*> nodes;
+        std::vector<std::size_t> indices;
+        std::uint32_t generation = 0;
+    };
+
+    struct Pool {
+        std::mutex mutex;
+        std::array<std::unique_ptr<Storage>, 32> idle;
+        std::size_t count = 0;
+    };
+
+    static Pool& poolStorage() {
+        static Pool available;
+        return available;
     }
 
-    std::vector<const TNode*> nodes;
-    std::vector<std::size_t> indices;
+    static std::unique_ptr<Storage> acquireStorage() {
+        auto& available = poolStorage();
+        std::lock_guard lock(available.mutex);
+        return available.count != 0u ? std::move(available.idle[--available.count]) : std::make_unique<Storage>();
+    }
+
+    [[nodiscard]] bool owns(const TNode* node) const {
+        const auto id = static_cast<std::size_t>(node->Id());
+        return id < storage.stamps.size() && storage.stamps[id] == storage.generation && storage.nodes[id] == node;
+    }
+
+    std::unique_ptr<Storage> owned;
+    Storage& storage;
     std::unordered_map<const TNode*, std::size_t> others;
 };
 

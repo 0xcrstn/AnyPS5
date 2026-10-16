@@ -88,6 +88,7 @@ int main() {
             const auto shader = Compile(*first);
             if (auto ticket = first->TryComputePipeline(shader, reinterpret_cast<std::uintptr_t>(Code.data()))) ticket->Wait();
             Dispatch(*first, shader, 0x12345678u);
+            first->StopPipelinePreparation();
             std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
             first->PrepareForReplacement();
         }

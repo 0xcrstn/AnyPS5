@@ -12,6 +12,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <exception>
 #include <mutex>
 #include <set>
 #ifdef _WIN32
@@ -163,6 +164,28 @@ void Driver::landPendingWaits(std::uint32_t queue) {
 
 void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
 
+    std::uint32_t polls = 0;
+    struct ObservedWait {
+        DrawTrace::Span span{"Driver.WaitMemory"};
+        const char* outcome = "unknown";
+        const char* resolution = "none";
+        const std::uint32_t& polls;
+        bool timeoutReported = false;
+        int exceptions = std::uncaught_exceptions();
+        explicit ObservedWait(const std::uint32_t& polls) : polls(polls) {}
+        void Satisfy(const char* reason) { outcome = "satisfied"; resolution = reason; }
+        ~ObservedWait() noexcept {
+            try {
+                if (std::uncaught_exceptions() > exceptions) outcome = "failed";
+                DrawTrace::Note("wait_outcome", outcome);
+                DrawTrace::Note("wait_resolution", resolution);
+                DrawTrace::Note("wait_timeout_reported", static_cast<std::uint64_t>(timeoutReported));
+                DrawTrace::RecordCounter("memory_wait_polls", polls, "polls");
+            } catch (...) {}
+        }
+    } observedWait(polls);
+    DrawTrace::Note("wait_reason", requireMemory ? "guest_memory_landing" : "guest_memory_or_label");
+
     auto start = std::chrono::steady_clock::now();
     auto lastDone = packetsDone.load();
 
@@ -201,7 +224,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         const bool fromMemory = source == WaitSource::Entry || source == WaitSource::Memory || source == WaitSource::HeldAtSubmit;
         if ((observing || scheduleRecording) && fromMemory) {
             const bool readable = GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(awaited)), awaitedBytes);
-            observation.value = !readable ? 0 : wideWait ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+            observation.value = !readable ? 0 : GuestMemory::LoadDriverAtomic(awaited, wideWait ? 8 : 4);
             if (observing && timeline != LabelTimelineMode::Off) ++outcomes.lifts[static_cast<std::size_t>(Lift::Latched)];
         }
         if (scheduleRecording) queueScheduler.NoteWait(queue, observation.value, static_cast<std::uint32_t>(source));
@@ -216,12 +239,15 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         observation.producerStamp = match->stamp;
         if (!proven(WaitSource::History)) return false;
         ++(match->queue == queue ? outcomes.storedSinceSameQueue : outcomes.storedSinceOtherQueue);
+        observedWait.Satisfy("stored_since_activation");
         discharge(WaitSource::History);
         return true;
     };
+    DrawTrace::Note("wait_address", awaited);
+    DrawTrace::Note("wait_bytes", static_cast<std::uint64_t>(awaitedBytes));
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)), packet[4],
-                               *reinterpret_cast<const volatile std::uint32_t*>(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)));
+                               static_cast<std::uint32_t>(GuestMemory::LoadDriverAtomic(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), 4)));
     struct WaitTrace {
         bool enabled; std::uint32_t queue; std::uint64_t address; std::chrono::steady_clock::time_point begin;
         ~WaitTrace() {
@@ -240,11 +266,13 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     } epochPoint{!heldAtSubmit};
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
+        observedWait.Satisfy("memory_at_entry");
         ++outcomes.atEntry;
         discharge(WaitSource::Entry);
         return;
     }
     if (heldAtSubmit) {
+        observedWait.resolution = "held_at_submit_shortcut";
         discharge(WaitSource::HeldAtSubmit);
         return;
     }
@@ -292,6 +320,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (trace) traceLate("trusted", hit, refusal);
         }
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
+        observedWait.Satisfy(hit->late ? "late_label_table" : "label_table");
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
@@ -453,7 +482,6 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     const auto spinLimit = queue == 0 ? std::chrono::microseconds(1500) : std::chrono::microseconds(100);
     const auto spinStart = std::chrono::steady_clock::now();
     bool spinning = pauseSpin;
-    std::uint32_t polls = 0;
     auto& broker = WaitBroker::Instance();
     const bool brokered = WaitBroker::Enabled() && !requireMemory;
     std::uint64_t brokerSeen = broker.Sequence();
@@ -490,6 +518,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
                 if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
+                    observedWait.Satisfy("recorded_writes_settled");
                     ++outcomes.landedSettled;
                     return;
                 }
@@ -502,6 +531,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
         if (!warned && std::chrono::steady_clock::now() - start > std::chrono::milliseconds(waitTimeoutMs())) {
             warned = true;
+            observedWait.timeoutReported = true;
             ++outcomes.timedOut;
             {
                 static std::mutex reportedMutex;
@@ -514,7 +544,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
             const std::uint64_t reference = wide ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : packet[4];
             const std::uint64_t mask = wide ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : packet[5];
-            const std::uint64_t current = wide ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+            const std::uint64_t current = GuestMemory::LoadDriverAtomic(awaited, wide ? 8 : 4);
             std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM%s%s at 0x%llx timed out after %dms (function %u ref 0x%llx mask 0x%llx value 0x%llx)\n", queue, wide ? "_64" : "", requireMemory ? " (landing)" : "",
                          static_cast<unsigned long long>(awaited), waitTimeoutMs(), packet[1] & 7u, static_cast<unsigned long long>(reference), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(current));
             const auto address = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
@@ -538,6 +568,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     }
     ++outcomes.polled;
     discharge(WaitSource::Memory);
+    observedWait.Satisfy("memory_after_polling");
 }
 
 }

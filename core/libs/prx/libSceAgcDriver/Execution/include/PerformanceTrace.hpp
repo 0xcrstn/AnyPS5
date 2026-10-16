@@ -20,6 +20,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include "prx/libSceAgcDriver/Execution/include/MeasurementWorkload.hpp"
+#include <exception>
 
 namespace AgcDriver {
 
@@ -513,6 +515,34 @@ private:
 
 class PerformanceTrace {
 public:
+    static MeasurementWorkload* Workload() noexcept;
+    class WorkloadScope {
+    public:
+        explicit WorkloadScope(MeasurementWorkload::Kind kind) : ledger(Workload()), kind(kind) {
+            if (ledger == nullptr) return;
+            exceptions = std::uncaught_exceptions();
+            prior = currentWorkload;
+            currentWorkload = this;
+            ledger->Begin(kind);
+        }
+        WorkloadScope(const WorkloadScope&) = delete;
+        WorkloadScope& operator=(const WorkloadScope&) = delete;
+        ~WorkloadScope() {
+            if (ledger == nullptr) return;
+            currentWorkload = prior;
+            ledger->End(kind, outcome == MeasurementWorkload::Outcome::Complete && std::uncaught_exceptions() > exceptions ? MeasurementWorkload::Outcome::Failed : outcome);
+        }
+        void Outcome(MeasurementWorkload::Outcome value) { outcome = value; }
+    private:
+        MeasurementWorkload* ledger;
+        MeasurementWorkload::Kind kind;
+        int exceptions = 0;
+        MeasurementWorkload::Outcome outcome = MeasurementWorkload::Outcome::Complete;
+        WorkloadScope* prior = nullptr;
+    };
+    static void WorkloadOutcome(MeasurementWorkload::Outcome outcome) {
+        if (currentWorkload != nullptr) currentWorkload->Outcome(outcome);
+    }
     static bool Configured() {
         static const bool configured = std::getenv("APS5_TRACE_FRAMES") != nullptr || std::getenv("APS5_TRACE_SECONDS") != nullptr || std::getenv("APS5_TRACE_SUMMARY_EVERY") != nullptr;
         return configured;
@@ -542,6 +572,7 @@ public:
     static void StopOutput();
 
 private:
+    inline static thread_local WorkloadScope* currentWorkload = nullptr;
     static void OpenInterval(std::chrono::steady_clock::time_point now, std::uint64_t present);
     static void FlushInterval(std::chrono::steady_clock::time_point now, std::uint32_t width, std::uint32_t height, const VulkanDevice* device);
 

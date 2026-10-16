@@ -554,7 +554,7 @@ bool WaitSatisfied(std::span<const std::uint32_t> packet) {
 bool WaitSatisfiedUnchecked(std::span<const std::uint32_t> packet) {
     const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
     const auto source = address(packet[2], packet[3]);
-    const std::uint64_t value = wide ? *reinterpret_cast<const volatile std::uint64_t*>(source) : *reinterpret_cast<const volatile std::uint32_t*>(source);
+    const std::uint64_t value = GuestMemory::LoadDriverAtomic(source, wide ? 8 : 4);
     return waitCompares(packet, wide, value);
 }
 
@@ -652,6 +652,12 @@ std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, co
     }
 }
 
+StoreWrite CaptureRegisterCopy(std::span<const std::uint32_t> packet, const QueueState& queue) {
+    Validate(packet, 0);
+    require(((packet[0] >> 8u) & 0xffu) == 0x40 && !CopyDataToRegister(packet) && CopyDataSource(packet) == CopyDataRegisterSource, "expected COPY_DATA from a register to memory");
+    return {address(packet[4], packet[5]), {}, copyDataSource(packet, queue, CopyDataBytes(packet))};
+}
+
 std::uint32_t DmaSource(std::span<const std::uint32_t> packet) {
     return dmaSource(packet);
 }
@@ -710,8 +716,8 @@ std::vector<PacketStore> DecodeStores(std::span<const std::uint32_t> packet) {
         case 0x50: {
             require(packet.size() == 7, "invalid DMA_DATA size");
             const auto bytes = DmaBytes(packet);
-            if (bytes == 0 || dmaDestination(packet) == DmaDestinationNowhere || dmaDestination(packet) == DmaSelectGds) return {};
-            const auto destination = address(packet[4], packet[5]);
+            if (bytes == 0 || dmaDestination(packet) == DmaDestinationNowhere) return {};
+            const auto destination = dmaDestination(packet) == DmaSelectGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
             if (dmaSource(packet) == DmaSourceData) return {pattern(destination, bytes, packet[2])};
             return {runTime(destination, bytes)};
         }
@@ -906,13 +912,29 @@ DrawParameters ResolveDraw(std::span<const std::uint32_t> packet, const QueueSta
     return {address, count, indexSize, queue.instanceCount, packet.back(), true, indexOffset->second, 0};
 }
 
-std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> packet) {
+std::vector<std::uint32_t> ReadIndirectRegisterWords(std::span<const std::uint32_t> packet, std::shared_ptr<GuestMemory::DriverStoreWatch>* writes) {
     require(packet.size() == 5 && IndirectRegisterOpcode((packet[0] >> 8u) & 0xffu), "expected indirect register packet");
     // Named for the [hooksync] attribution (the read goes through the flush hook).
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Registers);
+    const auto read = [&](std::span<std::byte> bytes) {
+        if (writes != nullptr) *writes = GuestMemory::ReadDriverSnapshot(address(packet[1], packet[2]), bytes, 4);
+        else GuestMemory::Read(address(packet[1], packet[2]), bytes, 4);
+    };
+    std::vector<std::uint32_t> values(static_cast<std::size_t>(packet[4]) * (packet[3] == 0x80000000u ? 2u : 1u));
+    read(std::as_writable_bytes(std::span(values)));
+    return values;
+}
+
+std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> packet, std::shared_ptr<GuestMemory::DriverStoreWatch>* writes) {
+    auto values = ReadIndirectRegisterWords(packet, writes);
+    if (packet[3] == 0x80000000u) return values;
+    return IndirectRegisterPairs(packet, values);
+}
+
+std::vector<std::uint32_t> IndirectRegisterPairs(std::span<const std::uint32_t> packet, std::span<const std::uint32_t> values) {
+    require(packet.size() == 5 && IndirectRegisterOpcode((packet[0] >> 8u) & 0xffu), "expected indirect register packet");
+    require(values.size() == static_cast<std::size_t>(packet[4]) * (packet[3] == 0x80000000u ? 2u : 1u), "indirect register words do not match their packet");
     if (packet[3] != 0x80000000u) {
-        std::vector<std::uint32_t> values(packet[4]);
-        GuestMemory::Read(address(packet[1], packet[2]), std::as_writable_bytes(std::span(values)), 4);
         std::vector<std::uint32_t> pairs;
         pairs.reserve(values.size() * 2);
         for (std::size_t i = 0; i < values.size(); ++i) {
@@ -921,9 +943,7 @@ std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> 
         }
         return pairs;
     }
-    std::vector<std::uint32_t> pairs(static_cast<std::size_t>(packet[4]) * 2);
-    GuestMemory::Read(address(packet[1], packet[2]), std::as_writable_bytes(std::span(pairs)), 4);
-    return pairs;
+    return {values.begin(), values.end()};
 }
 
 void NoteDispatchRegisters(std::span<const std::uint32_t> packet, QueueState& queue) {
@@ -988,6 +1008,7 @@ std::optional<CommandProcessorRead> CommandProcessorReadOf(std::span<const std::
     if (IndirectRegisterOpcode(opcode) && packet.size() == 5) return CommandProcessorRead{address(packet[1], packet[2]), static_cast<std::size_t>(packet[4]) * (packet[3] == 0x80000000u ? 8u : 4u)};
     if (opcode == 0x91 && packet.size() == 4) return CommandProcessorRead{address(packet[1], packet[2]) + static_cast<std::uint64_t>(packet[3] & 0xffffu) * IndexAttributesBytes, IndexAttributesBytes};
     if (opcode == 0x22 && packet.size() == 5) return CommandProcessorRead{address(packet[1], packet[2]), 4};
+    if (opcode == 0x40 && packet.size() == 6 && CopyDataToRegister(packet)) return CommandProcessorRead{address(packet[2], packet[3]), CopyDataBytes(packet)};
     return std::nullopt;
 }
 

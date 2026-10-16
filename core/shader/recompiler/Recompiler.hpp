@@ -4,8 +4,10 @@
 #include "BufferReadRanges.hpp"
 #include "RuntimeAbi.hpp"
 #include "PipelineSpecialization.hpp"
+#include "TraceIdentity.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -14,9 +16,33 @@
 #include <span>
 #include <utility>
 #include <string_view>
+#include <string>
 #include <vector>
 
 namespace ShaderRecompiler {
+
+enum class CompilerObservationKind { PlanBegin, PlanComplete, PlanFailed, PlanMemoryHit, PlanDiskHit, VariantMemoryHit, VariantDiskHit, CompileBegin, CompileComplete, CompileFailed, PlanFailureMemoHit, VariantFailureMemoHit, MaterializationMemoryHit, ObservationLost };
+
+using CompilerObserver = void (*)(void*, CompilerObservationKind, std::string_view) noexcept;
+
+struct CompilerObservationContext {
+    CompilerObserver observer = nullptr;
+    void* state = nullptr;
+    std::uint64_t producerJob = 0;
+};
+
+CompilerObservationContext ExchangeCompilerObserver(CompilerObservationContext context) noexcept;
+
+class CompilerObservationScope {
+public:
+    explicit CompilerObservationScope(CompilerObservationContext context) noexcept : previous(ExchangeCompilerObserver(context)) {}
+    ~CompilerObservationScope() { ExchangeCompilerObserver(previous); }
+    CompilerObservationScope(const CompilerObservationScope&) = delete;
+    CompilerObservationScope& operator=(const CompilerObservationScope&) = delete;
+
+private:
+    CompilerObservationContext previous;
+};
 
 enum class ShaderStage {
     Compute,
@@ -466,20 +492,67 @@ struct BarycentricEmulationLayout {
 // reference, or the per-dispatch copy this class removes comes back without a compiler hint.
 struct SpilledSpirv;
 
+struct SpirvContentHash {
+    std::uint64_t low = 0;
+    std::uint64_t high = 0;
+    bool operator==(const SpirvContentHash&) const = default;
+};
+
+inline std::uint64_t HashSpirvWords(std::span<const std::uint32_t> words, std::uint64_t seed) {
+    constexpr std::uint64_t multiplier = 0x9e3779b97f4a7c15ull;
+    std::uint64_t hash = seed ^ (static_cast<std::uint64_t>(words.size()) * multiplier);
+    const auto mix = [&](std::uint64_t chunk) {
+        chunk *= 0xff51afd7ed558ccdull;
+        chunk ^= chunk >> 32u;
+        hash = (hash ^ chunk) * multiplier;
+        hash = (hash << 27u) | (hash >> 37u);
+    };
+    std::size_t index = 0;
+    for (; index + 2 <= words.size(); index += 2) mix(words[index] | (static_cast<std::uint64_t>(words[index + 1]) << 32u));
+    if (index < words.size()) mix(words[index] ^ 0x8000000000000000ull);
+    hash ^= hash >> 33u;
+    hash *= 0xff51afd7ed558ccdull;
+    hash ^= hash >> 33u;
+    hash *= 0xc4ceb9fe1a85ec53ull;
+    hash ^= hash >> 33u;
+    return hash;
+}
+
 class SharedSpirv {
 public:
     SharedSpirv() = default;
-    SharedSpirv(std::vector<std::uint32_t> words) : words(std::make_shared<std::vector<std::uint32_t>>(std::move(words))) {}
-    SharedSpirv(std::shared_ptr<const void> owner, std::span<const std::uint32_t> view) : owner(std::move(owner)), view(view) {}
+    SharedSpirv(std::vector<std::uint32_t> words) : words(std::make_shared<std::vector<std::uint32_t>>(std::move(words))), traceDigest(MakeTraceDigestCache()) {}
+    SharedSpirv(std::shared_ptr<const void> owner, std::span<const std::uint32_t> view) : owner(std::move(owner)), view(view), traceDigest(MakeTraceDigestCache()) {}
     SharedSpirv& operator=(std::vector<std::uint32_t> other) {
         words = std::make_shared<std::vector<std::uint32_t>>(std::move(other));
         spilled.reset();
+        contentHash = std::make_shared<ContentHashState>();
         owner.reset();
         view = {};
+        traceDigest = MakeTraceDigestCache();
         return *this;
     }
 
+    [[nodiscard]] std::string TraceIdentity() const {
+        const auto calculate = [&] { TraceIdentityBuilder digest; digest.Text("anyps5.final-spirv.v1"); const auto resolved = Resolved(); digest.Words(resolved.Words()); return digest.Finish(); };
+        if (traceDigest == nullptr) return calculate();
+        std::call_once(traceDigest->ready, [&] { traceDigest->digest = calculate(); traceDigest->hashed.store(true, std::memory_order_release); });
+        return traceDigest->digest;
+    }
+    [[nodiscard]] const std::shared_ptr<TraceDigestCache>& TraceCache() const { return traceDigest; }
+
     [[nodiscard]] std::span<const std::uint32_t> Words() const { return words ? std::span<const std::uint32_t>(*words) : spilled ? SpilledWords() : view; }
+    [[nodiscard]] SpirvContentHash ContentHash() const {
+        if (contentHash->hashed.load(std::memory_order_acquire)) return {contentHash->low.load(std::memory_order_relaxed), contentHash->high.load(std::memory_order_relaxed)};
+        const auto resolved = Resolved();
+        const auto module = resolved.Words();
+        if (module.empty()) return {};
+        const SpirvContentHash hash{HashSpirvWords(module, 0x5eed5a1d00000001ull), HashSpirvWords(module, 0x5eed5a1d00000002ull)};
+        contentHash->low.store(hash.low, std::memory_order_relaxed);
+        contentHash->high.store(hash.high, std::memory_order_relaxed);
+        contentHash->hashed.store(true, std::memory_order_release);
+        return hash;
+    }
     [[nodiscard]] std::vector<std::uint32_t> Copy() const { return {Words().begin(), Words().end()}; }
     [[nodiscard]] bool Spilled() const { return words == nullptr && spilled != nullptr; }
     [[nodiscard]] std::size_t WordCount() const;
@@ -498,13 +571,15 @@ public:
     [[nodiscard]] std::vector<std::uint32_t>::iterator end() { return Mutable().end(); }
     void resize(std::size_t count) { Mutable().resize(count); }
     std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values) { return Mutable().insert(where, values); }
-    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return (left.words != nullptr && left.words == right.words) || (left.spilled != nullptr && left.spilled == right.spilled) || std::ranges::equal(left.Resolved().Words(), right.Resolved().Words()); }
+    friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return (left.words != nullptr && left.words == right.words) || (left.spilled != nullptr && left.spilled == right.spilled) || (left.words == nullptr && right.words == nullptr && left.spilled == nullptr && right.spilled == nullptr && left.owner != nullptr && right.owner != nullptr && !left.owner.owner_before(right.owner) && !right.owner.owner_before(left.owner) && left.view.data() == right.view.data() && left.view.size() == right.view.size()) || std::ranges::equal(left.Resolved().Words(), right.Resolved().Words()); }
 
 private:
     [[noreturn]] static std::span<const std::uint32_t> SpilledWords();
     std::vector<std::uint32_t>& Mutable() {
         if (Spilled()) *this = Resolved();
+        contentHash = std::make_shared<ContentHashState>();
         spilled.reset();
+        if (traceDigest != nullptr && (traceDigest.use_count() != 1 || traceDigest->hashed.load(std::memory_order_acquire))) traceDigest = MakeTraceDigestCache();
         if (words == nullptr || words.use_count() != 1) {
             words = std::make_shared<std::vector<std::uint32_t>>(Copy());
             owner.reset();
@@ -513,10 +588,16 @@ private:
         return *words;
     }
 
+    struct ContentHashState {
+        std::atomic<std::uint64_t> low{0}, high{0};
+        std::atomic<bool> hashed{false};
+    };
+    std::shared_ptr<ContentHashState> contentHash = std::make_shared<ContentHashState>();
     std::shared_ptr<std::vector<std::uint32_t>> words;
     std::shared_ptr<SpilledSpirv> spilled;
     std::shared_ptr<const void> owner;
     std::span<const std::uint32_t> view;
+    std::shared_ptr<TraceDigestCache> traceDigest;
 };
 
 struct VertexInput {
@@ -562,6 +643,8 @@ struct CompiledShaderArtifact {
     bool stencilReplaySafe = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;
     std::uint64_t variantId = 0;
+    std::shared_ptr<const ShaderTraceSourceIdentity> traceSourceIdentity;
+    std::uint64_t tracePreparationJob = 0;
 };
 
 struct ShaderInvocation {
@@ -578,7 +661,24 @@ struct ShaderInvocation {
     std::uint32_t imageTableFaults = 0;
 };
 
+class ShaderInputProvenance {
+public:
+    [[nodiscard]] std::shared_ptr<const std::string> Load() const { return identity.load(std::memory_order_acquire); }
+    bool Assign(std::shared_ptr<const std::string> value) {
+        std::shared_ptr<const std::string> empty;
+        return identity.compare_exchange_strong(empty, std::move(value), std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+    bool Clear(std::shared_ptr<const std::string> expected) {
+        return identity.compare_exchange_strong(expected, {}, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+private:
+    std::atomic<std::shared_ptr<const std::string>> identity;
+};
+
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
+    std::shared_ptr<ShaderInputProvenance> inputProvenance = std::make_shared<ShaderInputProvenance>();
+    std::shared_ptr<ShaderTraceMetadataCache> traceMetadata = MakeShaderTraceMetadataCache();
     bool cacheHit = false;
     bool bdaWrites = true;
     bool bdaAtomics = true;

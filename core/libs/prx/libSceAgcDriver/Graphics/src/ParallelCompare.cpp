@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -45,7 +46,7 @@ private:
         std::size_t compared = 0;
         for (auto index = next.fetch_add(1, std::memory_order_relaxed); index < spans.size(); index = next.fetch_add(1, std::memory_order_relaxed)) {
             const auto& span = spans[index];
-            equal[index] = std::memcmp(span.first, span.second, span.bytes) == 0 ? 1 : 0;
+            equal[index] = GuestMemory::CompareDriverMemory(span.first, span.second, span.bytes) ? 1 : 0;
             ++compared;
         }
         if (compared != 0) done.fetch_add(compared, std::memory_order_acq_rel);
@@ -98,7 +99,7 @@ void CompareSpansFrom(std::span<const CompareSpan> spans, std::span<std::uint8_t
     if (spans.size() > 1 && total >= parallelBytes) {
         if (sharedPool()->Run(spans, equal)) return;
     }
-    for (std::size_t index = 0; index < spans.size(); ++index) equal[index] = std::memcmp(spans[index].first, spans[index].second, spans[index].bytes) == 0 ? 1 : 0;
+    for (std::size_t index = 0; index < spans.size(); ++index) equal[index] = GuestMemory::CompareDriverMemory(spans[index].first, spans[index].second, spans[index].bytes) ? 1 : 0;
 }
 
 void CompareSpans(std::span<const CompareSpan> spans, std::span<std::uint8_t> equal) {

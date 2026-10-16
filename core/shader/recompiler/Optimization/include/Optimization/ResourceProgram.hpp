@@ -48,6 +48,7 @@ struct ResourceCapture {
     // key over the code, the plan) before the walk.
     std::uint64_t sourceNanoseconds = 0;
 };
+[[nodiscard]] bool SameResourceTrace(const ResourceCapture& a, const ResourceCapture& b);
 [[nodiscard]] std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime);
 
 // The resolved source of a request (its cache entry with the plan built), for a driver that
@@ -58,6 +59,12 @@ struct ResourceCapture {
 // the target); the vertex stages' input validation is repeated per capture because it reads V#
 // fields the key does not cover. Null for a request that bypasses the cache (useCache false).
 struct CompiledVariant;
+struct OfflineCompileTimings {
+    double frontendSeconds = 0;
+    double backendSeconds = 0;
+};
+[[nodiscard]] std::shared_ptr<const CompiledVariant> CompileShaderUncached(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, OfflineCompileTimings* timings = nullptr);
+[[nodiscard]] RecompileResult MaterializeShaderUncached(const RecompileRequest& request, const CompiledVariant& variant, std::span<const std::byte> artifactKey);
 struct SourceHandle {
     std::shared_ptr<SourceEntry> source;
     std::shared_ptr<const CompiledVariant> artifact;
@@ -71,7 +78,7 @@ public:
     const std::shared_ptr<const SourceHandle>& Handle() const { return handle; }
     std::shared_ptr<const ResourceCapture> Capture(const SrtRuntime& runtime) const;
     std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture) const;
-    std::shared_ptr<const ResourceCapture> CaptureValues(const SrtRuntime& runtime) const;
+    std::shared_ptr<const ResourceCapture> CaptureValues(const SrtRuntime& runtime, bool trace = false) const;
     std::shared_ptr<const RecompileResult> MaterializeValues(const ResourceCapture& capture, bool* templateHit = nullptr) const;
 
 private:

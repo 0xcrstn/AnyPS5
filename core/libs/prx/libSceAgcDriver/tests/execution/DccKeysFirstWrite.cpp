@@ -200,7 +200,13 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> co
 }
 
 std::size_t Count(const std::uint8_t* bytes, std::size_t size, std::uint8_t value) {
+#ifdef _WIN32
+    std::vector<std::uint8_t> snapshot(size);
+    AgcDriver::GuestMemory::CopyDriverMemory(snapshot.data(), bytes, size);
+    return static_cast<std::size_t>(std::count(snapshot.begin(), snapshot.end(), value));
+#else
     return static_cast<std::size_t>(std::count(bytes, bytes + size, value));
+#endif
 }
 
 void RequireKeys(const std::uint8_t* keys, std::uint8_t expected, const std::string& what) {
@@ -585,7 +591,7 @@ void RunUniformKeysBehindKernel(AgcDriver::VulkanDevice& device, std::uint8_t* b
     RequireKeys(keys, 0x00, "uniform sampled keys behind a kernel: the keys after the kernel");
 }
 
-void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+void RunMemoryReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     const auto address = AddressOf(block);
     std::memset(block, 0x55, BlockBytes);
     auto descriptor = TextureDescriptor(block, nullptr);
@@ -598,7 +604,11 @@ void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     Dispatch(device, WriteCode, userData);
     const auto image = StorageTexture::FindPending(address, BlockBytes);
     Require(image != nullptr && image->GuestBytes() == BlockBytes, "the two-block image has no pending results");
+#ifdef _WIN32
+    Require(AgcDriver::GuestMemory::Watched(address, BlockBytes), "the native reuse image lost write tracking");
+#else
     Require(!AgcDriver::GuestMemory::Watched(address, BlockBytes), "the imported test image is still write-watched");
+#endif
     AgcDriver::GuestMemory::BumpCollectEpoch();
     const auto version = image->Version();
     for (int repeat = 0; repeat < 3; ++repeat) {
@@ -624,7 +634,12 @@ void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     Require(Count(block, SurfaceBytes, 0x77) == SurfaceBytes, "write-back without refresh overwrote a CPU edit");
     image->Refresh();
     Require(image->Refresh(), "the image did not stabilize after write-back");
+#ifdef _WIN32
+    const std::vector<std::byte> driverBytes(SurfaceBytes, std::byte{0x22});
+    AgcDriver::GuestMemory::StoreOwnBytes(address, driverBytes);
+#else
     AgcDriver::GuestMemory::StoreOwnBytes(address, SurfaceBytes, [&] { std::memset(block, 0x22, SurfaceBytes); });
+#endif
     Require(!image->Refresh(), "a driver store within the comparison epoch was missed");
     Require(image->Refresh(), "the driver-edited image was uploaded twice");
     const std::array<std::uint32_t, 4> pattern{0x44444444u, 0x44444444u, 0x44444444u, 0x44444444u};
@@ -726,7 +741,7 @@ void RunHintedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     std::array<void*, 1> marked{};
     std::size_t count = marked.size();
     Require(GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(address + SurfaceBytes), 4096, marked.data(), &count, true) && count == 1, "hinted import: the store to hide was not marked");
-    MarkWritten(address + SurfaceBytes + 0x200, 1);
+    MarkWritten(address + SurfaceBytes + 0x200, 1, AgcDriver::GuestMemory::WriteExtent::Exact);
     BumpCollectEpoch();
     Require(!image->Refresh() && image->Version() != settled, "hinted import: a recorded store without a write-watch mark was missed");
     Dispatch(device, WriteCode, userData);
@@ -792,26 +807,40 @@ int main() {
         std::optional<GuestBlock> hinted;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        block.emplace(false);
+        const auto prepare = [](std::optional<GuestBlock>& memory, bool watch) {
+#ifdef _WIN32
+            static_cast<void>(watch);
+            memory.emplace(true, true);
+#else
+            memory.emplace(watch);
+#endif
+        };
+        prepare(block, false);
         Run(*device, block->Data());
-        untracked.emplace(false);
-        RunUntrackedReuse(*device, untracked->Data());
+        prepare(untracked, false);
+        RunMemoryReuse(*device, untracked->Data());
         std::optional<GuestBlock> reused;
-        reused.emplace(false);
+        prepare(reused, false);
         RunReusedKeys(*device, reused->Data());
         std::optional<GuestBlock> single;
-        single.emplace(false);
+        prepare(single, false);
         RunSingleKeys(*device, single->Data());
         std::optional<GuestBlock> sampled;
-        sampled.emplace(false);
+        prepare(sampled, false);
         std::optional<GuestBlock> sampledOutput;
-        sampledOutput.emplace(false);
-        RunSingleKeysSampled(*device, sampled->Data(), sampledOutput->Data(), "unwatched");
+        prepare(sampledOutput, false);
+        RunSingleKeysSampled(*device, sampled->Data(), sampledOutput->Data(),
+#ifdef _WIN32
+            "native shared"
+#else
+            "unwatched"
+#endif
+        );
         std::optional<GuestBlock> behind;
-        behind.emplace(false);
+        prepare(behind, false);
         RunSampledKeysBehindKernel(*device, behind->Data());
         std::optional<GuestBlock> uniform;
-        uniform.emplace(false);
+        prepare(uniform, false);
         RunUniformKeysBehindKernel(*device, uniform->Data());
 #ifdef _WIN32
         shared.emplace(true, true);
@@ -819,10 +848,10 @@ int main() {
         Run(*device, shared->Data());
 #endif
         if (AgcDriver::GuestMemory::WriteWatched()) {
-            watched.emplace(true);
+            prepare(watched, true);
             Run(*device, watched->Data());
             std::optional<GuestBlock> sampledWatched;
-            sampledWatched.emplace(true);
+            prepare(sampledWatched, true);
             RunSingleKeysSampled(*device, sampledWatched->Data(), sampledOutput->Data(), "write-watched");
 #ifdef _WIN32
             pendingSingle.emplace(true, true);

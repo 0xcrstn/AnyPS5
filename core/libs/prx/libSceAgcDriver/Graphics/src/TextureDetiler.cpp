@@ -116,9 +116,9 @@ TextureDetiler::~TextureDetiler() {
 bool TextureDetiler::retireToRecorders() {
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::vector<Recorder*> busy;
-    Recorder::ForEachActive([&](Recorder& recorder) {
-        if (!recorder.Idle()) busy.push_back(&recorder);
-    });
+    for (auto* recorder : Recorder::LiveForDevice(context.device)) {
+        if (!recorder->Idle()) busy.push_back(recorder);
+    }
     if (busy.empty()) return false;
     std::shared_ptr<TextureDetiler> retired(new TextureDetiler(context, Retired{}));
     retired->adopt(*this);

@@ -71,15 +71,15 @@ struct SpecializedModule {
     bool pushData = false;
 };
 
-std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, bool memoize = true) {
     ShaderCompileTrace::Event specializeEvent("specialize");
+    const auto input = artifact.spirv.Resolved();
     if (specializeEvent.Active()) {
         std::vector<std::uint32_t> vector;
         for (const auto& constant : constants) vector.insert(vector.end(), {constant.id, constant.value});
-        const auto input = artifact.spirv.Resolved();
         specializeEvent.Hex("variant", artifact.variantId).Number("spirv_words_in", input.size()).Hex("spirv_in_hash", ShaderCompileTrace::HashOf(input.Words())).Number("constants", constants.size()).Hex("specialization_hash", ShaderCompileTrace::HashOf(std::span<const std::uint32_t>(vector))).Hex("vertex_classes_hash", ShaderCompileTrace::HashOf(classes));
     }
-    auto source = SpecializeVertexInputTypes(artifact, classes);
+    auto source = SpecializeVertexInputTypes(artifact, input, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
     for (const auto& constant : constants) {
         if (!supplied.emplace(constant.id, constant.value).second) throw std::runtime_error("duplicate prepared specialization ID");
@@ -173,14 +173,16 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         }
         cursor += count;
     }
-    module->spirv = InternSpirv(std::move(materialized));
+    module->spirv = InternSpirv(std::move(materialized), memoize && SpirvInternEnabled());
     module->specializationId = constants.empty() ? 0u : nextVariantId();
     if (specializeEvent.Active()) {
         const auto interned = SpirvInternTotals();
         specializeEvent.Number("spirv_words", module->spirv.size()).Hex("spirv_hash", ShaderCompileTrace::HashOf(module->spirv.Words())).Number("intern_lookups", interned.lookups).Number("intern_shared", interned.shared).Number("intern_shared_bytes", interned.sharedBytes);
     }
-    retainedCounters().specializedModules.fetch_add(1, std::memory_order_relaxed);
-    retainedCounters().specializedSpirvBytes.fetch_add(module->spirv.Words().size() * sizeof(std::uint32_t), std::memory_order_relaxed);
+    if (memoize) {
+        retainedCounters().specializedModules.fetch_add(1, std::memory_order_relaxed);
+        retainedCounters().specializedSpirvBytes.fetch_add(module->spirv.Words().size() * sizeof(std::uint32_t), std::memory_order_relaxed);
+    }
     return module;
 }
 
@@ -269,7 +271,12 @@ void bindingPlanKeyWords(const CompiledVariant& variant, const ResourceSnapshot&
     for (const auto mapping : exports) key.push_back(mapping);
 }
 
-std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet) {
+std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet, bool memoize = true) {
+    if (!memoize) {
+        auto plan = std::make_shared<PreparedBindingPlan>();
+        plan->bindings = DescriptorBindingBuilder{}.Prepare(variant.bindings.layout, variant.info.info, variant.info.stage, snapshot, exports, variant.artifact.registrationModule, fragmentDescriptorSet);
+        return plan;
+    }
     struct BindingPlanKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, BindingPlanKeyStorage>();
     bindingPlanKeyWords(variant, snapshot, exports, key);
@@ -301,7 +308,8 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     return plan;
 }
 
-std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, bool memoize = true) {
+    if (!memoize) return buildSpecializedModule(artifact, classes, constants, target, false);
     struct ModuleKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
     key.clear();
@@ -330,7 +338,7 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     return entry->module;
 }
 
-RecompileResult materializeSkeleton(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults, MaterializedParts& parts) {
+RecompileResult materializeSkeleton(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults, MaterializedParts& parts, bool memoize) {
     RecompileResult result;
     const auto& artifact = variant.artifact;
     static_cast<CompiledShaderArtifact&>(result) = {
@@ -356,9 +364,11 @@ RecompileResult materializeSkeleton(const CompiledVariant& variant, const Recomp
         .stencilReferences = artifact.stencilReferences,
         .stencilReplaySafe = artifact.stencilReplaySafe,
         .stencilReferenceDword = artifact.stencilReferenceDword,
-        .variantId = artifact.variantId
+        .variantId = artifact.variantId,
+        .traceSourceIdentity = artifact.traceSourceIdentity,
+        .tracePreparationJob = artifact.tracePreparationJob
     };
-    const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
+    const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules, memoize);
     parts.plan = plan;
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
@@ -432,7 +442,8 @@ RecompileResult materializeSkeleton(const CompiledVariant& variant, const Recomp
                     constants.push_back({first + 5u, kind});
                 }
             }
-            const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
+            const auto specialize = [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target, memoize); };
+            const auto module = memoize && artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, specialize) : specialize();
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
             entry->bindings = std::move(selected);
@@ -459,7 +470,7 @@ RecompileResult materializeSkeleton(const CompiledVariant& variant, const Recomp
     return result;
 }
 
-void fillMaterializedValues(RecompileResult& result, const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, const MaterializedParts& parts) {
+void fillMaterializedValues(RecompileResult& result, const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, const MaterializedParts& parts, bool memoize) {
     const auto& artifact = variant.artifact;
     for (std::size_t index = 0; index < result.vertexInputs.size() && index < result.vertexAttributes.size(); ++index) {
         const auto& input = result.vertexInputs[index];
@@ -469,7 +480,7 @@ void fillMaterializedValues(RecompileResult& result, const CompiledVariant& vari
     }
     const DescriptorBindingPlan* bindingPlan = parts.bindings;
     const auto& runtimeSelectors = parts.runtimeSelectors;
-    const auto tables = ResourceMaterializer::ResolveImageTables(variant.info.info, snapshot, artifact.variantId);
+    const auto tables = ResourceMaterializer::ResolveImageTables(variant.info.info, snapshot, memoize ? artifact.variantId : 0u);
     DescriptorBindingBuilder{}.Populate(result, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     if (!artifact.stencilReferences.empty()) {
@@ -508,12 +519,13 @@ void fillMaterializedValues(RecompileResult& result, const CompiledVariant& vari
         result.imageTableShader = snapshot.tables.shader;
         result.imageTableFaults = tables.faults;
     }
+    FinalizeShaderTraceIdentity(result);
 }
 
-RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults) {
+RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults, bool memoize) {
     MaterializedParts parts;
-    auto result = materializeSkeleton(variant, request, snapshot, registrationDefaults, parts);
-    fillMaterializedValues(result, variant, request, snapshot, parts);
+    auto result = materializeSkeleton(variant, request, snapshot, registrationDefaults, parts, memoize);
+    fillMaterializedValues(result, variant, request, snapshot, parts, memoize);
     return result;
 }
 

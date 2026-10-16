@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -88,6 +89,15 @@ public:
         VkDeviceSize offset = 0;
         std::size_t bytes = 0;
     };
+    struct DataPatch {
+        std::size_t allocation;
+        std::uint32_t byte;
+        std::uint32_t adjustment;
+    };
+    struct WordView {
+        View view;
+        std::shared_ptr<Buffer> buffer;
+    };
 
     explicit DrawSnapshotArena(const Context& context);
     ~DrawSnapshotArena();
@@ -126,6 +136,8 @@ public:
         return view(recorder, placed->chunk, placed->offset, placed->bytes, true, placed->bytes, placed->bytes);
     }
     std::optional<View> Reuse(Recorder& recorder, const Placed& placed);
+    WordView PlaceWords(Recorder& recorder, std::uint64_t owner, std::size_t allocation, std::span<const std::uint32_t> words, std::size_t bytes, std::span<const DataPatch> patches, bool ring);
+    static std::uint64_t NextWordKey();
     Counters TakeCounters();
     std::size_t ChunkCount() const {
         std::lock_guard lock(mutex);
@@ -188,6 +200,18 @@ private:
         std::size_t chunk;
         VkDeviceSize offset;
     };
+    struct WordEntry {
+        std::size_t allocation;
+        std::vector<std::uint32_t> words;
+        std::size_t bytes;
+        std::shared_ptr<Buffer> buffer;
+        Placed placed{};
+    };
+    struct WordCache {
+        std::vector<WordEntry> entries;
+        std::size_t next = 0;
+        std::uint64_t used = 0;
+    };
     std::optional<Placement> allocate(std::size_t bytes);
     bool beginTake(std::size_t bytes);
     std::optional<std::span<std::byte>> reserve(std::size_t bytes, Placed* placed);
@@ -216,6 +240,8 @@ private:
     std::size_t current = 0;
     std::size_t createdBytes = 0;
     std::map<std::uint64_t, Entry> entries;
+    std::unordered_map<std::uint64_t, WordCache> wordCaches;
+    std::uint64_t wordUse = 0;
     Counters counters;
 };
 

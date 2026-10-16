@@ -225,7 +225,7 @@ int main(int argc, char** argv) {
         AgcDriver::GuestMemory::Write(AddressOf(run.texels) + run.texel, stored);
         run.Sample({0xff, 0xff, 0x00, 0x00}, "after a driver store in the same epoch");
         run.SetTexel({0x00, 0x00, 0xff, 0xff});
-        AgcDriver::GuestMemory::MarkWritten(AddressOf(run.texels) + run.texel, 4);
+        AgcDriver::GuestMemory::MarkWritten(AddressOf(run.texels) + run.texel, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
         run.Sample({0x00, 0x00, 0xff, 0xff}, "after a marked CPU store in the same epoch");
         run.SetTexel({0xff, 0xff, 0xff, 0x00});
         AgcDriver::GuestMemory::BumpCollectEpoch();

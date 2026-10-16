@@ -9,6 +9,8 @@
 #include <utility>
 #include <vector>
 
+namespace GuestArena { struct MappingSpan; }
+
 namespace AgcDriver::Coherence {
 
 enum class Mode : std::uint8_t { Reference, New, Verify };
@@ -116,13 +118,19 @@ struct ProtectionBackend {
     std::uint64_t (*protect)(std::uintptr_t address, std::size_t bytes, bool (*resolve)(std::uint64_t token, void* context), void* context, void (*releaseContext)(void* context)) = nullptr;
     void (*release)(std::uint64_t token) = nullptr;
     bool (*open)(std::uint64_t token) = nullptr;
+    std::uint64_t (*protectMapping)(const GuestArena::MappingSpan* spans, std::size_t count, std::uintptr_t address, std::size_t bytes, bool (*resolve)(std::uint64_t token, void* context), void* context, void (*releaseContext)(void* context)) = nullptr;
 };
 
 using Materializer = void (*)(Interval range);
 
 void SetProtectionBackend(ProtectionBackend backend);
+ProtectionBackend CurrentProtectionBackend();
+bool ClaimFaultService();
 void SetMaterializer(Materializer materializer);
+Materializer CurrentMaterializer();
+void SetOwnershipEligibility(bool (*eligible)(std::uint64_t address, std::size_t bytes));
 std::uint64_t ProtectDeviceOwned(Interval range, Source source, Version version);
+std::uint64_t ProtectDeviceOwned(Interval range, Source source, Version version, std::span<const GuestArena::MappingSpan> expected);
 void ReleaseDeviceOwned(std::uint64_t protection);
 bool ProtectionLive(std::uint64_t protection);
 void NoteLockedFault(Interval range);
@@ -144,6 +152,7 @@ inline bool InDriverAccess() {
     return driverAccessDepth != 0;
 }
 std::uint64_t AcquireReadLease(Interval range, Version version);
+std::uint64_t AcquireReadLease(Interval range, Version version, std::span<const GuestArena::MappingSpan> expected);
 std::uint64_t ProtectResident(Interval range, Version version);
 void RetireReadLease(std::uint64_t lease);
 
@@ -168,9 +177,11 @@ struct Counters {
     std::uint64_t leases = 0;
     std::uint64_t leaseWaits = 0;
     std::uint64_t driverReleases = 0;
+    std::uint64_t driverFaults = 0;
     std::uint64_t uncoveredReleases = 0;
 };
 
+void ProfileProtections();
 Counters CurrentCounters();
 std::string Report();
 std::vector<std::string> RecentEvents(Interval range, std::size_t limit);

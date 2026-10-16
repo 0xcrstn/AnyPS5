@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Execution/include/DrawTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DefaultSwitch.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
@@ -14,6 +16,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <bit>
 #include <array>
@@ -23,6 +26,7 @@
 #include <cstdlib>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -35,6 +39,95 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+class RecordObservation {
+public:
+    explicit RecordObservation(const char* name, const char* kind = nullptr) : token(DrawTrace::ScheduleJob(name)), kind(kind), workload(PerformanceTrace::Workload()) {
+        DrawTrace::Link(token.context.packet, token.id, "schedules_job");
+        if (workload != nullptr) workload->Begin(MeasurementWorkload::Kind::Job);
+    }
+    ~RecordObservation() noexcept {
+        if (finished) return;
+        try {
+            DrawTrace::JobScope job(token);
+            job.Outcome(DrawTrace::Status::Cancelled);
+            Finish(DrawTrace::Status::Cancelled);
+        } catch (...) { DrawTrace::ReportObservationLoss(); }
+    }
+    void Kind(const char* value) { kind = value; }
+    const DrawTrace::Context& Context() const { return token.context; }
+    void Outcome(DrawTrace::Status value) { outcome = value; }
+    void Finish(DrawTrace::Status value) noexcept {
+        if (finished) return;
+        finished = true;
+        if (workload != nullptr) workload->End(MeasurementWorkload::Kind::Job,
+            value == DrawTrace::Status::Failed ? MeasurementWorkload::Outcome::Failed :
+            value == DrawTrace::Status::Cancelled ? MeasurementWorkload::Outcome::Cancelled :
+            value == DrawTrace::Status::Rejected ? MeasurementWorkload::Outcome::Rejected :
+            value == DrawTrace::Status::Skipped ? MeasurementWorkload::Outcome::Skipped : MeasurementWorkload::Outcome::Complete);
+        if (kind != nullptr) {
+            try { DrawTrace::RecordOperation(token.context.operation, kind, value); }
+            catch (...) { DrawTrace::ReportObservationLoss(); }
+        }
+    }
+    void Run(const std::function<void()>& record) {
+        DrawTrace::JobScope job(token);
+        auto* previous = std::exchange(current, this);
+        struct Restore {
+            RecordObservation* previous;
+            ~Restore() { current = previous; }
+        } restore{previous};
+        try {
+            DrawTrace::Span scope(kind == nullptr ? "Driver.RecordPacket" : std::strcmp(kind, "draw") == 0 ? "Driver.CommitDraw" : "Driver.CommitDispatch");
+            record();
+        } catch (...) {
+            if (outcome != DrawTrace::Status::Rejected) outcome = DrawTrace::Status::Failed;
+            job.Outcome(outcome);
+            Finish(outcome);
+            throw;
+        }
+        job.Outcome(outcome);
+        Finish(outcome);
+    }
+    static void CurrentOutcome(DrawTrace::Status value) { if (current != nullptr) current->Outcome(value); }
+private:
+    DrawTrace::JobToken token;
+    const char* kind;
+    MeasurementWorkload* workload;
+    DrawTrace::Status outcome = DrawTrace::Status::Complete;
+    bool finished = false;
+    inline static thread_local RecordObservation* current = nullptr;
+};
+
+std::shared_ptr<RecordObservation> MakeRecordObservation(const char* name, const char* kind = nullptr) {
+    if (!DrawTrace::Configured() && PerformanceTrace::Workload() == nullptr) return nullptr;
+    return std::make_shared<RecordObservation>(name, kind);
+}
+
+std::function<void()> ObserveRecord(std::function<void()> record, std::shared_ptr<RecordObservation> observation) {
+    if (observation == nullptr) return record;
+    return [record = std::move(record), observation = std::move(observation)] { observation->Run(record); };
+}
+
+std::atomic<std::uint64_t>& unknownRecordWriters() {
+    static std::atomic<std::uint64_t> pending{0};
+    return pending;
+}
+
+class PendingWriter {
+public:
+    PendingWriter() { unknownRecordWriters().fetch_add(1, std::memory_order_relaxed); }
+    ~PendingWriter() { Complete(); }
+    void Complete() {
+        if (pending.exchange(false, std::memory_order_acq_rel)) unknownRecordWriters().fetch_sub(1, std::memory_order_release);
+    }
+private:
+    std::atomic<bool> pending{true};
+};
+
+}
+
 struct Driver::DrawRecordResult {
     std::uint64_t ticket = 0;
     DrawRecordEffects effects;
@@ -44,6 +137,8 @@ struct Driver::DrawRecordResult {
 };
 
 struct Driver::FrozenDraw {
+    std::shared_ptr<RecordObservation> trace = MakeRecordObservation("Driver.FrozenRecord");
+    std::shared_ptr<PendingWriter> writer;
     std::vector<std::uint32_t> packet;
     FrozenQueueState state;
     std::uint64_t serial = 0;
@@ -213,6 +308,8 @@ struct PacketWaitCounts {
     std::atomic<std::uint64_t> syncDrains{0};
     std::atomic<std::uint64_t> labelDrains{0};
     std::atomic<std::uint64_t> waitsSatisfied{0};
+    std::atomic<std::uint64_t> predicationReads{0};
+    std::atomic<std::uint64_t> unknownDrains{0};
     std::atomic<std::uint64_t> labelJobs{0};
     std::atomic<std::uint64_t> labelJobLabels{0};
     std::atomic<std::uint64_t> labelPackets{0};
@@ -226,10 +323,16 @@ struct LabelRangeInFlight {
     std::uint64_t end;
 };
 
-struct LabelRangesInFlightTag {};
+struct LabelRangesInFlight {
+    static constexpr std::size_t Capacity = 256;
+    std::array<LabelRangeInFlight, Capacity> ranges;
+    std::size_t count;
+    bool overflowed;
+};
 
-std::vector<LabelRangeInFlight>& labelRangesInFlight() {
-    return HostThreadLocal<std::vector<LabelRangeInFlight>, LabelRangesInFlightTag>();
+LabelRangesInFlight& labelRangesInFlight() {
+    thread_local LabelRangesInFlight inFlight{};
+    return inFlight;
 }
 
 std::uint64_t& labelItemsFrozen() {
@@ -243,16 +346,34 @@ std::atomic<std::uint64_t>& labelItemsRecorded() {
 }
 
 void noteLabelRangeInFlight(std::uint64_t sequence, std::uint64_t address, std::size_t bytes) {
-    if (bytes != 0) labelRangesInFlight().push_back({sequence, address, address + bytes});
+    if (bytes == 0) return;
+    auto& inFlight = labelRangesInFlight();
+    if (inFlight.count == LabelRangesInFlight::Capacity) {
+        inFlight.overflowed = true;
+        return;
+    }
+    inFlight.ranges[inFlight.count++] = {sequence, address, address + bytes};
 }
 
 bool labelInFlightOverlaps(std::uint64_t address, std::size_t bytes) {
+    if (bytes > std::numeric_limits<std::uint64_t>::max() - address) return true;
     const auto& deferred = deferredLabels().labels;
-    if (std::any_of(deferred.begin(), deferred.end(), [&](const DeferredLabel& label) { return address < label.address + label.size && label.address < address + bytes; })) return true;
-    auto& ranges = labelRangesInFlight();
+    auto& inFlight = labelRangesInFlight();
+    if (inFlight.overflowed) return true;
     const auto recorded = labelItemsRecorded().load(std::memory_order_acquire);
-    std::erase_if(ranges, [&](const LabelRangeInFlight& range) { return range.sequence <= recorded; });
-    return std::any_of(ranges.begin(), ranges.end(), [&](const LabelRangeInFlight& range) { return address < range.end && range.begin < address + bytes; });
+    const auto live = std::remove_if(inFlight.ranges.begin(), inFlight.ranges.begin() + static_cast<std::ptrdiff_t>(inFlight.count), [&](const LabelRangeInFlight& range) { return range.sequence <= recorded; });
+    inFlight.count = static_cast<std::size_t>(live - inFlight.ranges.begin());
+    const auto overlaps = [&](std::uint64_t begin, std::uint64_t end) {
+        return std::any_of(deferred.begin(), deferred.end(), [&](const DeferredLabel& label) { return begin < label.address + label.size && label.address < end; }) || std::any_of(inFlight.ranges.begin(), live, [&](const LabelRangeInFlight& range) { return begin < range.end && range.begin < end; });
+    };
+    if (overlaps(address, address + bytes)) return true;
+    std::array<std::uintptr_t, 16> begins{}, ends{};
+    const auto aliases = GuestArena::GuestArenaAliasRanges_nid_postfix(address, bytes, begins.data(), ends.data(), begins.size());
+    if (aliases > begins.size()) return true;
+    for (std::size_t alias = 0; alias < aliases; ++alias) {
+        if (overlaps(begins[alias], ends[alias])) return true;
+    }
+    return false;
 }
 
 bool& commandProcessorSyncPending() {
@@ -473,6 +594,8 @@ DrawVerdict Driver::freezeDraw(QueueState& queue, std::span<const std::uint32_t>
     startDrawRecords();
     auto& freezer = registerFreezer();
     auto frozen = std::make_shared<FrozenDraw>();
+    if (frozen->trace != nullptr) frozen->trace->Kind("draw");
+    frozen->writer = std::make_shared<PendingWriter>();
     frozen->packet.assign(packet.begin(), packet.end());
     frozen->state = freezer.Freeze(queue);
     frozen->serial = submission.serial;
@@ -489,6 +612,7 @@ DrawVerdict Driver::freezeDraw(QueueState& queue, std::span<const std::uint32_t>
         records.WaitFinished(ticket);
     }
     frozenDraws().Submit(std::move(frozen));
+    DrawTrace::SetOperationOutcome(DrawTrace::Status::Unknown);
     ++counters.frozen;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (profile) {
@@ -516,6 +640,8 @@ void Driver::freezeDispatch(QueueState& queue, std::span<const std::uint32_t> pa
     startDrawRecords();
     auto& freezer = registerFreezer();
     auto frozen = std::make_shared<FrozenDraw>();
+    if (frozen->trace != nullptr) frozen->trace->Kind("dispatch");
+    frozen->writer = std::make_shared<PendingWriter>();
     frozen->packet.assign(packet.begin(), packet.end());
     frozen->state = freezer.Freeze(queue);
     frozen->serial = submission.serial;
@@ -534,6 +660,7 @@ void Driver::freezeDispatch(QueueState& queue, std::span<const std::uint32_t> pa
         records.WaitFinished(ticket);
     }
     frozenDraws().Submit(std::move(frozen));
+    DrawTrace::SetOperationOutcome(DrawTrace::Status::Unknown);
     ++counters.frozenDispatches;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (profile) {
@@ -553,6 +680,10 @@ void Driver::freezeDispatch(QueueState& queue, std::span<const std::uint32_t> pa
 }
 
 std::shared_ptr<Driver::PreparedFrozenDraw> Driver::prepareFrozen(const FrozenDraw& frozen, bool inOrder) {
+    std::optional<DrawTrace::ContextScope> traceContext;
+    if (frozen.trace != nullptr) traceContext.emplace(frozen.trace->Context());
+    DrawTrace::Span preparation("Driver.PrepareFrozen");
+    DrawTrace::Note("preparation_order", inOrder ? "in_order" : "worker");
     if (frozenProducer()) throw std::logic_error("prepare workers: a frozen draw reached preparation on queue 0's own thread");
     if (!frozen.labels.empty() || frozen.endOfPipe || frozen.memoryPacket) return std::make_shared<PreparedFrozenDraw>();
     struct CopyTag {};
@@ -601,12 +732,20 @@ void Driver::emitFrozen(const std::shared_ptr<FrozenDraw>& frozen, std::optional
     const bool redo = error != nullptr || ready == nullptr || ready->refused != FrozenFallback::None || !ready->rejected.empty();
     if (!redo && ready->inputs == nullptr && ready->dispatchInputs == nullptr) {
         ++counters.frozenNothing;
+        if (frozen->trace != nullptr) {
+            frozen->trace->Run([&] { RecordObservation::CurrentOutcome(ready->verdict == DrawVerdict::Rejected ? DrawTrace::Status::Rejected : DrawTrace::Status::Skipped); });
+        }
+        frozen->writer->Complete();
         return;
     }
     if (!redo && ready->dispatchInputs != nullptr) noteDispatchInputWriters(*ready->dispatchInputs, frozen->queue);
     if (!redo && ready->inputs != nullptr) noteDrawInputWriters(*ready->inputs, frozen->queue);
     auto result = std::make_shared<DrawRecordResult>();
-    result->ticket = drawRecords().Post([this, frozen, ready, error, result] {
+    result->ticket = drawRecords().Post(ObserveRecord([this, frozen, ready, error, result] {
+        struct CompleteWriter {
+            const std::shared_ptr<PendingWriter>& writer;
+            ~CompleteWriter() { writer->Complete(); }
+        } completeWriter{frozen->writer};
         struct Restore {
             std::uint32_t tag;
             std::uint64_t epoch;
@@ -669,7 +808,11 @@ void Driver::emitFrozen(const std::shared_ptr<FrozenDraw>& frozen, std::optional
                     ++counters.dispatchVerified;
                 }
             }
-            if (!use->rejected.empty()) throw std::runtime_error(use->rejected);
+            if (!use->rejected.empty()) {
+                RecordObservation::CurrentOutcome(DrawTrace::Status::Rejected);
+                throw std::runtime_error(use->rejected);
+            }
+            if (use->inputs == nullptr && use->dispatchInputs == nullptr) RecordObservation::CurrentOutcome(DrawTrace::Status::Skipped);
             if (use->dispatchInputs != nullptr) recordDispatchInputs(*use->dispatchInputs, use->device);
             if (use->inputs != nullptr) recordDrawInputs(*use->inputs, *result, use->device);
         } catch (const std::exception& failure) {
@@ -678,14 +821,14 @@ void Driver::emitFrozen(const std::shared_ptr<FrozenDraw>& frozen, std::optional
         }
         GuestMemory::LogDriverStores(nullptr);
         result->effects.writeGenerationAfter = Graphics::Recorder::WriteGeneration();
-    });
+    }, frozen->trace));
     std::lock_guard lock(frozenPostedMutex);
     frozenPosted.push_back(std::move(result));
 }
 
 void Driver::emitFrozenLabels(const std::shared_ptr<FrozenDraw>& frozen) {
     auto result = std::make_shared<DrawRecordResult>();
-    result->ticket = drawRecords().Post([this, frozen, result] {
+    result->ticket = drawRecords().Post(ObserveRecord([this, frozen, result] {
         struct Restore {
             std::uint32_t tag;
             std::uint64_t epoch;
@@ -723,7 +866,7 @@ void Driver::emitFrozenLabels(const std::shared_ptr<FrozenDraw>& frozen) {
         labelItemsRecorded().store(frozen->labelSequence, std::memory_order_release);
         GuestMemory::LogDriverStores(nullptr);
         result->effects.writeGenerationAfter = Graphics::Recorder::WriteGeneration();
-    });
+    }, frozen->trace));
     std::lock_guard lock(frozenPostedMutex);
     frozenPosted.push_back(std::move(result));
 }
@@ -806,10 +949,11 @@ bool Driver::memoryPacketJob(std::uint32_t queue, std::span<const std::uint32_t>
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     switch (opcode) {
     case 0x40:
-        if (packet.size() != 6 || Pm4::CopyDataToRegister(packet) || Pm4::CopyDataSource(packet) == 0u) return false;
+        if (packet.size() != 6 || Pm4::CopyDataToRegister(packet)) return false;
         break;
     case 0x50:
-        if (packet.size() != 7 || Pm4::DmaDestination(packet) == Pm4::DmaSelectGds) return false;
+        if (packet.size() != 7) return false;
+        if (Pm4::DmaDestination(packet) == Pm4::DmaSelectGds && (packet[4] % 4 != 0 || Pm4::DmaBytes(packet) % 4 != 0)) return false;
         break;
     case 0x83:
     case 0x45:
@@ -826,7 +970,9 @@ bool Driver::memoryPacketJob(std::uint32_t queue, std::span<const std::uint32_t>
 bool Driver::freezeMemoryPacket(std::uint32_t queue, QueueState& state, std::span<const std::uint32_t> packet) {
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     std::optional<Pm4::StoreWrite> store;
-    if (opcode == 0x83) {
+    if (opcode == 0x40 && Pm4::CopyDataSource(packet) == 0u) {
+        store = Pm4::CaptureRegisterCopy(packet, state);
+    } else if (opcode == 0x83 || (opcode == 0x50 && Pm4::DmaSource(packet) == 2u && Pm4::DmaDestination(packet) == Pm4::DmaSelectGds)) {
         store = Pm4::ResolveStore(packet, state, std::numeric_limits<std::size_t>::max());
         if (!store.has_value()) return false;
     } else if (opcode == 0x37) {
@@ -957,6 +1103,8 @@ std::string Driver::recordIdentity(const Submission& submission, const char* wha
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
+    std::optional<DrawTrace::Operation> traceOperation;
+    if (!resolvingAhead() && frozenSink() == nullptr && DrawTrace::Current().operation == 0) traceOperation.emplace("draw");
     if (drawRecordState().active || frozenSink() != nullptr || !deferDrawRecords(submission.queue)) return drawNow(queue, packet, submission, rejected);
     if (prepareWorkers() != 0) {
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -980,6 +1128,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    std::optional<DrawTrace::Operation> traceOperation;
+    if (!resolvingAhead() && frozenSink() == nullptr && DrawTrace::Current().operation == 0) traceOperation.emplace("dispatch");
     if (drawRecordState().active || resolvingAhead() || frozenSink() != nullptr || !deferDispatchRecords(submission.queue)) {
         dispatchNow(queue, packet, submission, indirectArguments);
         return;
@@ -1214,7 +1364,31 @@ LabelRecordJobCounters LabelRecordJobTotals() {
 
 CommandProcessorReadCounters CommandProcessorReadTotals() {
     const auto& counts = packetWaitCounts();
-    return {counts.commandProcessorReads.load(std::memory_order_relaxed), counts.commandProcessorReadsAhead.load(std::memory_order_relaxed), counts.commandProcessorReadsVerified.load(std::memory_order_relaxed), counts.registerStatePackets.load(std::memory_order_relaxed), counts.syncsDeferred.load(std::memory_order_relaxed), counts.syncDrains.load(std::memory_order_relaxed), counts.labelDrains.load(std::memory_order_relaxed), counts.waitsSatisfied.load(std::memory_order_relaxed)};
+    return {counts.commandProcessorReads.load(std::memory_order_relaxed), counts.commandProcessorReadsAhead.load(std::memory_order_relaxed), counts.commandProcessorReadsVerified.load(std::memory_order_relaxed), counts.registerStatePackets.load(std::memory_order_relaxed), counts.syncsDeferred.load(std::memory_order_relaxed), counts.syncDrains.load(std::memory_order_relaxed), counts.labelDrains.load(std::memory_order_relaxed), counts.waitsSatisfied.load(std::memory_order_relaxed), counts.predicationReads.load(std::memory_order_relaxed), counts.unknownDrains.load(std::memory_order_relaxed)};
+}
+
+bool Driver::overlapPredicationRead(std::uint64_t address, std::size_t bytes) {
+    const auto mode = CommandProcessorReadsMode();
+    if (mode == CommandProcessorReads::Drain || commandProcessorSyncPending() || unknownRecordWriters().load(std::memory_order_acquire) != 0 || labelInFlightOverlaps(address, bytes)) return false;
+    auto& counts = packetWaitCounts();
+    counts.predicationReads.fetch_add(1, std::memory_order_relaxed);
+    if (mode == CommandProcessorReads::Overlap || !recordsInFlight()) return true;
+    std::vector<std::byte> early(bytes);
+    std::vector<std::byte> late(bytes);
+    {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Wait);
+        GuestMemory::Read(address, early, bytes);
+    }
+    waitDrawRecordsAt(0x102u);
+    {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Wait);
+        GuestMemory::Read(address, late, bytes);
+    }
+    counts.commandProcessorReadsVerified.fetch_add(1, std::memory_order_relaxed);
+    if (early == late) return true;
+    char what[192];
+    std::snprintf(what, sizeof(what), "APS5_CP_READS_OVERLAP=verify: the predicate at 0x%llx+0x%zx read ahead of the draw records changed once they were recorded", static_cast<unsigned long long>(address), bytes);
+    throw std::runtime_error(what);
 }
 
 bool Driver::overlapCommandProcessorRead(std::span<const std::uint32_t> packet) {
@@ -1233,6 +1407,10 @@ bool Driver::overlapCommandProcessorRead(std::span<const std::uint32_t> packet) 
     const auto waitOpcode = (packet[0] >> 8u) & 0xffu;
     if ((waitOpcode == 0x3c || waitOpcode == 0x93) && packet.size() >= 4) {
         if (commandProcessorSyncPending()) return false;
+        if (unknownRecordWriters().load(std::memory_order_acquire) != 0) {
+            packetWaitCounts().unknownDrains.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
         if (labelInFlightOverlaps(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), waitOpcode == 0x93 ? 8u : 4u)) return false;
         if (!Pm4::WaitSatisfied(packet)) return false;
         packetWaitCounts().waitsSatisfied.fetch_add(1, std::memory_order_relaxed);
@@ -1242,6 +1420,10 @@ bool Driver::overlapCommandProcessorRead(std::span<const std::uint32_t> packet) 
     if (!read) return false;
     if (commandProcessorSyncPending()) {
         packetWaitCounts().syncDrains.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (unknownRecordWriters().load(std::memory_order_acquire) != 0) {
+        packetWaitCounts().unknownDrains.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     if (labelInFlightOverlaps(read->address, read->bytes)) {
@@ -1275,6 +1457,8 @@ bool Driver::overlapCommandProcessorRead(std::span<const std::uint32_t> packet) 
 }
 
 void Driver::waitDrawRecords() {
+    DrawTrace::Span wait("Driver.RecordDrainWait");
+    DrawTrace::Note("wait_reason", "ordered_records");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto opcode = packetWaitOpcode();
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1297,13 +1481,16 @@ void Driver::waitDrawRecords() {
     Graphics::Recorder::DrainChunks();
     finishDrawRecords();
     commandProcessorSyncPending() = false;
-    labelRangesInFlight().clear();
+    labelRangesInFlight().count = 0;
+    labelRangesInFlight().overflowed = false;
 }
 
 void Driver::startDrawRecords() {
     auto& records = drawRecords();
     if (records.Started()) return;
     records.Start([] {
+        DrawTrace::BindThread("draw record worker");
+        if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("draw record worker");
         thread_local const bool tagged = (GuestMemory::TagGpuLockThread(RecordWorkerTag), true);
         (void)tagged;
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
@@ -1313,15 +1500,20 @@ void Driver::startDrawRecords() {
     });
 }
 
-void Driver::postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::string identity, std::function<void(DrawRecordResult&)> record) {
+void Driver::postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, std::uint32_t queue, std::string identity, std::function<void(DrawRecordResult&)> record, const char* operationKind) {
     auto& records = drawRecords();
     startDrawRecords();
     auto result = std::make_shared<DrawRecordResult>();
     drawRecordResult = result;
     const bool ahead = prepareAhead() != 0;
     auto provisional = ahead ? drawRecordWindow.Take() : PrepareAheadWindow<DrawRecordResult>::Provisional{};
+    auto writer = std::make_shared<PendingWriter>();
     if (!provisional.earlier.empty()) ++drawRecordCounters().aheadPosts;
-    result->ticket = records.Post([result, record = std::move(record), identity = std::move(identity), queue, epoch = GuestMemory::CollectEpoch(), device = localDevice, provisional = std::move(provisional)] {
+    result->ticket = records.Post(ObserveRecord([result, record = std::move(record), identity = std::move(identity), queue, epoch = GuestMemory::CollectEpoch(), device = localDevice, provisional = std::move(provisional), writer] {
+        struct CompleteWriter {
+            const std::shared_ptr<PendingWriter>& writer;
+            ~CompleteWriter() { writer->Complete(); }
+        } completeWriter{writer};
         struct Restore {
             std::uint32_t tag;
             std::uint64_t epoch;
@@ -1357,7 +1549,7 @@ void Driver::postDrawRecord(const std::shared_ptr<VulkanDevice>& localDevice, st
         }
         GuestMemory::LogDriverStores(nullptr);
         result->effects.writeGenerationAfter = Graphics::Recorder::WriteGeneration();
-    });
+    }, MakeRecordObservation("Driver.Record", operationKind)));
     if (ahead) {
         drawRecordWindow.Add(result);
         noteAheadDepth(records.Posted() - records.Finished());
@@ -1393,7 +1585,7 @@ void Driver::reportDrawRecords() {
         }
         static CommandProcessorReadCounters lastReads{};
         const auto reads = CommandProcessorReadTotals();
-        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s; command processor reads without a drain: %llu, %llu of them ahead of pending records, %llu verified; register-state packets without a drain: %llu; sync packets deferred to the next command processor read: %llu, drained there: %llu; drained for a label job still in flight over the read: %llu; WAIT_REG_MEM already satisfied without a drain: %llu\n", text.empty() ? " none" : text.c_str(), static_cast<unsigned long long>(reads.reads - lastReads.reads), static_cast<unsigned long long>(reads.ahead - lastReads.ahead), static_cast<unsigned long long>(reads.verified - lastReads.verified), static_cast<unsigned long long>(reads.registerState - lastReads.registerState), static_cast<unsigned long long>(reads.syncsDeferred - lastReads.syncsDeferred), static_cast<unsigned long long>(reads.syncDrains - lastReads.syncDrains), static_cast<unsigned long long>(reads.labelDrains - lastReads.labelDrains), static_cast<unsigned long long>(reads.waitsSatisfied - lastReads.waitsSatisfied));
+        ProfilePrint_nid_no_patch("[record-thread] drains by packet (10 s, waits and time):%s; command processor reads without a drain: %llu, %llu of them ahead of pending records, %llu verified; register-state packets without a drain: %llu; sync packets deferred to the next command processor read: %llu, drained there: %llu; drained for a label job still in flight over the read: %llu; WAIT_REG_MEM already satisfied without a drain: %llu; predicated packets without a drain: %llu\n", text.empty() ? " none" : text.c_str(), static_cast<unsigned long long>(reads.reads - lastReads.reads), static_cast<unsigned long long>(reads.ahead - lastReads.ahead), static_cast<unsigned long long>(reads.verified - lastReads.verified), static_cast<unsigned long long>(reads.registerState - lastReads.registerState), static_cast<unsigned long long>(reads.syncsDeferred - lastReads.syncsDeferred), static_cast<unsigned long long>(reads.syncDrains - lastReads.syncDrains), static_cast<unsigned long long>(reads.labelDrains - lastReads.labelDrains), static_cast<unsigned long long>(reads.waitsSatisfied - lastReads.waitsSatisfied), static_cast<unsigned long long>(reads.predicationReads - lastReads.predicationReads));
         lastReads = reads;
         static std::array<std::uint64_t, 5> lastLabels{};
         const std::array<std::uint64_t, 5> labelTotals{counts.labelPackets.load(std::memory_order_relaxed), counts.labelJobs.load(std::memory_order_relaxed), counts.labelJobLabels.load(std::memory_order_relaxed), counts.endOfPipeJobs.load(std::memory_order_relaxed), counts.memoryPacketJobs.load(std::memory_order_relaxed)};

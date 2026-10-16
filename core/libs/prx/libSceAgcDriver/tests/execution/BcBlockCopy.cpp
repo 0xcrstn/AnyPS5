@@ -222,6 +222,9 @@ void PendingBlocksCase(AgcDriver::VulkanDevice& device, const Case& test) {
     RequireSame(pending, second, test.name + ": sample of pending blocks");
     Store(device, texels, test, First);
     RequireSame(Sample(device, texels, test.compressed), first, test.name + ": sample of blocks stored again");
+    Require(AgcDriver::Graphics::StorageTexture::FindPending(reinterpret_cast<std::uintptr_t>(texels), bytes) != nullptr, test.name + ": sampling the repeated compressed view stored the pending blocks to guest memory");
+    Settle(device, texels, bytes);
+    Require(AgcDriver::Graphics::StorageTexture::FindPending(reinterpret_cast<std::uintptr_t>(texels), bytes) == nullptr, test.name + ": the guest block still owns unpublished GPU results at teardown");
 }
 
 }

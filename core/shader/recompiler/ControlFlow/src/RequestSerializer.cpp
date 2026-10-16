@@ -1,4 +1,5 @@
 #include "ControlFlow/RequestSerializer.hpp"
+#include <bit>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -100,9 +101,12 @@ std::string base64Decode(std::string_view text) {
 
 class Writer {
 public:
-    explicit Writer(std::string& buffer) : m_buffer(buffer) {}
+    explicit Writer(const std::function<void(std::string_view)>& visitor) : visitor(visitor) { buffer.reserve(4096u); }
 
-    void WriteU8(std::uint8_t value) { m_buffer.push_back(static_cast<char>(value)); }
+    void WriteU8(std::uint8_t value) {
+        buffer.push_back(static_cast<char>(value));
+        if (buffer.size() == 4096u) Flush();
+    }
     void WriteBool(bool value) { WriteU8(value ? 1u : 0u); }
 
     void WriteU32(std::uint32_t value) {
@@ -121,25 +125,35 @@ public:
 
     void WriteBytes(std::span<const std::byte> bytes) {
         WriteU64(bytes.size());
-        for (const std::byte b : bytes) {
-            WriteU8(static_cast<std::uint8_t>(b));
-        }
+        Flush();
+        visitor(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
     }
 
     void WriteU32Span(std::span<const std::uint32_t> values) {
         WriteU64(values.size());
-        for (const std::uint32_t value : values) {
-            WriteU32(value);
+        if constexpr (std::endian::native == std::endian::little) {
+            Flush();
+            visitor(std::string_view(reinterpret_cast<const char*>(values.data()), values.size_bytes()));
+        } else {
+            for (const std::uint32_t value : values) WriteU32(value);
         }
     }
 
     void WriteString(std::string_view text) {
         WriteU64(text.size());
-        m_buffer.append(text);
+        Flush();
+        visitor(text);
+    }
+
+    void Flush() {
+        if (buffer.empty()) return;
+        visitor(buffer);
+        buffer.clear();
     }
 
 private:
-    std::string& m_buffer;
+    const std::function<void(std::string_view)>& visitor;
+    std::string buffer;
 };
 
 class Reader {
@@ -773,10 +787,19 @@ GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGr
 }
 
 std::string RequestSerializer::Serialize(const RecompileRequest& request) const {
+    return base64Encode(SerializeBinary(request));
+}
+
+std::string RequestSerializer::SerializeBinary(const RecompileRequest& request) const {
     std::string buffer;
-    Writer writer(buffer);
+    VisitSerialized(request, [&](std::string_view bytes) { buffer.append(bytes); });
+    return buffer;
+}
+
+void RequestSerializer::VisitSerialized(const RecompileRequest& request, const std::function<void(std::string_view)>& visitor) const {
+    Writer writer(visitor);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(30u);
+    writer.WriteU32(32u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -801,15 +824,20 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.vertexSubgroups);
     writer.WriteBool(request.target.float16DenormPreserve);
     writer.WriteU32Span(request.context.linkedCallFallbacks);
-    return base64Encode(buffer);
+    writer.WriteBool(request.target.fixedPushSlots);
+    writer.Flush();
 }
 
 DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const {
     const std::string decoded = base64Decode(text);
-    Reader reader(decoded);
+    return DeserializeBinary(decoded);
+}
+
+DeserializedRequest RequestSerializer::DeserializeBinary(std::string_view bytes) const {
+    Reader reader(bytes);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 30u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 32u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);
@@ -845,6 +873,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.linkedCallFallbacks = reader.ReadU32Vector();
         result.request.context.linkedCallFallbacks = result.linkedCallFallbacks;
     }
+    if (version >= 31u) result.request.target.fixedPushSlots = reader.ReadBool();
     if (version >= 21u && reader.Remaining() != 0u) throw std::runtime_error("RequestSerializer: unexpected trailing data");
     return result;
 }

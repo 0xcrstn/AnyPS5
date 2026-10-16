@@ -268,7 +268,7 @@ void Run(const Context& context, const WatchedBlock& block) {
         FillLayer(block.Data() + LayerBytes, 0.75f);
         Require(sample("after a CPU write") != 0, "sampling the depth planes after a CPU write to the guest layer did not read it again");
         Require(sample("after the re-read") == 0, "sampling the depth planes after the re-read of the written layer read it once more");
-        AgcDriver::GuestMemory::MarkWritten(address + LayerBytes, 4096);
+        AgcDriver::GuestMemory::MarkWritten(address + LayerBytes, 4096, AgcDriver::GuestMemory::WriteExtent::Exact);
         Require(sample("after a driver store") != 0, "sampling the depth planes after a driver store over the guest layer did not read it again");
         const DepthTarget slice{address, 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0, 0};
         const DepthTarget other{address + 2 * BlockBytes, 0, {Side, Side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0, 0};

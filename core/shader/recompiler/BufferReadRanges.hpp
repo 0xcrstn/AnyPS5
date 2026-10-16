@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <initializer_list>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <utility>
@@ -65,6 +66,27 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
         if (value.second < 0.0f && value.second > -smallest) value.second = 0.0f;
         return value;
     };
+    constexpr auto infinity = std::numeric_limits<double>::infinity();
+    constexpr auto floatInfinity = std::numeric_limits<float>::infinity();
+    const auto rounded = [&](double low, double high) {
+        FloatInterval value{static_cast<float>(low), static_cast<float>(high)};
+        if (static_cast<double>(value.first) > low) value.first = std::nextafter(value.first, -floatInfinity);
+        if (static_cast<double>(value.second) < high) value.second = std::nextafter(value.second, floatInfinity);
+        constexpr double smallest = 0x1p-126;
+        if (low > 0.0 && low < smallest) value.first = 0.0f;
+        if (high < 0.0 && high > -smallest) value.second = 0.0f;
+        return value;
+    };
+    const auto sum = [&](float a, float b) {
+        const auto result = static_cast<double>(a) + static_cast<double>(b);
+        if (a == 0.0f || b == 0.0f || std::abs(std::ilogb(static_cast<double>(a)) - std::ilogb(static_cast<double>(b))) <= 29) return rounded(result, result);
+        return rounded(std::nextafter(result, -infinity), std::nextafter(result, infinity));
+    };
+    const auto errorBound = [&](double magnitude) {
+        const auto value = static_cast<float>(magnitude);
+        if (!std::isfinite(value)) return infinity;
+        return std::max(0x1p-126, static_cast<double>(std::nextafter(value, floatInfinity)) - static_cast<double>(value));
+    };
     const auto ones = [](std::uint64_t value) {
         std::uint64_t mask = 0;
         while (mask < value) mask = (mask << 1u) | 1u;
@@ -78,8 +100,8 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
         const bool floatArguments = isFloat(node.op) ? node.op != BufferIndexOp::FloatFromUnsigned : node.op == BufferIndexOp::UnsignedFromFloat;
         if ((!leaf && (floating[node.left] != 0u) != floatArguments) || (binary && (floating[node.right] != 0u) != floatArguments)) return fail(BufferIndexFailure::Malformed);
         if (isFloat(node.op)) {
-            const auto& x = floats[node.left];
-            const auto& y = floats[node.right];
+            const auto x = !leaf ? floats[node.left] : FloatInterval{0.0f, 0.0f};
+            const auto y = binary ? floats[node.right] : FloatInterval{0.0f, 0.0f};
             FloatInterval value{0.0f, 0.0f};
             switch (node.op) {
             case BufferIndexOp::FloatConstant: {
@@ -89,23 +111,32 @@ inline std::optional<std::pair<std::uint64_t, std::uint64_t>> EvaluateBufferInde
                 break;
             }
             case BufferIndexOp::FloatFromUnsigned:
-                value = hull({static_cast<float>(values[node.left].first), static_cast<float>(values[node.left].second)});
+                value = rounded(static_cast<double>(values[node.left].first), static_cast<double>(values[node.left].second));
                 break;
             case BufferIndexOp::FloatAdd:
-                value = hull({x.first + y.first, x.second + y.second});
+                value = {sum(x.first, y.first).first, sum(x.second, y.second).second};
                 break;
             case BufferIndexOp::FloatSub:
-                value = hull({x.first - y.second, x.second - y.first});
+                value = {sum(x.first, -y.second).first, sum(x.second, -y.first).second};
                 break;
-            case BufferIndexOp::FloatMul:
-                value = hull({x.first * y.first, x.first * y.second, x.second * y.first, x.second * y.second});
+            case BufferIndexOp::FloatMul: {
+                const auto products = {static_cast<double>(x.first) * y.first, static_cast<double>(x.first) * y.second, static_cast<double>(x.second) * y.first, static_cast<double>(x.second) * y.second};
+                value = rounded(std::min(products), std::max(products));
                 break;
+            }
             case BufferIndexOp::FloatFma: {
                 if (node.low >= index || floating[node.low] == 0u) return fail(BufferIndexFailure::Malformed);
                 const auto& z = floats[node.low];
-                const auto fused = [](float a, float b, float c) { return std::fma(a, b, c); };
-                const auto separate = [](float a, float b, float c) { const volatile float product = a * b; return product + c; };
-                value = hull({fused(x.first, y.first, z.first), fused(x.first, y.second, z.first), fused(x.second, y.first, z.first), fused(x.second, y.second, z.first), fused(x.first, y.first, z.second), fused(x.first, y.second, z.second), fused(x.second, y.first, z.second), fused(x.second, y.second, z.second), separate(x.first, y.first, z.first), separate(x.first, y.second, z.first), separate(x.second, y.first, z.first), separate(x.second, y.second, z.first), separate(x.first, y.first, z.second), separate(x.first, y.second, z.second), separate(x.second, y.first, z.second), separate(x.second, y.second, z.second)});
+                const auto products = {static_cast<double>(x.first) * y.first, static_cast<double>(x.first) * y.second, static_cast<double>(x.second) * y.first, static_cast<double>(x.second) * y.second};
+                const auto productLow = std::min(products);
+                const auto productHigh = std::max(products);
+                const auto magnitude = std::max(std::abs(productLow), std::abs(productHigh));
+                const auto productError = errorBound(magnitude);
+                const auto sumMagnitude = std::nextafter(magnitude + std::max(std::abs(static_cast<double>(z.first)), std::abs(static_cast<double>(z.second))) + productError, infinity);
+                const auto error = std::nextafter(productError + errorBound(sumMagnitude), infinity);
+                const auto low = std::nextafter(productLow + static_cast<double>(z.first), -infinity);
+                const auto high = std::nextafter(productHigh + static_cast<double>(z.second), infinity);
+                value = rounded(std::nextafter(low - error, -infinity), std::nextafter(high + error, infinity));
                 break;
             }
             case BufferIndexOp::FloatFloor:

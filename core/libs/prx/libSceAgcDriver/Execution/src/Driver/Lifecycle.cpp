@@ -5,8 +5,10 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrawTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "ShaderInputInventory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <atomic>
 #include <cstdint>
@@ -105,6 +107,7 @@ void Driver::stop() {
         queueScheduler.Close(std::make_exception_ptr(ProcessShutdown{}));
         eopFlips.clear();
         for (auto& [queue, worker] : workers) {
+            for (const auto& item : worker.pending) DrawTrace::CancelJob(item.traceJob);
             worker.pending.clear();
             worker.unfinishedWrites.clear();
             worker.queued.store(0, std::memory_order_release);
@@ -124,6 +127,9 @@ void Driver::stop() {
     StopWorkerSampler();
     MemoryReport::Stop();
     CloseRegistrationPreparation();
+    if (const auto current = device.Load()) current->StopPipelinePreparation();
+    for (const auto& replaced : replacedDevices) replaced->StopPipelinePreparation();
+    ShaderRecompiler::FlushShaderInputs();
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     device.Reset();
     replacedDevices.clear();
@@ -210,6 +216,7 @@ void Driver::ReportFailure(std::exception_ptr error) {
         for (const auto& [handle, output] : outputs) output->Fail(failure);
         for (auto& [queue, worker] : workers) {
             for (const auto& item : worker.pending) {
+                DrawTrace::CancelJob(item.traceJob, DrawTrace::Status::Failed);
                 for (const auto& [offset, flip] : item.flips) flip->Fail(failure);
             }
             worker.pending.clear();

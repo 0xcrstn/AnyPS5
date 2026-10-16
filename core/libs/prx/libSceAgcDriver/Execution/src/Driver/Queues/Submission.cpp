@@ -8,6 +8,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <span>
+#include <utility>
+#include <vector>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -37,6 +43,42 @@ bool EopRelease(std::span<const std::uint32_t> words) {
 
 }
 
+void Submission::InitializeTrace(DrawTrace::Context origin) {
+    if (!DrawTrace::Enabled()) return;
+    if (origin.submission == 0 && traceContext.submission != 0) origin = traceContext;
+    if (origin.driver == 0) {
+        static const auto driver = DrawTrace::NextId();
+        origin.driver = driver;
+    }
+    if (origin.submission == 0) origin.submission = DrawTrace::NextId();
+    if (traceContext.submission == 0 || origin.submission != traceContext.submission) origin.segment = DrawTrace::NextId();
+    else origin.segment = traceContext.segment;
+    origin.packet = origin.operation = origin.job = 0;
+    origin.queue = queue;
+    origin.packetOffset = 0;
+    origin.opcode = 0xffffffffu;
+    traceContext = origin;
+    DrawTrace::Link(origin.submission, origin.segment, "contains");
+    tracePackets.clear();
+    for (std::size_t at = 0; at < commands.size();) {
+        const auto header = commands[at];
+        const auto words = Pm4::FillerPacket(header) ? std::size_t{1} : Pm4::PacketWords(header);
+        if (words == 0 || words > commands.size() - at) break;
+        auto packet = origin;
+        packet.packet = DrawTrace::NextId();
+        packet.packetOffset = at;
+        packet.opcode = (header >> 8u) & 0xffu;
+        tracePackets.emplace(at, packet);
+        at += words;
+    }
+}
+
+DrawTrace::Context Submission::TraceAt(std::size_t offset) const {
+    if (!DrawTrace::Enabled()) return {};
+    if (const auto found = tracePackets.find(offset); found != tracePackets.end()) return found->second;
+    return traceContext;
+}
+
 void Driver::copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words) {
     submission.commands.clear();
     submission.conditionalEnds.clear();
@@ -47,6 +89,10 @@ void Driver::copyCommands(Submission& submission, const std::uint32_t* guest, st
 bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget) {
     require(words <= budget, "command buffer jumps exceed the copy limit (a jump loop?)");
     budget -= words;
+    const auto* guestAddress = guest;
+    std::vector<std::uint32_t> copied(words);
+    GuestMemory::CopyDriverMemory(copied.data(), guest, copied.size() * sizeof(std::uint32_t));
+    guest = copied.data();
     std::vector<std::pair<std::size_t, std::size_t>> guarded;
     const auto reach = [&](std::size_t cursor, std::size_t next) {
         std::erase_if(guarded, [&](const auto& range) {
@@ -121,7 +167,7 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
         cursor += count;
         if (opcode == 0x59u) {
             require(guarded.empty(), "a REWIND inside a conditional execution range is not implemented");
-            submission.rewindTail = guest + cursor;
+            submission.rewindTail = guestAddress + cursor;
             submission.rewindWords = words - cursor;
             return true;
         }
@@ -131,13 +177,68 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
     return false;
 }
 
+namespace {
+
+std::atomic<std::uint64_t>& deferredRegisterLists() {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
+}
+
+std::uint64_t Driver::DeferredRegisterLists() {
+    return deferredRegisterLists().load(std::memory_order_relaxed);
+}
+
+RegisterListSnapshot RegisterListSnapshot::Capture(std::span<const std::uint32_t> packet) {
+    const auto read = Pm4::CommandProcessorReadOf(packet);
+    require(read.has_value() && Pm4::IndirectRegisterOpcode((packet[0] >> 8u) & 0xffu), "expected an indirect register-list packet");
+    GuestMemory::FlushGpuWrites(read->address, read->bytes);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    RegisterListSnapshot snapshot;
+    snapshot.values = Pm4::ReadIndirectRegisterWords(packet, &snapshot.writes);
+    return snapshot;
+}
+
+std::vector<std::uint32_t> RegisterListSnapshot::Resolve(std::span<const std::uint32_t> packet) const {
+    const auto read = Pm4::CommandProcessorReadOf(packet);
+    require(read.has_value() && Pm4::IndirectRegisterOpcode((packet[0] >> 8u) & 0xffu), "expected an indirect register-list packet");
+    GuestMemory::FlushGpuWrites(read->address, read->bytes);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    require(writes != nullptr, "the register-list snapshot has no driver-store watch");
+    if (GuestMemory::DriverSnapshotUnchanged(*writes)) {
+        if (packet[3] == 0x80000000u) return values;
+        return Pm4::IndirectRegisterPairs(packet, values);
+    }
+    auto updated = values;
+    GuestMemory::ApplyDriverSnapshot(*writes, std::as_writable_bytes(std::span(updated)));
+    if (packet[3] == 0x80000000u) return updated;
+    return Pm4::IndirectRegisterPairs(packet, updated);
+}
+
 void Driver::readRegisterLists(Submission& submission) {
     submission.registerLists.clear();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
+    const auto storedBefore = [&](std::uint64_t address, std::size_t bytes) {
+        const auto overlaps = [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return address < range.second && range.first < address + bytes; };
+        return std::any_of(own.begin(), own.end(), overlaps);
+    };
     for (std::size_t cursor = 0; cursor < submission.commands.size(); cursor += Pm4::PacketWords(submission.commands[cursor])) {
         const auto header = submission.commands[cursor];
-        if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
+        if ((header >> 30u) != 3u) continue;
+        const auto packet = std::span<const std::uint32_t>(submission.commands).subspan(cursor, Pm4::PacketWords(header));
+        if (!Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) {
+            for (const auto& store : Pm4::DecodeStores(packet)) {
+                if (store.bytes != 0) own.emplace_back(store.address, store.address + store.bytes);
+            }
+            continue;
+        }
+        if (const auto read = Pm4::CommandProcessorReadOf(packet); read.has_value() && storedBefore(read->address, read->bytes)) {
+            deferredRegisterLists().fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         try {
-            submission.registerLists.emplace(cursor, Pm4::ReadIndirectRegisters(std::span<const std::uint32_t>(submission.commands).subspan(cursor, Pm4::PacketWords(header))));
+            submission.registerLists.emplace(cursor, RegisterListSnapshot::Capture(packet));
         } catch (const std::exception& error) {
             throw std::runtime_error("AGC driver: " + Pm4::Name(header) + " at DWORD " + std::to_string(cursor) + ": " + error.what());
         }
@@ -184,8 +285,12 @@ void Driver::holdFlipBehindWorker(const Submission& submission) {
         flips = words[0] == FlipPacketHeader || (EopRelease(words) && eopFlips.contains(words[7]));
     }
     if (!flips) return;
+    DrawTrace::Span flipHoldWait("Driver.FlipHoldWait");
+    DrawTrace::Note("wait_reason", "prior_flip_reservation");
+    DrawTrace::Note("wait_dependency", "prior_flip_identity_unavailable");
     flipHolders.fetch_add(1, std::memory_order_acq_rel);
     changed.wait(lock, [&] { return failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipsAhead.load(std::memory_order_acquire) == 0 || queue0AwaitsTitle.load(std::memory_order_acquire); });
+    DrawTrace::Note("wait_outcome", failure != nullptr ? "failed" : stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() ? "cancelled" : "satisfied");
     flipHolders.fetch_sub(1, std::memory_order_acq_rel);
 }
 
@@ -233,6 +338,9 @@ void Driver::executeRewindTail(const Submission& stalled) {
     PerformanceTimer timing("Driver.Rewind");
     std::atomic_ref<std::uint32_t> control(*const_cast<std::uint32_t*>(stalled.rewindTail - 1));
     if ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
+        DrawTrace::Span rewindWait("Driver.RewindControlWait");
+        DrawTrace::Note("wait_reason", "guest_rewind_valid");
+        DrawTrace::Note("wait_address", reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1));
         noteWaitBlocked(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1), true);
         struct BlockedWait {
             Driver& driver;
@@ -245,14 +353,21 @@ void Driver::executeRewindTail(const Submission& stalled) {
             noteAwaitingTitle(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1));
             PollSleep();
         }
+        DrawTrace::Note("wait_outcome", "satisfied");
     }
     Submission tail{};
     tail.queue = stalled.queue;
     if (APS5_ENABLE_TIMING_LOG) tail.receivedAt = std::chrono::steady_clock::now();
+    tail.InitializeTrace(stalled.traceContext);
+    DrawTrace::ContextScope traceContext(tail.traceContext);
+    DrawTrace::Record(DrawTrace::EventKind::Segment, tail.traceContext.segment, stalled.traceContext.segment);
+    DrawTrace::Link(stalled.traceContext.segment, tail.traceContext.segment, "rewinds_to");
     copyCommands(tail, stalled.rewindTail, stalled.rewindWords);
+    DrawTrace::RecordCounter("command_copy_bytes", tail.commands.size() * sizeof(std::uint32_t), "bytes", tail.traceContext.segment);
     if (APS5_ENABLE_TIMING_LOG) tail.copiedAt = std::chrono::steady_clock::now();
     validate(tail, stalled.rewindTail);
     readRegisterLists(tail);
+    tail.InitializeTrace(stalled.traceContext);
     if (APS5_ENABLE_TIMING_LOG) tail.validatedAt = std::chrono::steady_clock::now();
     waitForFlipRoom(tail);
     if (APS5_ENABLE_TIMING_LOG) tail.roomReadyAt = std::chrono::steady_clock::now();
@@ -271,18 +386,25 @@ void Driver::executeRewindTail(const Submission& stalled) {
     if (capture != nullptr) writeCaptured(*this, *capture, captured);
     if (APS5_ENABLE_TIMING_LOG) tail.enqueuedAt = tail.dequeuedAt = tail.orderedAt = std::chrono::steady_clock::now();
     timing.Finish();
+    tail.traceJob = DrawTrace::ScheduleJob("Driver.RewindSegment");
     execute(tail);
 }
 
 void Driver::Submit(const Packet* packet, std::uint32_t queue) {
+    Submission submission{};
+    submission.queue = queue;
+    submission.InitializeTrace();
+    DrawTrace::ContextScope traceContext(submission.traceContext);
+    DrawTrace::BindThread("submission caller");
+    DrawTrace::Span submitScope("Driver.Submit");
+    DrawTrace::Record(DrawTrace::EventKind::Submission, submission.traceContext.submission);
+    DrawTrace::Record(DrawTrace::EventKind::Segment, submission.traceContext.segment);
     const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CheckFailure();
     require(queue == 0 || (queue >= 0x20 && queue < 0x58), "unsupported compute queue");
     GuestMemory::CheckRange(packet, sizeof(Packet), alignof(Packet));
     const auto descriptor = *packet;
     require(descriptor.flags == 0, "nonzero submission flags are not implemented");
-    Submission submission{};
-    submission.queue = queue;
     submission.receivedAt = receivedAt;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& costs = submissionCosts(queue);
@@ -293,13 +415,23 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         copyCommands(submission, descriptor.addr, descriptor.dw_num);
     }
     const auto copied = profile ? std::chrono::steady_clock::now() : start;
+    DrawTrace::RecordCounter("command_copy_bytes", submission.commands.size() * sizeof(std::uint32_t), "bytes", submission.traceContext.segment);
     if (APS5_ENABLE_TIMING_LOG) submission.copiedAt = std::chrono::steady_clock::now();
     validate(submission, descriptor.addr);
     readRegisterLists(submission);
+    submission.InitializeTrace();
     if (APS5_ENABLE_TIMING_LOG) submission.validatedAt = std::chrono::steady_clock::now();
-    waitForFlipRoom(submission);
-    holdFlipBehindWorker(submission);
-    AwaitRegistrationPreparation();
+    {
+        DrawTrace::Span flipRoomWait("Driver.FlipRoomWait");
+        DrawTrace::Note("wait_reason", "video_output_flip_capacity");
+        waitForFlipRoom(submission);
+        holdFlipBehindWorker(submission);
+    }
+    {
+        DrawTrace::Span preparationWait("Shader.SubmittedPreparationWait");
+        DrawTrace::Note("wait_reason", "submitted_shader_preparation_ticket");
+        AwaitRegistrationPreparation();
+    }
     if (APS5_ENABLE_TIMING_LOG) submission.roomReadyAt = std::chrono::steady_clock::now();
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));
@@ -314,6 +446,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         reserveOutputs(submission);
         submission.shaders = shaders;
         submission.serial = accepted + 1;
+        DrawTrace::Note("submission_serial", submission.serial);
 
         submission.received = ++eventSerial;
         if (capture != nullptr) capture->Take(captured, submission.serial, captureTime(), submission.heldAtSubmit);
@@ -329,7 +462,14 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
             submission.holdsFlip = true;
             flipsAhead.fetch_add(1, std::memory_order_acq_rel);
         }
-        enqueue(std::move(submission));
+        const auto traceJob = DrawTrace::ScheduleJob("Driver.SubmissionExecution");
+        submission.traceJob = traceJob;
+        try {
+            enqueue(std::move(submission));
+        } catch (...) {
+            DrawTrace::CancelJob(traceJob, DrawTrace::Status::Failed);
+            throw;
+        }
         ++accepted;
     }
     changed.notify_all();
@@ -337,6 +477,8 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
 }
 
 void Driver::SuspendPoint() {
+    DrawTrace::BindThread("submission caller");
+    DrawTrace::Span suspendScope("Driver.SuspendPoint");
     const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     require(!onWorkerThread(), "worker cannot suspend itself");
     auto* const capture = SubmissionCapture::Active();
@@ -350,10 +492,21 @@ void Driver::SuspendPoint() {
     boundary.suspend = true;
 
     boundary.queue = 0;
+    boundary.InitializeTrace();
+    DrawTrace::ContextScope traceContext(boundary.traceContext);
+    DrawTrace::Record(DrawTrace::EventKind::Submission, boundary.traceContext.submission, 0, boundary.serial);
+    DrawTrace::Record(DrawTrace::EventKind::Segment, boundary.traceContext.segment);
     boundary.receivedAt = receivedAt;
     boundary.enqueuedAt = std::chrono::steady_clock::now();
     if (capture != nullptr) capture->Take(captured, boundary.serial, captureTime(), boundary.heldAtSubmit);
-    enqueue(std::move(boundary));
+    const auto traceJob = DrawTrace::ScheduleJob("Driver.SuspendExecution");
+    boundary.traceJob = traceJob;
+    try {
+        enqueue(std::move(boundary));
+    } catch (...) {
+        DrawTrace::CancelJob(traceJob, DrawTrace::Status::Failed);
+        throw;
+    }
     ++accepted;
 
     changed.notify_all();
@@ -453,8 +606,8 @@ void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
         if (std::find(submission.labelWrites.begin(), submission.labelWrites.end(), dword) != submission.labelWrites.end()) return;
         if (worker != workers.end() && worker->second.unfinishedWrites.contains(dword)) return;
     }
-    std::uint64_t value = *reinterpret_cast<const volatile std::uint32_t*>(address);
-    if (bytes == 8) value |= static_cast<std::uint64_t>(*reinterpret_cast<const volatile std::uint32_t*>(address + 4)) << 32u;
+    std::uint64_t value = GuestMemory::LoadDriverAtomic(address, 4);
+    if (bytes == 8) value |= GuestMemory::LoadDriverAtomic(address + 4, 4) << 32u;
     if (Pm4::WaitComparesValue(packet, value)) submission.heldAtSubmit.insert(cursor);
 }
 

@@ -1,8 +1,11 @@
 #include "SpirvBackend/SpirvModule.hpp"
 #include "SpirvBackend/SpirvSpecialization.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
+#include "IntermediateRepresentation/IrProgram.hpp"
 #include <array>
 #include <cstdio>
 #include <exception>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -298,7 +301,56 @@ void testIdsBeyondTheBoundAreRejected() {
     check(rejected, "a module whose ids reach its bound was specialized");
 }
 
+void testBdaRootOrderFollowsProgram() {
+    IrProgram program;
+    auto& entry = program.CreateBlock();
+    auto& left = program.CreateBlock();
+    auto& right = program.CreateBlock();
+    program.BlockOrder() = {&entry, &left, &right};
+    entry.AddSuccessor(&left);
+    entry.AddSuccessor(&right);
+    left.AddPredecessor(&entry);
+    right.AddPredecessor(&entry);
+    auto& lowA = program.CreateValue(IrOpcode::GetUserData, IrType::U32);
+    auto& lowB = program.CreateValue(IrOpcode::GetUserData, IrType::U32);
+    auto& high = program.CreateValue(IrOpcode::GetUserData, IrType::U32);
+    entry.AppendInstruction(&lowA);
+    entry.AppendInstruction(&lowB);
+    entry.AppendInstruction(&high);
+    const auto pointerLess = std::less<const IrValue*>{};
+    IrValue* first = pointerLess(&lowA, &lowB) ? &lowB : &lowA;
+    IrValue* second = first == &lowA ? &lowB : &lowA;
+    auto& handleFirst = program.CreateValue(IrOpcode::GetAddressResource, IrType::U64);
+    handleFirst.AddArgument(first);
+    handleFirst.AddArgument(&high);
+    auto& handleSecond = program.CreateValue(IrOpcode::GetAddressResource, IrType::U64);
+    handleSecond.AddArgument(second);
+    handleSecond.AddArgument(&high);
+    entry.AppendInstruction(&handleFirst);
+    entry.AppendInstruction(&handleSecond);
+    program.Resources().memoryInfo.resize(1);
+    for (auto* block : {&left, &right}) {
+        for (auto* handle : {&handleFirst, &handleSecond}) {
+            auto& load = program.CreateValue(IrOpcode::LoadAddressU32, IrType::U32);
+            load.AddArgument(handle);
+            load.SetFlags(MemoryFlags{});
+            block->AppendInstruction(&load);
+        }
+    }
+    SpirvEmitterState state(program, {});
+    state.bdaProvenance = RewriteMode::On;
+    state.bdaRelative = BdaTable::Relative::On;
+    state.bdaCapability[0] = 1u;
+    PrepareBdaProvenance(state);
+    const auto roots = state.bdaRootsAfter.at(&high);
+    check(roots.size() == 2u && roots[0].first == first && roots[1].first == second,
+          "BDA roots sharing a placement followed allocation addresses instead of program encounter order");
+    PrepareBdaProvenance(state);
+    check(state.bdaRootsAfter.at(&high) == roots, "repeated BDA provenance planning changed root order");
+}
+
 int main() {
+    testBdaRootOrderFollowsProgram();
     testFoldingLeavesNoDeadBlocksOrConstants();
     testIdsBeyondTheBoundAreRejected();
     testStructExtractsAreNotShuffled();

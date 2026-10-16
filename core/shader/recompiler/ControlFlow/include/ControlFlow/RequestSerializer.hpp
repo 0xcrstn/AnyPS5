@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILIER_CONTROLFLOW_INCLUDE_CONTROLFLOW_REQUESTSERIALIZER_HPP
 
 #include <memory>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -47,6 +48,9 @@ namespace ShaderRecompiler {
     public:
         [[nodiscard]] std::string Serialize(const RecompileRequest& request) const;
         [[nodiscard]] DeserializedRequest Deserialize(std::string_view text) const;
+        [[nodiscard]] std::string SerializeBinary(const RecompileRequest& request) const;
+        [[nodiscard]] DeserializedRequest DeserializeBinary(std::string_view bytes) const;
+        void VisitSerialized(const RecompileRequest& request, const std::function<void(std::string_view)>& visitor) const;
     };
 
 }

@@ -64,9 +64,14 @@ class GuestBlock {
 public:
     explicit GuestBlock(bool watched) {
 #ifdef _WIN32
-        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
-        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
-        static_cast<void>(watched);
+        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(2 * BlockBytes, 65536));
+        Require(block != nullptr, "one-slice alias: cannot reserve shared guest memory");
+        GuestArena::GuestArenaCommit_nid_postfix(block, 2 * BlockBytes, PAGE_READWRITE, BlockBytes);
+        GuestArena::GuestArenaReset_nid_postfix(block, 2 * BlockBytes);
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, BlockBytes, nullptr);
+        Require(section != nullptr, "one-slice alias: cannot allocate shared backing");
+        GuestArena::GuestArenaMap_nid_postfix(block, BlockBytes, section, 0, PAGE_READWRITE);
+        GuestArena::GuestArenaMap_nid_postfix(block + BlockBytes, BlockBytes, section, 0, PAGE_READWRITE);
 #else
         constexpr std::uintptr_t alignment = 65536;
         void* mapped = mmap(nullptr, BlockBytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -87,8 +92,9 @@ public:
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(block);
 #ifdef _WIN32
-        GuestArena::GuestArenaReset_nid_postfix(block, BlockBytes);
-        GuestArena::GuestArenaRelease_nid_postfix(block, BlockBytes);
+        GuestArena::GuestArenaReset_nid_postfix(block, 2 * BlockBytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, 2 * BlockBytes);
+        CloseHandle(section);
 #else
         munmap(block, BlockBytes);
         GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, BlockBytes);
@@ -102,6 +108,9 @@ public:
 
 private:
     std::uint8_t* block = nullptr;
+#ifdef _WIN32
+    HANDLE section = nullptr;
+#endif
 };
 
 std::array<std::uint32_t, 8> TextureDescriptor(const std::uint8_t* texels, std::uint32_t type) {
@@ -170,6 +179,9 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool watched) {
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     Store(device, texels, 0x11111111u);
     Require(StorageTexture::FindPending(surface, SurfaceBytes) != nullptr, "the 2D store left no pending image");
+#ifdef _WIN32
+    Require(GuestArena::GuestArenaMappingProtected_nid_postfix(surface, SurfaceBytes), "the shared one-slice producer did not retain its real native guard");
+#endif
     LoadArray(device, texels);
     RequireOutput(0x11111111u, "the first load through the one-slice array");
     Store(device, texels, 0x22222222u);
@@ -180,6 +192,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, bool watched) {
     if (watched && AgcDriver::GuestMemory::Watched(surface, SurfaceBytes)) {
         Require(StorageTexture::FindPending(surface, SurfaceBytes) == written, "the array image's refresh wrote the 2D image's results back instead of taking them on the device");
     } else {
+        Require(!watched, "the one-slice shared alias lost its native write watch");
         std::puts("the imported block is compared, not watched: taking the results on the device is not checked");
     }
     StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");

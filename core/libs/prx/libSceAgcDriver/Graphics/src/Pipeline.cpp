@@ -1,7 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SlowReport.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrawTraceIdentity.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineRecipe.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelinePreparation.hpp"
+#include "ShaderInputInventory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCreationTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -241,14 +245,14 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || state.depthBiasPerFace || state.rectList || SplitsAlternateAlpha(state)) return false;
     keys = {};
     for (const auto& shader : shaders) {
-        if (shader.stage == Stage::Geometry || shader.program->PipelineVariantId() == 0) return false;
+        if (shader.stage == Stage::Geometry) return false;
         auto& key = shader.stage == Stage::Fragment ? keys.fragmentShader : keys.preRasterization;
         auto& identity = shader.stage == Stage::Fragment ? keys.fragmentShaders : keys.preRasterizationShaders;
-        appendKey(key, shader.stage);
-        appendKey(key, shader.program->PipelineVariantId());
-        appendKey(key, shader.pushConstantOffset);
-        appendKey(identity, shader.stage);
-        appendKey(identity, shader.program->PipelineVariantId());
+        const auto content = PipelineShaderIdentity(shader);
+        appendKey(key, content.size());
+        key.insert(key.end(), content.begin(), content.end());
+        appendKey(identity, content.size());
+        identity.insert(identity.end(), content.begin(), content.end());
         auto& offsets = shader.stage == Stage::Fragment ? keys.fragmentFields[0] : keys.preRasterizationFields[0];
         offsets = offsets * 31u + shader.pushConstantOffset + 1u;
         if (resources.split) {
@@ -354,6 +358,13 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : Pipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout) {}
 
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias), dynamicRendering(context.graphicsPipelineLibrary) {
+    if (DrawTrace::Enabled()) {
+        traceIdentity = DrawTrace::GraphicsPipelineIdentity(context, state, vertexInput, resources, shaders, attachmentLayout);
+        const auto stages = DrawTrace::RegisterShaderStages(shaders);
+        traceMetadata = DrawTrace::RegisterPipelineIdentity(traceIdentity, stages);
+        traceMetadataEpoch = DrawTrace::MetadataEpoch();
+        traceInstance = DrawTrace::NextId();
+    }
     PerformanceTimer timing("Vulkan.GraphicsPipeline");
     sampleLocationsEnabled = ValidateSampleLocations(context, state);
     // A cached pipeline may outlive its device's teardown (see ClearCachedPipelines); it must not keep
@@ -689,6 +700,10 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         release();
         throw;
     }
+}
+
+std::uint64_t Pipeline::TraceMetadata() const {
+    return traceMetadataEpoch == DrawTrace::MetadataEpoch() ? traceMetadata : 0;
 }
 
 bool Pipeline::Prebuild(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
@@ -1042,108 +1057,32 @@ void append(std::vector<std::byte>& key, const TValue& value) {
 // control and evaluation stages are generated from the vertex and fragment results, which the key
 // already names, so they carry no id of their own.
 void pipelineKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
-    using Stage = ShaderRecompiler::ShaderStage;
-    key.clear();
-    append(key, context.device);
-    append(key, attachmentLayout);
+    key = PipelineRecipeStateIdentity(state, input, resources, attachmentLayout);
     append(key, shaders.size());
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
-        const bool generated = (state.rectList && (shader.stage == Stage::TessellationControl || shader.stage == Stage::TessellationEvaluation)) || shader.stage == Stage::Geometry;
-        if (!generated && shader.program->PipelineVariantId() == 0) {
-            key.clear();
-            return;
-        }
         append(key, shader.stage);
-        append(key, generated ? std::uint64_t{0} : shader.program->PipelineVariantId());
-        // Where the stage's push constants sit in the block (AssemblePushConstants).
         append(key, shader.pushConstantOffset);
+        append(key, shader.program->spirv.ContentHash());
+        append(key, shader.program->runtimeAbiVersion);
+        append(key, shader.program->bdaAbiVersion);
+        append(key, shader.program->hostSubgroupSize);
+        append(key, shader.program->pushConstants.size());
+        append(key, shader.program->stencilReferences.empty());
+        auto specialization = shader.program->specialization;
+        std::sort(specialization.begin(), specialization.end(), [](const auto& left, const auto& right) { return left.id < right.id; });
+        append(key, specialization.size());
+        for (const auto& constant : specialization) {
+            append(key, constant.id);
+            append(key, constant.value);
+        }
     }
-    append(key, PushConstantStages(shaders));
-    append(key, input.bindings.size());
-    for (const auto& binding : input.bindings) {
-        append(key, binding.binding);
-        append(key, binding.stride);
-        append(key, binding.inputRate);
-    }
-    append(key, input.attributes.size());
-    for (const auto& attribute : input.attributes) {
-        append(key, attribute.location);
-        append(key, attribute.binding);
-        append(key, attribute.format);
-        append(key, attribute.offset);
-    }
-    append(key, resources.mainKey.size());
-    for (const auto word : resources.mainKey) append(key, word);
-    append(key, resources.fragmentKey.size());
-    for (const auto word : resources.fragmentKey) append(key, word);
-    append(key, state.hasColorTarget);
-    append(key, state.rectList);
-    append(key, state.topology);
-    append(key, state.primitiveRestart);
-    append(key, state.cullMode);
-    append(key, state.frontFace);
-    append(key, state.provokingVertexMode);
-    append(key, state.negativeOneToOne);
-    append(key, state.depthClamp && context.depthClamp);
-    append(key, state.conservativeRasterization);
-    append(key, state.blends.size());
-    for (const auto& blend : state.blends) append(key, blend);
-    for (const auto value : state.blendConstants) append(key, value);
-    append(key, state.samples);
-    append(key, state.perSampleShading);
-    append(key, state.customSampleLocations);
-    if (state.customSampleLocations) {
-        append(key, state.sampleLocationGrid);
-        append(key, state.sampleLocations);
-    }
-    append(key, state.colors.size());
-    for (const auto& color : state.colors) append(key, color.format);
-    if (state.blends.size() != state.colors.size()) {
-        for (const auto& color : state.colors) append(key, color.exportIndex);
-    }
-    append(key, state.depth.has_value());
-    if (state.depth) {
-        append(key, state.depth->format);
-        append(key, state.depthTest);
-        append(key, state.depthWrite);
-        append(key, state.depthCompare);
-        append(key, state.depthBoundsTest);
-        append(key, state.depthBias);
-        append(key, state.depthBiasPerFace);
-        append(key, state.stencilTest);
-        auto front = state.stencilFront;
-        auto back = state.stencilBack;
-        if (state.stencilReplayReference) front.reference = back.reference = 0u;
-        append(key, state.stencilReplayReference.has_value());
-        append(key, front);
-        append(key, back);
-    }
-    append(key, state.stages.mesh.has_value());
-    if (state.stages.mesh) {
-        const auto& mesh = *state.stages.mesh;
-        append(key, mesh.inputPrimitive);
-        append(key, mesh.primitivesPerGroup);
-        append(key, mesh.verticesPerGroup);
-        append(key, mesh.maxVertices);
-        append(key, mesh.maxPrimitives);
-        append(key, mesh.threadsPerGroup);
-        append(key, mesh.ldsSizeDwords);
-        append(key, mesh.provokingVertex);
-    }
-    append(key, state.stages.tessellation.has_value());
-    if (state.stages.tessellation) {
-        const auto& tessellation = *state.stages.tessellation;
-        append(key, tessellation.inputControlPoints);
-        append(key, tessellation.outputControlPoints);
-        append(key, tessellation.domain);
-        append(key, tessellation.partitioning);
-        append(key, tessellation.outputTopology);
-        append(key, tessellation.patchesPerGroup);
-        append(key, tessellation.primitiveGroupSize);
-        append(key, tessellation.breakAtInstance);
-    }
-    append(key, HostSampleMask(state));
+    append(key, context.device);
+    append(key, context.bufferPool.get());
+    append(key, context.graphicsPipelineLibrary);
+    append(key, context.pipelineLinkTimeOptimization);
+    append(key, context.pipelineExecutableInfo);
+    append(key, pushStagesOf(context));
 }
 
 std::uint64_t hashKey(const std::vector<std::byte>& key) {
@@ -1158,6 +1097,7 @@ struct PipelineStore {
         std::weak_ptr<BufferPool> pool;
         std::uint64_t hash;
         std::vector<std::byte> key;
+        std::vector<ShaderRecompiler::SharedSpirv> modules;
         std::shared_ptr<Pipeline> pipeline;
     };
     std::mutex mutex;
@@ -1167,12 +1107,14 @@ struct PipelineStore {
     struct Pending {
         VkDevice device;
         std::vector<std::byte> key;
+        std::vector<ShaderRecompiler::SharedSpirv> modules;
         std::shared_future<std::shared_ptr<Pipeline>> result;
         std::shared_ptr<CompileTicket> ticket;
     };
     std::unordered_map<std::uint64_t, Pending> pending;
     std::condition_variable settled;
     std::uint64_t joined = 0;
+    std::uint64_t duplicateBuilds = 0, buildsUnderGpuMutex = 0;
     std::uint64_t hits = 0;
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
@@ -1209,8 +1151,30 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %llu joined a build in flight, %zu cached, %zu building\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), static_cast<unsigned long long>(store.joined), store.entries.size(), store.pending.size());
+    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private, %llu evicted, %llu joined a build in flight, %zu cached, %zu building\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), static_cast<unsigned long long>(store.joined), store.entries.size(), store.pending.size());
     store.hits = store.misses = store.uncached = store.evicted = store.joined = 0;
+}
+
+}
+
+namespace {
+
+std::vector<ShaderRecompiler::SharedSpirv> pipelineModules(std::span<const CompiledShader> shaders) {
+    std::vector<ShaderRecompiler::SharedSpirv> modules;
+    modules.reserve(shaders.size());
+    for (const auto& shader : shaders) modules.push_back(shader.program->spirv);
+    return modules;
+}
+
+void capturePipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) noexcept {
+    if (const auto preparation = context.pipelinePreparation.lock()) {
+        if (!preparation->CanCapture()) return;
+        try {
+            auto recipe = MakePipelineRecipe(state, vertexInput, resources, shaders, attachmentLayout);
+            for (std::size_t index = 0; index < shaders.size(); ++index) recipe.stages[index].inputIdentity = ShaderRecompiler::FindShaderInputIdentity(*shaders[index].program);
+            preparation->Capture(recipe);
+        } catch (...) { preparation->RecordCaptureFailure(); }
+    }
 }
 
 }
@@ -1221,21 +1185,27 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     const auto build = [&] {
-        if (context.pipelineBuildRunner == nullptr) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+        if (context.pipelineBuildRunner == nullptr) {
+            auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+            capturePipeline(context, state, vertexInput, resources, shaders, attachmentLayout);
+            return pipeline;
+        }
         std::size_t words = 0;
         for (const auto& shader : shaders) words += shader.program != nullptr ? shader.program->spirv.WordCount() : 0u;
         std::shared_ptr<Pipeline> built;
         context.pipelineBuildRunner(context.pipelineBuildOwner, words * sizeof(std::uint32_t) * 8u, [&] { built = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout); });
         Require(built != nullptr, "graphics pipeline build ran without producing a pipeline");
+        capturePipeline(context, state, vertexInput, resources, shaders, attachmentLayout);
         return built;
     };
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled) return build();
     auto& store = Pipelines();
-    std::unique_lock lock(store.mutex);
-    reportPipelines(store);
     std::vector<std::byte> key;
     pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    const auto modules = pipelineModules(shaders);
+    std::unique_lock lock(store.mutex);
+    reportPipelines(store);
     if (key.empty()) {
         ++store.uncached;
         if (context.pipelineBuildRunner != nullptr) lock.unlock();
@@ -1244,10 +1214,11 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     const auto hash = hashKey(key);
     if (const auto found = store.index.find(hash); found != store.index.end()) {
         const auto it = found->second;
-        if (it->key == key) {
+        if (it->key == key && it->modules == modules) {
             // The key names the device handle, which the loader may reuse for a device created after
             // this one was destroyed without ClearCachedPipelines: such an entry is a miss.
             if (alive(*it, context)) {
+                it->modules = modules;
                 ++store.hits;
                 store.entries.splice(store.entries.end(), store.entries, it);
                 return it->pipeline;
@@ -1256,15 +1227,34 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         } else {
             // A different configuration with the same hash keeps the resident entry; this one stays private.
             ++store.uncached;
-            if (context.pipelineBuildRunner != nullptr) lock.unlock();
+            lock.unlock();
             return build();
         }
     }
     if (const auto building = store.pending.find(hash); building != store.pending.end()) {
-        if (building->second.key != key) {
+        if (building->second.key != key || building->second.modules != modules || GuestMemory::GpuMutex().HeldByThisThread() || context.pipelinePreparationNoWait) {
             ++store.uncached;
-            if (context.pipelineBuildRunner != nullptr) lock.unlock();
-            return build();
+            ++store.duplicateBuilds;
+            if (GuestMemory::GpuMutex().HeldByThisThread()) ++store.buildsUnderGpuMutex;
+            const bool exact = building->second.key == key && building->second.modules == modules;
+            lock.unlock();
+            auto pipeline = build();
+            if (exact) {
+                lock.lock();
+                if (const auto found = store.index.find(hash); found != store.index.end() && found->second->key == key && found->second->modules == modules && alive(*found->second, context)) pipeline = found->second->pipeline;
+                else if (!store.index.contains(hash)) {
+                    store.entries.push_back({context.device, context.bufferPool, hash, key, modules, pipeline});
+                    store.index[hash] = std::prev(store.entries.end());
+                }
+                while (store.entries.size() > 1024) {
+                    const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
+                    if (victim == store.entries.end()) break;
+                    store.index.erase(victim->hash);
+                    store.entries.erase(victim);
+                    ++store.evicted;
+                }
+            }
+            return pipeline;
         }
         ++store.joined;
         auto result = building->second.result;
@@ -1272,6 +1262,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         return result.get();
     }
     ++store.misses;
+    if (GuestMemory::GpuMutex().HeldByThisThread()) ++store.buildsUnderGpuMutex;
     // Entries of another device belong to one the driver replaced (it does so under the GpuMutex
     // before any draw reaches the new device), whose objects went with it: forget them.
     for (auto it = store.entries.begin(); it != store.entries.end();) {
@@ -1279,7 +1270,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     }
     const auto publish = [&](const std::shared_ptr<Pipeline>& pipeline) {
         if (!store.index.contains(hash)) {
-            store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
+            store.entries.push_back({context.device, context.bufferPool, hash, key, modules, pipeline});
             store.index[hash] = std::prev(store.entries.end());
         }
         constexpr std::size_t bound = 1024;
@@ -1291,13 +1282,8 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             ++store.evicted;
         }
     };
-    if (context.pipelineBuildRunner == nullptr) {
-        auto pipeline = build();
-        publish(pipeline);
-        return pipeline;
-    }
     std::promise<std::shared_ptr<Pipeline>> promise;
-    store.pending.emplace(hash, PipelineStore::Pending{context.device, key, promise.get_future().share(), nullptr});
+    store.pending.emplace(hash, PipelineStore::Pending{context.device, key, modules, promise.get_future().share(), nullptr});
     lock.unlock();
     std::shared_ptr<Pipeline> pipeline;
     try {
@@ -1321,9 +1307,9 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 
 namespace {
 
-void publishPipeline(PipelineStore& store, const Context& context, std::uint64_t hash, const std::vector<std::byte>& key, const std::shared_ptr<Pipeline>& pipeline) {
+void publishPipeline(PipelineStore& store, const Context& context, std::uint64_t hash, const std::vector<std::byte>& key, const std::shared_ptr<Pipeline>& pipeline, std::span<const CompiledShader> shaders) {
     if (!store.index.contains(hash)) {
-        store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
+        store.entries.push_back({context.device, context.bufferPool, hash, key, pipelineModules(shaders), pipeline});
         store.index[hash] = std::prev(store.entries.end());
     }
     constexpr std::size_t bound = 1024;
@@ -1381,17 +1367,22 @@ std::shared_ptr<PipelineBuildInputs> ownBuildInputs(const Context& context, cons
 std::shared_ptr<CompileTicket> TryCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled || context.pipelineBuildSubmitter == nullptr) return nullptr;
-    auto& store = Pipelines();
-    std::unique_lock lock(store.mutex);
     std::vector<std::byte> key;
     pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    const auto modules = pipelineModules(shaders);
+    auto& store = Pipelines();
+    std::unique_lock lock(store.mutex);
     if (key.empty()) return nullptr;
     const auto hash = hashKey(key);
     if (const auto found = store.index.find(hash); found != store.index.end()) {
-        if (found->second->key != key || alive(*found->second, context)) return nullptr;
+        if (found->second->key != key) return nullptr;
+        if (alive(*found->second, context)) {
+            if (found->second->modules == modules) found->second->modules = modules;
+            return nullptr;
+        }
         abandon(store, found->second);
     }
-    if (const auto building = store.pending.find(hash); building != store.pending.end()) return building->second.key == key ? building->second.ticket : nullptr;
+    if (const auto building = store.pending.find(hash); building != store.pending.end()) return building->second.key == key && building->second.modules == pipelineModules(shaders) ? building->second.ticket : nullptr;
     ++store.misses;
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
@@ -1407,40 +1398,48 @@ std::shared_ptr<CompileTicket> TryCachedPipeline(const Context& context, const S
         lock.lock();
         if (probed != nullptr) {
             pipelineCacheProbeHits.fetch_add(1, std::memory_order_relaxed);
-            publishPipeline(store, context, hash, key, probed);
+            publishPipeline(store, context, hash, key, probed, shaders);
             return nullptr;
         }
         pipelineCacheProbeMisses.fetch_add(1, std::memory_order_relaxed);
         if (const auto found = store.index.find(hash); found != store.index.end() && found->second->key == key && alive(*found->second, context)) return nullptr;
-        if (const auto building = store.pending.find(hash); building != store.pending.end()) return building->second.key == key ? building->second.ticket : nullptr;
+        if (const auto building = store.pending.find(hash); building != store.pending.end()) return building->second.key == key && building->second.modules == pipelineModules(shaders) ? building->second.ticket : nullptr;
     }
     auto inputs = ownBuildInputs(context, state, vertexInput, resources, shaders, attachmentLayout);
     std::size_t words = 0;
     for (const auto& program : inputs->programs) words += program.spirv.WordCount();
     auto promise = std::make_shared<std::promise<std::shared_ptr<Pipeline>>>();
-    auto& pending = store.pending.emplace(hash, PipelineStore::Pending{context.device, key, promise->get_future().share(), nullptr}).first->second;
-    pending.ticket = context.pipelineBuildSubmitter(context.pipelineBuildOwner, words * sizeof(std::uint32_t) * 8u, [inputs, promise, hash, key] {
-        auto& owner = Pipelines();
-        std::shared_ptr<Pipeline> pipeline;
-        try {
-            pipeline = std::make_shared<Pipeline>(inputs->context, inputs->state, inputs->vertexInput, inputs->layouts, inputs->shaders, inputs->attachmentLayout);
-        } catch (...) {
+    auto& pending = store.pending.emplace(hash, PipelineStore::Pending{context.device, key, pipelineModules(shaders), promise->get_future().share(), nullptr}).first->second;
+    try {
+        pending.ticket = context.pipelineBuildSubmitter(context.pipelineBuildOwner, words * sizeof(std::uint32_t) * 8u, [inputs, promise, hash, key] {
+            auto& owner = Pipelines();
+            std::shared_ptr<Pipeline> pipeline;
+            try {
+                pipeline = std::make_shared<Pipeline>(inputs->context, inputs->state, inputs->vertexInput, inputs->layouts, inputs->shaders, inputs->attachmentLayout);
+            } catch (...) {
+                {
+                    std::lock_guard failed(owner.mutex);
+                    owner.pending.erase(hash);
+                    owner.settled.notify_all();
+                }
+                promise->set_exception(std::current_exception());
+                throw;
+            }
             {
-                std::lock_guard failed(owner.mutex);
+                std::lock_guard built(owner.mutex);
                 owner.pending.erase(hash);
                 owner.settled.notify_all();
+                publishPipeline(owner, inputs->context, hash, key, pipeline, inputs->shaders);
             }
-            promise->set_exception(std::current_exception());
-            throw;
-        }
-        {
-            std::lock_guard built(owner.mutex);
-            owner.pending.erase(hash);
-            owner.settled.notify_all();
-            publishPipeline(owner, inputs->context, hash, key, pipeline);
-        }
-        promise->set_value(pipeline);
-    });
+            promise->set_value(pipeline);
+            capturePipeline(inputs->context, inputs->state, inputs->vertexInput, inputs->layouts, inputs->shaders, inputs->attachmentLayout);
+        });
+    } catch (...) {
+        store.pending.erase(hash);
+        store.settled.notify_all();
+        promise->set_exception(std::current_exception());
+        throw;
+    }
     if (pending.ticket == nullptr) {
         store.pending.erase(hash);
         return nullptr;
@@ -1457,7 +1456,8 @@ std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, const State
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     const auto found = store.index.find(hashKey(key));
-    if (found == store.index.end() || found->second->key != key || !alive(*found->second, context)) return nullptr;
+    if (found == store.index.end() || found->second->key != key || found->second->modules != pipelineModules(shaders) || !alive(*found->second, context)) return nullptr;
+    found->second->modules = pipelineModules(shaders);
     store.entries.splice(store.entries.end(), store.entries, found->second);
     return found->second->pipeline;
 }
@@ -1469,6 +1469,7 @@ PipelineCacheProbeStatistics GraphicsPipelineCacheProbes() {
 void ClearCachedPipelines(VkDevice device) {
     auto& store = Pipelines();
     std::unique_lock lock(store.mutex);
+    Require(!GuestMemory::GpuMutex().HeldByThisThread() || std::none_of(store.pending.begin(), store.pending.end(), [&](const auto& building) { return building.second.device == device; }), "graphics pipeline teardown cannot wait under GpuMutex");
     store.settled.wait(lock, [&] { return std::none_of(store.pending.begin(), store.pending.end(), [&](const auto& building) { return building.second.device == device; }); });
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         if (it->device != device) {
@@ -1480,6 +1481,12 @@ void ClearCachedPipelines(VkDevice device) {
     }
     lock.unlock();
     ClearPipelineLibraries(device);
+}
+
+PipelineCreationCounters PipelineCreationTotals() {
+    auto& store = Pipelines();
+    std::lock_guard lock(store.mutex);
+    return {store.duplicateBuilds, store.buildsUnderGpuMutex};
 }
 
 }

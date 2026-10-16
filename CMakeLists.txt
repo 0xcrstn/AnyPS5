@@ -15,6 +15,8 @@ endfunction()
 option(BUILD_TESTING "Build and register relinker tests" OFF)
 option(ANYPS5_RELINKER_ONLY "Build the relinker without system libraries or third-party dependencies" OFF)
 option(ANYPS5_BUILD_WASM "Build the browser relinker" OFF)
+option(ANYPS5_CAPTURE_SYMBOLS "Retain debug information in optimized AnyPS5 core targets for local profiling" OFF)
+include(cmake/CaptureSymbols.cmake)
 if(ANYPS5_BUILD_WASM)
     if(NOT EMSCRIPTEN)
         message(FATAL_ERROR "ANYPS5_BUILD_WASM requires emcmake and Emscripten")
@@ -24,6 +26,7 @@ if(ANYPS5_BUILD_WASM)
     endif()
     set(ANYPS5_RELINKER_CLI OFF CACHE BOOL "Build the native relinker command line" FORCE)
     add_subdirectory(core/relinker)
+    configure_capture_symbols("${CMAKE_SOURCE_DIR}")
     return()
 endif()
 
@@ -170,11 +173,53 @@ if(BUILD_TESTING)
         add_test(NAME performance_compare COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_performance_compare.py)
         set_tests_properties(performance_compare PROPERTIES TIMEOUT 20)
+        add_test(NAME capture_schema COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_schema.py)
+        add_test(NAME capture_manifest COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_manifest.py)
+        add_test(NAME capture_health COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_health.py)
+        add_test(NAME capture_compare COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_compare.py)
+        add_test(NAME capture_run COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_run.py)
+        add_test(NAME capture_workflow COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_workflow.py)
+        add_test(NAME capture_draws COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_draws.py)
+        add_test(NAME capture_draw_workflow COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_draw_workflow.py)
+        add_test(NAME capture_process COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_process.py)
+        add_test(NAME capture_collectors COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_collectors.py)
+        add_test(NAME capture_symbols COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_symbols.py)
+        add_test(NAME capture_gpu_profile COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_gpu_profile.py)
+        add_test(NAME capture_external COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_external.py)
+        add_test(NAME capture_tabular COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_tabular.py)
+        add_test(NAME capture_evidence COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_evidence.py)
+        add_test(NAME capture_recover COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_recover.py)
+        add_test(NAME capture_experiment COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_experiment.py)
+        add_test(NAME capture_issues COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_capture_issues.py)
+        set_tests_properties(capture_schema capture_manifest capture_health
+            capture_compare capture_run capture_workflow capture_draws
+            capture_draw_workflow capture_process capture_collectors capture_symbols capture_gpu_profile
+            capture_external capture_tabular capture_evidence
+            capture_recover capture_experiment capture_issues PROPERTIES TIMEOUT 30)
     endif()
 endif()
 
 if(ANYPS5_RELINKER_ONLY)
     add_subdirectory(core/relinker)
+    configure_capture_symbols("${CMAKE_SOURCE_DIR}")
     return()
 endif()
 
@@ -260,3 +305,4 @@ add_subdirectory(core/Decoder/Jpeg)
 add_subdirectory(core/Decoder/Png)
 add_subdirectory(core/libs)
 add_subdirectory(core/relinker)
+configure_capture_symbols("${CMAKE_SOURCE_DIR}")

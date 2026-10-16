@@ -7,6 +7,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/PreparationQueue.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/PreparationAdmission.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/PreparationRetryQueue.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderTraceObserver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostThread.hpp"
@@ -21,6 +24,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <set>
 #include <condition_variable>
@@ -34,6 +38,7 @@
 #include <exception>
 #include <functional>
 #include <list>
+#include <limits>
 #include <atomic>
 #include <map>
 #include <pthread.h>
@@ -58,15 +63,17 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
         std::snprintf(text, sizeof(text), "shader 0x%llx stage %u preparation (%s, %zu code dwords)", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.shader.stage), preparation != nullptr ? "ahead of use" : "at use", request.shader.code.size());
         return std::string(text);
     });
+    ShaderTraceObserver compilerObservation;
     std::exception_ptr failure;
     std::string dump;
     try {
         auto handle = ShaderRecompiler::PrepareShader(request, preparation);
+        DrawTrace::Note("preparation_outcome", "artifact_ready");
         return handle;
     } catch (...) {
         failure = std::current_exception();
         try {
-            if (std::getenv("APS5_DUMP_SHADERS") != nullptr) dump = Driver::dumpRequest(request.shader.codeAddress, request);
+            if (std::getenv("APS5_DUMP_SHADERS") != nullptr) dump = Driver::dumpRequest(request.shader.codeAddress, request, ".prepare");
         } catch (...) {}
     }
     try {
@@ -266,10 +273,21 @@ void NotePartialGroupUse(const ShaderSnapshot& snapshot, const ShaderRecompiler:
     ShaderRecompiler::ShaderDiskCache::StoreShaderUse({key, 0u});
 }
 
+DrawTrace::Id RegisteredPreparationTraceJob(const PreparedShaders& prepared);
+
 void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock) {
+    DrawTrace::Span preparationWait("Shader.RegisteredPreparationWait");
+    DrawTrace::Note("wait_reason", "registered_shader_preparation");
+    DrawTrace::Note("preparation_pending", static_cast<std::uint64_t>(prepared.pending));
+    if (DrawTrace::Enabled() && prepared.pending) {
+        const auto job = RegisteredPreparationTraceJob(prepared);
+        if (job != 0) DrawTrace::Link(preparationWait.GetId(), job, "waits_for_job");
+        else DrawTrace::Note("preparation_job", "unknown");
+    }
     NoteRegisteredUse(prepared);
-    if (prepared.pending) PrioritizeRegistrationPreparation(prepared);
+    if (prepared.pending || prepared.deferred) PrioritizeRegistrationPreparation(prepared);
     prepared.settled.wait(lock, [&] { return !prepared.pending; });
+    DrawTrace::Note("wait_outcome", prepared.failure != nullptr ? "failed" : "satisfied");
     if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
 }
 
@@ -461,7 +479,8 @@ bool FusedHullHeader(const ShaderSnapshot& snapshot, Shader used, const Shader& 
     for (std::size_t index = 0; index < registered.num_sh_registers; ++index) {
         ShaderRegister expected;
         std::memcpy(&expected, snapshot.header.data() + (address - snapshot.headerAddress) + index * sizeof(ShaderRegister), sizeof(ShaderRegister));
-        const auto reg = bound[index];
+        ShaderRegister reg;
+        GuestMemory::CopyDriverMemory(&reg, bound + index, sizeof(reg));
         if (reg.offset != expected.offset) return false;
         const bool fused = reg.offset == 0x100u || reg.offset == 0x10au || reg.offset == 0x10bu || reg.offset == 0x148u || reg.offset == 0x149u;
         if (!fused && reg.value != expected.value) return false;
@@ -472,7 +491,7 @@ bool FusedHullHeader(const ShaderSnapshot& snapshot, Shader used, const Shader& 
 static Shader GuestShaderFields(const Shader* shader) {
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader fields;
-    std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
+    GuestMemory::CopyDriverMemory(&fields, static_cast<const void*>(shader), sizeof(Shader));
     return fields;
 }
 
@@ -484,7 +503,7 @@ static bool RelocatedRegisters(const ShaderSnapshot& snapshot, Shader used, cons
     const std::size_t bytes = registered.num_sh_registers * sizeof(ShaderRegister);
     if (bytes == 0 || bound == nullptr || address < snapshot.headerAddress || address - snapshot.headerAddress > snapshot.header.size() || snapshot.header.size() - (address - snapshot.headerAddress) < bytes) return false;
     GuestMemory::CheckRange(bound, bytes, alignof(ShaderRegister));
-    return std::memcmp(static_cast<const void*>(bound), snapshot.header.data() + (address - snapshot.headerAddress), bytes) == 0;
+    return GuestMemory::CompareDriverMemory(static_cast<const void*>(bound), snapshot.header.data() + (address - snapshot.headerAddress), bytes);
 }
 
 bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
@@ -493,7 +512,7 @@ bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader used;
     Shader registered;
-    std::memcpy(&used, static_cast<const void*>(shader), sizeof(Shader));
+    GuestMemory::CopyDriverMemory(&used, static_cast<const void*>(shader), sizeof(Shader));
     std::memcpy(&registered, snapshot.header.data(), sizeof(Shader));
     used.user_data = registered.user_data;
     return std::memcmp(&used, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) == 0 || RelocatedRegisters(snapshot, used, registered) || FusedHullHeader(snapshot, used, registered);
@@ -768,7 +787,11 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
             if (entry.codeOffset != codeOffset) continue;
             invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
             if (!linked.code.empty() && !std::ranges::equal(invocationRequest.shader.code, linked.code)) continue;
-            if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return invocation;
+            if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) {
+                DrawTrace::Note("preparation_outcome", "prepared_handle_hit");
+                ShaderTraceObserver::LinkProducer(ShaderRecompiler::GetPreparedArtifact(*entry.handle));
+                return invocation;
+            }
         }
         return std::nullopt;
     };
@@ -779,6 +802,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     ReportPreparedAtUse(snapshot, source);
     NotePartialGroupUse(snapshot, source);
     if (!linked.code.empty()) calleePreparationsAtUse.fetch_add(1, std::memory_order_relaxed);
+    DrawTrace::Note("preparation_outcome", "prepare_at_use");
     auto handle = PrepareShaderWithDiagnostics(source);
     invocationRequest = source;
     invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
@@ -920,7 +944,7 @@ struct RegisteredPreparation {
     bool budgeted = false;
 };
 
-std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, bool* deferred = nullptr) {
+std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, bool* deferred = nullptr, bool reportDeferral = true) {
     using Stage = ShaderRecompiler::ShaderStage;
     const auto header = ReadHeader(snapshot);
     std::uint32_t programRegister;
@@ -943,7 +967,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
         throw std::runtime_error("AGC driver: unsupported registered shader type " + std::to_string(snapshot.type));
     }
     const auto defer = [&](const char* reason) {
-        APS5_LOG_ERR("Shader 0x%llx could not be prepared at registration (%s); preparing it when it is used", static_cast<unsigned long long>(snapshot.codeAddress), reason);
+        if (reportDeferral) APS5_LOG_ERR("Shader 0x%llx could not be prepared at registration (%s); preparing it when it is used", static_cast<unsigned long long>(snapshot.codeAddress), reason);
         *deferred = true;
         return std::unique_ptr<RegisteredPreparation>{};
     };
@@ -1067,6 +1091,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
     const auto append = [&] {
         PerformanceTimer timing("Shader.PrepareArtifact");
         entries.push_back({plan.codeOffset, PrepareShaderWithDiagnostics(request, &preparation)});
+        DrawTrace::RecordCounter("prepared_shader_artifacts", 1, "artifacts");
     };
     append();
     if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Fragment && !LibraryPrebuildDisabled()) {
@@ -1154,22 +1179,41 @@ private:
 public:
 
     void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr, bool behind = false, bool awaited = true) {
+        const auto traceJob = DrawTrace::ScheduleJob(libraryPrebuild ? "Shader.LibraryPrebuild" : "Shader.RegistrationPrepare");
         {
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
                 const auto sequence = ++submitted;
-                tasks.Push({std::move(task), sequence, ShaderCompileTrace::Clock::now()}, prepared, prepared != nullptr ? prepared->useRank : Queue::Unranked, prepared != nullptr && prepared->demanded.load(), behind);
+                try {
+                    tasks.Push({std::move(task), sequence, ShaderCompileTrace::Clock::now(), traceJob, prepared}, prepared, prepared != nullptr ? prepared->useRank : Queue::Unranked, prepared != nullptr && prepared->demanded.load(), behind);
+                } catch (...) {
+                    DrawTrace::CancelJob(traceJob, DrawTrace::Status::Failed);
+                    throw;
+                }
                 if (awaited) unfinished.insert(sequence);
+                if (DrawTrace::Enabled()) {
+                    traceJobs.emplace(sequence, traceJob);
+                    if (prepared != nullptr) tracePreparedJobs.insert_or_assign(prepared, traceJob.id);
+                }
                 lock.unlock();
                 ready.notify_one();
                 return;
             }
         }
+        DrawTrace::JobScope jobScope(traceJob);
+        DrawTrace::Note("job_execution", "inline");
         task();
     }
 
     unsigned Threads() const {
         return threads;
+    }
+
+    DrawTrace::Id TraceJob(const PreparedShaders& prepared) {
+        if (!DrawTrace::Enabled()) return 0;
+        std::lock_guard lock(mutex);
+        const auto found = tracePreparedJobs.find(&prepared);
+        return found != tracePreparedJobs.end() ? found->second : 0;
     }
 
     void Prioritize(const PreparedShaders& prepared) {
@@ -1193,17 +1237,29 @@ public:
     void AwaitSubmitted() {
         std::unique_lock lock(mutex);
         const auto ticket = submitted;
+        DrawTrace::Span submittedWait("Shader.PreparationTicketWait");
+        DrawTrace::Note("wait_reason", "shader_preparation_ticket");
+        if (DrawTrace::Enabled()) {
+            for (const auto& [sequence, job] : traceJobs) {
+                if (sequence > ticket) break;
+                DrawTrace::Link(submittedWait.GetId(), job.id, "waits_for_job");
+            }
+        }
         idle.wait(lock, [&] { return unfinished.empty() || *unfinished.begin() > ticket; });
+        DrawTrace::Note("wait_outcome", "satisfied");
     }
 
     void Close() {
+        DrawTrace::Span closeWait("Shader.PreparationCloseWait");
+        DrawTrace::Note("wait_reason", "shader_preparation_shutdown");
         std::unique_lock lock(mutex);
         closed = true;
         idle.wait(lock, [&] { return tasks.Empty() && running == 0; });
+        DrawTrace::Note("wait_outcome", "satisfied");
     }
 
 private:
-    RegistrationPreparePool(unsigned count, const char* role) : role(role) {
+    RegistrationPreparePool(unsigned count, const char* role) : role(role), libraryPrebuild(std::string_view(role) == "library prebuild") {
         for (unsigned index = 0; index < count; ++index) {
             if (StartDetachedHostThread(&RegistrationPreparePool::Main, this, 64u << 20u)) ++threads;
         }
@@ -1215,17 +1271,26 @@ private:
         NameHostThread(pool.role);
         LowerPreparationThreadPriority(pool.role);
         PinPreparationThread(pool.role);
+        DrawTrace::BindThread(pool.role);
         if (PerformanceTrace::Configured()) PerformanceTrace::BindThread(pool.role, TraceThread::DefaultCapacity / 8);
         for (;;) {
             Task task;
             {
                 std::unique_lock lock(pool.mutex);
-                pool.ready.wait(lock, [&] { return !pool.tasks.Empty(); });
+                {
+                    DrawTrace::Span idleWait("Shader.PreparationIdleWait", false);
+                    DrawTrace::Note("wait_reason", "shader_preparation_queue_empty");
+                    pool.ready.wait(lock, [&] { return !pool.tasks.Empty(); });
+                }
                 task = pool.tasks.Pop();
                 ++pool.running;
             }
             const auto sequence = task.sequence;
+            const auto* prepared = task.prepared;
+            const auto traceJobId = task.traceJob.id;
             {
+                DrawTrace::JobScope jobScope(task.traceJob);
+                DrawTrace::Span workScope(pool.libraryPrebuild ? "Shader.LibraryPrebuildJob" : "Shader.RegistrationPrepareJob");
                 ShaderCompileTrace::Event event("queue.prepare_task");
                 event.Queued(task.enqueued).Text("pool", pool.role);
                 task.function();
@@ -1236,6 +1301,11 @@ private:
                 std::lock_guard lock(pool.mutex);
                 --pool.running;
                 pool.unfinished.erase(sequence);
+                pool.traceJobs.erase(sequence);
+                if (prepared != nullptr) {
+                    const auto found = pool.tracePreparedJobs.find(prepared);
+                    if (found != pool.tracePreparedJobs.end() && found->second == traceJobId) pool.tracePreparedJobs.erase(found);
+                }
                 drained = pool.tasks.Empty() && pool.running == 0;
                 pool.idle.notify_all();
             }
@@ -1250,6 +1320,8 @@ private:
         std::function<void()> function;
         std::uint64_t sequence = 0;
         ShaderCompileTrace::Clock::time_point enqueued{};
+        DrawTrace::JobToken traceJob;
+        const PreparedShaders* prepared = nullptr;
     };
     using Queue = PreparationQueue<Task>;
 
@@ -1262,8 +1334,16 @@ private:
     unsigned running = 0;
     std::uint64_t submitted = 0;
     std::set<std::uint64_t> unfinished;
+    std::map<std::uint64_t, DrawTrace::JobToken> traceJobs;
+    std::map<const PreparedShaders*, DrawTrace::Id> tracePreparedJobs;
+    bool libraryPrebuild = false;
     bool closed = false;
 };
+
+DrawTrace::Id RegisteredPreparationTraceJob(const PreparedShaders& prepared) {
+    if (auto* pool = RegistrationPreparePool::Existing()) return pool->TraceJob(prepared);
+    return 0;
+}
 
 bool AsyncRegistrationPrepare() {
     static const bool sync = std::getenv("APS5_SYNC_SHADER_PREPARE") != nullptr;
@@ -1274,10 +1354,11 @@ std::uint64_t RegistrationPrepareLimit() {
     static const std::uint64_t limit = [] {
         const char* text = std::getenv("APS5_REGISTRATION_PREPARE_LIMIT");
         if (text == nullptr || *text == '\0') return std::uint64_t{1024};
-        char* end = nullptr;
-        const auto value = std::strtoull(text, &end, 10);
-        if (end == text || *end != '\0') throw std::runtime_error("APS5_REGISTRATION_PREPARE_LIMIT is not a whole number: " + std::string(text));
-        return static_cast<std::uint64_t>(value);
+        std::uint64_t value = 0;
+        const auto* end = text + std::strlen(text);
+        const auto parsed = std::from_chars(text, end, value);
+        if (parsed.ec != std::errc{} || parsed.ptr != end) throw std::runtime_error("APS5_REGISTRATION_PREPARE_LIMIT must be an unsigned 64-bit integer: " + std::string(text));
+        return value;
     }();
     return limit;
 }
@@ -1287,7 +1368,10 @@ std::uint64_t RegistrationPrepareCommitBudget();
 bool RegistrationPrepareAdmitted() {
     static std::atomic<std::uint64_t> admitted{0};
     const auto limit = RegistrationPrepareLimit();
-    if (admitted.fetch_add(1, std::memory_order_relaxed) < limit) return true;
+    auto count = admitted.load(std::memory_order_relaxed);
+    while (count < limit) {
+        if (admitted.compare_exchange_weak(count, count + 1u, std::memory_order_relaxed)) return true;
+    }
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true)) APS5_LOG_OUT("%llu registered shaders were prepared ahead of use; later ones are prepared in the background while the process commits less than %.1f GiB, else when they are first used (APS5_REGISTRATION_PREPARE_LIMIT, APS5_REGISTRATION_PREPARE_COMMIT_GB)", static_cast<unsigned long long>(limit), static_cast<double>(RegistrationPrepareCommitBudget()) / 1073741824.0);
     return false;
@@ -1309,18 +1393,50 @@ bool RegistrationPrepareWithinBudget() {
     const auto budget = RegistrationPrepareCommitBudget();
     if (budget != 0 && GuestMemory::HostProcessCommitBytes() < budget) return true;
     static std::atomic<bool> reported{false};
-    if (!reported.exchange(true)) APS5_LOG_OUT("the process commits %.1f GiB, the registration preparation budget is %.1f GiB; registered shaders past APS5_REGISTRATION_PREPARE_LIMIT are prepared when they are first used from now on", static_cast<double>(GuestMemory::HostProcessCommitBytes()) / 1073741824.0, static_cast<double>(budget) / 1073741824.0);
+    if (!reported.exchange(true)) APS5_LOG_OUT("the process commits %.1f GiB, the registration preparation budget is %.1f GiB; preparation is deferred until budget is available or the shader is first used", static_cast<double>(GuestMemory::HostProcessCommitBytes()) / 1073741824.0, static_cast<double>(budget) / 1073741824.0);
     return false;
 }
 
-void PreparePartialGroupsInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan) {
+PreparationAdmission& RegistrationAdmission() {
+    static auto* admission = new PreparationAdmission({std::size_t{512} << 20u, 64, RegistrationPrepareCommitBudget()});
+    return *admission;
+}
+
+using RegistrationReservation = std::shared_ptr<PreparationAdmission::Reservation>;
+using RegistrationRetries = PreparationRetryQueue<const ShaderSnapshot, VulkanDevice>;
+
+RegistrationRetries& DeferredRegistrations() {
+    static auto* retries = new RegistrationRetries(512);
+    return *retries;
+}
+
+RegistrationReservation AdmitRegistration(const ShaderSnapshot& snapshot, bool budgeted, std::size_t extraCodeBytes = 0) {
+    const bool demanded = snapshot.prepared->demanded.load();
+    if (budgeted && RegistrationPrepareCommitBudget() == 0 && !demanded) return nullptr;
+    const auto codeBytes = snapshot.code.size() * sizeof(std::uint32_t);
+    const auto totalBytes = extraCodeBytes > std::numeric_limits<std::size_t>::max() - codeBytes ? std::numeric_limits<std::size_t>::max() : codeBytes + extraCodeBytes;
+    auto reservation = RegistrationAdmission().TryAcquire(PreparationAdmission::Estimate(totalBytes, snapshot.header.size()), demanded, budgeted ? GuestMemory::HostProcessCommitBytes() : 0, budgeted);
+    if (!reservation) return nullptr;
+    return std::make_shared<PreparationAdmission::Reservation>(std::move(reservation));
+}
+
+void DeferRegistration(const std::shared_ptr<const ShaderSnapshot>& snapshot, const std::shared_ptr<VulkanDevice>& device, bool budgeted) {
+    DeferredRegistrations().Push(snapshot, device, snapshot->prepared->useRank, snapshot->prepared->demanded.load(), budgeted);
+}
+
+void RetryDeferredRegistrations() noexcept;
+void RetryKnownCallees();
+
+void PreparePartialGroupsInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan, RegistrationReservation reservation) {
     const auto* preparedKey = snapshot->prepared.get();
-    SubmitRegistrationPreparation([snapshot = std::move(snapshot), plan = std::move(plan)] {
+    SubmitRegistrationPreparation([snapshot = std::move(snapshot), plan = std::move(plan), reservation = std::move(reservation)]() mutable {
         PerformanceContext timingContext(FrameTiming::Preparation());
         std::vector<PreparedShaders::Entry> entries;
         try {
             entries = PreparePartialGroups(*plan);
         } catch (const std::exception& error) {
+            DrawTrace::SetJobOutcome(DrawTrace::Status::Failed);
+            DrawTrace::Note("preparation_outcome", "failed");
             APS5_LOG_ERR("Shader 0x%llx could not be prepared for partial thread groups after registration: %s", static_cast<unsigned long long>(snapshot->codeAddress), error.what());
         }
         auto& prepared = *snapshot->prepared;
@@ -1330,23 +1446,30 @@ void PreparePartialGroupsInBackground(std::shared_ptr<const ShaderSnapshot> snap
             prepared.partialGroupsPending = false;
         }
         prepared.settled.notify_all();
+        plan.reset();
+        reservation->Reset();
+        RetryDeferredRegistrations();
     }, preparedKey, true);
 }
 
-void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan) {
+void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan, RegistrationReservation reservation) {
     const auto* preparedKey = snapshot->prepared.get();
     const bool awaited = !plan->budgeted;
-    RegistrationPreparePool::Instance().Submit([snapshot = std::move(snapshot), plan = std::move(plan)]() mutable {
+    RegistrationPreparePool::Instance().Submit([snapshot = std::move(snapshot), plan = std::move(plan), reservation = std::move(reservation)]() mutable {
         PerformanceContext timingContext(FrameTiming::Preparation());
         std::vector<PreparedShaders::Entry> entries;
         std::exception_ptr failure;
-        const bool skipped = plan->budgeted && !RegistrationPrepareWithinBudget();
+        const bool skipped = plan->budgeted && !snapshot->prepared->demanded.load() && !RegistrationPrepareWithinBudget();
         try {
             if (!skipped) entries = PrepareRegistered(*plan, false);
         } catch (const std::exception& error) {
+            DrawTrace::SetJobOutcome(DrawTrace::Status::Failed);
+            DrawTrace::Note("preparation_outcome", "failed");
             APS5_LOG_ERR("Shader 0x%llx could not be prepared after registration: %s", static_cast<unsigned long long>(snapshot->codeAddress), error.what());
             failure = std::current_exception();
         } catch (...) {
+            DrawTrace::SetJobOutcome(DrawTrace::Status::Failed);
+            DrawTrace::Note("preparation_outcome", "failed");
             failure = std::current_exception();
         }
         const bool possible = failure == nullptr && !skipped && PartialGroupsPossible(*plan);
@@ -1363,20 +1486,126 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
             prepared.pending = false;
         }
         prepared.settled.notify_all();
-        if (partialGroups) PreparePartialGroupsInBackground(std::move(snapshot), std::move(plan));
+        if (skipped) DeferRegistration(snapshot, plan->prebuildDevice, plan->budgeted);
+        if (partialGroups) {
+            try {
+                PreparePartialGroupsInBackground(snapshot, std::move(plan), reservation);
+                return;
+            } catch (...) {
+                std::lock_guard lock(prepared.mutex);
+                prepared.partialGroupsPending = false;
+                prepared.partialGroupsDeferred = true;
+                prepared.settled.notify_all();
+                std::fprintf(stderr, "[shader-prepare] optional partial-group submission failed; preparation deferred until use\n");
+            }
+        }
+        plan.reset();
+        reservation->Reset();
+        RetryDeferredRegistrations();
     }, preparedKey, false, awaited);
+}
+
+void RetryDeferredRegistrationsPass() {
+    const auto attempts = DeferredRegistrations().Size();
+    std::vector<RegistrationRetries::Entry> deferred;
+    deferred.reserve(attempts);
+    for (std::size_t attempt = 0; attempt < attempts; ++attempt) {
+        auto entry = DeferredRegistrations().Pop();
+        if (!entry) break;
+        const auto snapshot = entry->source.lock();
+        const auto device = entry->context.lock();
+        if (snapshot == nullptr || device == nullptr) continue;
+        auto& prepared = *snapshot->prepared;
+        {
+            std::lock_guard lock(prepared.mutex);
+            if (prepared.pending || !prepared.entries.empty() || !prepared.deferred) continue;
+        }
+        auto reservation = AdmitRegistration(*snapshot, entry->processBudgeted);
+        if (reservation == nullptr) {
+            deferred.push_back(std::move(*entry));
+            continue;
+        }
+        {
+            std::lock_guard lock(prepared.mutex);
+            if (prepared.pending || !prepared.entries.empty() || !prepared.deferred) continue;
+            prepared.pending = true;
+            prepared.deferred = false;
+        }
+        std::shared_ptr<RegisteredPreparation> plan;
+        std::exception_ptr failure;
+        bool incomplete = false;
+        try {
+            QueueState state{};
+            state.shader = snapshot->registeredState->shader;
+            state.context = snapshot->registeredState->context;
+            state.userConfig = snapshot->registeredState->userConfig;
+            plan = PlanRegistered(*snapshot, *device, state, true, &incomplete, false);
+            if (plan != nullptr && !plan->awaitsCallees) {
+                plan->budgeted = entry->processBudgeted;
+                plan->prebuildDevice = device;
+                if (snapshot->type == 0 || snapshot->type == 1) BuildRegisteredAbiKey(state, *device, plan->abiKey);
+            } else {
+                plan.reset();
+            }
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        if (plan != nullptr) {
+            try {
+                PrepareRegisteredInBackground(snapshot, std::move(plan), std::move(reservation));
+            } catch (...) {
+                std::lock_guard lock(prepared.mutex);
+                prepared.deferred = true;
+                prepared.pending = false;
+                prepared.settled.notify_all();
+                std::fprintf(stderr, "[shader-prepare] optional retry submission failed; preparation deferred until use\n");
+            }
+        } else {
+            std::lock_guard lock(prepared.mutex);
+            prepared.failure = entry->processBudgeted ? nullptr : failure;
+            prepared.deferred = true;
+            prepared.pending = false;
+            prepared.settled.notify_all();
+        }
+    }
+    for (auto& entry : deferred) DeferredRegistrations().Push(std::move(entry.source), std::move(entry.context), entry.rank, entry.demanded, entry.processBudgeted);
+    RetryKnownCallees();
+}
+
+void RetryDeferredRegistrations() noexcept {
+    static std::mutex retryMutex;
+    static std::atomic<bool> requested{false};
+    requested.store(true);
+    try {
+        std::unique_lock retryLock(retryMutex, std::try_to_lock);
+        if (!retryLock.owns_lock()) return;
+        for (unsigned round = 0; round < 4; ++round) {
+            requested.store(false);
+            RetryDeferredRegistrationsPass();
+            retryLock.unlock();
+            if (!requested.load() || round == 3) return;
+            retryLock.try_lock();
+            if (!retryLock.owns_lock()) return;
+        }
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[shader-prepare] optional retries deferred: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "[shader-prepare] optional retries deferred by an unknown scheduling failure\n");
+    }
 }
 
 struct CalleeWaiter {
     std::weak_ptr<const ShaderSnapshot> snapshot;
-    std::shared_ptr<const RegisteredPreparation> plan;
+    std::weak_ptr<VulkanDevice> device;
     std::vector<ShaderRecompiler::UserDataCall> calls;
-    std::vector<std::vector<std::uint32_t>> linked;
+    std::vector<std::vector<std::uint64_t>> linked;
+    bool budgeted = false;
 };
 
 struct KnownCallee {
     std::vector<std::uint32_t> code;
     bool linkedThisRun = false;
+    std::uint64_t identity = 0;
 };
 
 struct UserDataCallees {
@@ -1386,6 +1615,18 @@ struct UserDataCallees {
 };
 
 constexpr std::size_t MaxCalleesPerRegisters = 4;
+constexpr std::size_t MaxCalleeWaiters = 512;
+constexpr std::size_t MaxWaiterCalls = 64;
+constexpr std::size_t MaxWaiterCombinations = 32;
+
+std::uint64_t NextCalleeIdentity() {
+    static std::atomic<std::uint64_t> next{0};
+    auto previous = next.load();
+    for (;;) {
+        require(previous != std::numeric_limits<std::uint64_t>::max(), "callee preparation identity exhausted");
+        if (next.compare_exchange_weak(previous, previous + 1u)) return previous + 1u;
+    }
+}
 
 bool PersistedCallee(const ShaderRecompiler::ShaderDiskCache::UserDataCallee& callee) {
     try {
@@ -1404,7 +1645,7 @@ UserDataCallees& KnownUserDataCallees() {
             auto& known = created->known[{callee.userDataRegister, callee.linkRegister}];
             if (std::ranges::any_of(known, [&](const KnownCallee& entry) { return entry.code == callee.code; })) continue;
             if (known.size() == MaxCalleesPerRegisters) known.erase(known.begin());
-            known.push_back({std::move(callee.code), false});
+            known.push_back({std::move(callee.code), false, NextCalleeIdentity()});
         }
         return created;
     }();
@@ -1413,52 +1654,106 @@ UserDataCallees& KnownUserDataCallees() {
 
 void PrepareWithKnownCallees(UserDataCallees& state, CalleeWaiter& waiter, std::uint64_t caller) {
     const auto snapshot = waiter.snapshot.lock();
-    if (snapshot == nullptr || snapshot->codeAddress == caller) return;
-    std::vector<std::vector<std::uint32_t>> callees;
+    const auto device = waiter.device.lock();
+    if (snapshot == nullptr || device == nullptr || snapshot->codeAddress == caller) return;
+    std::vector<std::uint64_t> combination;
+    std::size_t calleeBytes = 0;
     for (const auto& call : waiter.calls) {
         const auto found = state.known.find({call.userDataRegister, call.linkRegister});
         if (found == state.known.end() || found->second.empty()) return;
-        callees.push_back(found->second.back().code);
+        const auto& selected = found->second.back();
+        combination.push_back(selected.identity);
+        const auto bytes = selected.code.size() * sizeof(std::uint32_t);
+        if (bytes > std::numeric_limits<std::size_t>::max() - calleeBytes) return;
+        calleeBytes += bytes;
     }
-    auto linked = ShaderRecompiler::LinkUserDataCalls(waiter.plan->decoded, waiter.calls, callees);
-    if (std::ranges::find(waiter.linked, linked) != waiter.linked.end()) return;
+    if (std::ranges::find(waiter.linked, combination) != waiter.linked.end() || waiter.linked.size() >= MaxWaiterCombinations) return;
     auto& prepared = *snapshot->prepared;
+    {
+        std::lock_guard lock(prepared.mutex);
+        if (prepared.pending) return;
+    }
+    auto reservation = AdmitRegistration(*snapshot, waiter.budgeted, calleeBytes);
+    if (reservation == nullptr) return;
+    QueueState registered{};
+    registered.shader = snapshot->registeredState->shader;
+    registered.context = snapshot->registeredState->context;
+    registered.userConfig = snapshot->registeredState->userConfig;
+    bool deferred = false;
+    std::shared_ptr<RegisteredPreparation> plan = PlanRegistered(*snapshot, *device, registered, true, &deferred, false);
+    if (plan == nullptr || !plan->awaitsCallees) return;
+    plan->budgeted = waiter.budgeted;
+    std::vector<std::vector<std::uint32_t>> callees;
+    for (const auto& call : waiter.calls) callees.push_back(state.known.at({call.userDataRegister, call.linkRegister}).back().code);
+    auto code = std::make_shared<const std::vector<std::uint32_t>>(ShaderRecompiler::LinkUserDataCalls(plan->decoded, waiter.calls, callees));
     {
         std::lock_guard lock(prepared.mutex);
         if (prepared.pending) return;
         prepared.pending = true;
     }
-    waiter.linked.push_back(linked);
     if (std::getenv("APS5_TRACE_PREPARATION_WAIT") != nullptr) std::fprintf(stderr, "[shader-prepare] queued compute shader 0x%llx with the user-data callees a dispatch of 0x%llx linked\n", static_cast<unsigned long long>(snapshot->codeAddress), static_cast<unsigned long long>(caller));
-    auto code = std::make_shared<const std::vector<std::uint32_t>>(std::move(linked));
-    SubmitRegistrationPreparation([snapshot, plan = waiter.plan, code] {
-        PerformanceContext timingContext(FrameTiming::Preparation());
-        std::vector<PreparedShaders::Entry> entries;
-        try {
-            auto linkedPlan = *plan;
-            linkedPlan.request->shader.code = *code;
-            linkedPlan.prebuildDevice = nullptr;
-            entries = PrepareRegistered(linkedPlan);
-            calleePreparationsAhead.fetch_add(1, std::memory_order_relaxed);
-        } catch (const std::exception& error) {
-            APS5_LOG_ERR("Shader 0x%llx could not be prepared with a callee another dispatch linked: %s", static_cast<unsigned long long>(snapshot->codeAddress), error.what());
-        }
-        auto& prepared = *snapshot->prepared;
-        {
-            std::lock_guard lock(prepared.mutex);
-            prepared.entries.insert(prepared.entries.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
-            prepared.pending = false;
-        }
+    try {
+        SubmitRegistrationPreparation([snapshot, device, plan = std::move(plan), code = std::move(code), reservation]() mutable {
+            PerformanceContext timingContext(FrameTiming::Preparation());
+            std::vector<PreparedShaders::Entry> entries;
+            try {
+                plan->request->shader.code = *code;
+                plan->prebuildDevice = nullptr;
+                entries = PrepareRegistered(*plan);
+                calleePreparationsAhead.fetch_add(1, std::memory_order_relaxed);
+            } catch (const std::exception& error) {
+                APS5_LOG_ERR("Shader 0x%llx could not be prepared with a callee another dispatch linked: %s", static_cast<unsigned long long>(snapshot->codeAddress), error.what());
+            }
+            auto& prepared = *snapshot->prepared;
+            {
+                std::lock_guard lock(prepared.mutex);
+                prepared.entries.insert(prepared.entries.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
+                prepared.pending = false;
+            }
+            prepared.settled.notify_all();
+            plan.reset();
+            code.reset();
+            reservation->Reset();
+            RetryDeferredRegistrations();
+        }, &prepared);
+        waiter.linked.push_back(std::move(combination));
+    } catch (...) {
+        std::lock_guard lock(prepared.mutex);
+        prepared.pending = false;
+        prepared.deferred = true;
         prepared.settled.notify_all();
-    }, &prepared);
+        std::fprintf(stderr, "[shader-prepare] optional callee submission failed; preparation deferred until use\n");
+    }
 }
 
 void AwaitUserDataCallees(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<const RegisteredPreparation> plan) {
     auto calls = ShaderRecompiler::FindUserDataCalls(plan->decoded, plan->swappc);
     auto& state = KnownUserDataCallees();
     std::lock_guard lock(state.mutex);
-    state.waiters.push_back({snapshot, std::move(plan), std::move(calls), {}});
+    std::erase_if(state.waiters, [](const auto& waiter) { return waiter.snapshot.expired() || waiter.device.expired(); });
+    if (state.waiters.size() >= MaxCalleeWaiters || calls.size() > MaxWaiterCalls) return;
+    CalleeWaiter waiter{snapshot, plan->prebuildDevice, std::move(calls), {}, plan->budgeted};
+    waiter.linked.reserve(MaxWaiterCombinations);
+    state.waiters.push_back(std::move(waiter));
     PrepareWithKnownCallees(state, state.waiters.back(), 0);
+}
+
+void RetryKnownCallees() {
+    if (CalleePreparationDisabled()) return;
+    auto& state = KnownUserDataCallees();
+    std::unique_lock lock(state.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    std::erase_if(state.waiters, [](const auto& waiter) { return waiter.snapshot.expired() || waiter.device.expired(); });
+    std::array<std::size_t, MaxCalleeWaiters> order{};
+    for (std::size_t index = 0; index < state.waiters.size(); ++index) order[index] = index;
+    std::sort(order.begin(), order.begin() + state.waiters.size(), [&](const auto left, const auto right) {
+        const auto leftSnapshot = state.waiters[left].snapshot.lock();
+        const auto rightSnapshot = state.waiters[right].snapshot.lock();
+        const auto leftRank = leftSnapshot ? leftSnapshot->prepared->useRank : RegistrationRetries::Unranked;
+        const auto rightRank = rightSnapshot ? rightSnapshot->prepared->useRank : RegistrationRetries::Unranked;
+        return leftRank != rightRank ? leftRank < rightRank : left < right;
+    });
+    for (std::size_t index = 0; index < state.waiters.size(); ++index) PrepareWithKnownCallees(state, state.waiters[order[index]], 0);
 }
 
 void NoteUserDataCallees(std::uint64_t caller, std::span<const ShaderRecompiler::UserDataCall> calls, std::span<const std::vector<std::uint32_t>> callees) {
@@ -1479,7 +1774,7 @@ void NoteUserDataCallees(std::uint64_t caller, std::span<const ShaderRecompiler:
                 if (stale == known.end()) continue;
                 known.erase(stale);
             }
-            known.push_back({callees[index], true});
+            known.push_back({callees[index], true, NextCalleeIdentity()});
         }
         ShaderRecompiler::ShaderDiskCache::StoreUserDataCallee({calls[index].userDataRegister, calls[index].linkRegister, callees[index]});
         added = true;
@@ -1513,6 +1808,7 @@ void PrioritizeRegistrationPreparation(PreparedShaders& prepared) {
 }
 
 void AwaitRegistrationPreparation() {
+    RetryDeferredRegistrations();
     if (auto* pool = RegistrationPreparePool::Existing()) pool->AwaitSubmitted();
 }
 
@@ -1533,6 +1829,8 @@ RegistrationBacklog RegistrationPreparationBacklog() {
 }
 
 void CloseRegistrationPreparation() {
+    RegistrationAdmission().Close();
+    DeferredRegistrations().Close();
     RegistrationPreparePool::Instance().Close();
     if (auto* prebuild = RegistrationPreparePool::ExistingPrebuild()) prebuild->Close();
 }
@@ -1886,7 +2184,7 @@ void Driver::RegisterShader(const Shader* shader) {
     require(!RawGraphicsDrawn(), "a shader was registered after graphics programs were drawn without registration");
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader fields;
-    std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
+    GuestMemory::CopyDriverMemory(&fields, static_cast<const void*>(shader), sizeof(Shader));
     require(fields.file_header == 0x34333231u && fields.version == 0x18u, "invalid shader header");
     require(fields.header_size >= sizeof(Shader), "shader header is smaller than its fixed fields");
     require(fields.shader_size != 0 && (fields.shader_size & 3u) == 0, "invalid shader size");
@@ -1895,9 +2193,9 @@ void Driver::RegisterShader(const Shader* shader) {
     GuestMemory::CheckRange(code, fields.shader_size, 256);
     ShaderSnapshot snapshot{reinterpret_cast<std::uintptr_t>(code), reinterpret_cast<std::uintptr_t>(shader), fields.type, {}, {}};
     snapshot.code.resize(fields.shader_size / sizeof(std::uint32_t));
-    std::memcpy(snapshot.code.data(), code, fields.shader_size);
+    GuestMemory::CopyDriverMemory(snapshot.code.data(), code, fields.shader_size);
     snapshot.header.resize(fields.header_size);
-    std::memcpy(snapshot.header.data(), static_cast<const void*>(shader), fields.header_size);
+    GuestMemory::CopyDriverMemory(snapshot.header.data(), static_cast<const void*>(shader), fields.header_size);
 
     transaction.Hold();
     {
@@ -1930,11 +2228,15 @@ void Driver::RegisterShader(const Shader* shader) {
     registered.context = snapshot.registeredState->context;
     registered.userConfig = snapshot.registeredState->userConfig;
     std::shared_ptr<RegisteredPreparation> preparation;
+    RegistrationReservation reservation;
+    bool retryPreparation = false;
+    bool retryBudgeted = false;
     AssignUseRank(snapshot);
     if (AsyncRegistrationPrepare()) {
         preparation = PlanRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
         if (preparation != nullptr && !RegistrationPrepareAdmitted()) {
             if (RegistrationPrepareCommitBudget() == 0) {
+                DrawTrace::Note("preparation_outcome", "deferred_admission_limit");
                 preparation = nullptr;
                 snapshot.prepared->deferred = true;
             } else {
@@ -1943,7 +2245,17 @@ void Driver::RegisterShader(const Shader* shader) {
         }
         if (preparation != nullptr) preparation->prebuildDevice = localDevice;
         if (preparation != nullptr && !preparation->awaitsCallees && (snapshot.type == 0 || snapshot.type == 1)) BuildRegisteredAbiKey(registered, *localDevice, preparation->abiKey);
+        if (preparation != nullptr && !preparation->awaitsCallees) {
+            reservation = AdmitRegistration(snapshot, preparation->budgeted);
+            if (reservation == nullptr) {
+                retryBudgeted = preparation->budgeted;
+                preparation.reset();
+                snapshot.prepared->deferred = true;
+                retryPreparation = true;
+            }
+        }
         snapshot.prepared->pending = preparation != nullptr && !preparation->awaitsCallees;
+        DrawTrace::Note("registration_preparation", preparation != nullptr ? "scheduled" : snapshot.prepared->deferred ? "deferred" : "unsupported_registration_shape");
     } else {
         snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
         if ((snapshot.type == 0 || snapshot.type == 1) && !snapshot.prepared->entries.empty()) {
@@ -1975,8 +2287,16 @@ void Driver::RegisterShader(const Shader* shader) {
         PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(PrepareNullPixelProgram(*localDevice)));
     }
     transaction.Commit();
-    if (preparation != nullptr && preparation->awaitsCallees) AwaitUserDataCallees(published, std::move(preparation));
-    else if (preparation != nullptr) PrepareRegisteredInBackground(published, std::move(preparation));
+    if (preparation != nullptr && preparation->awaitsCallees) {
+        AwaitUserDataCallees(published, std::move(preparation));
+        RetryDeferredRegistrations();
+    } else if (preparation != nullptr) {
+        PrepareRegisteredInBackground(published, std::move(preparation), std::move(reservation));
+    }
+    if (retryPreparation) {
+        DeferRegistration(published, localDevice, retryBudgeted);
+        RetryDeferredRegistrations();
+    }
 }
 
 }

@@ -52,9 +52,9 @@ struct MaterializedParts {
 };
 
 void bindingPlanKeyWords(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, std::vector<std::uint64_t>& key);
-RecompileResult materializeSkeleton(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults, MaterializedParts& parts);
-void fillMaterializedValues(RecompileResult& result, const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, const MaterializedParts& parts);
-RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false);
+RecompileResult materializeSkeleton(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults, MaterializedParts& parts, bool memoize = true);
+void fillMaterializedValues(RecompileResult& result, const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, const MaterializedParts& parts, bool memoize = true);
+RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false, bool memoize = true);
 
 }
 

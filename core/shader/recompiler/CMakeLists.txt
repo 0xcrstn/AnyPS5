@@ -39,8 +39,10 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderManifest.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CompileTrace.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvIntern.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/TraceIdentity.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/StencilReplay.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderDiskCache.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderInputInventory.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderCachePack.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/RectListShaders.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/BarycentricGeometryShader.cpp
@@ -232,6 +234,19 @@ function(add_shader_recompiler target runtimeTarget)
         string(APPEND shaderCacheExtra " system-deps=${ANYPS5_SYSTEM_DEPS_STAMP}")
     endif()
     set(shaderCacheReviewedNames
+            ShouldCaptureShaderInput
+            SameResourceTrace
+            ShaderDiskCache::CompilerConfigurationKey
+            MaterializeShaderUncached
+            CompileShaderUncached
+            CaptureShaderInput
+            ShaderInputInventory::DefaultDirectory
+            ShaderInputCaptureTotals
+            FlushShaderInputs
+            FindShaderInputIdentity
+            ShaderDiskCache::SourceVersion
+            ShaderDiskCache::DecodeResult
+            ShaderDiskCache::EncodeResult
             BuildBarycentricGeometryShader
             BuildPreparedShaderKey
             BuildRectListShaders
@@ -287,6 +302,7 @@ function(add_shader_recompiler target runtimeTarget)
             ShaderDiskCache::EarlierShaderUses
             ShaderDiskCache::StoreShaderUse
             ShaderDiskCache::LayeredCache
+            ShaderTraceVariantFields
             SrgbDecodeBit
             SrgbUnormFormat
             FindUserDataTail

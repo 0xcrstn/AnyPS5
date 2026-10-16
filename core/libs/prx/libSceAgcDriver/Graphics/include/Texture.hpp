@@ -21,6 +21,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include "prx/libc/include/GuestArena.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -29,6 +30,7 @@ class ResidentColor;
 class CommandBatch;
 class DeviceBuffer;
 class StorageTexture;
+class Recorder;
 struct HostImport;
 
 // The Vulkan format storage images of a guest format use (sRGB formats store as their UNORM form).
@@ -199,8 +201,12 @@ public:
     void RecordAttachmentProxyStore(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
     void WriteBack();
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
-    void MarkDirty();
-    void MarkSliceDirty(std::uint32_t slice);
+    void MarkDirty(Recorder* writer = nullptr);
+    void MarkSliceDirty(std::uint32_t slice, Recorder* writer = nullptr);
+    void PrepareWrite();
+    void PrepareSliceWrite(std::uint32_t slice);
+    void MarkKeysUncompressed();
+    std::optional<std::uint64_t> ProducedThrough(const Recorder& recorder) const;
     void Flush();
     // Stores every pending image overlapping the range, except `except`; returns whether any was.
     // Stores into host-imported memory are recorded (not waited for): a CPU reader syncs afterwards.
@@ -280,7 +286,7 @@ public:
     // does when it lists no image, and all an access AccessKeptByCpu approved needs): whether any
     // unit was published.
     static bool PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason = "memory access");
-    static bool StoreForPointerAccess(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt);
+    static bool StoreForPointerAccess(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt, bool writes);
     static bool ShadowForPointerReads(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt);
     static void AuditPointerReads(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> exempt);
     static void MaterializeForNativeAccess(std::uint64_t address, std::size_t bytes);
@@ -507,7 +513,21 @@ private:
     bool otherPendingOverlaps(bool exceptHandOvers = false) const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
-    void markLayersPending(std::uint32_t first, std::uint32_t count);
+    void markLayersPending(std::uint32_t first, std::uint32_t count, Recorder* writer = nullptr);
+    void captureMappings(const std::vector<bool>* layers = nullptr);
+    void validateMappings(std::uint32_t first, std::uint32_t count);
+    void prepareLayersWrite(std::uint32_t first, std::uint32_t count);
+    struct MappingWitness {
+        std::vector<GuestArena::MappingSpan> spans;
+        bool known = false;
+        bool native = false;
+        bool failed = false;
+    };
+    std::vector<MappingWitness> mappingWitnesses;
+    bool nativeGuestMapping() const;
+    MappingWitness keysMappingWitness;
+    void captureMapping(MappingWitness& witness, std::uint64_t address, std::size_t bytes);
+    void validateMapping(MappingWitness& witness);
     // Registers or unregisters the image as its pending layers say (after a write-back).
     void reconcilePending();
     // Pending images whose surface shares one of the 64 KiB write-stamp blocks firstBlock..lastBlock
@@ -641,6 +661,8 @@ private:
     VkFormat storageFormat = VK_FORMAT_UNDEFINED;
     // Results are on the GPU only (guarded by the pending-write registry lock).
     bool dirty = false;
+    bool unknownWriter = false;
+    std::map<std::uint64_t, std::uint64_t> writerSubmissions;
     std::uint64_t version = 0;
     Coherence::Version coherenceVersion = 0;
     std::uint64_t accessProtection = 0;

@@ -4,11 +4,16 @@
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
 #include <cstddef>
+#include <memory>
 #include <vector>
 #include <optional>
 #include <array>
 #include <span>
 #include <string>
+
+namespace AgcDriver::GuestMemory {
+class DriverStoreWatch;
+}
 
 namespace AgcDriver::Pm4 {
 
@@ -91,7 +96,9 @@ std::string_view UnsupportedReason(std::uint32_t header);
 void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue);
 void Execute(std::span<const std::uint32_t> packet, QueueState& queue);
 inline bool IndirectRegisterOpcode(std::uint32_t opcode) { return opcode == 0x63 || opcode == 0x64 || opcode == 0x9f; }
-std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> packet);
+std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> packet, std::shared_ptr<GuestMemory::DriverStoreWatch>* writes = nullptr);
+std::vector<std::uint32_t> ReadIndirectRegisterWords(std::span<const std::uint32_t> packet, std::shared_ptr<GuestMemory::DriverStoreWatch>* writes = nullptr);
+std::vector<std::uint32_t> IndirectRegisterPairs(std::span<const std::uint32_t> packet, std::span<const std::uint32_t> values);
 struct CommandProcessorRead {
     std::uint64_t address;
     std::size_t bytes;
@@ -143,6 +150,7 @@ struct StoreWrite {
     std::span<const std::byte> Bytes() const { return ownedBytes.empty() ? viewBytes : std::span<const std::byte>(ownedBytes); }
 };
 std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, const QueueState& queue, std::size_t limit);
+StoreWrite CaptureRegisterCopy(std::span<const std::uint32_t> packet, const QueueState& queue);
 struct MemoryCopy {
     std::uint64_t source;
     std::uint64_t destination;

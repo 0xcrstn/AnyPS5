@@ -55,6 +55,15 @@ std::optional<StreamCopy> StreamCopyRange(const std::vector<std::uint32_t>& user
 void Driver::countCopy(int path, std::size_t bytes, std::chrono::steady_clock::time_point started, std::chrono::steady_clock::time_point locked, const VulkanDevice::CopyOutcome* outcome) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (path < 0 || path >= CopyPaths) return;
+    static constexpr const char* tracePaths[CopyPaths] = {"cpu", "gpu", "not_imported", "alias", "count_record_pending", "shape_refused", "overlap_refused", "inaccessible", "gpu_limit_refused"};
+    DrawTrace::Note("copy_outcome", tracePaths[path]);
+    if (path == CopyCpu) DrawTrace::RecordCounter("copy_cpu_bytes", bytes, "bytes");
+    else if (path == CopyGpu) DrawTrace::RecordCounter("copy_gpu_bytes", bytes, "bytes");
+    else if (path == CopyAliased) DrawTrace::RecordCounter("copy_alias_bytes", bytes, "bytes");
+    if (outcome != nullptr) {
+        DrawTrace::Note("copy_cpu_refusal", static_cast<std::uint64_t>(outcome->reason));
+        DrawTrace::Note("copy_source_waited", static_cast<std::uint64_t>(outcome->waitedForSource));
+    }
     copyPathCounts[path].fetch_add(1, std::memory_order_relaxed);
     if (!profile) return;
     using Outcome = VulkanDevice::CopyOutcome;
@@ -147,7 +156,10 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         return false;
     }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+    DrawTrace::Span copyLockWait("Driver.CopyGpuMutexWait");
+    DrawTrace::Note("wait_reason", "gpu_mutex");
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    copyLockWait.Finish();
     const auto locked = std::chrono::steady_clock::now();
 
     recordLabelsForPacket(localDevice.get(), queueId);
@@ -178,8 +190,8 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             return false;
         }
         std::uint32_t count = 0, period = 0;
-        std::memcpy(&count, reinterpret_cast<const void*>(record), 4);
-        std::memcpy(&period, reinterpret_cast<const void*>(record + 4), 4);
+        GuestMemory::CopyDriverMemory(&count, reinterpret_cast<const void*>(record), 4);
+        GuestMemory::CopyDriverMemory(&period, reinterpret_cast<const void*>(record + 4), 4);
         bytes = static_cast<std::size_t>(count) * 4u;
 
         if (count == 0 || period < count || groups[0] != (count + 63u) / 64u || count > userData[2] || count > userData[6] || bytes > (16u << 20u) || source % 4 != 0 || destination % 4 != 0 || (record < destination + bytes && destination < record + 8)) {

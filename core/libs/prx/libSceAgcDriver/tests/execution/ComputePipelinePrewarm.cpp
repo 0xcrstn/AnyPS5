@@ -93,6 +93,7 @@ int main() {
             const auto shader = Compile(*first);
             Dispatch(*first, shader, 0x12345678u);
             Require(first->PipelinePrewarmCounters().stored >= 1u && Recipes(directory) >= 1u, "a created compute pipeline left no prewarm recipe");
+            first->StopPipelinePreparation();
             std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
             first->PrepareForReplacement();
         }

@@ -19,6 +19,7 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrawTraceIdentity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -26,6 +27,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -182,6 +184,7 @@ std::atomic<int>& WaitersOf(std::uint64_t id) { return unlockedWaiters[id % Wait
 // released the GpuMutex around a wait learns whether its recorder still exists before touching it.
 std::mutex liveRecordersMutex;
 std::vector<std::uint64_t> liveRecorders;
+std::vector<Recorder*> recorderInstances;
 std::atomic<std::uint64_t> nextRecorderId{1};
 std::atomic<std::uint64_t> samplesPassed{0};
 constexpr std::uint32_t SampleFoldCapacity = 64;
@@ -824,7 +827,7 @@ public:
         // A store's bytes are not compared (counted as a store instead).
         if (key.site != GuestMemory::ReadSite::Store && bytes <= CompareLimit && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) {
             before.resize(bytes);
-            std::memcpy(before.data(), reinterpret_cast<const void*>(address), bytes);
+            GuestMemory::CopyDriverMemory(before.data(), reinterpret_cast<const void*>(address), bytes);
         }
         start = std::chrono::steady_clock::now();
     }
@@ -852,7 +855,7 @@ public:
         const auto outcome = [&]() -> std::uint64_t HookSyncOutcomes::* {
             if (key.site == GuestMemory::ReadSite::Store) return &HookSyncOutcomes::stores;
             if (before.empty() || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return &HookSyncOutcomes::unchecked;
-            if (std::memcmp(before.data(), reinterpret_cast<const void*>(address), bytes) != 0) return &HookSyncOutcomes::changed;
+            if (!GuestMemory::CompareDriverMemory(before.data(), reinterpret_cast<const void*>(address), bytes)) return &HookSyncOutcomes::changed;
             // A target already signaled (or no target found: the batch is finishing) had run
             // before the copy, so its unchanged bytes are not evidence of a false overlap.
             if (!info.has_value() || info->signaled) return &HookSyncOutcomes::unchangedSignaled;
@@ -960,7 +963,7 @@ public:
         batchesInFlight = recorder.InFlightBatches();
         if (key.site != GuestMemory::ReadSite::Store && bytes <= CompareLimit && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) {
             before.resize(bytes);
-            std::memcpy(before.data(), reinterpret_cast<const void*>(address), bytes);
+            GuestMemory::CopyDriverMemory(before.data(), reinterpret_cast<const void*>(address), bytes);
         }
         start = std::chrono::steady_clock::now();
     }
@@ -981,7 +984,7 @@ public:
             totals.imagesDead += classification.dead;
             totals.imagesLive += classification.live;
             if (before.empty() || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) ++totals.unchecked;
-            else if (std::memcmp(before.data(), reinterpret_cast<const void*>(address), bytes) != 0) ++totals.changed;
+            else if (!GuestMemory::CompareDriverMemory(before.data(), reinterpret_cast<const void*>(address), bytes)) ++totals.changed;
             else ++totals.unchanged;
         };
         add(stats.byKey[key]);
@@ -1143,6 +1146,35 @@ Recorder* Recorder::Current() {
     return ForPhysicalQueue(PhysicalQueueOf(GuestMemory::GpuLockThreadTag()));
 }
 
+bool Recorder::SyncIfLive(const Recorder* recorder) {
+    GuestMemory::AssertGpuLockHeld("Recorder::SyncIfLive");
+    Recorder* instance = nullptr;
+    {
+        std::lock_guard lock(liveRecordersMutex);
+        const auto found = std::find(recorderInstances.begin(), recorderInstances.end(), recorder);
+        if (found != recorderInstances.end()) instance = *found;
+    }
+    if (instance == nullptr) return false;
+    instance->Sync();
+    return true;
+}
+
+std::vector<Recorder*> Recorder::Live() {
+    GuestMemory::AssertGpuLockHeld("Recorder::Live");
+    std::lock_guard lock(liveRecordersMutex);
+    return {recorderInstances.begin(), recorderInstances.end()};
+}
+
+std::vector<Recorder*> Recorder::LiveForDevice(VkDevice device) {
+    GuestMemory::AssertGpuLockHeld("Recorder::LiveForDevice");
+    std::vector<Recorder*> result;
+    std::lock_guard lock(liveRecordersMutex);
+    for (auto* recorder : recorderInstances) {
+        if (recorder->Device() == device) result.push_back(recorder);
+    }
+    return result;
+}
+
 Recorder* Recorder::GraphicsRecorder() {
     auto* current = Current();
     if (current == nullptr || current->GraphicsCapable()) return current;
@@ -1201,10 +1233,15 @@ void Recorder::RequireOrderAfter(const Recorder& producer, std::uint64_t serial)
     if (&producer == peer && !OrderWaitsSuppressed().load(std::memory_order_acquire)) raisePeerFloor(serial);
 }
 
-Recorder::Recorder(const Context& context, bool timelineSemaphores, std::uint32_t physicalQueue) : context(context), id(nextRecorderId.fetch_add(1)), physicalQueue(physicalQueue), domain(Domain(physicalQueue)) {
+Recorder::Recorder(const Context& context, bool timelineSemaphores, std::uint32_t physicalQueue, DrawTrace::Id traceDevice, std::uint32_t traceTimestampValidBits) : context(context), id(nextRecorderId.fetch_add(1)), physicalQueue(physicalQueue), domain(Domain(physicalQueue)), traceDevice(traceDevice), traceTimestampValidBits(traceTimestampValidBits) {
+    if (DrawTrace::Configured()) {
+        traceRecorder = DrawTrace::NextId();
+        traceQueue = DrawTrace::NextId();
+    }
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
+        recorderInstances.push_back(this);
     }
     // Idempotent: the same hook for every recorder (the deferred lists are per thread, not per recorder).
     GuestMemory::SetGpuUnlockHook(&ReleaseDeferredKeeps);
@@ -1273,6 +1310,7 @@ Recorder::~Recorder() {
         // would run this without the mutex, concurrently with a relocked waiter.
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.erase(std::remove(liveRecorders.begin(), liveRecorders.end(), id), liveRecorders.end());
+        recorderInstances.erase(std::remove(recorderInstances.begin(), recorderInstances.end(), this), recorderInstances.end());
     }
     // Sync() above completed every batch, so every timeline wait in progress on this recorder
     // returns now; the semaphore is destroyed only once they all left it.
@@ -1316,6 +1354,10 @@ Recorder::~Recorder() {
     spareLedgers.clear();
     for (const auto pool : sparePools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
     sparePools.clear();
+    for (const auto pool : detailSparePools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
+    detailSparePools.clear();
+    for (const auto pool : detailSpareStatistics) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
+    detailSpareStatistics.clear();
     // Sync() above waited for every batch, so no submission still signals the timeline.
     if (timeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, timeline, nullptr);
     timeline = VK_NULL_HANDLE;
@@ -1679,6 +1721,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     open->drawDepth = depth;
     if (access.knownAddressWrites && DrawOrGpuProfiled()) readOnlyAddressDraws.fetch_add(1, std::memory_order_relaxed);
     auto& pass = open->renderPass;
+    forced = forced || (pass.emitted.has_value() && pass.emitted->passes.front().draws.size() >= 128);
     const auto coveredStart = [&] {
         VkAccessFlags covered = 0;
         const auto commands = Commands(&covered);
@@ -1750,7 +1793,21 @@ std::uint32_t Recorder::EmitWorkers() {
 }
 
 bool Recorder::EmitPass() {
-    return emit != nullptr && !GpuTimingEnabled() && !countingSamples;
+    return emit != nullptr && !GpuTimingEnabled() && !DrawTrace::Configured() && !countingSamples;
+}
+
+CommandSink Recorder::OpenEmit(const Context& drawContext, EmitPassBegin begin, const ChunkDraw& draw) {
+    Require(open != nullptr && !open->renderPass.open && !open->renderPass.emitted.has_value(), "an emit pass is opened over another render pass");
+    const auto slot = CutForEmit();
+    auto& unit = open->renderPass.emitted.emplace();
+    unit.slot = slot;
+    unit.functions = drawContext.functions;
+    unit.passes.emplace_back();
+    auto& pass = unit.passes.back();
+    pass.begin = std::move(begin);
+    pass.drawOffsets.push_back(0);
+    pass.draws.push_back(draw);
+    return CommandSink(pass.commands, reinterpret_cast<std::uintptr_t>(&pass.commands));
 }
 
 VkCommandBuffer Recorder::takeLedger() {
@@ -1817,7 +1874,7 @@ void Recorder::collectEmitUnits(Batch& batch) {
 
 bool Recorder::ChunkPass() {
     if (chunks == nullptr) return false;
-    if (GpuTimingEnabled()) {
+    if (GpuTimingEnabled() || DrawTrace::Configured()) {
         ChunkedRecording::CountInline(ChunkInlineReason::GpuTiming);
         return false;
     }
@@ -1839,6 +1896,12 @@ CommandSink Recorder::OpenChunk(const Context& drawContext, const ChunkInheritan
 CommandSink Recorder::PassSink(const Context& drawContext, const ChunkDraw& draw) {
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;
+    if (pass.emitted.has_value()) {
+        auto& emitted = pass.emitted->passes.front();
+        emitted.drawOffsets.push_back(emitted.commands.Words().size());
+        emitted.draws.push_back(draw);
+        return CommandSink(emitted.commands, reinterpret_cast<std::uintptr_t>(&emitted.commands));
+    }
     if (!pass.chunked || chunks == nullptr) return CommandSink(open->commands);
     if (!chunks->IsOpen()) return chunks->Begin(drawContext, open->chunkPool, pass.inheritance, draw);
     return chunks->Next(draw);
@@ -1859,7 +1922,8 @@ void Recorder::endOpenRenderPass(bool barrier) {
         chunkMismatch = closed.mismatch;
     }
     if (open->segmentActive) endSegment(*open);
-    EndRenderPass(context, open->commands);
+    if (pass.emitted.has_value()) PostEmitUnit(std::move(*pass.emitted));
+    else EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
     // host sees them at the batch's fence).
     constexpr VkAccessFlags passedAccess = DrawPassAccess | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1992,6 +2056,7 @@ void Recorder::ensureOpen() {
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
+        prepareDetailTiming(*open);
         if (PerformanceTrace::Recording()) {
             static std::atomic<std::uint64_t> traceIds{0};
             open->traceId = traceIds.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2001,6 +2066,7 @@ void Recorder::ensureOpen() {
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
         if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);
     }
+    if (open != nullptr) noteDetailContributor(*open);
     flushDispatchBarrier();
 }
 
@@ -2369,6 +2435,292 @@ bool Recorder::GpuTimingEnabled() {
     return enabled;
 }
 
+bool Recorder::TraceLabelsRequested() {
+    static const bool requested = [] { const auto* value = std::getenv("APS5_TRACE_GPU_LABELS"); return value != nullptr && std::string_view(value) == "1"; }();
+    return DrawTrace::Configured() && requested;
+}
+
+bool Recorder::TraceCountersRequested() {
+    static const bool requested = [] { const auto* value = std::getenv("APS5_TRACE_GPU_COUNTERS"); return value != nullptr && std::string_view(value) == "1"; }();
+    return DrawTrace::Configured() && requested;
+}
+
+void Recorder::ConfigureTraceFeatures(bool statistics, bool labels, std::uint32_t nativeQueueIndex) {
+    if (!DrawTrace::Configured()) return;
+    traceStatistics = TraceCountersRequested() && statistics;
+    traceLabels = TraceLabelsRequested() && labels;
+    if (traceLabels) {
+        traceBeginLabel = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(context.deviceProc(context.device, "vkCmdBeginDebugUtilsLabelEXT"));
+        traceEndLabel = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(context.deviceProc(context.device, "vkCmdEndDebugUtilsLabelEXT"));
+        traceLabels = traceBeginLabel != nullptr && traceEndLabel != nullptr;
+    }
+    try {
+        const auto capabilityKey = std::string("gpu-trace-capabilities.v1:") + (TraceCountersRequested() ? "1:" : "0:")
+            + (traceStatistics ? "1:" : "0:") + (TraceLabelsRequested() ? "1:" : "0:") + (traceLabels ? "1:" : "0:") + std::to_string(context.queueFamily) + ":" + std::to_string(nativeQueueIndex) + ":inline_capture";
+        traceCapabilities = DrawTrace::RegisterMetadata("gpu_trace_capabilities", capabilityKey, {
+            {"pipeline_statistics_requested", TraceCountersRequested() ? "true" : "false"},
+            {"pipeline_statistics_enabled", traceStatistics ? "true" : "false"},
+            {"pipeline_statistics_capacity", "512"},
+            {"batch_origin_capacity", "2048"},
+            {"pipeline_statistics_scope", "individual_host_command_inclusive"},
+            {"pipeline_statistics_overhead", "additional_query_commands_and_feature_enable_opt_in"},
+            {"presentation_statistics_status", "not_instrumented_shared_presentation_path"},
+            {"native_queue_family", std::to_string(context.queueFamily)},
+            {"native_queue_index", std::to_string(nativeQueueIndex)},
+            {"physical_queue_domain", std::to_string(physicalQueue)},
+            {"recording_mode", "inline_primary_commands"},
+            {"recording_mode_reason", "capture_gpu_queries_require_primary_commands"},
+            {"performance_comparison_scope", "capture_inline_mode_changes_chunk_and_emit_recording"},
+            {"other_native_queues", "separate_recorder_domains_when_enabled"},
+            {"occlusion_status", "unsupported_existing_guest_query_conflict"},
+            {"mesh_statistics_status", "unsupported_mesh_query_feature_not_enabled"},
+            {"debug_labels_requested", TraceLabelsRequested() ? "true" : "false"},
+            {"debug_labels_enabled", traceLabels ? "true" : "false"},
+            {"debug_label_format", "aps5 run=<uuid> capture=<uuid> op=<id> batch=<id> pipeline=<id> command=<id>"},
+            {"shader_stage_timing", "unsupported_external_profiler_required"}}, {});
+        traceCapabilitiesEpoch = DrawTrace::MetadataEpoch();
+    } catch (...) {
+        traceCapabilities = 0;
+        DrawTrace::ReportObservationLoss();
+    }
+}
+
+void Recorder::prepareDetailStatistics(Batch& batch) noexcept {
+    if (!traceStatistics) return;
+    try {
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+        info.queryCount = 512;
+        info.pipelineStatistics = TraceStatisticFlags;
+        if (!detailSpareStatistics.empty()) {
+            batch.detailStatistics = detailSpareStatistics.back();
+            detailSpareStatistics.pop_back();
+        } else if (context.Function<PFN_vkCreateQueryPool>("vkCreateQueryPool")(context.device, &info, nullptr, &batch.detailStatistics) != VK_SUCCESS) {
+            batch.detailStatistics = VK_NULL_HANDLE;
+            batch.detailStatisticsStatus = DrawTrace::QueryStatus::AllocationFailed;
+            return;
+        }
+        batch.detailStatisticsStatus = DrawTrace::QueryStatus::Pending;
+        batch.detailStatisticRecords.reserve(info.queryCount);
+        function(cmdResetQueryPool, "vkCmdResetQueryPool")(batch.commands, batch.detailStatistics, 0, info.queryCount);
+    } catch (...) {
+        batch.detailStatisticsStatus = DrawTrace::QueryStatus::AllocationFailed;
+        DrawTrace::ReportObservationLoss();
+    }
+}
+
+void Recorder::prepareDetailTiming(Batch& batch) {
+    if (!DrawTrace::Configured()) return;
+    batch.detailBatchDeclared = DrawTrace::Eligible();
+    batch.detailBatch = DrawTrace::DeclareBatch(traceDevice, traceRecorder, ++detailBatchSerial);
+    batch.detailContext = DrawTrace::Current();
+    batch.detailContext.device = traceDevice;
+    batch.detailContext.batch = batch.detailBatch;
+    batch.detailContributors.resize(2048);
+    prepareDetailStatistics(batch);
+    if (traceDevice == 0 || traceTimestampValidBits != 64 || !std::isfinite(context.limits.timestampPeriod) || context.limits.timestampPeriod <= 0) return;
+    const auto capacity = std::min(DrawTrace::GpuQueryCapacity(), std::size_t{512});
+    if (capacity == 0 || capacity > std::numeric_limits<std::uint32_t>::max() / 2) return;
+    VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    info.queryCount = static_cast<std::uint32_t>(capacity * 2);
+    if (!detailSparePools.empty()) {
+        batch.detailQueries = detailSparePools.back();
+        detailSparePools.pop_back();
+    } else {
+        const auto result = context.Function<PFN_vkCreateQueryPool>("vkCreateQueryPool")(context.device, &info, nullptr, &batch.detailQueries);
+        if (result != VK_SUCCESS) {
+            batch.detailQueries = VK_NULL_HANDLE;
+            batch.detailQueryStatus = DrawTrace::QueryStatus::AllocationFailed;
+            return;
+        }
+    }
+    batch.detailQueryStatus = DrawTrace::QueryStatus::Pending;
+    batch.detailQueryRecords.reserve(capacity);
+    function(cmdResetQueryPool, "vkCmdResetQueryPool")(batch.commands, batch.detailQueries, 0, info.queryCount);
+}
+
+void Recorder::noteDetailContributor(Batch& batch) {
+    if (!DrawTrace::Eligible() || batch.detailBatch == 0) return;
+    auto detailContext = DrawTrace::Current();
+    detailContext.device = traceDevice;
+    detailContext.batch = batch.detailBatch;
+    DrawTrace::ContextScope scope(detailContext);
+    if (!batch.detailBatchDeclared) {
+        DrawTrace::BoundaryReference(batch.detailBatch, "batch");
+        batch.detailBatchDeclared = true;
+    }
+    if (!batch.detailHasContributors) {
+        batch.detailContext = detailContext;
+        batch.detailHasContributors = true;
+        DrawTrace::DeclareIdentity(traceQueue, "native_queue");
+        DrawTrace::Link(traceQueue, batch.detailBatch, "queue_batch");
+        DrawTrace::Link(traceQueue, traceCapabilitiesEpoch == DrawTrace::MetadataEpoch() ? traceCapabilities : 0, "gpu_capabilities");
+    }
+    if (batch.detailContributorLoss) return;
+    const auto contribute = [&](DrawTrace::Id origin, const char* relation) {
+        const auto result = InsertTraceContributor(batch.detailContributors, origin);
+        if (result == TraceContributorResult::Inserted) DrawTrace::Link(origin, batch.detailBatch, relation);
+        else if (result == TraceContributorResult::CapacityDropped && !batch.detailContributorLoss) {
+            batch.detailContributorLoss = true;
+            DrawTrace::RecordCounter("batch_origin_capacity_dropped", 1, "batch", batch.detailBatch);
+        }
+    };
+    contribute(detailContext.operation, "operation_batch");
+    contribute(detailContext.packet, "packet_batch");
+    contribute(detailContext.submission, "submission_batch");
+    contribute(detailContext.job, "job_batch");
+}
+
+Recorder::TraceCommand Recorder::BeginTraceCommand(Recorder* recorder, VkCommandBuffer commands, const char* kind, std::uint64_t expansionIndex, std::uint32_t requestedCount, bool dynamicCount, DrawTrace::Id pipeline) {
+    TraceCommand result;
+    if (auto* ledger = PerformanceTrace::Workload(); ledger != nullptr && kind != nullptr) {
+        const std::string_view name(kind);
+        result.workloadDraw = name.find("draw") != std::string_view::npos;
+        if (result.workloadDraw || name.find("dispatch") != std::string_view::npos) {
+            result.workload = true;
+            ledger->Begin(result.workloadDraw ? MeasurementWorkload::Kind::HostDraw : MeasurementWorkload::Kind::HostDispatch);
+        }
+    }
+    if (!DrawTrace::Eligible()) return result;
+    result.recorder = recorder;
+    result.commands = commands;
+    result.context = DrawTrace::Current();
+    result.expansionIndex = expansionIndex;
+    result.requestedCount = requestedCount;
+    result.dynamicCount = dynamicCount;
+    result.kind = kind;
+    Batch* batch = recorder != nullptr && recorder->open != nullptr && recorder->open->commands == commands ? recorder->open.get() : nullptr;
+    if (batch != nullptr) {
+        result.context.batch = batch->detailBatch;
+        result.context.device = recorder->traceDevice;
+        recorder->noteDetailContributor(*batch);
+    }
+    DrawTrace::ContextScope scope(result.context);
+    DrawTrace::DeclareIdentity(result.context.device, "device");
+    if (recorder != nullptr) DrawTrace::DeclareIdentity(recorder->traceRecorder, "recorder");
+    const auto slot = batch != nullptr ? batch->detailRequested++ : 0;
+    result.query = DrawTrace::RegisterGpuQuery(result.context.batch, slot, result.context.operation, kind);
+    result.command = DrawTrace::NextId();
+    DrawTrace::RecordHostCommand(result.command, result.context.operation, kind, expansionIndex, requestedCount, dynamicCount, DrawTrace::Status::Unknown);
+    DrawTrace::Link(result.query, result.command, "measures");
+    DrawTrace::Link(result.command, result.context.batch, "records_in");
+    DrawTrace::AssociateMetadata(result.command, pipeline, "pipeline");
+    if (recorder != nullptr) {
+        DrawTrace::Link(result.command, recorder->traceCapabilitiesEpoch == DrawTrace::MetadataEpoch() ? recorder->traceCapabilities : 0, "gpu_capabilities");
+        if (recorder->traceLabels) {
+            std::array<char, 256> name{};
+            const auto* run = std::getenv("APS5_CAPTURE_RUN_ID");
+            if (FormatTraceLabel(name, run != nullptr ? run : "unknown", DrawTrace::CaptureId(), result.context.operation, result.context.batch, pipeline, result.command)) {
+                VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+                label.pLabelName = name.data();
+                recorder->traceBeginLabel(commands, &label);
+                result.label = true;
+            } else DrawTrace::Note("debug_label_id_loss", std::uint64_t{1});
+        }
+        if (TraceCountersRequested()) {
+            try {
+                auto statisticsStatus = TraceQueryPrecondition(batch != nullptr ? batch->detailStatisticsStatus : DrawTrace::QueryStatus::Unsupported,
+                    batch != nullptr ? batch->detailStatisticRecords.size() : 0, 512);
+                if (kind != nullptr && std::string_view(kind).starts_with("draw_mesh")) statisticsStatus = DrawTrace::QueryStatus::Unsupported;
+                if (statisticsStatus == DrawTrace::QueryStatus::Pending) {
+                    const auto beginQuery = recorder->context.Function<PFN_vkCmdBeginQuery>("vkCmdBeginQuery");
+                    result.statisticsSlot = static_cast<std::uint32_t>(batch->detailStatisticRecords.size());
+                    batch->detailStatisticRecords.push_back({result.command, false, result.context});
+                    beginQuery(commands, batch->detailStatistics, result.statisticsSlot, 0);
+                }
+                for (std::size_t column = 0; column < TraceStatisticNames.size(); ++column)
+                    DrawTrace::RecordHardwareCounter(result.command, TraceStatisticNames[column], statisticsStatus, 0, TraceStatisticUnits[column]);
+                DrawTrace::RecordHardwareCounter(result.command, "occlusion_samples", DrawTrace::QueryStatus::Unsupported, 0, "samples");
+            } catch (...) {
+                DrawTrace::ReportObservationLoss();
+            }
+        }
+    }
+    if (result.query == 0) return result;
+    const auto availability = TraceQueryPrecondition(batch != nullptr ? batch->detailQueryStatus : DrawTrace::QueryStatus::Unsupported,
+                                                    batch != nullptr ? batch->detailQueryRecords.size() : 0,
+                                                    std::min(DrawTrace::GpuQueryCapacity(), std::size_t{512}));
+    if (availability != DrawTrace::QueryStatus::Pending) {
+        DrawTrace::ResolveGpuQuery(result.query, availability);
+        return result;
+    }
+    result.slot = static_cast<std::uint32_t>(batch->detailQueryRecords.size());
+    batch->detailQueryRecords.push_back({result.query, false});
+    recorder->context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, batch->detailQueries, result.slot * 2);
+    return result;
+}
+
+void Recorder::EndTraceCommand(const TraceCommand& command, DrawTrace::Status status) {
+    if (command.workload) {
+        if (auto* ledger = PerformanceTrace::Workload()) ledger->End(command.workloadDraw ? MeasurementWorkload::Kind::HostDraw : MeasurementWorkload::Kind::HostDispatch,
+            status == DrawTrace::Status::Complete ? MeasurementWorkload::Outcome::Complete : MeasurementWorkload::Outcome::Failed);
+    }
+    if (command.command == 0) return;
+    DrawTrace::ContextScope scope(command.context);
+    if (command.recorder != nullptr && command.label) command.recorder->traceEndLabel(command.commands);
+    if (command.statisticsSlot != NoTiming && command.recorder != nullptr) {
+        auto* batch = command.recorder->open.get();
+        if (batch != nullptr && batch->commands == command.commands && batch->detailBatch == command.context.batch
+            && command.statisticsSlot < batch->detailStatisticRecords.size()) {
+            command.recorder->context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery")(command.commands, batch->detailStatistics, command.statisticsSlot);
+            batch->detailStatisticRecords[command.statisticsSlot].ended = true;
+        } else {
+            for (std::size_t column = 0; column < TraceStatisticNames.size(); ++column)
+                DrawTrace::RecordHardwareCounter(command.command, TraceStatisticNames[column], DrawTrace::QueryStatus::Uncollected, 0, TraceStatisticUnits[column]);
+        }
+    }
+    if (command.slot != NoTiming && command.recorder != nullptr) {
+        auto* batch = command.recorder->open.get();
+        if (batch != nullptr && batch->commands == command.commands && batch->detailBatch == command.context.batch
+            && command.slot < batch->detailQueryRecords.size()) {
+            command.recorder->context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(command.commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, batch->detailQueries, command.slot * 2 + 1);
+            batch->detailQueryRecords[command.slot].ended = true;
+        } else {
+            DrawTrace::ResolveGpuQuery(command.query, DrawTrace::QueryStatus::Uncollected);
+        }
+    }
+    DrawTrace::RecordHostCommand(command.command, command.context.operation, command.kind, command.expansionIndex, command.requestedCount, command.dynamicCount, status);
+}
+
+void Recorder::readDetailStatistics(Batch& batch) noexcept {
+    if (batch.detailStatisticRecords.empty() || batch.detailStatistics == VK_NULL_HANDLE) return;
+    try {
+        std::vector<std::uint64_t> values(batch.detailStatisticRecords.size() * 8);
+        const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(
+            context.device, batch.detailStatistics, 0, static_cast<std::uint32_t>(batch.detailStatisticRecords.size()),
+            values.size() * sizeof(std::uint64_t), values.data(), 8 * sizeof(std::uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        for (std::size_t index = 0; index < batch.detailStatisticRecords.size(); ++index) {
+            const auto& entry = batch.detailStatisticRecords[index];
+            DrawTrace::ContextScope detailScope(entry.context);
+            const auto row = std::span<const std::uint64_t, 8>(values.data() + index * 8, 8);
+            const auto status = DecodeTraceStatistics(result, row, entry.ended);
+            for (std::size_t column = 0; column < TraceStatisticNames.size(); ++column)
+                DrawTrace::RecordHardwareCounter(entry.command, TraceStatisticNames[column], status, row[column], TraceStatisticUnits[column]);
+        }
+        batch.detailStatisticRecords.clear();
+    } catch (...) {
+        batch.detailStatisticRecords.clear();
+        DrawTrace::ReportObservationLoss();
+    }
+}
+
+void Recorder::readDetailTiming(Batch& batch) {
+    if (batch.detailQueryRecords.empty() || batch.detailQueries == VK_NULL_HANDLE) return;
+    std::vector<std::uint64_t> values(batch.detailQueryRecords.size() * 4);
+    const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(
+        context.device, batch.detailQueries, 0, static_cast<std::uint32_t>(batch.detailQueryRecords.size() * 2),
+        values.size() * sizeof(std::uint64_t), values.data(), sizeof(std::uint64_t) * 2,
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    for (std::size_t index = 0; index < batch.detailQueryRecords.size(); ++index) {
+        const auto& query = batch.detailQueryRecords[index];
+        const auto decoded = DecodeTraceQuery(result, std::span<const std::uint64_t, 4>(values.data() + index * 4, 4), query.ended, traceTimestampValidBits, context.limits.timestampPeriod);
+        DrawTrace::ResolveGpuQueryTicks(query.id, decoded.status, decoded.beginTicks, decoded.endTicks, decoded.periodNs, decoded.validBits);
+    }
+    batch.detailQueryRecords.clear();
+}
+
 bool Recorder::BatchStampsEnabled() {
     return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured();
 }
@@ -2607,6 +2959,18 @@ bool Recorder::gpuSampleCounter() {
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
             Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &samplePipeline), "vkCreateComputePipelines sample counter");
         }
+        DrawTrace::BuiltinComputePipelineState traceState;
+        traceState.pushes = std::span(&push, 1);
+        traceState.layoutFlags = layoutInfo.flags;
+        traceState.pipelineFlags = pipelineInfo.flags;
+        traceState.stageFlags = pipelineInfo.stage.flags;
+        try {
+            traceSampleCounter = DrawTrace::RegisterBuiltinComputePipelineIdentity("recorder_sample_counter", SAMPLE_COUNTER_SPV, traceState);
+            traceSampleCounterEpoch = DrawTrace::MetadataEpoch();
+        } catch (...) {
+            traceSampleCounter = 0;
+            DrawTrace::ReportObservationLoss();
+        }
         context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         module = VK_NULL_HANDLE;
         const VkPushConstantRange dumpPush{VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleDumpPushBytes};
@@ -2620,6 +2984,14 @@ bool Recorder::gpuSampleCounter() {
         {
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
             Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &dumpPipeline), "vkCreateComputePipelines sample dumps");
+        }
+        traceState.pushes = std::span(&dumpPush, 1);
+        try {
+            traceSampleDumps = DrawTrace::RegisterBuiltinComputePipelineIdentity("recorder_sample_dumps", SAMPLE_DUMPS_SPV, traceState);
+            traceSampleDumpsEpoch = DrawTrace::MetadataEpoch();
+        } catch (...) {
+            traceSampleDumps = 0;
+            DrawTrace::ReportObservationLoss();
         }
         context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         module = VK_NULL_HANDLE;
@@ -2772,8 +3144,13 @@ void Recorder::dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, 
         std::uint32_t lastSegment;
     } parameters{sampleCounter->DeviceAddress(), sampleCounter->DeviceAddress() + DumpListOffset, firstDump, dumps, firstSegment, lastSegment};
     static_assert(sizeof(parameters) == SampleDumpPushBytes);
-    function(cmdPushConstants, "vkCmdPushConstants")(commands, dumpLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleDumpPushBytes, &parameters);
-    function(cmdDispatch, "vkCmdDispatch")(commands, 1, 1, 1);
+    const auto push = function(cmdPushConstants, "vkCmdPushConstants");
+    const auto dispatch = function(cmdDispatch, "vkCmdDispatch");
+    push(commands, dumpLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleDumpPushBytes, &parameters);
+    const auto tracePipeline = traceSampleDumpsEpoch == DrawTrace::MetadataEpoch() ? traceSampleDumps : 0;
+    const auto trace = BeginTraceCommand(this, commands, "internal_sample_dump_dispatch", 0, 1, false, tracePipeline);
+    dispatch(commands, 1, 1, 1);
+    EndTraceCommand(trace);
 }
 
 void Recorder::foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes, std::size_t first, std::size_t end, std::uint32_t& dumpIndex, std::uint32_t& consumed) {
@@ -2837,7 +3214,10 @@ void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
         } parameters{sampleCounter->DeviceAddress(), target, count, last && target != 0 ? 1u : 0u};
         static_assert(sizeof(parameters) == SampleCounterPushBytes);
         push(commands, sampleLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleCounterPushBytes, &parameters);
+        const auto tracePipeline = traceSampleCounterEpoch == DrawTrace::MetadataEpoch() ? traceSampleCounter : 0;
+        const auto trace = BeginTraceCommand(this, commands, "internal_sample_fold_dispatch", done, 1, false, tracePipeline);
         dispatch(commands, 1, 1, 1);
+        EndTraceCommand(trace);
     } while (done < pendingSamples.size());
     recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_HOST_READ_BIT);
     CountBarriers(CommandClass::Copy, 2);
@@ -2903,6 +3283,18 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
                 auto pipelineCacheLock = context.LockPipelineCacheForUse();
                 Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &meshArgumentPipeline), "vkCreateComputePipelines mesh arguments");
             }
+            DrawTrace::BuiltinComputePipelineState traceState;
+            traceState.pushes = std::span(&push, 1);
+            traceState.layoutFlags = layoutInfo.flags;
+            traceState.pipelineFlags = pipelineInfo.flags;
+            traceState.stageFlags = pipelineInfo.stage.flags;
+            try {
+                traceMeshArguments = DrawTrace::RegisterBuiltinComputePipelineIdentity("recorder_mesh_arguments", MESH_ARGUMENTS_SPV, traceState);
+                traceMeshArgumentsEpoch = DrawTrace::MetadataEpoch();
+            } catch (...) {
+                traceMeshArguments = 0;
+                DrawTrace::ReportObservationLoss();
+            }
             context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
             meshArgumentState = 1;
         } catch (const std::exception& error) {
@@ -2920,7 +3312,10 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
     } parameters{record, arguments, {rules[0], rules[1], rules[2], rules[3], rules[4], rules[5], rules[6], 0u}};
     static_assert(sizeof(parameters) == PushBytes);
     function(cmdPushConstants, "vkCmdPushConstants")(commands, meshArgumentLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &parameters);
+    const auto trace = BeginTraceCommand(this, commands, "internal_mesh_arguments_dispatch", 0, 1, false,
+        traceMeshArgumentsEpoch == DrawTrace::MetadataEpoch() ? traceMeshArguments : 0);
     function(cmdDispatch, "vkCmdDispatch")(commands, 1, 1, 1);
+    EndTraceCommand(trace);
     recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
     CountBarriers(CommandClass::Draw, 2);
     return true;
@@ -2967,7 +3362,7 @@ void Recorder::readSamples(Batch& batch) {
 void Recorder::readGpuTiming(Batch& batch) {
     if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
     std::vector<std::uint64_t> stamps(batch.timedKeys.size() * 2);
-    const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
     if (result != VK_SUCCESS) return;
     const auto period = context.limits.timestampPeriod;
     if (!GpuTimingEnabled()) {
@@ -3304,7 +3699,7 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         if (!differing.empty() && differing.back().first + differing.back().second == offset) differing.back().second += length;
         else differing.emplace_back(offset, length);
     }
-    for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
+    for (const auto& [offset, length] : differing) GuestMemory::CopyDriverMemory(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
     return true;
 }
 
@@ -4191,7 +4586,37 @@ bool Recorder::writtenBackSince(std::uint64_t sequence, std::uint64_t begin, std
     return false;
 }
 
+std::vector<DrawTrace::Id> Recorder::CollectTraceDependencies() const {
+    std::vector<DrawTrace::Id> result;
+    if (!DrawTrace::Eligible()) return result;
+    result.reserve(inFlight.size() + (open != nullptr ? 1 : 0));
+    for (const auto& batch : inFlight) {
+        if (batch->detailBatch != 0) {
+            if (!batch->detailBatchDeclared) DrawTrace::BoundaryReference(batch->detailBatch, "batch");
+            result.push_back(batch->detailBatch);
+        }
+    }
+    if (open != nullptr && open->detailBatch != 0) {
+        if (!open->detailBatchDeclared) DrawTrace::BoundaryReference(open->detailBatch, "batch");
+        result.push_back(open->detailBatch);
+    }
+    return result;
+}
+
+void Recorder::RecordTraceSubmission(DrawTrace::Id batch, std::uint64_t serial) {
+    if (batch == 0) return;
+    DrawTrace::DeclareIdentity(traceQueue, "native_queue");
+    DrawTrace::Link(traceQueue, batch, "queue_batch");
+    if (tracePreviousBatch != 0) {
+        DrawTrace::BoundaryReference(tracePreviousBatch, "batch");
+        DrawTrace::Link(tracePreviousBatch, batch, "queue_after");
+    }
+    DrawTrace::RecordBatch(batch, traceQueue, serial, DrawTrace::Status::Unknown);
+    tracePreviousBatch = batch;
+}
+
 void Recorder::Submit() {
+    Coherence::ProfileProtections();
     PerformanceTimer frameTiming("Recorder.Submit");
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
@@ -4340,7 +4765,12 @@ void Recorder::Submit() {
         ++queueOrder.waitedSubmits;
     }
     const auto submitStart = std::chrono::steady_clock::now();
-    Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    const auto submitResult = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    if (submitResult != VK_SUCCESS && batch->detailBatch != 0 && (batch->detailHasContributors || batch->detailBatchDeclared)) {
+        DrawTrace::ContextScope detailScope(batch->detailContext);
+        DrawTrace::RecordBatch(batch->detailBatch, traceQueue, serial, DrawTrace::Status::Failed);
+    }
+    Check(submitResult, "vkQueueSubmit recorder");
     orderWaits.clear();
     requiredOrder.clear();
     skipPeerOnce = false;
@@ -4352,6 +4782,11 @@ void Recorder::Submit() {
     if (crossQueueLock.owns_lock()) crossQueueLock.unlock();
     if (!batch->completions.empty()) PokeSubmitSequence();
     batch->submittedAt = std::chrono::steady_clock::now();
+    if (batch->detailBatch != 0 && (batch->detailHasContributors || batch->detailBatchDeclared)) {
+        DrawTrace::ContextScope detailScope(batch->detailContext);
+        DrawTrace::Note("recorder_submit_serial", batch->serial);
+        RecordTraceSubmission(batch->detailBatch, batch->serial);
+    }
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
         ++submitCount;
@@ -4900,10 +5335,20 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
         if (result != VK_SUCCESS) {
+            if (batch->detailBatch != 0 && (batch->detailHasContributors || batch->detailBatchDeclared)) {
+                DrawTrace::ContextScope detailScope(batch->detailContext);
+                DrawTrace::RecordBatch(batch->detailBatch, traceQueue, batch->serial, DrawTrace::Status::Failed);
+            }
             release(*batch);
             Check(result, "vkWaitForFences recorder");
         }
     }
+    if (batch->detailBatch != 0 && (batch->detailHasContributors || batch->detailBatchDeclared)) {
+        DrawTrace::ContextScope detailScope(batch->detailContext);
+        DrawTrace::RecordBatch(batch->detailBatch, traceQueue, batch->serial, DrawTrace::Status::Complete);
+    }
+    readDetailStatistics(*batch);
+    readDetailTiming(*batch);
     readGpuTiming(*batch);
     readSamples(*batch);
     LabelVersions::MarkAll(batch->labelStamps, LabelVersions::Milestone::DeviceReady);
@@ -5022,6 +5467,36 @@ void Recorder::release(Batch& batch) noexcept {
         if (batch.prologue != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &batch.prologue);
         batch.prologue = VK_NULL_HANDLE;
     }
+    try {
+        for (const auto& entry : batch.detailStatisticRecords) {
+            DrawTrace::ContextScope detailScope(entry.context);
+            for (std::size_t column = 0; column < TraceStatisticNames.size(); ++column)
+                DrawTrace::RecordHardwareCounter(entry.command, TraceStatisticNames[column], DrawTrace::QueryStatus::Uncollected, 0, TraceStatisticUnits[column]);
+        }
+    } catch (...) {
+        DrawTrace::ReportObservationLoss();
+    }
+    batch.detailStatisticRecords.clear();
+    if (batch.detailStatistics != VK_NULL_HANDLE && detailSpareStatistics.size() < 64) {
+        try {
+            detailSpareStatistics.push_back(batch.detailStatistics);
+            batch.detailStatistics = VK_NULL_HANDLE;
+        } catch (...) {
+        }
+    }
+    if (batch.detailStatistics != VK_NULL_HANDLE) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, batch.detailStatistics, nullptr);
+    batch.detailStatistics = VK_NULL_HANDLE;
+    for (const auto& query : batch.detailQueryRecords) DrawTrace::ResolveGpuQuery(query.id, DrawTrace::QueryStatus::Uncollected);
+    batch.detailQueryRecords.clear();
+    if (batch.detailQueries != VK_NULL_HANDLE && detailSparePools.size() < 64) {
+        try {
+            detailSparePools.push_back(batch.detailQueries);
+            batch.detailQueries = VK_NULL_HANDLE;
+        } catch (...) {
+        }
+    }
+    if (batch.detailQueries != VK_NULL_HANDLE) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, batch.detailQueries, nullptr);
+    batch.detailQueries = VK_NULL_HANDLE;
     if (batch.queries != VK_NULL_HANDLE) {
         if (!GpuTimingEnabled() && sparePools.size() < 64) {
             try {

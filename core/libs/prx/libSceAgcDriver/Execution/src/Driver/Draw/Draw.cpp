@@ -1,3 +1,6 @@
+#include "prx/libSceAgcDriver/Execution/include/DrawTraceIdentity.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderTraceObserver.hpp"
+#include <optional>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CompileService.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueScheduler.hpp"
@@ -43,7 +46,11 @@ struct Driver::DrawInputs {
 void Driver::recordDrawInputs(const DrawInputs& inputs, DrawRecordResult& result, const std::shared_ptr<VulkanDevice>& localDevice) {
     const auto& state = inputs.state->state;
     if (inputs.recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(state, inputs.draw, inputs.stages, inputs.snapshots, inputs.recipe) == RecipeOutcome::Recorded) return;
+        if (localDevice->DrawFromRecipe(state, inputs.draw, inputs.stages, inputs.snapshots, inputs.recipe) == RecipeOutcome::Recorded) {
+            DrawTrace::Note("draw_recipe_outcome", "recorded");
+            return;
+        }
+        DrawTrace::Note("draw_recipe_outcome", "rebuild");
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
@@ -56,7 +63,18 @@ void Driver::noteDrawInputWriters(const DrawInputs& inputs, std::uint32_t queue)
 }
 
 DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
+    std::optional<DrawTrace::Operation> traceOperation;
+    if (frozenSink() == nullptr && DrawTrace::Current().operation == 0) traceOperation.emplace("draw");
     PerformanceTimer timing("Driver.Draw");
+    const auto finishVerdict = [&](DrawVerdict verdict) {
+        const auto outcome = verdict == DrawVerdict::Rejected ? DrawTrace::Status::Rejected : verdict == DrawVerdict::Nothing ? DrawTrace::Status::Skipped : DrawTrace::Status::Complete;
+        if (frozenSink() == nullptr) {
+            if (traceOperation) traceOperation->Outcome(outcome);
+            else DrawTrace::SetOperationOutcome(outcome);
+        }
+        if (verdict == DrawVerdict::Rejected) DrawTrace::Note("rejection_reason", rejected.c_str());
+        return verdict;
+    };
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::uint64_t captures = 0;
@@ -66,17 +84,20 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
 
     const auto drawn = [&] {
         phaseTiming.Phase(DrawRowVectors);
-        if (!profile) return DrawVerdict::Drawn;
+        if (!profile) return finishVerdict(DrawVerdict::Drawn);
         auto& pending = pendingDrawPhases();
         pending.phases = true;
         pending.captures = captures;
         pending.ms = phaseMs;
         pending.tailAt = phaseLap;
-        return DrawVerdict::Drawn;
+        return finishVerdict(DrawVerdict::Drawn);
     };
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
+    DrawTrace::Note("draw_index_count", static_cast<std::uint64_t>(drawParameters.indexCount));
+    DrawTrace::Note("draw_instance_count", static_cast<std::uint64_t>(drawParameters.instanceCount));
+    DrawTrace::Note("draw_indirect", static_cast<std::uint64_t>(drawParameters.indirect.has_value()));
     bool traceIndirect = false;
-    if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
+    if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return finishVerdict(*verdict);
     phaseTiming.Phase(DrawRowPrecheck);
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
@@ -91,7 +112,9 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
     if (lockedPrepare) {
 
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        DrawTrace::Span lockWait("Driver.DrawGpuMutexWait");
         gpuLock.lock();
+        lockWait.Finish();
         timing.Mark("gpu_mutex_wait");
         phaseTiming.Phase(DrawRowLockWait);
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
@@ -101,11 +124,14 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         phaseTiming.Phase(DrawRowLabels);
     } else if ((localDevice = device.Load()) == nullptr) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        DrawTrace::Span lockWait("Driver.DeviceSetupMutexWait");
         std::lock_guard createLock(GuestMemory::GpuMutex());
+        lockWait.Finish();
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
         localDevice = device;
     }
     timing.Mark("device_setup");
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) localDevice->EnsurePipelinePreparation();
     const auto parkForPipeline = [&](const Graphics::State& pipelineState, std::span<const Graphics::CompiledShader> pipelineStages) {
         if (!VulkanDevice::CompileParkingEnabled() || GuestMemory::GpuMutex().HeldByThisThread()) return;
         auto* sink = frozenSink();
@@ -248,11 +274,17 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
     }
     if (!planned) resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
     const auto& graphics = decode->state;
-    if (auto* sink = frozenSink(); sink != nullptr && (graphics.rectList || graphics.stages.mesh) && sink->Refuse(graphics.rectList ? FrozenFallback::RectList : FrozenFallback::Mesh)) return DrawVerdict::Nothing;
+    if (auto* sink = frozenSink(); sink != nullptr && (graphics.rectList || graphics.stages.mesh) && sink->Refuse(graphics.rectList ? FrozenFallback::RectList : FrozenFallback::Mesh)) return finishVerdict(DrawVerdict::Nothing);
     auto pixel = decode->pixel;
     std::vector<DrawProgram> programs = decode->programs;
     for (const auto& patch : userPatches) programs[patch.program].userData[patch.index] = patch.value;
-    if (const auto skipped = SkippedShader(); skipped != 0 && std::any_of(programs.begin(), programs.end(), [skipped](const DrawProgram& program) { return program.binary.codeAddress == skipped; })) return drawn();
+    if (const auto skipped = SkippedShader(); skipped != 0 && std::any_of(programs.begin(), programs.end(), [skipped](const DrawProgram& program) { return program.binary.codeAddress == skipped; })) {
+        const auto verdict = drawn();
+        if (traceOperation) traceOperation->Outcome(DrawTrace::Status::Skipped);
+        else DrawTrace::SetOperationOutcome(DrawTrace::Status::Skipped);
+        DrawTrace::Note("skip_reason", "selected_shader");
+        return verdict;
+    }
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
         auto& words = programs.front().userData;
@@ -336,6 +368,9 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
     bool verifyHit = false;
     const bool stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData);
+    DrawTrace::Note("draw_cache_outcome", !stageEntries ? "disabled" : drawHit ? "hit" : "miss");
+    DrawTrace::Note("draw_cache_verification_requested", static_cast<std::uint64_t>(verifyHit));
+    DrawTrace::RecordCounter("draw_stage_cache_hits", static_cast<std::uint64_t>(std::count_if(matched.begin(), matched.end(), [](const auto& stage) { return stage != nullptr; })), "stages");
     const bool patchedStages = std::any_of(stageData.begin(), stageData.end(), [](const StageDataHit& hit) { return hit.compiled != nullptr; });
     std::uint64_t stageDataVerified = 0;
     for (auto& variant : matched) {
@@ -467,7 +502,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
                     stageCaptures[i].inputExports = front->parameterExports;
                 }
                 const auto compiled = materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
-                if (!rejected.empty()) return DrawVerdict::Rejected;
+                if (!rejected.empty()) return finishVerdict(DrawVerdict::Rejected);
                 require(compiled != nullptr, "draw stage materialization returned no result");
                 if (copyStageResults) {
                     resultIndex[i] = results.size();
@@ -483,9 +518,14 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             else if (dataEntry != nullptr) ++dataStagesCompiled;
         }
         const auto& result = *programResults[i];
+        ShaderTraceObserver::LinkProducer(result);
+        if (DrawTrace::Enabled()) {
+            const auto identity = DrawTrace::RegisterShaderIdentity(program.binary.stage, result);
+            DrawTrace::AssociateMetadata(DrawTrace::Current().operation, identity, "shader_stage");
+        }
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
-            if (auto* sink = frozenSink(); sink != nullptr && indirectCpu.has_value() && sink->Refuse(FrozenFallback::Indirect)) return DrawVerdict::Nothing;
+            if (auto* sink = frozenSink(); sink != nullptr && indirectCpu.has_value() && sink->Refuse(FrozenFallback::Indirect)) return finishVerdict(DrawVerdict::Nothing);
         } else if (i == 0) {
             fold(result, drawParameters);
         }
@@ -522,7 +562,10 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         for (const auto& read : reads) memory.push_back({read.address, std::as_bytes(std::span(read.bytes))});
     }
 
-    if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
+    if (recordQueuedLabelsAfterCapture(submission.queue, memory)) {
+        DrawTrace::Note("draw_retry", "labels_changed_after_capture");
+        return draw(queue, packet, submission, rejected);
+    }
 
     bool rectListBuilt = false;
 
@@ -564,7 +607,9 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         if (gpuLock.owns_lock()) return;
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        DrawTrace::Span lockWait("Driver.DrawGpuMutexWait");
         gpuLock.lock();
+        lockWait.Finish();
         timing.Mark("gpu_mutex_wait");
         phaseTiming.Phase(DrawRowLockWait);
 
@@ -578,7 +623,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         phaseTiming.Phase(DrawRowLabels);
     };
     if (drawParameters.indirect && indirectCpu) {
-        if (drawRecordState().active && !settleDrawRecords(snapshots, true)) return DrawVerdict::Nothing;
+        if (drawRecordState().active && !settleDrawRecords(snapshots, true)) return finishVerdict(DrawVerdict::Nothing);
 
         const auto indirect = *drawParameters.indirect;
         results.reserve(programs.size() + 2u);
@@ -594,6 +639,8 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         if (frozenSink() == nullptr) recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
+        DrawTrace::Note("indirect_requested_limit", static_cast<std::uint64_t>(indirect.count));
+        DrawTrace::Note("indirect_resolved_count", static_cast<std::uint64_t>(count));
         std::vector<Pm4::DrawArguments> records;
         for (std::uint32_t record = 0; record < count; ++record) records.push_back(Pm4::ReadDrawArguments(indirect, record));
         Graphics::CountIndirectDraw(*indirectCpu, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
@@ -601,9 +648,25 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         const auto startInstanceWord = locate(indirect.startInstanceLocation);
         const auto drawIndexWord = indirect.drawIndexEnabled ? locate(indirect.drawIndexLocation) : std::nullopt;
         for (std::uint32_t record = 0; record < records.size(); ++record) {
+            PerformanceTrace::WorkloadScope workload(MeasurementWorkload::Kind::IndirectRecord);
+            const auto groupOperation = DrawTrace::Current().operation;
+            DrawTrace::Operation recordOperation("draw_indirect_record");
+            DrawTrace::Link(groupOperation, recordOperation.GetId(), "indirect_record");
+            DrawTrace::Note("indirect_record_index", static_cast<std::uint64_t>(record));
             const auto& arguments = records[record];
+            DrawTrace::RecordCounter("indirect_argument_records_read", 1, "records");
+            DrawTrace::Note("indirect_argument_count", static_cast<std::uint64_t>(arguments.count));
+            DrawTrace::Note("indirect_argument_instances", static_cast<std::uint64_t>(arguments.instances));
+            DrawTrace::Note("indirect_argument_first", static_cast<std::uint64_t>(arguments.firstVertexOrIndex));
+            DrawTrace::Note("indirect_argument_vertex_offset", static_cast<std::uint64_t>(arguments.vertexOffset));
+            DrawTrace::Note("indirect_argument_first_instance", static_cast<std::uint64_t>(arguments.firstInstance));
             if (traceIndirect) std::fprintf(stderr, "[draw]   record %u: count %u instances %u first %u vertexOffset %u startInstance %u\n", record, arguments.count, arguments.instances, arguments.firstVertexOrIndex, arguments.vertexOffset, arguments.firstInstance);
-            if (arguments.count == 0 || arguments.instances == 0) continue;
+            if (arguments.count == 0 || arguments.instances == 0) {
+                workload.Outcome(MeasurementWorkload::Outcome::Skipped);
+                recordOperation.Outcome(DrawTrace::Status::Skipped);
+                DrawTrace::Note("skip_reason", "empty_indirect_record");
+                continue;
+            }
             std::set<std::size_t> patched;
             const auto patch = [&](const std::optional<std::pair<std::size_t, std::size_t>>& word, std::uint32_t value) {
                 if (!word) return;
@@ -621,7 +684,12 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             Pm4::DrawParameters direct{0, arguments.count, 0, arguments.instances, drawParameters.flags, drawParameters.indexed, 0, 0};
             if (drawParameters.indexed) {
 
-                if (arguments.firstVertexOrIndex >= drawParameters.indexCount) continue;
+                if (arguments.firstVertexOrIndex >= drawParameters.indexCount) {
+                    workload.Outcome(MeasurementWorkload::Outcome::Skipped);
+                    recordOperation.Outcome(DrawTrace::Status::Skipped);
+                    DrawTrace::Note("skip_reason", "indirect_index_out_of_range");
+                    continue;
+                }
                 direct.indexAddress = drawParameters.indexAddress + static_cast<std::uint64_t>(arguments.firstVertexOrIndex) * drawParameters.indexSize;
                 direct.indexCount = std::min(arguments.count, drawParameters.indexCount - arguments.firstVertexOrIndex);
                 direct.indexSize = drawParameters.indexSize;
@@ -637,7 +705,11 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
                 const auto pushBytes = result.pushConstants.size();
                 decodeVertexInfo(programIndex);
                 const auto compiled = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, programs[programIndex].binary.stage == Stage::TessellationControl || programs[programIndex].binary.stage == Stage::TessellationEvaluation ? direct : drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
-                if (!rejected.empty()) return DrawVerdict::Rejected;
+                if (!rejected.empty()) {
+                    recordOperation.Outcome(DrawTrace::Status::Rejected);
+                    workload.Outcome(MeasurementWorkload::Outcome::Rejected);
+                    return finishVerdict(DrawVerdict::Rejected);
+                }
                 require(compiled != nullptr, "patched draw stage materialization returned no result");
                 result = *compiled;
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
@@ -648,7 +720,8 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             snapshot();
             if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
                 rejected = std::move(*known);
-                return DrawVerdict::Rejected;
+                recordOperation.Outcome(DrawTrace::Status::Rejected);
+                return finishVerdict(DrawVerdict::Rejected);
             }
             phaseTiming.Phase(DrawRowVectors);
             parkForPipeline(graphics, stages);
@@ -673,12 +746,13 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
     std::shared_ptr<const DrawRecipe> recipe;
     if (drawHit && !recipeStages.empty()) {
         recipe = findDrawRecipe(drawKey, recipeStages);
+        DrawTrace::Note("draw_recipe_lookup", recipe != nullptr ? "hit" : "miss");
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
     }
     if (recipe == nullptr) {
         if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
             rejected = std::move(*known);
-            return DrawVerdict::Rejected;
+            return finishVerdict(DrawVerdict::Rejected);
         }
         phaseTiming.Phase(DrawRowVectors);
         parkForPipeline(graphics, stages);
@@ -704,7 +778,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         return drawn();
     }
     if (drawRecordState().active) {
-        if (!settleDrawRecords(snapshots)) return DrawVerdict::Nothing;
+        if (!settleDrawRecords(snapshots)) return finishVerdict(DrawVerdict::Nothing);
         if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value()) {
             lockForDraw();
             gpuLock.unlock();
@@ -712,16 +786,21 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
         noteDrawWriters(stages, submission.queue);
         phaseTiming.Phase(DrawRowVectors);
         auto inputs = std::make_shared<DrawInputs>(DrawInputs{relocatedDecode, decode, entry, shaderMemoryOwner, drawParameters, std::move(programs), std::move(decodeReads), std::move(memory), std::move(matchedRegions), std::move(matched), std::move(fresh), std::move(stageCaptures), std::move(results), std::move(stages), std::move(snapshots), recipe, std::move(recipeStages), drawKey});
-        postDrawRecord(localDevice, submission.queue, recordIdentity(submission, "draw", stages.empty() ? 0 : stages.back().programAddress), [inputs, localDevice](DrawRecordResult& result) { recordDrawInputs(*inputs, result, localDevice); });
+        postDrawRecord(localDevice, submission.queue, recordIdentity(submission, "draw", stages.empty() ? 0 : stages.back().programAddress), [inputs, localDevice](DrawRecordResult& result) { recordDrawInputs(*inputs, result, localDevice); }, "draw");
         phaseTiming.Phase(DrawRowGraphics);
         timing.Mark("draw_and_resource_release");
-        return drawn();
+        const auto verdict = drawn();
+        if (traceOperation) traceOperation->Outcome(DrawTrace::Status::Unknown);
+        else DrawTrace::SetOperationOutcome(DrawTrace::Status::Unknown);
+        DrawTrace::Note("draw_path", "deferred_record");
+        return verdict;
     }
     lockForDraw();
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) {
+            DrawTrace::Note("draw_recipe_outcome", "recorded");
             phaseTiming.Phase(DrawRowGraphics);
             timing.Mark("draw_and_resource_release");
             return drawn();

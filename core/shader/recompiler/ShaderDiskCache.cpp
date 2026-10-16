@@ -84,10 +84,16 @@ std::filesystem::path ShaderCacheDirectory() {
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
+template<typename TResult>
+constexpr std::size_t TransientProvenanceBytes() {
+    if constexpr (requires(const TResult& result) { result.inputProvenance; }) return sizeof(decltype(std::declval<TResult>().inputProvenance));
+    else return 0;
+}
+
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 280, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 320, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 200, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 536, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(RecompileResult) == 592 + TransientProvenanceBytes<RecompileResult>(), "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 616, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
@@ -300,6 +306,15 @@ public:
     [[nodiscard]] std::size_t Remaining() const { return ok ? bytes.size() - position : 0; }
     void Fail() { ok = false; }
 
+    [[nodiscard]] bool Allocate(std::size_t count, std::size_t elementBytes) {
+        if (!ok || elementBytes == 0 || count > allocationRemaining / elementBytes) {
+            ok = false;
+            return false;
+        }
+        allocationRemaining -= count * elementBytes;
+        return true;
+    }
+
     [[nodiscard]] std::uint64_t Compact() {
         std::uint64_t value = 0;
         for (std::uint32_t shift = 0; shift < 64u; shift += 7u) {
@@ -337,6 +352,7 @@ public:
     template<typename TValue>
     void Values(std::vector<TValue>& values) requires std::is_integral_v<TValue> {
         const auto count = Count(sizeof(TValue));
+        if (!Allocate(count, sizeof(TValue))) { values.clear(); return; }
         values.resize(count);
         if (count != 0) {
             std::memcpy(values.data(), bytes.data() + position, count * sizeof(TValue));
@@ -348,9 +364,11 @@ public:
         const auto count = Count(sizeof(std::uint32_t));
         const auto* first = bytes.data() + position;
         position += count * sizeof(std::uint32_t);
+        if (!ok) return {};
         if (owner != nullptr && reinterpret_cast<std::uintptr_t>(first) % alignof(std::uint32_t) == 0) {
             return SharedSpirv(owner, std::span(reinterpret_cast<const std::uint32_t*>(first), count));
         }
+        if (!Allocate(count, sizeof(std::uint32_t))) return {};
         std::vector<std::uint32_t> words(count);
         if (count != 0) std::memcpy(words.data(), first, count * sizeof(std::uint32_t));
         return SharedSpirv(std::move(words));
@@ -358,12 +376,14 @@ public:
 
     void Flags(std::vector<bool>& flags) {
         const auto count = Count(1);
+        if (!Allocate(count, 1)) { flags.clear(); return; }
         flags.assign(count, false);
         for (std::size_t i = 0; i < count; ++i) flags[i] = Get<bool>();
     }
 
     void Text(std::string& text) {
         const auto count = Count(1);
+        if (!Allocate(count, 1)) { text.clear(); return; }
         text.assign(reinterpret_cast<const char*>(bytes.data() + position), count);
         position += count;
     }
@@ -371,6 +391,7 @@ public:
     template<typename TValue, typename TDecode>
     void List(std::vector<TValue>& values, std::size_t minimum, TDecode&& decode) {
         const auto count = Count(minimum);
+        if (!Allocate(count, sizeof(TValue))) { values.clear(); return; }
         values.assign(count, TValue{});
         for (auto& value : values) {
             if (!ok) break;
@@ -403,6 +424,7 @@ private:
     std::span<const std::byte> bytes;
     std::shared_ptr<const void> owner;
     std::size_t position = 0;
+    std::size_t allocationRemaining = 64u * 1024u * 1024u;
     bool ok = true;
 };
 
@@ -650,6 +672,7 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     reader.List(invocation.bindings, 8, decodeBinding);
     std::vector<std::uint8_t> pushConstants;
     reader.Values(pushConstants);
+    if (!reader.Allocate(pushConstants.size(), sizeof(std::byte))) return;
     invocation.pushConstants.resize(pushConstants.size());
     if (!pushConstants.empty()) std::memcpy(invocation.pushConstants.data(), pushConstants.data(), pushConstants.size());
     reader.List(invocation.vertexAttributes, 32, [](Reader& in, VertexAttribute& attribute) {
@@ -1182,6 +1205,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         record.registerValue = {static_cast<RegisterBank>(registerValue & 0xfu), static_cast<std::uint32_t>(registerValue >> 4u)};
         record.hasImmediate = (shape & 1u) != 0u;
         if (record.hasImmediate) record.immediate = in.Compact();
+        if (!in.Allocate(static_cast<std::size_t>(arguments), sizeof(std::uint32_t))) return;
         record.arguments.resize(static_cast<std::size_t>(arguments));
         for (auto& argument : record.arguments) {
             const auto code = in.Compact();
@@ -1199,6 +1223,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
             argument = static_cast<std::uint32_t>(index);
         }
         if (record.opcode == IrOpcode::Phi) {
+            if (!in.Allocate(record.arguments.size(), sizeof(std::uint32_t))) return;
             record.phiBlocks.resize(record.arguments.size());
             for (auto& block : record.phiBlocks) {
                 const auto index = in.Compact();
@@ -1209,6 +1234,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         ++current;
     });
     if (!reader.Ok()) return false;
+    if (!reader.Allocate(blockIds.size(), sizeof(IrBlock) + sizeof(std::unique_ptr<IrBlock>)) || !reader.Allocate(records.size(), sizeof(IrValue))) return false;
     plan.blockStorage.reserve(blockIds.size());
     for (const auto id : blockIds) plan.blockStorage.push_back(std::make_unique<IrBlock>(id));
     plan.valueStorage.Reserve(records.size());
@@ -1232,7 +1258,9 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         auto& value = plan.valueStorage[index];
         std::vector<IrValue*> arguments;
         std::vector<IrBlock*> phiBlocks;
+        if (!reader.Allocate(record.arguments.size(), sizeof(IrValue*)) || (value.IsPhi() && !reader.Allocate(record.arguments.size(), sizeof(IrBlock*)))) return false;
         arguments.reserve(record.arguments.size());
+        if (value.IsPhi()) phiBlocks.reserve(record.arguments.size());
         for (std::size_t operand = 0; operand < record.arguments.size(); ++operand) {
             arguments.push_back(valueAt(record.arguments[operand]));
             if (value.IsPhi()) phiBlocks.push_back(plan.blockStorage[record.phiBlocks[operand]].get());
@@ -1309,6 +1337,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
 }
 
 constexpr std::string_view NeutralSwitches[] = {
+    "APS5_TRACE_DETAIL",
     "APS5_COMPILE_TRACE",
     "APS5_SHADER_CACHE_V2",
     "APS5_SPIRV_INTERN",
@@ -1318,6 +1347,7 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",
     "APS5_NO_FAILURE_MEMO",
+    "APS5_NO_SHADER_INPUTS",
     "APS5_NO_MATERIALIZE_STORAGE_REUSE",
     "APS5_NO_PERF_FRONTEND_PAIR",
     "APS5_NO_PERF_DISK_PLANS",
@@ -1450,6 +1480,8 @@ public:
         if (DecodeEntry(bytes, key, *persisted, std::move(mapped)) != LoadStatus::Loaded) return nullptr;
         persisted->layout = variant.layout;
         persisted->artifact.variantId = variant.artifact.variantId;
+        persisted->artifact.traceSourceIdentity = variant.artifact.traceSourceIdentity;
+        persisted->artifact.tracePreparationJob = variant.artifact.tracePreparationJob;
         return persisted;
     }
 
@@ -1838,6 +1870,10 @@ bool SamePlan(const IrResourcePlan& reference, const IrResourcePlan& candidate) 
     return expected == actual;
 }
 
+std::span<const std::byte> CompilerConfigurationKey() {
+    return switchKey();
+}
+
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {
     key.clear();
     Writer writer(key);
@@ -1903,6 +1939,25 @@ std::vector<std::byte> EncodeEntry(std::span<const std::byte> key, const Compile
     encodeInfo(writer, variant.info);
     encodeAllocation(writer, variant.bindings);
     return wrapEntry(key, payload);
+}
+
+std::span<const std::byte> EntryKey(std::span<const std::byte> file) {
+    if (file.size() < sizeof(FileHeader)) return {};
+    FileHeader header;
+    std::memcpy(&header, file.data(), sizeof(header));
+    if (header.keyBytes == 0u || header.keyBytes > file.size() - sizeof(header)) return {};
+    const auto key = file.subspan(sizeof(header), static_cast<std::size_t>(header.keyBytes));
+    std::span<const std::byte> payload;
+    return unwrapEntry(file, key, payload) == LoadStatus::Loaded ? key : std::span<const std::byte>{};
+}
+
+bool IsCurrentEntryHeader(std::span<const std::byte> bytes, std::uint64_t fileBytes) {
+    if (bytes.size() < sizeof(FileHeader) || fileBytes < sizeof(FileHeader)) return false;
+    FileHeader header;
+    std::memcpy(&header, bytes.data(), sizeof(header));
+    if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != SourceVersion() || header.keyBytes == 0u || header.keyBytes > fileBytes - sizeof(header) || header.keyBytes > std::numeric_limits<std::size_t>::max() - sizeof(header) - 7u) return false;
+    const auto payloadOffset = PayloadOffset(static_cast<std::size_t>(header.keyBytes));
+    return payloadOffset <= fileBytes && header.payloadBytes == fileBytes - payloadOffset;
 }
 
 LoadStatus DecodeEntry(std::span<const std::byte> file, std::span<const std::byte> key, CompiledVariant& variant, std::shared_ptr<const void> owner) {

@@ -254,7 +254,7 @@ bool StoreUncompressedOnGpu(const Context& context, Recorder& recorder, std::uin
     // a later command writing the keys; see Recorder::QueueKeyStore).
     recorder.QueueKeyStore(import->buffer, first, last, std::move(seed), begin, begin + count);
     recorder.NotePendingFill(begin, count, 0xff);
-    GuestMemory::MarkWritten(begin, count);
+    GuestMemory::MarkWritten(begin, count, AgcDriver::GuestMemory::WriteExtent::Exact);
     // After the note: an unlocked memo lookup drops an entry the snapshot does not cover yet. The
     // entry is kept only for the active recorder (the one the flush hook and the lookups consult).
     {
@@ -269,12 +269,12 @@ bool StoreUncompressedOnGpu(const Context& context, Recorder& recorder, std::uin
     return true;
 }
 
-void StoreUncompressedOnCpu(std::uint64_t begin, std::size_t count) {
+void StoreUncompressedOnCpu(std::uint64_t begin, std::size_t count, const std::function<void()>& validate = {}) {
     TraceKeyStore("cpu", begin, count);
     // The write waits for recorded work over the range (the flush hook), so the bytes are current after.
     ForgetStores(begin, begin + count);
     const std::vector<std::byte> uncompressed(count, std::byte{0xff});
-    GuestMemory::Write(begin, uncompressed);
+    GuestMemory::Write(begin, uncompressed, 1, validate);
     CountStore(Scans().cpuStores);
 }
 
@@ -328,7 +328,9 @@ LandedKeys KeysAfterPendingWrites(const Recorder& recorder, std::uint64_t begin,
     }
     for (const auto& [from, to] : unwritten) {
         if (landed.mixed) break;
-        const auto* keys = reinterpret_cast<const std::uint8_t*>(from);
+        std::vector<std::uint8_t> copied(static_cast<std::size_t>(to - from));
+        GuestMemory::CopyDriverMemory(copied.data(), reinterpret_cast<const void*>(from), copied.size());
+        const auto* keys = copied.data();
         if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
         else landed.mixed = true;
     }
@@ -365,7 +367,9 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
 // Whether the keys already read as uncompressed: scans the same bytes as ReadDccKeys, so it counts
 // as a scan too.
 bool AlreadyUncompressed(std::uint64_t metaAddress, std::size_t count) {
-    const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
+    std::vector<std::uint8_t> copied(count);
+    GuestMemory::CopyDriverMemory(copied.data(), reinterpret_cast<const void*>(metaAddress), count);
+    const auto* keys = copied.data();
     const auto start = ScanProfileEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool uncompressed = AllKeysEqual(keys, count, 0xff);
     if (ScanProfileEnabled()) CountScan(count, start);
@@ -507,7 +511,9 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
             recorder.Sync();
         });
     }
-    const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
+    std::vector<std::uint8_t> copied(count);
+    GuestMemory::CopyDriverMemory(copied.data(), reinterpret_cast<const void*>(metaAddress), count);
+    const auto* keys = copied.data();
     const auto first = keys[0];
     const auto start = ScanProfileEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool uniform = AllKeysEqual(keys + 1, count - 1, first);
@@ -588,7 +594,8 @@ void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes) 
     MarkDccUncompressed(metaAddress, surfaceBytes, DccKeyBytes(surfaceBytes));
 }
 
-void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount) {
+void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount, const std::function<void()>& validate) {
+    if (validate) validate();
     const auto count = StoredKeyCount(metaAddress, surfaceBytes, keyCount);
     if (count == 0) return;
     // The bytes are trusted only when no recorded work writes them (lock-free, with or without
@@ -596,7 +603,7 @@ void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes, 
     // GPU store of the driver's own is no reason to skip: a title kernel recorded into the same
     // batch after it may write clear keys, and the memo cannot order inside a batch.
     if (!Recorder::SnapshotWriteOverlaps(metaAddress, count) && AlreadyUncompressed(metaAddress, count)) return;
-    StoreUncompressedOnCpu(metaAddress, count);
+    StoreUncompressedOnCpu(metaAddress, count, validate);
 }
 
 void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std::uint64_t surfaceBytes) {

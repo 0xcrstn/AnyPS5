@@ -225,7 +225,9 @@ Graphics::DccKeys DisplayBufferKeys(const DisplayBuffer& buffer) {
     if (keys == Graphics::DccKeys::Uncompressed || Graphics::IsDccClear(keys)) return keys;
     char differing[128] = "";
     if (keys == Graphics::DccKeys::Mixed && GuestMemory::Accessible(reinterpret_cast<const void*>(buffer.dccAddress), count)) {
-        const auto* bytes = reinterpret_cast<const std::uint8_t*>(buffer.dccAddress);
+        std::vector<std::uint8_t> copied(count);
+        GuestMemory::CopyDriverMemory(copied.data(), reinterpret_cast<const void*>(buffer.dccAddress), count);
+        const auto* bytes = copied.data();
         traceDisplayKeys(buffer, bytes, count);
         const auto* other = std::find_if(bytes + 1, bytes + count, [&](std::uint8_t key) { return key != bytes[0]; });
         if (other == bytes + count) {
@@ -250,8 +252,9 @@ std::vector<std::byte> ReadDisplayBuffer(const DisplayBuffer& buffer) {
     }
     GuestMemory::FlushGpuWrites(buffer.address, size);
     GuestMemory::CheckRange(reinterpret_cast<const void*>(buffer.address), size, 65536);
-    const auto* source = reinterpret_cast<const std::byte*>(buffer.address);
-    return DecodeDisplayBuffer(buffer, {source, size});
+    std::vector<std::byte> copied(size);
+    GuestMemory::CopyDriverMemory(copied.data(), reinterpret_cast<const void*>(buffer.address), size);
+    return DecodeDisplayBuffer(buffer, copied);
 }
 
 std::vector<std::byte> DisplayBufferTexels(const DisplayBuffer& buffer, std::span<const std::byte> source) {
@@ -268,7 +271,9 @@ std::vector<std::byte> ReadDisplayBufferTexels(const DisplayBuffer& buffer) {
     const auto size = DisplayBufferSize(buffer);
     GuestMemory::FlushGpuWrites(buffer.address, size);
     GuestMemory::CheckRange(reinterpret_cast<const void*>(buffer.address), size, 65536);
-    return DisplayBufferTexels(buffer, {reinterpret_cast<const std::byte*>(buffer.address), size});
+    std::vector<std::byte> copied(size);
+    GuestMemory::CopyDriverMemory(copied.data(), reinterpret_cast<const void*>(buffer.address), size);
+    return DisplayBufferTexels(buffer, copied);
 }
 
 }

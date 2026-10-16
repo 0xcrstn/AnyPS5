@@ -5,9 +5,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/EmitUnit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommandSink.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrawTrace.hpp"
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
+#include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -21,6 +24,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -77,6 +81,9 @@ public:
     static std::uint32_t PhysicalQueueOf(std::uint32_t guestQueue);
     static RecorderDomain& DomainOf(std::uint32_t guestQueue);
     static Recorder* Current();
+    static bool SyncIfLive(const Recorder* recorder);
+    static std::vector<Recorder*> Live();
+    static std::vector<Recorder*> LiveForDevice(VkDevice device);
     template<typename TAction>
     static void ForEachActive(TAction&& action) {
         for (std::uint32_t queue = 0; queue < PhysicalQueues; ++queue) {
@@ -87,7 +94,7 @@ public:
     bool GraphicsCapable() const { return context.graphicsQueue; }
     static Recorder* GraphicsRecorder();
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
-    explicit Recorder(const Context& context, bool timelineSemaphores = false, std::uint32_t physicalQueue = 0);
+    explicit Recorder(const Context& context, bool timelineSemaphores = false, std::uint32_t physicalQueue = 0, DrawTrace::Id traceDevice = 0, std::uint32_t traceTimestampValidBits = 0);
     VkSemaphore Timeline() const { return timeline; }
     void SetPeer(Recorder* peer) {
         this->peer = peer;
@@ -110,6 +117,105 @@ public:
     };
     QueueOrderStatistics QueueOrderCounts() const { return queueOrder; }
     ~Recorder();
+    static constexpr std::uint32_t NoTiming = 0xffffffffu;
+    struct TraceCommand {
+        bool workload = false;
+        bool workloadDraw = false;
+        Recorder* recorder = nullptr;
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        DrawTrace::Context context;
+        DrawTrace::Id command = 0;
+        DrawTrace::Id query = 0;
+        std::uint64_t expansionIndex = 0;
+        std::uint32_t requestedCount = 1;
+        bool dynamicCount = false;
+        const char* kind = nullptr;
+        std::uint32_t slot = NoTiming;
+        std::uint32_t statisticsSlot = NoTiming;
+        bool label = false;
+    };
+    static TraceCommand BeginTraceCommand(Recorder* recorder, VkCommandBuffer commands, const char* kind, std::uint64_t expansionIndex = 0, std::uint32_t requestedCount = 1, bool dynamicCount = false, DrawTrace::Id pipeline = 0);
+    static void EndTraceCommand(const TraceCommand& command, DrawTrace::Status status = DrawTrace::Status::Complete);
+    static bool TraceLabelsRequested();
+    static bool TraceCountersRequested();
+    void ConfigureTraceFeatures(bool statistics, bool labels, std::uint32_t nativeQueueIndex = 0);
+    static bool FormatTraceLabel(std::span<char> output, std::string_view run, std::string_view capture, DrawTrace::Id operation, DrawTrace::Id batch, DrawTrace::Id pipeline, DrawTrace::Id command) {
+        if (output.empty()) return false;
+        auto* position = output.data();
+        auto* end = position + output.size();
+        const auto text = [&](std::string_view value) {
+            if (static_cast<std::size_t>(end - position) <= value.size()) return false;
+            for (const char c : value) *position++ = c;
+            return true;
+        };
+        const auto number = [&](std::uint64_t value) {
+            const auto result = std::to_chars(position, end, value);
+            if (result.ec != std::errc{}) return false;
+            position = result.ptr;
+            return position != end;
+        };
+        if (!text("aps5 run=") || !text(run) || !text(" capture=") || !text(capture) || !text(" op=") || !number(operation) || !text(" batch=") || !number(batch)
+            || !text(" pipeline=") || !number(pipeline) || !text(" command=") || !number(command)) return false;
+        *position = '\0';
+        return true;
+    }
+    struct TraceQueryResult {
+        DrawTrace::QueryStatus status = DrawTrace::QueryStatus::Uncollected;
+        double beginNs = 0;
+        double endNs = 0;
+        std::uint64_t beginTicks = 0;
+        std::uint64_t endTicks = 0;
+        double periodNs = 0;
+        double durationNs = 0;
+        std::uint32_t validBits = 0;
+    };
+    static DrawTrace::QueryStatus TraceQueryPrecondition(DrawTrace::QueryStatus poolStatus, std::size_t used, std::size_t capacity) {
+        if (poolStatus != DrawTrace::QueryStatus::Pending) return poolStatus;
+        return used >= capacity ? DrawTrace::QueryStatus::CapacityDropped : DrawTrace::QueryStatus::Pending;
+    }
+    static TraceQueryResult DecodeTraceQuery(VkResult result, std::span<const std::uint64_t, 4> values, bool ended, std::uint32_t validBits, double periodNs) {
+        if (!ended) return {DrawTrace::QueryStatus::Uncollected};
+        if (validBits != 64 || !std::isfinite(periodNs) || periodNs <= 0) return {DrawTrace::QueryStatus::Unsupported};
+        if ((result != VK_SUCCESS && result != VK_NOT_READY) || values[1] == 0 || values[3] == 0) return {DrawTrace::QueryStatus::ReadFailed};
+        const std::uint64_t delta = values[2] - values[0];
+        if (delta >= (std::uint64_t{1} << 63)) return {DrawTrace::QueryStatus::InvalidTimestamp};
+        const double first = static_cast<double>(values[0]) * periodNs;
+        const double duration = static_cast<double>(delta) * periodNs;
+        const double last = first + duration;
+        if (!std::isfinite(first) || !std::isfinite(last) || !std::isfinite(duration)) return {DrawTrace::QueryStatus::InvalidTimestamp};
+        return {DrawTrace::QueryStatus::Available, first, last, values[0], values[2], periodNs, duration, validBits};
+    }
+    static constexpr std::array<const char*, 7> TraceStatisticNames{
+        "input_assembly_vertices", "input_assembly_primitives", "vertex_shader_invocations", "clipping_invocations",
+        "clipping_primitives", "fragment_shader_invocations", "compute_shader_invocations"};
+    static constexpr std::array<const char*, 7> TraceStatisticUnits{"vertices", "primitives", "invocations", "invocations", "primitives", "invocations", "invocations"};
+    static constexpr VkQueryPipelineStatisticFlags TraceStatisticFlags = VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT
+        | VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT | VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT
+        | VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT | VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT
+        | VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT | VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
+    static DrawTrace::QueryStatus DecodeTraceStatistics(VkResult result, std::span<const std::uint64_t, 8> values, bool ended) {
+        if (!ended) return DrawTrace::QueryStatus::Uncollected;
+        if ((result != VK_SUCCESS && result != VK_NOT_READY) || values.back() == 0) return DrawTrace::QueryStatus::ReadFailed;
+        return DrawTrace::QueryStatus::Available;
+    }
+    static std::optional<long double> DecodeHostClockOffsetNs(std::uint64_t sample, std::uint64_t conversion, std::uint64_t frequency) {
+        if (frequency == 0 || conversion < sample) return std::nullopt;
+        const auto result = static_cast<long double>(conversion - sample) * 1000000000.0L / static_cast<long double>(frequency);
+        if (!std::isfinite(result)) return std::nullopt;
+        return result;
+    }
+    enum class TraceContributorResult { Existing, Inserted, CapacityDropped };
+    static TraceContributorResult InsertTraceContributor(std::span<DrawTrace::Id> table, DrawTrace::Id value) {
+        if (value == 0) return TraceContributorResult::Existing;
+        if (table.empty()) return TraceContributorResult::CapacityDropped;
+        const auto first = static_cast<std::size_t>(value % table.size());
+        for (std::size_t probe = 0; probe < table.size(); ++probe) {
+            auto& slot = table[(first + probe) % table.size()];
+            if (slot == value) return TraceContributorResult::Existing;
+            if (slot == 0) { slot = value; return TraceContributorResult::Inserted; }
+        }
+        return TraceContributorResult::CapacityDropped;
+    }
     Recorder(const Recorder&) = delete;
     Recorder& operator=(const Recorder&) = delete;
 
@@ -147,6 +253,7 @@ public:
     void PostEmitUnit(EmitUnit&& unit);
     bool ChunkPass();
     bool EmitPass();
+    CommandSink OpenEmit(const Context& drawContext, EmitPassBegin begin, const ChunkDraw& draw);
     CommandSink OpenChunk(const Context& drawContext, const ChunkInheritance& inheritance, const ChunkDraw& draw);
     CommandSink PassSink(const Context& drawContext, const ChunkDraw& draw);
     static void DrainChunks();
@@ -166,6 +273,9 @@ public:
     void FlushKeyStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedKeyStores() && QueuedKeyStoreOverlaps(address, bytes)) FlushKeyStores(); }
     bool Recording() const { return open != nullptr; }
     bool Idle() const { return open == nullptr && inFlight.empty(); }
+    std::vector<DrawTrace::Id> CollectTraceDependencies() const;
+    DrawTrace::Id TraceQueueId() const { return traceQueue; }
+    void RecordTraceSubmission(DrawTrace::Id batch, std::uint64_t serial);
     std::uint64_t OpenSerial() const { return submissions + 1; }
     std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
@@ -363,6 +473,8 @@ public:
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
     std::uint64_t Submissions() const { return submissions; }
+    std::uint64_t Identity() const { return id; }
+    std::uint64_t PendingSubmission() const { return submissions + (open != nullptr ? 1u : 0u); }
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
@@ -582,7 +694,6 @@ public:
     // APS5_PROFILE_GPU=1: GPU time of recorded work by key (a guest program address), from timestamp
     // queries around each timed range; the totals per key are reported every 10 s. Begin returns the
     // range index to pass to End, or NoTiming when timing is off or the batch's queries are used up.
-    static constexpr std::uint32_t NoTiming = 0xffffffffu;
     static bool GpuTimingEnabled();
     static bool BatchStampsEnabled();
     std::uint32_t BeginGpuTiming(std::uint64_t key);
@@ -721,6 +832,28 @@ private:
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         std::uint64_t traceId = 0;
+        DrawTrace::Id detailBatch = 0;
+        bool detailBatchDeclared = false;
+        DrawTrace::Context detailContext;
+        std::vector<DrawTrace::Id> detailContributors;
+        bool detailHasContributors = false;
+        bool detailContributorLoss = false;
+        VkQueryPool detailQueries = VK_NULL_HANDLE;
+        DrawTrace::QueryStatus detailQueryStatus = DrawTrace::QueryStatus::Unsupported;
+        struct DetailQuery {
+            DrawTrace::Id id = 0;
+            bool ended = false;
+        };
+        std::vector<DetailQuery> detailQueryRecords;
+        std::uint32_t detailRequested = 0;
+        VkQueryPool detailStatistics = VK_NULL_HANDLE;
+        DrawTrace::QueryStatus detailStatisticsStatus = DrawTrace::QueryStatus::Unsupported;
+        struct DetailStatistic {
+            DrawTrace::Id command = 0;
+            bool ended = false;
+            DrawTrace::Context context;
+        };
+        std::vector<DetailStatistic> detailStatisticRecords;
         bool submitted = false;
         std::atomic<std::uint64_t> submitOrder{0};
         std::atomic<std::uint64_t> afterPeer{0};
@@ -816,6 +949,7 @@ private:
             std::function<void(VkCommandBuffer)> afterPass;
             bool chunked = false;
             ChunkInheritance inheritance;
+            std::optional<EmitUnit> emitted;
         } renderPass;
         PassHazards passHazards;
         PassHazards dispatchHazards;
@@ -860,6 +994,11 @@ private:
         bool behindCompletion = false;
     };
     void readGpuTiming(Batch& batch);
+    void readDetailTiming(Batch& batch);
+    void prepareDetailTiming(Batch& batch);
+    void prepareDetailStatistics(Batch& batch) noexcept;
+    void readDetailStatistics(Batch& batch) noexcept;
+    void noteDetailContributor(Batch& batch);
     void beginSamples(Batch& batch);
     void readSamples(Batch& batch);
     bool gpuSampleCounter();
@@ -886,13 +1025,19 @@ private:
     int meshArgumentState = 0;
     VkPipelineLayout meshArgumentLayout = VK_NULL_HANDLE;
     VkPipeline meshArgumentPipeline = VK_NULL_HANDLE;
+    DrawTrace::Id traceMeshArguments = 0;
+    DrawTrace::Id traceMeshArgumentsEpoch = 0;
     int sampleCounterState = 0;
     std::unique_ptr<Buffer> sampleCounter;
     VkPipelineLayout sampleLayout = VK_NULL_HANDLE;
     VkPipeline samplePipeline = VK_NULL_HANDLE;
+    DrawTrace::Id traceSampleCounter = 0;
+    DrawTrace::Id traceSampleCounterEpoch = 0;
     std::shared_ptr<void> samplePools;
     VkPipelineLayout dumpLayout = VK_NULL_HANDLE;
     VkPipeline dumpPipeline = VK_NULL_HANDLE;
+    DrawTrace::Id traceSampleDumps = 0;
+    DrawTrace::Id traceSampleDumpsEpoch = 0;
     std::shared_ptr<void> segmentPools;
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
     // Commands() would close).
@@ -1005,6 +1150,19 @@ private:
     std::map<VkSemaphore, std::uint64_t> orderWaits;
     std::map<VkSemaphore, std::uint64_t> requiredOrder;
     QueueOrderStatistics queueOrder;
+    DrawTrace::Id traceDevice = 0;
+    DrawTrace::Id traceRecorder = 0;
+    DrawTrace::Id traceQueue = 0;
+    DrawTrace::Id tracePreviousBatch = 0;
+    bool traceStatistics = false;
+    bool traceLabels = false;
+    PFN_vkCmdBeginDebugUtilsLabelEXT traceBeginLabel = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT traceEndLabel = nullptr;
+    DrawTrace::Id traceCapabilities = 0;
+    DrawTrace::Id traceCapabilitiesEpoch = 0;
+    std::vector<VkQueryPool> detailSpareStatistics;
+    std::uint32_t traceTimestampValidBits = 0;
+    std::uint64_t detailBatchSerial = 0;
     // Every access holds the table mutex (Recorder.cpp): the recorded entries are mutated under
     // GuestMemory::GpuMutex as well, the queued ones (NoteQueuedLabel) under the table mutex alone.
     // Ordered, so a range (a noted write, PendingLabelIn) finds its dwords by lower_bound.
@@ -1032,6 +1190,7 @@ private:
     // frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
     std::vector<VkQueryPool> sparePools;
+    std::vector<VkQueryPool> detailSparePools;
     mutable std::mutex completedMutex;
     std::array<Completed, CompletedRingSize> completed;
     std::uint64_t newestSubmitted = 0;

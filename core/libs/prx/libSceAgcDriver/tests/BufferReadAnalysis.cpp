@@ -232,7 +232,7 @@ void FloatIndices() {
     analysis.Note(quartered, fixture.Load(IrOpcode::LoadBufferU32, fused, builder.Constant(0u), builder.Constant(0u)), Memory(0u, 1u));
     Require(quartered.bounded && quartered.ranges.size() == 1u && quartered.ranges[0].indexSource == BufferIndexSource::Expression, "a load at index u32(fma(f32(vertex), 0.25, 1)) was not recorded as an expression");
     const auto quarter = EvaluateBufferIndex(quartered.ranges[0].indexExpression, BufferIndexInputs{0u, 8u, 0u, 0u});
-    Require(quarter && quarter->first == 1u && quarter->second == 3u, "u32(fma(f32(vertex), 0.25, 1)) over vertices 0 to 8 does not give records 1 to 3");
+    Require(quarter && quarter->first <= 1u && quarter->second >= 3u, "u32(fma(f32(vertex), 0.25, 1)) does not cover records 1 to 3");
     auto& below = emit(IrOpcode::ConvertU32F32, {&emit(IrOpcode::FPSub32, {&emit(IrOpcode::ConvertF32U32, {&instance}), &builder.ConstantF32(2.0f)})});
     BufferReadRanges negative;
     analysis.Note(negative, fixture.Load(IrOpcode::LoadBufferU32, below, builder.Constant(0u), builder.Constant(0u)), Memory(0u, 1u));
@@ -246,6 +246,54 @@ void FloatIndices() {
     Require(!EvaluateBufferIndex(overflowing.ranges[0].indexExpression, BufferIndexInputs{0u, 8u, 0u, 0u}, &failure) && failure == BufferIndexFailure::Overflow, "u32(f32(vertex) * 1e10) past 32 bits was given a range");
     const std::vector<BufferIndexNode> mistyped{{BufferIndexOp::VertexIndex, 0u, 0u, 0u, 0u}, {BufferIndexOp::UnsignedFromFloat, 0u, 0u, 0u, 0u}};
     Require(!EvaluateBufferIndex(mistyped, BufferIndexInputs{0u, 8u, 0u, 0u}, &failure) && failure == BufferIndexFailure::Malformed, "a float conversion of an integer node was evaluated");
+}
+
+void FloatRoundingBounds() {
+    const auto constant = [](float value) { return BufferIndexNode{BufferIndexOp::FloatConstant, 0u, 0u, std::bit_cast<std::uint32_t>(value), 0u}; };
+    const auto covers = [](const std::vector<BufferIndexNode>& expression, std::uint64_t first, std::uint64_t last) {
+        const auto range = EvaluateBufferIndex(expression, {});
+        return range && range->first <= first && range->second >= last;
+    };
+    const std::vector<BufferIndexNode> converted{
+        {BufferIndexOp::Range, 0u, 0u, 16777219u, 16777219u},
+        {BufferIndexOp::FloatFromUnsigned, 0u},
+        {BufferIndexOp::UnsignedFromFloat, 1u}
+    };
+    Require(covers(converted, 16777218u, 16777220u), "integer-to-float bounds omit an allowed rounding direction");
+    for (const auto operation : {BufferIndexOp::FloatAdd, BufferIndexOp::FloatSub}) {
+        const std::vector<BufferIndexNode> sum{
+            constant(1.0f), constant(operation == BufferIndexOp::FloatAdd ? -0x1p-25f : 0x1p-25f),
+            {operation, 0u, 1u}, {BufferIndexOp::UnsignedFromFloat, 2u}
+        };
+        Require(covers(sum, 0u, 1u), "addition or subtraction bounds omit a legal integer after rounding");
+    }
+    const std::vector<BufferIndexNode> multiplied{
+        constant(0x1.fffffep-1f), constant(0x1.000002p+0f),
+        {BufferIndexOp::FloatMul, 0u, 1u}, constant(0x1p+24f),
+        {BufferIndexOp::FloatMul, 2u, 3u}, {BufferIndexOp::UnsignedFromFloat, 4u}
+    };
+    Require(covers(multiplied, 16777216u, 16777218u), "multiplication bounds omit an allowed rounded product");
+    const std::vector<BufferIndexNode> fused{
+        constant(4097.0f), constant(4097.0f), constant(-16785408.0f),
+        {BufferIndexOp::FloatFma, 0u, 1u, 2u}, {BufferIndexOp::UnsignedFromFloat, 3u}
+    };
+    const auto fmaRange = EvaluateBufferIndex(fused, {});
+    Require(!fmaRange || (fmaRange->first == 0u && fmaRange->second >= 2u), "Fma bounds omit inherited multiply/add rounding error");
+    const std::vector<BufferIndexNode> flushed{
+        constant(0x1p-126f), constant(0x1.fffffep-1f),
+        {BufferIndexOp::FloatMul, 0u, 1u}, constant(0x1p+126f),
+        {BufferIndexOp::FloatMul, 2u, 3u}, {BufferIndexOp::UnsignedFromFloat, 4u}
+    };
+    Require(covers(flushed, 0u, 1u), "a subnormal result that rounds to a normal value lost its flush-to-zero alternative");
+    const std::vector<BufferIndexNode> farApart{
+        constant(1.0f), constant(0x1p-80f), {BufferIndexOp::FloatAdd, 0u, 1u}, constant(0x1p+24f),
+        {BufferIndexOp::FloatMul, 2u, 3u}, {BufferIndexOp::UnsignedFromFloat, 4u}
+    };
+    Require(covers(farApart, 16777216u, 16777218u), "an addition beyond host double precision was treated as exact");
+    auto ignoredOperands = constant(1.0f);
+    ignoredOperands.left = 255u;
+    ignoredOperands.right = 255u;
+    Require(covers({ignoredOperands, {BufferIndexOp::UnsignedFromFloat, 0u}}, 1u, 1u), "a float constant accessed unused operand indices");
 }
 
 void Collapse() {
@@ -266,6 +314,7 @@ int main() {
         Unbounded();
         DrawIndices();
         FloatIndices();
+        FloatRoundingBounds();
         Collapse();
         std::puts("buffer read analysis tests passed");
         return 0;

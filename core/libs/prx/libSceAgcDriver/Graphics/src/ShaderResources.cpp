@@ -2698,6 +2698,7 @@ ShaderResources::EpochProofVerdict ShaderResources::AdoptEpochProof(const EpochP
     const auto start = std::chrono::steady_clock::now();
     if (!reusable || !GuestMemory::EpochDirtySetEnabled() || GuestMemory::EpochDirtySetVerify()) return EpochProofVerdict::Disabled;
     if (addressTemplate && (!guestMemory.AddressSpaceCurrent() || !guestMemory.SlabReadsCurrent())) return EpochProofVerdict::Stamps;
+    if (HoldsUnusableMirror()) return EpochProofVerdict::Stamps;
     std::lock_guard lock(proofMutex);
     if (proofBasis != result.basis) return EpochProofVerdict::Basis;
     if (!epochProofScalarsHold()) return EpochProofVerdict::Stamps;
@@ -3091,6 +3092,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     if (addressTemplate && (!guestMemory.AddressSpaceCurrent() || !guestMemory.SlabReadsCurrent())) return false;
+    if (HoldsUnusableMirror()) return false;
     std::unique_lock<std::recursive_mutex> proofLock(proofMutex, std::defer_lock);
     if (EpochProofsOffThread()) proofLock.lock();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3993,7 +3995,11 @@ std::string ShaderResources::Describe() const {
         const auto* data = reinterpret_cast<const std::uint32_t*>(address);
         const auto words = bytes / 4;
         const auto step = std::max<std::uint64_t>(1, words / 4096);
-        for (std::uint64_t i = 0; i < words; i += step, ++samples) nonzero += data[i] != 0;
+        for (std::uint64_t i = 0; i < words; i += step, ++samples) {
+            std::uint32_t word = 0;
+            GuestMemory::CopyDriverMemory(&word, data + i, sizeof(word));
+            nonzero += word != 0;
+        }
         return samples == 0 ? 0.0 : static_cast<double>(nonzero) / samples;
     };
     std::string text;
@@ -4007,8 +4013,10 @@ std::string ShaderResources::Describe() const {
             text += line;
             if (keys == DccKeys::Mixed) {
                 // Where the keys change: first key, how many leading keys match it, and the next key.
-                const auto* bytes = reinterpret_cast<const std::uint8_t*>(range.dccAddress);
                 const auto count = static_cast<std::size_t>(range.bytes / 256u);
+                std::vector<std::uint8_t> copied(count);
+                GuestMemory::CopyDriverMemory(copied.data(), reinterpret_cast<const void*>(range.dccAddress), count);
+                const auto* bytes = copied.data();
                 std::size_t run = 1;
                 while (run < count && bytes[run] == bytes[0]) ++run;
                 std::snprintf(line, sizeof(line), "(%02x x%zu then %02x of %zu)", bytes[0], run, run < count ? bytes[run] : 0u, count);
@@ -4023,7 +4031,9 @@ std::string ShaderResources::Describe() const {
         text += " [";
         for (std::size_t i = 0; i < bytes / 4; ++i) {
             char word[12];
-            std::snprintf(word, sizeof(word), "%s%08x", i == 0 ? "" : " ", data[i]);
+            std::uint32_t value = 0;
+            GuestMemory::CopyDriverMemory(&value, data + i, sizeof(value));
+            std::snprintf(word, sizeof(word), "%s%08x", i == 0 ? "" : " ", value);
             text += word;
         }
         text += "]";
@@ -5034,6 +5044,9 @@ std::optional<std::vector<ShaderResources::MovedDispatchBuffer>> ShaderResources
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::BindMovedDispatchBuffers(Recorder& recorder, std::span<const MovedDispatchBuffer> moved) const {
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (storageWritten[index]) storageTextures[index]->PrepareWrite();
+    }
     auto result = writeMovedDispatchSet(moved);
     recorder.Keep(result);
     return result;
@@ -5368,6 +5381,10 @@ void ShaderResources::VerifyDataWords(std::span<const CompiledShader> shaders, s
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindingsStatistics* statistics, const DrawIndexRanges* drawRanges, std::span<const DrawSnapshotArena::Prefill> prefills) const {
+    PrepareGpuWrites();
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (storageWritten[index]) storageTextures[index]->PrepareWrite();
+    }
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !(AddressBasedDrawSnapshots() && bdaReadOnly))) return {};
     auto lapStart = statistics != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto lap = [&](double DrawBindingsStatistics::*bucket) {
@@ -5386,61 +5403,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
-            constexpr std::size_t MovedWordBufferSlots = 8;
-            std::lock_guard movedWordLock(movedWordMutex);
-            const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
-            const auto keep = [&](MovedWordBuffer entry) {
-                if (held != movedWordBuffers.end()) *held = std::move(entry);
-                else if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
-                else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
-            };
-            if (MovedWordRing()) {
-                auto& arena = recorder.SnapshotArena();
-                auto view = held != movedWordBuffers.end() && held->buffer == nullptr ? arena.Reuse(recorder, held->placed) : std::nullopt;
-                const bool reusedPlacement = view.has_value();
-                DrawSnapshotArena::Placed placed;
-                if (!view) {
-                    view = arena.Place(recorder, override->size, [&](std::span<std::byte> target) {
-                        std::memcpy(target.data(), override->words.data(), override->size);
-                        for (const auto& patch : dataPatches) {
-                            if (patch.allocation == index && patch.byte < override->size) target[patch.byte] = static_cast<std::byte>(patch.adjustment);
-                        }
-                    }, &placed);
-                }
-                if (view) {
-                    if (!reusedPlacement) keep(MovedWordBuffer{index, override->words, override->size, nullptr, placed});
-                    selected.push_back(index);
-                    result->snapshots.push_back({0, nullptr, {}, view->buffer, view->offset, view->bytes});
-                    if (statistics != nullptr && reusedPlacement) {
-                        ++statistics->reused;
-                    } else if (statistics != nullptr) {
-                        ++statistics->copied;
-                        statistics->copiedBytes += override->size;
-                    }
-                    continue;
-                }
-            }
-            const bool reusedWords = held != movedWordBuffers.end() && held->buffer != nullptr;
-            std::shared_ptr<Buffer> buffer;
-            if (reusedWords) {
-                buffer = held->buffer;
-            } else {
-                buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-                std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
-                for (const auto& patch : dataPatches) {
-                    if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
-                }
-                keep(MovedWordBuffer{index, override->words, override->size, buffer});
-            }
+            auto placed = recorder.SnapshotArena().PlaceWords(recorder, wordCacheKey, index, override->words, override->size, dataPatches, MovedWordRing());
             selected.push_back(index);
-            const auto wordHandle = buffer->Handle();
-            const auto wordBytes = buffer->Bytes();
-            result->snapshots.push_back({0, std::move(buffer), {}, wordHandle, 0, wordBytes});
-            if (statistics != nullptr && reusedWords) {
+            result->snapshots.push_back({0, std::move(placed.buffer), {}, placed.view.buffer, placed.view.offset, placed.view.bytes});
+            if (statistics != nullptr && !placed.view.copied) {
                 ++statistics->reused;
             } else if (statistics != nullptr) {
                 ++statistics->copied;
-                statistics->copiedBytes += override->size;
+                statistics->copiedBytes += placed.view.copiedBytes;
             }
             continue;
         }
@@ -5546,7 +5516,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (verifySnapshots && buffer != nullptr) {
             static std::atomic<std::uint64_t> checked{0}, differing{0};
             const auto slow = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, GuestMemory::CollectWrites(begin, bytes));
-            const bool same = slow == buffer || (slow != nullptr && slow->Bytes().size() == buffer->Bytes().size() && std::memcmp(slow->Bytes().data(), buffer->Bytes().data(), buffer->Bytes().size()) == 0) || (slow == nullptr && std::memcmp(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes) == 0);
+            const bool same = slow == buffer || (slow != nullptr && slow->Bytes().size() == buffer->Bytes().size() && std::memcmp(slow->Bytes().data(), buffer->Bytes().data(), buffer->Bytes().size()) == 0) || (slow == nullptr && GuestMemory::CompareDriverMemory(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes));
             if (!same) differing.fetch_add(1);
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
@@ -5566,9 +5536,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 partial = limitedCopy;
                 if (partial) {
                     const auto bytesOut = buffer->Bytes();
-                    for (const auto& [from, to] : *readRanges) std::memcpy(bytesOut.data() + item.adjustment + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
+                    for (const auto& [from, to] : *readRanges) GuestMemory::CopyDriverMemory(bytesOut.data() + item.adjustment + from, reinterpret_cast<const void*>(address + from), static_cast<std::size_t>(to - from));
                 } else {
-                    std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                    GuestMemory::CopyDriverMemory(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                 }
                 lap(&DrawBindingsStatistics::copyUs);
                 if (!partial) recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer, Recorder::SnapshotUse::Storage, 0, GuestMemory::EpochDirtySetEnabled() ? stamp[0] : 0);
@@ -5786,6 +5756,9 @@ void ShaderResources::SetRecordBindingsMode(RecordBindings mode) {
 }
 
 void ShaderResources::Bind(const CommandSink& commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (storageWritten[index]) storageTextures[index]->PrepareWrite();
+    }
     if (_set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, bindPoint, layout, 0, _set, templateOffsets[0]);
     if (fragment.set != VK_NULL_HANDLE) commands.BindDescriptorSet(context, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, fragment.set, templateOffsets[1]);
 }
@@ -5819,7 +5792,10 @@ void ShaderResources::LeaseInPlaceReads(Recorder& recorder, std::span<const std:
     });
 }
 
+void ShaderResources::PrepareGpuWrites() const { guestMemory.PrepareDirectWriteSnapshots(); }
+
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
+    guestMemory.RecordDirectWriteSnapshots(recorder);
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
@@ -5865,7 +5841,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (!storageWritten[index]) continue;
-        storageTextures[index]->MarkDirty();
+        storageTextures[index]->MarkDirty(&recorder);
         static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
     }
     // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
@@ -5875,7 +5851,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes());
-    guestMemory.MarkDirectWrites();
+    guestMemory.MarkObservedDirectWrites();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in
@@ -5934,16 +5910,12 @@ std::uint64_t ShaderResources::RetainedBytes() const {
     std::uint64_t total = sizeof(ShaderResources);
     total += vectorBytes(layoutKey) + vectorBytes(fragmentLayoutKey) + vectorBytes(allocations) + vectorBytes(descriptorBuffers) + vectorBytes(descriptorImages) + vectorBytes(descriptorWrites);
     total += vectorBytes(textures) + vectorBytes(storageTextures) + vectorBytes(storageMips) + vectorBytes(storageKeys) + vectorBytes(samplers) + vectorBytes(samplerSources);
-    total += vectorBytes(directRegions) + vectorBytes(validatedTextures) + vectorBytes(pushPatches) + vectorBytes(dataPatches) + vectorBytes(bindings) + vectorBytes(refreshResourceKey) + vectorBytes(movedWordBuffers);
+    total += vectorBytes(directRegions) + vectorBytes(validatedTextures) + vectorBytes(pushPatches) + vectorBytes(dataPatches) + vectorBytes(bindings) + vectorBytes(refreshResourceKey);
     for (const auto& allocation : allocations) {
         total += vectorBytes(allocation.dataWords);
         if (allocation.buffer != nullptr) total += sizeof(Buffer) + allocation.buffer->AllocationBytes();
     }
     for (const auto& binding : bindings) total += vectorBytes(binding.allocations) + vectorBytes(binding.imageAllocations);
-    for (const auto& moved : movedWordBuffers) {
-        total += vectorBytes(moved.words);
-        if (moved.buffer != nullptr) total += sizeof(Buffer) + moved.buffer->AllocationBytes();
-    }
     total += (descriptorBuffers.size() + descriptorImages.size()) * descriptorBytes;
     return total;
 }

@@ -274,7 +274,10 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
     filledBytes += bytes;
     if (bytes == 0) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
+    DrawTrace::Span fillLockWait("Driver.FillGpuMutexWait");
+    DrawTrace::Note("wait_reason", "gpu_mutex");
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    fillLockWait.Finish();
     const auto holdStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto phaseStart = holdStart;
     const auto phase = [&](FillPhase which) {
@@ -330,6 +333,9 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
     }
     phase(FillFlush);
     const bool stored = cleared || absorbed || localDevice->FillBuffer(base, bytes, pattern);
+    DrawTrace::Note("fill_outcome", cleared ? "resident_image_clear" : absorbed ? "metadata_absorbed" : stored ? "gpu_recorded" : "cpu_fallback");
+    if (cleared || absorbed) DrawTrace::RecordCounter("fill_guest_write_elided_bytes", bytes, "bytes");
+    else if (stored) DrawTrace::RecordCounter("fill_gpu_bytes", bytes, "bytes");
     phase(FillDevice);
     if (stored && !cleared && !absorbed) {
         if (const auto filled = KeysFillMemo(pattern, uniformKeysFill, memoryValueFill)) Graphics::NoteKeysFillOnGpu(base, bytes, *filled);
@@ -349,6 +355,7 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
         block.resize(chunk);
         for (std::size_t at = 0; at < chunk; at += 16) std::memcpy(block.data() + at, pattern.data(), 16);
         for (std::size_t done = 0; done < bytes; done += chunk) GuestMemory::Write(base + done, std::span<const std::byte>(block).first(std::min(chunk, bytes - done)), 16);
+        DrawTrace::RecordCounter("fill_cpu_bytes", bytes, "bytes");
         phase(FillCpu);
     }
     if (noteMetadata && uniform) {

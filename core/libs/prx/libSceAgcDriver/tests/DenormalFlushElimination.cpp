@@ -1,5 +1,6 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/DenormalFlushEliminator.hpp"
+#include "Optimization/DenormalFreeProof.hpp"
 #include "Optimization/InterpolationFactsAnnotator.hpp"
 #include "Recompiler.hpp"
 #include <cstdint>
@@ -102,6 +103,25 @@ bool run(const char* name, const std::function<bool()>& test) {
 
 int main() {
     bool passed = true;
+
+    passed &= run("denormal proof rejects an untracked value whose numeric ID belongs to a normal value", [] {
+        Builder b;
+        auto& normal = b.emit(IrOpcode::ConvertUToF32, IrType::F32, {&b.unknown()});
+        Builder other;
+        static_cast<void>(other.unknown());
+        auto& foreign = other.unknown();
+        const DenormalFreeProof proof(b.program);
+        return normal.Id() == foreign.Id() && proof.Contains(&normal) && !proof.Contains(&foreign);
+    });
+
+    passed &= run("denormal proof leaves detached values untracked across gaps in live IDs", [] {
+        Builder b;
+        auto& detached = b.program.CreateValue(IrOpcode::LaneId, IrType::U32);
+        for (std::uint32_t index = 0; index < 512u; ++index) static_cast<void>(b.program.CreateValue(IrOpcode::LaneId, IrType::U32));
+        auto& normal = b.emit(IrOpcode::ConvertUToF32, IrType::F32, {&b.unknown()});
+        const DenormalFreeProof proof(b.program);
+        return proof.Contains(&normal) && !proof.Contains(&detached);
+    });
 
     passed &= run("a flush of a flushed value is removed and the first flush stays", [] {
         Builder b;
