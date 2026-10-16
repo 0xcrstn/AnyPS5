@@ -4947,7 +4947,7 @@ void GuestBufferMemory::PrepareDirectWriteSnapshots() const {
     }
     std::size_t ranges = 0, bytes = 0;
     for (const auto& [begin, end] : merged) {
-        const auto* region = owner(begin);
+        const auto* region = owner(begin, end);
         if (region == nullptr || region->direct == nullptr || end > region->end) continue;
         const auto serial = HostImportSerial(context, begin, static_cast<std::size_t>(end - begin), false);
         auto payload = GuestMemory::PrepareDriverGpuWrite(begin, static_cast<std::size_t>(end - begin));
@@ -5295,7 +5295,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
 VkDescriptorBufferInfo GuestBufferMemory::MirroredDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment, std::vector<std::shared_ptr<ResidentMirror>>& mirrors) const {
     auto info = Descriptor(address, bytes, adjustment);
     if (!BufferMirrorsEnabled() || context.recorder == nullptr) return info;
-    const auto* region = owner(address);
+    const auto* region = owner(address, address + bytes);
     if (region == nullptr || region->direct == nullptr || info.buffer != region->direct->buffer) return info;
     const auto begin = address - adjustment;
     const auto end = begin + info.range;
@@ -5369,7 +5369,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::MirroredRanges(s
     for (auto& range : result) {
         if ((range.permissions & ShaderRecompiler::BdaAbi::Read) == 0 || range.end <= range.begin) continue;
         if (std::any_of(writes.begin(), writes.end(), [&](const auto& write) { return write.first < range.end && range.begin < write.second; })) continue;
-        const auto* region = owner(range.begin);
+        const auto* region = owner(range.begin, range.end);
         if (region == nullptr || region->direct == nullptr || range.end > region->end) continue;
         const auto& import = *region->direct;
         if (range.begin < import.base || range.end > import.base + import.bytes || range.deviceAddress != import.address + (range.begin - import.base)) continue;
@@ -5396,7 +5396,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::PlacedRanges(std
         constexpr auto writable = ShaderRecompiler::BdaAbi::Read | ShaderRecompiler::BdaAbi::Write;
         if ((range.permissions & writable) != writable || range.end <= range.begin) continue;
         if (overlaps(writes, range.begin, range.end) || overlaps(pointerExempt, range.begin, range.end)) continue;
-        const auto* region = owner(range.begin);
+        const auto* region = owner(range.begin, range.end);
         if (region == nullptr || region->direct == nullptr || region->mirror != nullptr || range.end > region->end) continue;
         const auto& import = *region->direct;
         if (range.begin < import.base || range.end > import.base + import.bytes || range.deviceAddress != import.address + (range.begin - import.base)) continue;

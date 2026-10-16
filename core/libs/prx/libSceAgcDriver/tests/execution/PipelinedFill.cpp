@@ -44,7 +44,7 @@ std::array<std::uint32_t, 12> UserData(const void* pattern, const void* control,
     return data;
 }
 
-void AppendFill(std::vector<std::uint32_t>& words, const void* pattern, const void* control, void* output) {
+void AppendFillState(std::vector<std::uint32_t>& words, const void* pattern, const void* control, void* output) {
     const auto registers = [&](std::uint32_t first, std::span<const std::uint32_t> values) {
         words.push_back(0xc0007600u | (static_cast<std::uint32_t>(values.size()) << 16u));
         words.push_back(first);
@@ -58,15 +58,19 @@ void AppendFill(std::vector<std::uint32_t>& words, const void* pattern, const vo
     const std::array<std::uint32_t, 1> resource{(12u << 1u) | (1u << 7u)};
     registers(0x213, resource);
     registers(0x240, UserData(pattern, control, output));
+}
+
+void AppendDispatch(std::vector<std::uint32_t>& words) {
     words.insert(words.end(), {0xc0031500u, 4, 1, 1, 0x41u | 0x8000u});
 }
 
 void AppendScratchFill(std::vector<std::uint32_t>& words) {
-    AppendFill(words, ScratchPattern.data(), ScratchControl.data(), Scratch.data());
+    AppendFillState(words, ScratchPattern.data(), ScratchControl.data(), Scratch.data());
+    AppendDispatch(words);
 }
 
-void AppendOutputFill(std::vector<std::uint32_t>& words) {
-    AppendFill(words, Pattern.data(), Control.data(), Output.data());
+void AppendOutputFillState(std::vector<std::uint32_t>& words) {
+    AppendFillState(words, Pattern.data(), Control.data(), Output.data());
 }
 
 void AppendLabel(std::vector<std::uint32_t>& words, std::uint32_t* target, std::uint32_t value) {
@@ -77,6 +81,18 @@ void AppendLabel(std::vector<std::uint32_t>& words, std::uint32_t* target, std::
 void Submit(std::vector<std::uint32_t>& words) {
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
     AgcDriver::Submit(&packet, 0);
+}
+
+template <class TPending>
+void SubmitQueuedLabels(std::vector<std::uint32_t>& words, std::size_t expectedLabels, TPending&& pending) {
+    std::unique_lock gate(AgcDriver::GuestMemory::GpuMutex());
+    const auto before = LabelRecordJobTotals();
+    Submit(words);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (LabelRecordJobTotals().labels - before.labels < expectedLabels && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const auto after = LabelRecordJobTotals();
+    Require(after.jobs > before.jobs && after.labels - before.labels == expectedLabels, "fill labels did not enter candidate record jobs before the blocked fill");
+    Require(pending(), "queued fill labels were stored while the record thread was blocked");
 }
 
 void Finish() {
@@ -96,12 +112,12 @@ void InputsAfterQueuedLabels() {
     Pattern = {0x40404040u, 0, 0, 0};
     Control = {256, 0, 0, 0};
     std::vector<std::uint32_t> words;
-    AppendScratchFill(words);
+    AppendOutputFillState(words);
     AppendLabel(words, &Control[0], 128);
     AppendLabel(words, &Pattern[0], 0xababababu);
-    AppendOutputFill(words);
+    AppendDispatch(words);
     const auto before = LabelRecordJobTotals();
-    Submit(words);
+    SubmitQueuedLabels(words, 2, [] { return Control[0] == 256 && Pattern[0] == 0x40404040u; });
     Finish();
     Require(LabelRecordJobTotals().jobs > before.jobs, "fill input labels did not use candidate record jobs");
     for (std::size_t i = 0; i < Output.size(); ++i) {
@@ -117,11 +133,14 @@ void FillAfterManyQueuedLabels() {
     Labels.fill(0);
     const auto labelCount = Labels.size();
     std::vector<std::uint32_t> words;
-    AppendScratchFill(words);
+    AppendOutputFillState(words);
     for (std::size_t i = 0; i < labelCount; ++i) AppendLabel(words, &Labels[i], static_cast<std::uint32_t>(i + 1));
-    AppendOutputFill(words);
+    AppendDispatch(words);
     const auto before = LabelRecordJobTotals();
-    Submit(words);
+    SubmitQueuedLabels(words, labelCount, [] {
+        for (const auto label : Labels) if (label != 0) return false;
+        return true;
+    });
     Finish();
     Require(LabelRecordJobTotals().jobs > before.jobs, "many fill labels did not use candidate record jobs");
     for (std::size_t i = 0; i < labelCount; ++i) Require(Labels[i] == i + 1, "a queued label was not stored");
@@ -136,17 +155,27 @@ int main() {
     _putenv_s("APS5_PREPARE_WORKERS", "2");
     _putenv_s("APS5_PREPARE_AHEAD", "4");
     _putenv_s("APS5_LABEL_RECORD_JOBS", "1");
+    _putenv_s("APS5_RECORD_THREAD_DISPATCH", "1");
+    _putenv_s("APS5_PREPARE_DISPATCHES", "1");
+    _putenv_s("APS5_LABEL_FLUSH_US", "10000000");
 #else
     setenv("APS5_RECORD_THREAD", "1", 1);
     setenv("APS5_PREPARE_WORKERS", "2", 1);
     setenv("APS5_PREPARE_AHEAD", "4", 1);
     setenv("APS5_LABEL_RECORD_JOBS", "1", 1);
+    setenv("APS5_RECORD_THREAD_DISPATCH", "1", 1);
+    setenv("APS5_PREPARE_DISPATCHES", "1", 1);
+    setenv("APS5_LABEL_FLUSH_US", "10000000", 1);
 #endif
     try {
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
         }
+        std::vector<std::uint32_t> warmUp;
+        AppendScratchFill(warmUp);
+        Submit(warmUp);
+        Finish();
         InputsAfterQueuedLabels();
         FillAfterManyQueuedLabels();
         AgcDriverShutdown_nid_postfix();

@@ -217,9 +217,9 @@ void Run(const Context& context) {
     AgcDriver::GuestMemory::BumpCollectEpoch();
     Require(Refused(context, watchedMips), "a CPU write, then depth, then a view with two levels: the live depth surface did not refuse it");
 
-    AgcDriver::GuestMemory::MarkWritten(watched + Block, 4);
+    AgcDriver::GuestMemory::MarkWritten(watched + Block, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(Refused(context, watchedMips), "a driver store past the depth plane retired the depth surface");
-    AgcDriver::GuestMemory::MarkWritten(watched + 0x100, 4);
+    AgcDriver::GuestMemory::MarkWritten(watched + 0x100, 4, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(Sample(context, watchedMips) == nullptr, "depth, then a driver store, then a view with two levels: the view was not left to guest memory");
 }
 

@@ -7,6 +7,8 @@
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
+#include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -22,7 +24,13 @@ alignas(256) std::array<std::uint32_t, 7> CounterCode{0xf4080200u, 0xfa000000u, 
 
 constexpr std::size_t BlockBytes = 65536;
 constexpr std::uint32_t ArgumentsOffset = 4;
-alignas(BlockBytes) std::array<std::uint8_t, BlockBytes> Block{};
+std::array<std::uint8_t, 2 * BlockBytes> BlockStorage{};
+const auto Block = [] {
+    void* storage = BlockStorage.data();
+    std::size_t bytes = BlockStorage.size();
+    auto* aligned = static_cast<std::uint8_t*>(std::align(BlockBytes, BlockBytes, storage, bytes));
+    return std::span<std::uint8_t, BlockBytes>(aligned, BlockBytes);
+}();
 alignas(256) std::array<std::uint32_t, 4> WriterDescriptor{};
 alignas(256) std::array<std::uint32_t, 4> Counter{};
 alignas(256) std::array<std::uint32_t, 4> CounterDescriptor{};
@@ -77,6 +85,8 @@ int main() {
         GuestAllocations::Mutation().Add(Block.data(), BlockBytes, true, true, true);
         SetArguments(1, 1, 1);
         const auto* arguments = Block.data() + ArgumentsOffset;
+        Require(reinterpret_cast<std::uintptr_t>(Block.data()) % BlockBytes == 0, "the guest block is not 64 KiB aligned");
+        Require(reinterpret_cast<std::uintptr_t>(arguments) % 256 == ArgumentsOffset, "the indirect arguments binding is not misaligned by four bytes");
         WriterDescriptor = Descriptor(arguments, 16);
         CounterDescriptor = Descriptor(Counter.data(), sizeof(Counter));
         std::vector<std::uint32_t> warmUp;

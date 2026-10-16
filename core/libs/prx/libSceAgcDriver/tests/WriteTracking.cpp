@@ -141,6 +141,9 @@ void CheckStoredAllSince() {
     Require(StoredAllSince_nid_no_patch(base + 16, dword.size(), before), "a tracked dword store is absent from its exact range");
     Require(!StoredAllSince_nid_no_patch(base, 64, before), "one dword store proves complete surface coverage");
     Require(!StoredAllSince_nid_no_patch(base + 15, 5, before) && !StoredAllSince_nid_no_patch(base + 16, 5, before), "a dword store covers an unstored boundary byte");
+    MarkWritten(base + 16, dword.size(), WriteExtent::Possible);
+    Require(StoredAllSince_nid_no_patch(base + 16, dword.size(), before), "a later possible store erased exact historical driver coverage");
+    Require(StoresSince(base + 16, dword.size(), before) == StoreProvenance::Unknown, "historical driver coverage hides unknown current store provenance");
     const auto dwordStored = TrackerGeneration();
     Require(!StoredAllSince_nid_no_patch(base + 16, dword.size(), dwordStored), "a dword store at the baseline is taken as newer");
     MarkWritten(base, 64, WriteExtent::Exact);
@@ -188,7 +191,7 @@ void CheckStoredAllSince() {
     Require(!StoredAllSince_nid_no_patch(base, 0, before) && !StoredAllSince_nid_no_patch(base, 1, 0), "empty or unknown-baseline complete coverage is accepted");
     Require(!StoredAllSince_nid_no_patch(std::numeric_limits<std::uint64_t>::max(), 2, before), "overflowing complete coverage is accepted");
     Unwatch(base + 3 * Block, Block);
-    Require(MarkWritten(base + 3 * Block, Block) == 0, "an unwatched whole store acquired trusted driver coverage", WriteExtent::Exact);
+    Require(MarkWritten(base + 3 * Block, Block, WriteExtent::Exact) == 0, "an unwatched whole store acquired trusted driver coverage");
     Require(!StoredAllSince_nid_no_patch(base + 3 * Block, Block, before), "unwatched stores prove complete coverage");
     Require(!StoredAllSince_nid_no_patch(base + 3 * Block - 1, 2, before), "a range entering unwatched memory has complete coverage");
     std::array<std::uint8_t, 16> outside{};

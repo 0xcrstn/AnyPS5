@@ -7849,6 +7849,9 @@ void pipelineJournalTests() {
         clampedState.depthBiasClamp = 2.0f;
         BuildPipelineStoreKey(biased, context, clampedState, input, layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL);
         Require(biased == clamped, "the depth bias clamp's value entered the key");
+        GraphicsPipelineRecipe biasedDecoded;
+        Require(DecodeGraphicsPipelineRecipe(EncodeGraphicsPipelineRecipe(MakeGraphicsPipelineRecipe(clampedState, input, layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL)), biasedDecoded), "the biased pipeline recipe does not decode");
+        Require(biasedDecoded.state.depthBias && biasedDecoded.state.depthBiasClamp == 2.0f, "key normalization changed the persisted depth bias clamp");
         auto compute = module(3);
         compute.bindings.push_back(makeBinding(Role::GuestBuffers, 0, 2, std::vector<std::uint32_t>(8)));
         compute.pushConstants.resize(16);

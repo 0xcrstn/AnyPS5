@@ -207,7 +207,7 @@ void NonUniformSliceIsRefused(AgcDriver::VulkanDevice& device, const Shaders& sh
     auto* sliceOne = WordsAt(htile, HtileFillBytes);
     std::fill(sliceOne, sliceOne + HtileFillBytes / 4u, 0u);
     sliceOne[0] = 0xffffffffu;
-    AgcDriver::GuestMemory::MarkWritten(htile.Address() + HtileFillBytes, HtileFillBytes);
+    AgcDriver::GuestMemory::MarkWritten(htile.Address() + HtileFillBytes, HtileFillBytes, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(Draw(device, shaders, second, {}) == 0u, "slice 1 took a clear from HTILE words that are not all equal");
     Require(sliceOne[0] == 0xffffffffu && std::all_of(sliceOne + 1, sliceOne + HtileFillBytes / 4u, [](std::uint32_t word) { return word == 0u; }), "a bind of slice 1 stored back HTILE words that are not all equal");
     Require(AllWords(WordsAt(htile, 0), 0xfffc000fu), "a bind of slice 1 changed slice 0's HTILE");
@@ -222,7 +222,7 @@ void UniformSliceDecodes(AgcDriver::VulkanDevice& device, const Shaders& shaders
     Require(Draw(device, shaders, second, {}) == 0u, "the depth drawn into slice 1 was lost");
     auto* sliceOne = WordsAt(htile, HtileFillBytes);
     std::fill(sliceOne, sliceOne + HtileFillBytes / 4u, 0u);
-    AgcDriver::GuestMemory::MarkWritten(htile.Address() + HtileFillBytes, HtileFillBytes);
+    AgcDriver::GuestMemory::MarkWritten(htile.Address() + HtileFillBytes, HtileFillBytes, AgcDriver::GuestMemory::WriteExtent::Exact);
     Require(Draw(device, shaders, second, {.depthWrite = true}) == Covered, "slice 1 did not take the clear from HTILE words that are all equal");
     Require(AllWords(sliceOne, 0xfffc000fu), "slice 1's bind did not store its cleared HTILE back as expanded");
     Require(Draw(device, shaders, second, {}) == 0u, "the depth drawn into slice 1 after the clear was lost");

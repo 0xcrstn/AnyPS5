@@ -547,6 +547,7 @@ std::vector<std::byte> PipelineRecipeStateIdentity(const State& state, const Ver
     stateBounds(state, vertexInput, resources.mainKey.size(), resources.fragmentKey.size());
     PipelineRecipe recipe;
     recipe.state = CanonicalPipelineState(state);
+    recipe.state.depthBiasClamp = recipe.state.depth && recipe.state.depthBias && recipe.state.depthBiasClamp != 0.0f ? 1.0f : 0.0f;
     recipe.vertexInput = vertexInput;
     recipe.mainLayoutKey.assign(resources.mainKey.begin(), resources.mainKey.end());
     recipe.fragmentLayoutKey.assign(resources.fragmentKey.begin(), resources.fragmentKey.end());

@@ -2929,7 +2929,6 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 #ifdef _WIN32
     if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes)) return false;
 #endif
-    if (tracker.unknownSince(address, end, generation)) return false;
     if (!tracker.unstampedStores.empty()) {
         const auto first = address / WriteBlockBytes;
         const auto last = (end - 1u) / WriteBlockBytes;

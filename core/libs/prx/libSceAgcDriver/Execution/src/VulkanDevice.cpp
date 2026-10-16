@@ -2092,7 +2092,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     for (std::uint32_t index = 0; index < families && !settleQueue; ++index) {
         if (index != family) settleQueue = reserveSettleQueue(index);
     }
-    if (!settleQueue) APS5_LOG_OUT("Vulkan settle queue disabled: no unused transfer-capable queue is available");
+    if (!settleQueue) APS5_LOG_CHARS_OUT("Vulkan settle queue disabled: no unused transfer-capable queue is available");
 #endif
     // Indirect draw records with a non-zero first instance, and several records per call.
     enabled.drawIndirectFirstInstance = available.drawIndirectFirstInstance;

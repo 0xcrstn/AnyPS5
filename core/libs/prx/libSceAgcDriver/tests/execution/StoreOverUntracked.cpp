@@ -23,6 +23,7 @@
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -457,6 +458,7 @@ std::array<std::uint32_t, 8> TextureDescriptor(const std::uint32_t* texels, std:
 }
 
 void Dispatch(std::span<const std::uint32_t> code, std::uint32_t threads, std::uint32_t resource, std::span<const std::uint32_t> userData, std::uint32_t groups) {
+    Require(!AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "store over untracked: a dispatch completion wait cannot hold the GPU mutex");
     std::vector<std::uint32_t> words;
     const auto registers = [&](const std::uint32_t first, const std::span<const std::uint32_t> values) {
         words.push_back(0xc0007600u | (static_cast<std::uint32_t>(values.size()) << 16u));
@@ -474,6 +476,7 @@ void Dispatch(std::span<const std::uint32_t> code, std::uint32_t threads, std::u
     words.insert(words.end(), {0xc0031500u, groups, 1, 1, 0x41u});
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
     AgcDriver::Submit(&packet, 0);
+    AgcDriverWaitIdle_nid_postfix();
 }
 
 void Store(const std::uint32_t* texels, std::uint32_t side = Side, std::span<const std::uint32_t> code = StoreCode) {
@@ -598,7 +601,7 @@ bool HoldPending(THold& hold, const Surface& surface, std::uint32_t result) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (true) {
         hold.lock();
-        if (StorageTexture::AnyPending()) return true;
+        if (StorageTexture::FindPending(surface.Address(), SurfaceBytes) != nullptr) return true;
         hold.unlock();
         if (Holds(surface.Texels(), result)) return false;
         Require(std::chrono::steady_clock::now() < deadline, "store over untracked: the result neither became pending nor reached guest memory");
@@ -626,6 +629,7 @@ struct Case {
 };
 
 enum class Outcome { Kept, Lost, Missed };
+enum class ExpectedRefusal { UnknownProvenance, PartialCoverageAtUnwatch };
 
 // The surface is outside the write watch from the start. Its first results are stored, which
 // leaves their bytes saved for the next store to compare with; the CPU writes another block, then
@@ -633,7 +637,7 @@ enum class Outcome { Kept, Lost, Missed };
 // keeps the CPU's bytes as the write watch would keep them.
 
 template <typename TOperation>
-bool CheckPublicationRefusal(const char* name, const Surface& surface, const std::uint8_t* written, TOperation&& operation) {
+bool CheckPublicationRefusal(const char* name, const Surface& surface, const std::uint8_t* written, TOperation&& operation, ExpectedRefusal expected = ExpectedRefusal::UnknownProvenance) {
     const auto address = surface.Address();
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + SurfaceBytes}}};
     const auto image = StorageTexture::FindLive(address, SurfaceBytes);
@@ -646,16 +650,23 @@ bool CheckPublicationRefusal(const char* name, const Surface& surface, const std
     const auto pixels = DeterministicStorage::Pixels(recorder->GetContext(), *recorder, image);
     Require(LostBytes(written) == 0, "store over untracked: CPU bytes changed before publication");
     const auto cpu = std::vector<std::uint8_t>(surface.Bytes(), surface.Bytes() + SurfaceBytes);
+    if (expected == ExpectedRefusal::PartialCoverageAtUnwatch) Require(AgcDriver::GuestMemory::Watched(address, SurfaceBytes), "store over untracked: partial-coverage unwatch fixture was not watched");
     try {
         operation();
         return false;
     } catch (const std::runtime_error& error) {
-        if (!UnknownProvenanceRefusal(error, address, SurfaceBytes)) throw;
+        if (expected == ExpectedRefusal::UnknownProvenance) {
+            if (!UnknownProvenanceRefusal(error, address, SurfaceBytes)) throw;
+        } else {
+            const auto prefix = "AGC guest memory: cannot discard pending GPU results without full exact newer-store coverage at address=" + std::to_string(address) + " bytes=" + std::to_string(Block) + " since=";
+            if (!std::string_view(error.what()).starts_with(prefix)) throw;
+            Require(AgcDriver::GuestMemory::Watched(address, SurfaceBytes), "store over untracked: refused partial-coverage unwatch removed write tracking");
+        }
         Require(StorageTexture::FindLive(address, SurfaceBytes) == image && StorageTexture::AnyPendingOverlaps(range), "store over untracked: refusal lost pending GPU output");
         Require(std::equal(cpu.begin(), cpu.end(), surface.Bytes()), "store over untracked: refusal changed CPU bytes");
         Require(DeterministicStorage::Pixels(recorder->GetContext(), *recorder, image) == pixels, "store over untracked: refusal changed actual GPU pixels");
         Require(std::equal(cpu.begin(), cpu.end(), surface.Bytes()) && StorageTexture::AnyPendingOverlaps(range), "store over untracked: GPU verification disturbed retained output");
-        std::fprintf(stderr, "[store over untracked] %s: explicit unknown-provenance refusal retained CPU bytes and pending GPU pixels\n", name);
+        std::fprintf(stderr, "[store over untracked] %s: explicit %s refusal retained CPU bytes and pending GPU pixels%s\n", name, expected == ExpectedRefusal::UnknownProvenance ? "unknown-provenance" : "partial-coverage unwatch", expected == ExpectedRefusal::UnknownProvenance ? "" : "; write tracking retained");
         return true;
     }
 }
@@ -791,17 +802,12 @@ Outcome Run(const Case& test) {
         std::fill(surface.Texels(), surface.Texels() + SurfaceBytes / 4u, Untouched);
         Store(surface.Texels());
         // Pending results are the surface image's alone once it exists.
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (true) {
-            hold.lock();
-            if (StorageTexture::FindLive(address, SurfaceBytes) != nullptr) {
-                if (StorageTexture::AnyPending()) break;
-                hold.unlock();
-                return Outcome::Missed;
-            }
+        hold.lock();
+        const auto live = StorageTexture::FindLive(address, SurfaceBytes);
+        Require(live != nullptr, "store over untracked: the completed surface dispatch has no live storage image");
+        if (StorageTexture::FindPending(address, SurfaceBytes) != live) {
             hold.unlock();
-            Require(std::chrono::steady_clock::now() < deadline, "store over untracked: the surface's storage image was never created");
-            std::this_thread::yield();
+            return Outcome::Missed;
         }
         const auto from = StorageTexture::FindLive(source->Address(), Block);
         const auto to = StorageTexture::FindLive(address + LastBlock, Block);
@@ -835,7 +841,7 @@ Outcome Run(const Case& test) {
             else AgcDriver::GuestMemory::Unwatch(address, SurfaceBytes);
         };
         if (test.kind == Kind::WrittenThenLeftWatch) {
-            if (CheckPublicationRefusal(test.name, surface, bytes, leaveWatch)) return Outcome::Kept;
+            if (CheckPublicationRefusal(test.name, surface, bytes, leaveWatch, ExpectedRefusal::PartialCoverageAtUnwatch)) return Outcome::Kept;
         } else leaveWatch();
         if (!neighbour) Require(!AgcDriver::GuestMemory::Watched(address, SurfaceBytes), "store over untracked: the surface is still write-watched");
     }
