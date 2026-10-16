@@ -24,7 +24,13 @@ EpochBumps& Driver::epochBumps() {
     return bumps;
 }
 
+std::chrono::steady_clock::time_point& Driver::lastEpochBump() {
+    static thread_local std::chrono::steady_clock::time_point at{};
+    return at;
+}
+
 void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter) {
+    lastEpochBump() = std::chrono::steady_clock::now();
     GuestMemory::BumpCollectEpoch();
     ++(epochBumps().*counter);
 }

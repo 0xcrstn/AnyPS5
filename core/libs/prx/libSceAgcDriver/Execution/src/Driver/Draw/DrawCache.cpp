@@ -128,7 +128,14 @@ bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape) {
             for (std::size_t stage = 0; stage < pending.aliases.content.size(); ++stage) {
                 if (pending.aliases.content[stage] == 0) continue;
                 const auto stageKey = (pending.aliases.structure ^ (pending.aliases.content[stage] + 0x9e3779b97f4a7c15ull + stage)) * 0x100000001b3ull;
-                if (drawKeySightings->SeenBefore(stageKey)) seen = true;
+                const auto trial = drawRelocationTrials.find(pending.identity);
+                if (drawKeySightings->SeenBefore(stageKey) && trial != drawRelocationTrials.end()) {
+                    auto& state = trial->second;
+                    if (state.productive || state.hits != 0 || state.admissions < DrawRelocationTrial::ProbationAdmissions) {
+                        if (!state.productive && state.hits == 0) ++state.admissions;
+                        seen = true;
+                    }
+                }
             }
         } else if (!drawRelocations.contains(pending.identity)) {
             if (drawKeySightings->SeenBefore(pending.identity ^ 0xc2b2ae3d27d4eb4full)) seen = true;
@@ -156,7 +163,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
     for (std::size_t i = 0; i < fresh.size(); ++i) {
         if (fresh[i] == nullptr) continue;
         auto& variants = replacement->stages[i];
-        const auto present = std::find_if(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& kept) { return kept->pushOffset == fresh[i]->pushOffset && kept->runs == fresh[i]->runs && kept->words == fresh[i]->words; });
+        const auto present = std::find_if(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& kept) { return kept->pushOffset == fresh[i]->pushOffset && kept->meshIndexDescriptor == fresh[i]->meshIndexDescriptor && kept->runs == fresh[i]->runs && kept->words == fresh[i]->words; });
         if (present != variants.end()) {
             ++counters.present;
             fresh[i] = *present;

@@ -20,6 +20,7 @@ using AgcDriver::Graphics::Require;
 using AgcDriver::DriverDetail::DrawMiss;
 
 alignas(256) constexpr std::array<std::uint32_t, 8> VertexCode{0x7e000208u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf80008cfu, 0x03020100u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 8> SecondVertexCode = VertexCode;
 alignas(256) constexpr std::array<std::uint32_t, 8> PixelCode{0xf4000100u, 0xfa000000u, 0x7e000204u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
 alignas(16) std::array<float, 4> Other{0.5f, 0.0f, 0.0f, 0.0f};
 alignas(256) std::array<std::byte, 1024> ColorMemory{};
@@ -30,6 +31,7 @@ struct Header {
 };
 
 alignas(8) Header VertexHeader{};
+alignas(8) Header SecondVertexHeader{};
 alignas(8) Header PixelHeader{};
 
 const Shader* Registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
@@ -49,9 +51,9 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-std::vector<std::uint32_t> DrawFrom(std::initializer_list<const float*> sources) {
+std::vector<std::uint32_t> DrawFrom(std::initializer_list<const float*> sources, const std::uint32_t* vertexCode = VertexCode.data()) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
-    const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
+    const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode);
     const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         {0x2d5, 0x2000},
@@ -115,6 +117,36 @@ void MovedDataHitsTheCache(bool libraries) {
     Require(again.lookups == 10 && again.hits == 6, mode + ": a draw at an address seen before did not reuse the cached draw (" + std::to_string(again.hits) + " hits)");
 }
 
+void UnrelocatedAliasesStayOut(bool libraries) {
+    Registered(SecondVertexHeader, SecondVertexCode.data(), sizeof(SecondVertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    const auto draw = [&](const float* source) {
+        auto commands = DrawFrom({source}, SecondVertexCode.data());
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        return AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    };
+    alignas(16) static std::array<float, 4> repeated{1.0f, 0.0f, 0.0f, 0.0f};
+    alignas(16) static std::array<std::array<std::array<float, 4>, 2>, 12> twice{};
+    for (std::size_t i = 0; i < twice.size(); ++i) {
+        for (auto& entry : twice[i]) entry = {0.25f + 0.03125f * static_cast<float>(i), 0.0f, 0.0f, 0.0f};
+    }
+    draw(repeated.data());
+    const auto start = draw(repeated.data());
+    AgcDriver::DriverDetail::DrawEntryCounters counters = start;
+    for (const auto& pair : twice) {
+        for (const auto& entry : pair) draw(entry.data());
+        const auto beforeRepeated = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+        counters = draw(repeated.data());
+        Require(counters.hits == beforeRepeated.hits + 1, mode + ": a repeated exact key lost its cache hit next to newly relocated data");
+    }
+    const auto inserts = counters.inserts - start.inserts;
+    Require(inserts <= AgcDriver::DriverDetail::DrawRelocationTrial::ProbationAdmissions, mode + ": draws whose alias repeats but never relocates were cached (" + std::to_string(inserts) + " inserts for " + std::to_string(twice.size()) + " aliases)");
+    Require(counters.hits - start.hits >= twice.size(), mode + ": the exact key of a repeated draw lost its hits next to draws whose alias never relocates (" + std::to_string(counters.hits - start.hits) + " hits in " + std::to_string(twice.size()) + " draws)");
+}
+
 }
 
 int main() {
@@ -127,6 +159,7 @@ int main() {
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
         MovedDataHitsTheCache(libraries);
+        UnrelocatedAliasesStayOut(libraries);
         AgcDriverShutdown_nid_postfix();
         std::cout << "A draw whose data moved reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
         return 0;

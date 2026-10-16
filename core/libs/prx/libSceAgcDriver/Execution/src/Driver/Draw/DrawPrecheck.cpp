@@ -19,6 +19,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
         if (auto* sink = frozenSink(); sink != nullptr && sink->Refuse(FrozenFallback::MetadataPass)) return DrawVerdict::Nothing;
+        if (frozenSink() == nullptr && drawRecordState().active) waitDrawRecords();
         if (const auto current = device.Load(); current != nullptr && !GuestMemory::GpuMutex().HeldByThisThread()) current->EnsurePipelinePreparation();
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());

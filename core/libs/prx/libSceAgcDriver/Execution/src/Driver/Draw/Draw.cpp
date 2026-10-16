@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
+#include <cstdio>
 #include "prx/libSceAgcDriver/Execution/include/DrawTraceIdentity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderTraceObserver.hpp"
 #include <optional>
@@ -157,6 +159,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
     const bool useDrawEntries = !planned && drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
+    std::array<std::uint64_t, 5> drawKeyComponents{};
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
     std::uint64_t drawIdentity = 0;
@@ -183,7 +186,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
                 aliasFirst = relocation != nullptr && trial.productive;
             }
         }
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAliases : nullptr);
+        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAliases : nullptr, traceDrawCache() ? &drawKeyComponents : nullptr);
         std::unique_lock cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -214,7 +217,6 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
             if (relocation != nullptr) {
                 auto& trial = drawRelocationTrials[drawIdentity];
                 ++trial.lookups;
-                if (decode != nullptr) ++trial.hits;
                 if (trial.lookups >= DrawRelocationTrial::Window) {
                     trial.productive = trial.hits * DrawRelocationTrial::MinimumHitShare >= trial.lookups;
                     if (!trial.productive) trial.idle = DrawRelocationTrial::IdleDraws;
@@ -236,6 +238,7 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
                 if (dataEntry != nullptr) ++drawEntryCounters.dataHits;
             }
         }
+        if (traceDrawCache()) traceDrawKeyLookup(drawKeyComponents, found == drawCache.end());
         if (traceDrawCache()) {
             traceInsert(traceKeysSeen, drawKey);
             traceInsert(traceShapes, shapeKey);
@@ -295,6 +298,17 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
     if (!drawParameters.indirect) setMeshIndexBuffer(drawParameters);
     else if (graphics.stages.mesh) setMeshIndexBuffer(Pm4::DrawParameters{drawParameters.indexAddress, std::max(drawParameters.indexCount, 1u), drawParameters.indexSize, 1, 0, drawParameters.indexed});
     const std::vector<Role>& roles = decode->roles;
+    static const bool tracePrograms = std::getenv("APS5_TRACE_DRAW_PROGRAMS") != nullptr;
+    if (tracePrograms) {
+        std::vector<DrawProgramTraceEntry> identities;
+        identities.reserve(programs.size());
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            identities.push_back({programs[i].binary.stage, roles[i], programs[i].snapshot->codeAddress, programs[i].binary.codeAddress});
+        }
+        const auto line = FormatDrawProgramTrace(submission.serial, submission.queue, identities);
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
+
     phaseTiming.Phase(DrawRowDecode);
 
     const auto locate = [&](std::uint32_t location) -> std::optional<std::pair<std::size_t, std::size_t>> {
@@ -379,7 +393,10 @@ DrawVerdict Driver::drawNow(QueueState& queue, std::span<const std::uint32_t> pa
     const auto relocatedDecode = decode;
     if (!userPatches.empty() && registerKey) {
         std::lock_guard cacheLock(drawCacheMutex);
-        if (drawHit) ++drawRelocationCounters.hits;
+        if (drawHit || verifyHit) {
+            ++drawRelocationCounters.hits;
+            ++drawRelocationTrials[drawIdentity].hits;
+        }
         if (profile && drawRelocationCounters.lookups >= 100000) reportDrawRelocation();
     }
     if (drawHit && std::any_of(matched.begin(), matched.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant != nullptr && variant->dataPatched; })) {

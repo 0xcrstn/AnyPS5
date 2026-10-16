@@ -289,6 +289,8 @@ function(add_shader_recompiler target runtimeTarget)
             MaterializeShader
             RegistrationResult
             ResolveSource
+            ResourceMaterializer::EvaluateNanoseconds
+            ResourceMaterializer::MaterializeNanoseconds
             ResourceMaterializer::SpecializationNanoseconds
             ResourceMaterializer::ThreadEvaluationNanoseconds
             RuntimeAbi::RequireVersion
@@ -303,12 +305,20 @@ function(add_shader_recompiler target runtimeTarget)
             ShaderDiskCache::StoreShaderUse
             ShaderDiskCache::LayeredCache
             ShaderTraceVariantFields
+            ShaderStage
+            HashSpirvWords
+            ShaderDiskCache::DecodeResult
+            ShaderDiskCache::Enabled
+            ShaderDiskCache::EncodeResult
+            ShaderDiskCache::EntryDirectory
+            ShaderDiskCache::SourceVersion
             SrgbDecodeBit
             SrgbUnormFormat
             FindUserDataTail
             LinkUserDataTail
             ThreadOwned
             ThreadSrtEvaluationCounts
+            ProgramRole
             UnresolvableSwappcTarget
             ValidateAndOptimizeSpirv
             FindUserDataCalls

@@ -37,7 +37,7 @@ std::mutex& pathMutex(const std::filesystem::path& path) {
 
 }
 
-PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool background) : context(context), properties(properties) {
+PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool background, bool loadFromFile) : context(context), properties(properties) {
     static_assert(sizeof(FileHeader) == 24);
     const auto directory = ShaderRecompiler::ShaderCacheDirectory();
     if (!directory.empty()) {
@@ -55,7 +55,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
     std::vector<std::byte> initialData;
     if (!path.empty()) {
         std::lock_guard pathLock(pathMutex(path));
-        load(initialData);
+        if (loadFromFile) load(initialData);
     }
     VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     info.initialDataSize = initialData.size();
@@ -69,6 +69,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         loadedBytes = 0;
         settledBytes = 0;
         settledFile.reset();
+        holdsFile = false;
         result = create(context.device, &info, nullptr, &cache);
     }
     Check(result, "vkCreatePipelineCache");
@@ -171,7 +172,7 @@ std::optional<PipelineCache::FileHeader> PipelineCache::readHeader() const {
 }
 
 void PipelineCache::load(std::vector<std::byte>& initialData) {
-    const auto file = readFile();
+    auto file = readFile();
     if (file.state == FileState::Missing) return;
     if (file.state == FileState::Unreadable) {
         std::fprintf(stderr, "[pipeline-cache] cannot read %s; starting empty\n", path.string().c_str());
@@ -181,11 +182,12 @@ void PipelineCache::load(std::vector<std::byte>& initialData) {
         std::fprintf(stderr, "[pipeline-cache] ignoring %s: %s\n", path.string().c_str(), file.invalidReason);
         return;
     }
-    const auto data = file.Payload();
-    initialData.assign(data.begin(), data.end());
+    initialData = std::move(file.contents);
+    initialData.erase(initialData.begin(), initialData.begin() + sizeof(FileHeader));
     loadedBytes = initialData.size();
     settledBytes = initialData.size();
     settledFile = file.header;
+    holdsFile = true;
     std::fprintf(stderr, "[pipeline-cache] loaded %.1f KiB from %s\n", static_cast<double>(initialData.size()) / 1024.0, path.string().c_str());
 }
 
@@ -215,7 +217,9 @@ bool PipelineCache::save(bool final, bool force) {
         return false;
     }
     if (liveBytes == 0) return !force;
-    if (!force && liveBytes == settledBytes && readHeader() == settledFile) return !force;
+    const auto onDisk = readHeader();
+    if (!force && liveBytes == settledBytes && onDisk == settledFile) return !force;
+    const bool fileUnchanged = holdsFile && settledFile.has_value() && onDisk == settledFile;
     std::vector<std::byte> live;
     if (!snapshot(final || force, &live, liveBytes)) {
         ++deferredSaves;
@@ -229,14 +233,14 @@ bool PipelineCache::save(bool final, bool force) {
         settledBytes = live.size();
         settledFile = file;
     };
-    const auto disk = readFile();
+    const auto disk = fileUnchanged ? File{} : readFile();
     if (disk.state == FileState::Unreadable) {
         std::fprintf(stderr, "[pipeline-cache] cannot read %s; not saving over it\n", path.string().c_str());
         settle(readHeader());
         return !force;
     }
     if (disk.state == FileState::Invalid) std::fprintf(stderr, "[pipeline-cache] replacing %s: %s\n", path.string().c_str(), disk.invalidReason);
-    std::size_t floor = 0;
+    std::size_t floor = fileUnchanged ? std::max<std::size_t>(loadedBytes, settledFile->dataBytes) : 0;
     VkPipelineCache merged = VK_NULL_HANDLE;
     VkPipelineCache copied = VK_NULL_HANDLE;
     struct DestroyCaches {
@@ -297,7 +301,7 @@ bool PipelineCache::save(bool final, bool force) {
     }
     if (size < floor) {
         std::fprintf(stderr, "[pipeline-cache] keeping %s: the merged cache has %.1f KiB, less than the %.1f KiB on disk or loaded at start\n", path.string().c_str(), static_cast<double>(size) / 1024.0, static_cast<double>(floor) / 1024.0);
-        settle(disk.header);
+        settle(fileUnchanged ? *settledFile : disk.header);
         return !force;
     }
     const FileHeader header{FileMagic, FileFormat, size, ShaderRecompiler::HashBytes(std::span(file).subspan(sizeof(FileHeader)))};
@@ -307,8 +311,13 @@ bool PipelineCache::save(bool final, bool force) {
         return !force;
     }
     settle(header);
+    holdsFile = merged == VK_NULL_HANDLE;
     if (final || profiling()) std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms%s%s; the snapshot waited for %llu attempts while pipelines were being created\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), merged != VK_NULL_HANDLE ? " (merged with the file)" : "", final ? " (teardown)" : "", static_cast<unsigned long long>(deferred));
     return true;
+}
+
+void PipelineCache::SaveNow() {
+    save(false);
 }
 
 void PipelineCache::run() {

@@ -167,7 +167,8 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
     if (ProvedCurrentDccKeys(color.dccAddress, color.bytes, resident.TargetKeyProof()) != DccKeys::ClearRegister) return;
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     const char* refusal = nullptr;
-    bool cleared = clearToTexel(resident, texel, color.elementBytes, refusal);
+    const bool pendingKeysKnown = KnownPendingDccKeys(color.dccAddress, color.bytes) == DccKeys::ClearRegister;
+    bool cleared = clearToTexel(resident, texel, color.elementBytes, refusal, pendingKeysKnown);
     const auto keyBytes = static_cast<std::size_t>(color.bytes / 256);
     if (!cleared && keyBytes != 0) {
         bool synced = false;
@@ -885,6 +886,7 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
         add(context.shaderClipDistance);
         add(context.shaderCullDistance);
         add(context.viewportIndexLayer);
+        add(context.shaderTerminateInvocation);
         add(state.paClVsOutCntl);
         add(state.stages.mesh.has_value());
         if (state.stages.mesh) {
@@ -897,6 +899,7 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
             add(mesh.threadsPerGroup);
             add(mesh.ldsSizeDwords);
             add(mesh.provokingVertex);
+            add(mesh.outputPrimitiveSize);
         }
         add(state.stages.tessellation.has_value());
         if (state.stages.tessellation) {
@@ -940,7 +943,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
     }
     std::set<std::uint32_t> outputs;
     try {
-        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics, context.shaderClipDistance, context.shaderCullDistance, context.viewportIndexLayer, context.runtimeDescriptorArray, context.demoteToHelperInvocation);
+        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics, context.shaderClipDistance, context.shaderCullDistance, context.viewportIndexLayer, context.runtimeDescriptorArray, context.demoteToHelperInvocation, context.shaderTerminateInvocation);
     } catch (const std::exception& error) {
         if (keyed) {
             std::lock_guard lock(validationMutex());
@@ -1165,15 +1168,22 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
     recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived, copy.dirtySerial);
 }
 
-const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
+const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
     if (context.recorder == nullptr) return nullptr;
-    return InPlaceDrawInput(context, *context.recorder, address, bytes, alignment);
+    return InPlaceDrawInput(context, *context.recorder, address, bytes, alignment, behindGpuWrite);
 }
 
-const HostImport* InPlaceDrawInput(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
+const HostImport* InPlaceDrawInput(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
     if (bytes == 0) return nullptr;
-    GuestMemory::FlushGpuWrites(address, bytes);
-    if (recorder.PendingWriteOverlaps(address, bytes) || recorder.PendingLabelIn(address, bytes) || recorder.QueuedStoreOverlaps(address, bytes)) return nullptr;
+    bool behind = false;
+    if (behindGpuWrite == nullptr) {
+        GuestMemory::FlushGpuWrites(address, bytes);
+        if (recorder.PendingWriteOverlaps(address, bytes)) return nullptr;
+    } else {
+        StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
+        behind = recorder.PendingWriteOverlaps(address, bytes);
+    }
+    if (recorder.PendingLabelIn(address, bytes) || recorder.QueuedStoreOverlaps(address, bytes)) return nullptr;
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
     if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
     const auto drawWriters = DrawCopiedWriters();
@@ -1181,6 +1191,7 @@ const HostImport* InPlaceDrawInput(const Context& context, Recorder& recorder, s
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || (address - import->base) % alignment != 0) return nullptr;
     recorder.NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
+    if (behindGpuWrite != nullptr && behind) *behindGpuWrite = true;
     return import;
 }
 
@@ -1234,6 +1245,7 @@ struct DrawInputs {
         std::shared_ptr<Buffer> buffer;
     };
     std::vector<ReusedCopy> reusedCopies;
+    bool vertexInputBehindGpuWrite = false;
     std::set<std::uint32_t> fragmentOutputs;
     VkPipelineStageFlags shaderStages = 0;
     std::uint32_t meshGroups = 0;
@@ -1246,8 +1258,8 @@ struct InputImport {
     std::uint64_t base = 0;
 };
 
-std::optional<InputImport> inPlaceInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
-    if (const auto* import = InPlaceDrawInput(context, address, bytes, alignment)) return InputImport{import->buffer, import->base};
+std::optional<InputImport> inPlaceInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite = nullptr) {
+    if (const auto* import = InPlaceDrawInput(context, address, bytes, alignment, behindGpuWrite)) return InputImport{import->buffer, import->base};
     return std::nullopt;
 }
 
@@ -1283,7 +1295,8 @@ struct InputResolve {
         throw ResolveRefused{reason};
     }
 
-    std::optional<InputImport> InPlace(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
+    std::optional<InputImport> InPlace(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite = nullptr) {
+        static_cast<void>(behindGpuWrite);
         if (context.recorder == nullptr || bytes == 0) Refuse(ResolveRefusal::NotInPlace);
         if (Recorder::AccessNeedsFlush(address, bytes)) Refuse(ResolveRefusal::NeedsSync);
         const auto found = ImportedHostRange(context, address, bytes);
@@ -1523,7 +1536,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
-        if (const auto import = resolve != nullptr ? resolve->InPlace(context, begin, bytes, plan.alignments[range]) : inPlaceInput(context, begin, bytes, plan.alignments[range])) {
+        if (const auto import = resolve != nullptr ? resolve->InPlace(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite) : inPlaceInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite)) {
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(begin - import->base);
             inputs.inPlaceReads.emplace_back(begin, end);
@@ -2480,6 +2493,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             countBarrier(1);
         }
         APS5_LOG_CHARS_OUT_DEBUG("Upload barrier recorded");
+        if (inputs.vertexInputBehindGpuWrite) {
+            RecordMemoryBarrier(context, primary, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
+            countBarrier(1);
+        }
         if (meshIndirect) {
             meshArguments = recordMeshArguments(context, primary, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
             argumentBuffer = meshArguments->Handle();
@@ -3227,6 +3244,7 @@ void drawBody(const Context& context, const State& state, const Pm4::DrawParamet
         }
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
         const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        RetireDepthSurfaces(context.device, color.address, colorLayout.Bytes());
         constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         timer.phase(PhaseSetup);
         // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
@@ -3455,6 +3473,7 @@ void drawBody(const Context& context, const State& state, const Pm4::DrawParamet
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
     }
+    if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto masked = maskedState(state, inputs.fragmentOutputs);
@@ -3619,6 +3638,10 @@ void drawBody(const Context& context, const State& state, const Pm4::DrawParamet
         countBarrier();
     }
     APS5_LOG_CHARS_OUT_DEBUG("Upload barrier recorded");
+    if (inputs.vertexInputBehindGpuWrite) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
+        countBarrier();
+    }
     std::shared_ptr<Buffer> meshArguments;
     if (state.stages.mesh && args != nullptr) {
         meshArguments = recordMeshArguments(context, commands, recorder, recorded, state, draw, indirect, countBarrier, inputs.restartTable);

@@ -117,7 +117,7 @@ std::unique_ptr<Decoded> Decode(std::span<const std::byte> key, std::vector<std:
     auto decoded = std::make_unique<Decoded>();
     Bytes bytes(key);
     static_cast<void>(bytes.Read<std::uint32_t>());
-    static_cast<void>(bytes.Read<std::uint32_t>());
+    const auto format = bytes.Read<std::uint32_t>();
     static_cast<void>(bytes.Read<std::uint64_t>());
     const auto keyWords = bytes.Read<std::uint64_t>();
     if (keyWords > key.size() / 8u) throw std::runtime_error("not a variant key");
@@ -251,9 +251,12 @@ std::unique_ptr<Decoded> Decode(std::span<const std::byte> key, std::vector<std:
     decoded->fallbacks.resize(fallbackCount);
     for (auto& fallback : decoded->fallbacks) fallback = words.As<std::uint32_t>();
     context.linkedCallFallbacks = decoded->fallbacks;
+    std::optional<std::size_t> legacyMeshOutputIndex;
     if (request.shader.stage == ShaderStage::Mesh && words.Flag()) {
         MeshConfiguration mesh{};
         for (auto* field : {&mesh.inputPrimitive, &mesh.primitivesPerGroup, &mesh.verticesPerGroup, &mesh.maxVertices, &mesh.maxPrimitives, &mesh.threadsPerGroup, &mesh.ldsSizeDwords, &mesh.provokingVertex, &mesh.esgsItemSize}) *field = words.As<std::uint32_t>();
+        if (format >= 40u) mesh.outputPrimitiveSize = words.As<std::uint32_t>();
+        else legacyMeshOutputIndex = words.Position();
         request.graphics.emplace();
         request.graphics->mesh = mesh;
     }
@@ -326,6 +329,7 @@ std::unique_ptr<Decoded> Decode(std::span<const std::byte> key, std::vector<std:
     std::vector<std::uint64_t> rebuilt;
     if (verifyKey) {
         RecompileCacheKey::Build(request, rebuilt);
+        if (legacyMeshOutputIndex) rebuilt.erase(rebuilt.begin() + static_cast<std::ptrdiff_t>(*legacyMeshOutputIndex));
         if (!robustWord) rebuilt.erase(rebuilt.begin() + static_cast<std::ptrdiff_t>(robustIndex));
         if (rebuilt != decoded->storedKey) throw std::runtime_error("the decoded request does not rebuild its key");
     }
@@ -355,6 +359,31 @@ void VerifyKeyDecode() {
             const auto legacy = Decode(key, nullptr);
             if (legacy->request.target.robustBufferAccess2) throw std::runtime_error("corpus enabled robustness for an old key");
         }
+    }
+    {
+        auto meshRequest = request;
+        meshRequest.shader.stage = ShaderStage::Mesh;
+        meshRequest.context.compute.reset();
+        meshRequest.graphics.emplace();
+        meshRequest.graphics->mesh.emplace();
+        meshRequest.graphics->mesh->outputPrimitiveSize = 2u;
+        std::vector<std::byte> meshKey;
+        ShaderDiskCache::BuildKey(meshRequest, 32u, meshKey);
+        const auto decoded = Decode(meshKey, nullptr);
+        if (decoded->request.graphics->mesh->outputPrimitiveSize != 2u) throw std::runtime_error("corpus key changed mesh outputPrimitiveSize");
+        meshRequest.graphics->mesh->outputPrimitiveSize = 3u;
+        std::vector<std::uint64_t> defaultWords;
+        RecompileCacheKey::Build(meshRequest, defaultWords);
+        const auto outputIndex = static_cast<std::size_t>(std::mismatch(decoded->storedKey.begin(), decoded->storedKey.end(), defaultWords.begin()).first - decoded->storedKey.begin());
+        if (outputIndex == decoded->storedKey.size()) throw std::runtime_error("mesh outputPrimitiveSize is absent from the key");
+        const auto outputByte = 24u + outputIndex * sizeof(std::uint64_t);
+        meshKey.erase(meshKey.begin() + static_cast<std::ptrdiff_t>(outputByte), meshKey.begin() + static_cast<std::ptrdiff_t>(outputByte + sizeof(std::uint64_t)));
+        const std::uint32_t legacyFormat = 39u;
+        std::memcpy(meshKey.data() + 4u, &legacyFormat, sizeof(legacyFormat));
+        const auto legacyWords = static_cast<std::uint64_t>(decoded->storedKey.size() - 1u);
+        std::memcpy(meshKey.data() + 16u, &legacyWords, sizeof(legacyWords));
+        const auto legacy = Decode(meshKey, nullptr);
+        if (legacy->request.graphics->mesh->outputPrimitiveSize != 3u) throw std::runtime_error("corpus changed the legacy mesh output primitive default");
     }
     for (const auto size : {0u, 47u, 48u}) {
         std::vector<std::byte> entry(size);

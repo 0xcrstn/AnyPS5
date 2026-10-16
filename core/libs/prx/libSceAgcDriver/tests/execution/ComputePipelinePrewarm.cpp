@@ -87,6 +87,7 @@ int main() {
         SetVariable("ANYPS5_SHADER_CACHE_DIR", directory.string());
         SetVariable("APS5_COMPILE_SCHEDULER", "priority");
         SetVariable("APS5_PIPELINE_PREWARM", "1");
+        SetVariable("APS5_NO_PIPELINE_JOURNAL", "1");
         {
             const auto first = OpenVulkanTestDevice();
             if (!first) return VulkanTestSkipped;
@@ -99,6 +100,7 @@ int main() {
         }
         const auto second = OpenVulkanTestDevice();
         Require(second != nullptr, "the second Vulkan device could not be opened");
+        second->EnsurePipelinePreparation();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         while (second->PipelinePrewarmCounters().pending != 0u) {
             Require(std::chrono::steady_clock::now() < deadline, "pipeline prewarm did not finish within ten seconds");

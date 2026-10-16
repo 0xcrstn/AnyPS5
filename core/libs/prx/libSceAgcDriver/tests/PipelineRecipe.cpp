@@ -84,16 +84,26 @@ PipelineRecipe fixture() {
 
 void codec() {
     auto recipe = fixture();
+    recipe.state.stages.mesh.emplace();
+    recipe.state.stages.mesh->outputPrimitiveSize = 7u;
     pushOverrides(PipelineRecipeShaders(recipe).front());
     auto encoded = EncodePipelineRecipe(recipe);
     PipelineRecipe decoded;
     require(DecodePipelineRecipe(encoded, decoded), "recipe round trip failed");
     require(EncodePipelineRecipe(decoded) == encoded, "recipe round trip changed canonical bytes");
+    require(decoded.state.stages.mesh && decoded.state.stages.mesh->outputPrimitiveSize == 7u, "mesh output primitive size was lost");
+    auto legacyVersion = encoded;
+    legacyVersion[4] = std::byte{1};
+    require(!DecodePipelineRecipe(legacyVersion, decoded), "legacy recipe missing mesh output primitive size was accepted");
+    require(DecodePipelineRecipe(encoded, decoded), "current recipe failed after legacy version rejection");
     require(decoded.stages[0].program->specialization[0].id == 2u && decoded.stages[0].program->specialization[1].value == 11u, "materialized specialization was lost");
     require(decoded.stages[0].program->bindings[0].guestDescriptor.empty(), "guest descriptors persisted");
     require(decoded.stages[0].program->pushConstants.size() == 16 && decoded.stages[0].program->pushConstants[0] == std::byte{0}, "push layout was lost or draw values persisted");
     require(decoded.mainLayoutKey == recipe.mainLayoutKey && decoded.vertexInput.attributes[0].format == VK_FORMAT_R32G32B32A32_SFLOAT, "pipeline layouts changed");
     const auto initialIdentity = PipelineRecipeIdentity(recipe);
+    auto meshChanged = recipe;
+    meshChanged.state.stages.mesh->outputPrimitiveSize ^= 1u;
+    require(PipelineRecipeIdentity(meshChanged) != initialIdentity, "mesh output primitive size is missing from native identity");
     auto different = recipe;
     auto shader = std::make_shared<RecompileResult>(*recipe.stages[0].program);
     different.stages[0].program = shader;

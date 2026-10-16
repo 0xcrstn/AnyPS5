@@ -46,6 +46,14 @@ public:
     struct CompileOnly {};
     explicit VulkanDevice(CompileOnly);
     ComputePipelineReplayResult ReplayComputePipeline(const ComputePipelineCapture& capture, std::span<const std::byte> initialCache = {});
+    // Builds the pipeline of a journaled compute result ahead of its first dispatch (the journal
+    // replay's hook, on its threads): false when the device already holds a pipeline for the module.
+    bool ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants);
+    // Starts the journal replay if the device has not (a headless device starts it at its first
+    // draw or dispatch) and joins it (tests; the teardown joins it anyway).
+    void WaitForPipelineJournalReplay();
+    // Compute pipelines this device built, by dispatches and by the journal replay (tests).
+    std::uint64_t ComputePipelinesCreated() const;
     ~VulkanDevice();
     VulkanDevice(const VulkanDevice&) = delete;
     VulkanDevice& operator=(const VulkanDevice&) = delete;
@@ -87,6 +95,7 @@ public:
         std::uint64_t computeHits, computeMisses, graphicsHits, graphicsMisses;
     };
     PipelineCacheProbeStatistics PipelineCacheProbeCounters() const;
+    void startJournalReplay();
     bool ImportGuestMemory(const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
     // Sends recorded work to the GPU without waiting for it. With `reapFirst` it first retires batches
     // that already finished, so the in-flight list stays short (APS5_NO_OPPORTUNISTIC_REAP=1 skips

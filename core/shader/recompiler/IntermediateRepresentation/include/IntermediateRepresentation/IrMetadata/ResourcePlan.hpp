@@ -22,6 +22,7 @@ namespace ShaderRecompiler {
 struct DescriptorValue {
     std::array<std::uint32_t, 8> dwords = {};
     std::uint32_t dwordCount = 0;
+    std::uint8_t availableDwordMask = 0;
 
     bool operator==(const DescriptorValue& other) const = default;
 };
@@ -136,6 +137,26 @@ struct CompiledWalkCell {
     std::shared_ptr<const void> walk;
 };
 
+struct CompactPlanValue {
+    std::uint64_t immediate = 0;
+    std::uint64_t flags = 0;
+    std::uint32_t firstArgument = 0;
+    std::uint32_t registerIndex = 0;
+    IrType type = IrType::Void;
+    IrOpcode opcode = IrOpcode::Void;
+    std::uint8_t argumentCount = 0;
+    bool hasImmediate = false;
+};
+
+struct CompactResourcePlan {
+    static constexpr std::uint32_t NoValue = 0xffffffffu;
+    std::vector<CompactPlanValue> values;
+    std::vector<std::uint32_t> arguments;
+    std::vector<std::uint32_t> sourceDwords;
+    std::vector<std::uint32_t> srtReads;
+    std::vector<std::uint32_t> conditions;
+};
+
 struct IrResourcePlan {
     IrShaderStage stage = IrShaderStage::Unknown;
     std::uint64_t shaderHash = 0;
@@ -155,6 +176,8 @@ struct IrResourcePlan {
     // One byte per srtReads slot, 1 when the CPU walk never consumes the slot's value (see
     // Detail::ComputePureFlatSlots): a driver may reuse a capture whose words differ only there.
     std::vector<std::uint8_t> pureFlatSlots;
+    bool denseValueIds = false;
+    CompactResourcePlan compact;
     bool requiresSpecializationMemory = false;
     bool srtPlanComplete = false;
     bool resourceTrackingComplete = false;

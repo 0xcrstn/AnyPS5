@@ -193,6 +193,7 @@ std::shared_ptr<DriverStoreWatch> ReadDriverSnapshot(std::uint64_t address, std:
 void ApplyDriverSnapshot(const DriverStoreWatch& writes, std::span<std::byte> snapshot);
 bool DriverSnapshotUnchanged(const DriverStoreWatch& writes);
 std::uint64_t ExchangeCollectEpoch(std::uint64_t epoch);
+bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
 // returns the current generation instead. A guest write landing between two collects of the same
 // epoch is seen by the next epoch, which is the ordering real hardware gives a CPU write made while a

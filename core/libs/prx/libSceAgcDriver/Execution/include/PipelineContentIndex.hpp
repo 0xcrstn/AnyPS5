@@ -3,10 +3,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <future>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <utility>
 
 namespace AgcDriver {
@@ -30,6 +34,53 @@ inline PipelineContentKey HashPipelineContent(std::span<const std::uint64_t> fie
 template<typename TValue>
 class PipelineContentIndex {
 public:
+    struct BuildResult {
+        std::shared_ptr<TValue> value;
+        bool created = false;
+        bool joined = false;
+    };
+
+    template<typename TBuilder>
+    BuildResult GetOrBuild(const PipelineContentKey& key, TBuilder&& builder) {
+        std::shared_future<std::shared_ptr<TValue>> future;
+        std::shared_ptr<std::promise<std::shared_ptr<TValue>>> promise;
+        {
+            std::lock_guard lock(mutex);
+            if (const auto found = entries.find(key); found != entries.end()) {
+                if (auto value = found->second.lock()) {
+                    ++hits;
+                    return {std::move(value), false, false};
+                }
+                entries.erase(found);
+            }
+            if (const auto found = inFlight.find(key); found != inFlight.end()) {
+                future = found->second;
+                ++hits;
+            } else {
+                promise = std::make_shared<std::promise<std::shared_ptr<TValue>>>();
+                future = promise->get_future().share();
+                inFlight.emplace(key, future);
+            }
+        }
+        if (promise == nullptr) return {future.get(), false, true};
+        try {
+            std::shared_ptr<TValue> value = std::forward<TBuilder>(builder)();
+            {
+                std::lock_guard lock(mutex);
+                if (value != nullptr) insert(key, value);
+                promise->set_value(value);
+                inFlight.erase(key);
+            }
+            const bool created = value != nullptr;
+            return {std::move(value), created, false};
+        } catch (...) {
+            std::lock_guard lock(mutex);
+            promise->set_exception(std::current_exception());
+            inFlight.erase(key);
+            throw;
+        }
+    }
+
     std::shared_ptr<TValue> Find(const PipelineContentKey& key) {
         std::lock_guard lock(mutex);
         const auto found = entries.find(key);
@@ -45,9 +96,13 @@ public:
 
     void Insert(const PipelineContentKey& key, const std::shared_ptr<TValue>& value) {
         std::lock_guard lock(mutex);
-        entries[key] = value;
-        if (++inserts % 256u != 0u) return;
-        for (auto it = entries.begin(); it != entries.end();) it = it->second.expired() ? entries.erase(it) : std::next(it);
+        if (value != nullptr) insert(key, value);
+    }
+
+    void Clear() {
+        std::lock_guard lock(mutex);
+        if (!inFlight.empty()) throw std::logic_error("pipeline content index clear requires drained builds");
+        entries.clear();
     }
 
     std::uint64_t Hits() const {
@@ -61,8 +116,15 @@ public:
     }
 
 private:
+    void insert(const PipelineContentKey& key, const std::shared_ptr<TValue>& value) {
+        entries[key] = value;
+        if (++inserts % 256u != 0u) return;
+        for (auto it = entries.begin(); it != entries.end();) it = it->second.expired() ? entries.erase(it) : std::next(it);
+    }
+
     mutable std::mutex mutex;
     std::map<PipelineContentKey, std::weak_ptr<TValue>> entries;
+    std::map<PipelineContentKey, std::shared_future<std::shared_ptr<TValue>>> inFlight;
     std::uint64_t hits = 0;
     std::uint64_t inserts = 0;
 };

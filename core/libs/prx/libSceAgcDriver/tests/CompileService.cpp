@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <future>
 #include <mutex>
 #include <semaphore>
 #include <stdexcept>
@@ -304,6 +305,100 @@ void ContentIndex() {
     Require(index.Find(key) == nullptr && index.Size() == 0, "an expired entry was returned or kept");
 }
 
+bool ContentHits(PipelineContentIndex<int>& index, std::uint64_t expected) {
+    const auto end = std::chrono::steady_clock::now() + 3s;
+    while (index.Hits() < expected && std::chrono::steady_clock::now() < end) std::this_thread::yield();
+    return index.Hits() >= expected;
+}
+
+void ContentIndexSingleFlight() {
+    PipelineContentIndex<int> index;
+    const PipelineContentKey key{17, 19};
+    Gate gate;
+    std::atomic<int> builds{0};
+    auto owner = std::async(std::launch::async, [&] {
+        return index.GetOrBuild(key, [&] {
+            ++builds;
+            gate.Block();
+            return std::make_shared<int>(41);
+        });
+    });
+    gate.Ready();
+    std::vector<std::future<PipelineContentIndex<int>::BuildResult>> waiters;
+    for (int waiter = 0; waiter < 4; ++waiter) {
+        waiters.push_back(std::async(std::launch::async, [&] {
+            return index.GetOrBuild(key, [&] {
+                ++builds;
+                return std::make_shared<int>(99);
+            });
+        }));
+    }
+    const bool joined = ContentHits(index, waiters.size());
+    auto different = std::async(std::launch::async, [&] {
+        return index.GetOrBuild(PipelineContentKey{23, 29}, [] { return std::make_shared<int>(53); });
+    });
+    const bool independent = different.wait_for(1s) == std::future_status::ready;
+    gate.Open();
+    auto made = owner.get();
+    Require(joined && independent, "content builds or waiting clients serialized a different key");
+    Require(made.value != nullptr && *made.value == 41 && made.created && !made.joined, "the content builder returned wrong ownership flags");
+    for (auto& waiter : waiters) {
+        const auto result = waiter.get();
+        Require(result.value == made.value && !result.created && result.joined, "a content waiter rebuilt or received a different pipeline");
+    }
+    const auto other = different.get();
+    Require(other.value != nullptr && *other.value == 53 && other.created && !other.joined && builds.load() == 1, "different content did not build independently or duplicate content rebuilt");
+    const auto cached = index.GetOrBuild(key, []() -> std::shared_ptr<int> { throw std::runtime_error("cached content rebuilt"); });
+    Require(cached.value == made.value && !cached.created && !cached.joined, "retained content did not serve without a build");
+    index.Clear();
+    Require(index.Size() == 0 && index.Find(key) == nullptr && *made.value == 41, "clearing a drained content index destroyed a caller's pipeline or retained entries");
+}
+
+void ContentIndexFailureAndRetry() {
+    PipelineContentIndex<int> index;
+    const PipelineContentKey key{31, 37};
+    Gate gate;
+    std::atomic<int> builds{0};
+    auto owner = std::async(std::launch::async, [&] {
+        return index.GetOrBuild(key, [&]() -> std::shared_ptr<int> {
+            ++builds;
+            gate.Block();
+            throw std::runtime_error("shared content failure");
+        });
+    });
+    gate.Ready();
+    auto waiter = std::async(std::launch::async, [&] {
+        return index.GetOrBuild(key, [&] {
+            ++builds;
+            return std::make_shared<int>(1);
+        });
+    });
+    const bool joined = ContentHits(index, 1);
+    gate.Open();
+    int failures = 0;
+    for (auto* future : {&owner, &waiter}) {
+        try { static_cast<void>(future->get()); }
+        catch (const std::runtime_error& error) { if (std::string_view(error.what()) == "shared content failure") ++failures; }
+    }
+    Require(joined && failures == 2 && builds.load() == 1 && index.Size() == 0, "a failed content build did not propagate to its waiter or was retained");
+    auto retry = index.GetOrBuild(key, [&] { ++builds; return std::make_shared<int>(67); });
+    Require(retry.value != nullptr && *retry.value == 67 && retry.created && !retry.joined && builds.load() == 2, "a failed content key could not be rebuilt");
+    retry.value.reset();
+    Require(index.Find(key) == nullptr && index.Size() == 0, "a completed single-flight future retained its value strongly");
+}
+
+void ContentIndexNullProbe() {
+    PipelineContentIndex<int> index;
+    const PipelineContentKey key{41, 43};
+    int builds = 0;
+    const auto miss = index.GetOrBuild(key, [&] { ++builds; return std::shared_ptr<int>{}; });
+    Require(miss.value == nullptr && !miss.created && !miss.joined && index.Size() == 0, "a null content probe was retained as a pipeline");
+    auto made = index.GetOrBuild(key, [&] { ++builds; return std::make_shared<int>(71); });
+    Require(made.value != nullptr && *made.value == 71 && made.created && !made.joined && builds == 2, "a null content probe blocked a later pipeline build");
+    made.value.reset();
+    Require(index.Find(key) == nullptr && index.Size() == 0, "the content index permanently retained a successful probe replacement");
+}
+
 void FinishedJobsStayFinished() {
     CompileService::Limits limits;
     limits.workers = 6;
@@ -445,6 +540,9 @@ int main() {
         FinishedJobsStayFinished();
         RecipeVerification();
         ContentIndex();
+        ContentIndexSingleFlight();
+        ContentIndexFailureAndRetry();
+        ContentIndexNullProbe();
         RecipeRoundTrip();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "compile service test failed: %s\n", error.what());

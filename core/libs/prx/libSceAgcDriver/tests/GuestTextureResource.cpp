@@ -104,6 +104,10 @@ void RunGuestTextureResourceTests() {
     Fields nullType = base;
     nullType.typeRaw = 0;
     Require(IsNullTextureResource(pack(nullType)), "a type-0 texture with a nonzero base was not classified as null");
+    nullType.typeRaw = 1;
+    Require(IsNullTextureResource(pack(nullType)), "a type-1 texture with a nonzero base was not classified as null");
+    nullType.typeRaw = 2;
+    Require(!IsNullTextureResource(pack(nullType)), "a reserved type-2 texture was classified as null");
     auto result = DecodeTextureResource(pack(base));
     Require(result.baseAddress == (base.base40 << 8u), "decoded base address changed");
     Require(result.width == 16 && result.height == 16, "decoded width or height changed");
@@ -283,6 +287,34 @@ void RunGuestTextureResourceTests() {
     multisampledArray.typeRaw = 15;
     rejectFields(multisampledArray, "unsupported image type");
 
+    for (const auto format : {7u, 22u}) {
+        for (const auto log2 : {1u, 2u, 3u}) {
+            auto nativeDepth = base;
+            nativeDepth.typeRaw = 14;
+            nativeDepth.format = format;
+            nativeDepth.tileModeRaw = 24;
+            nativeDepth.lastLevel = log2;
+            nativeDepth.maxMip = log2;
+            nativeDepth.msaaDepth = true;
+            const auto decoded = DecodeTextureResource(pack(nativeDepth));
+            Require(decoded.iterate256 && decoded.samples == (1u << log2) && decoded.tileMode == TextureTileMode::kZ64KBX && decoded.format == format, "a native multisampled depth descriptor lost ITERATE_256 or its identity");
+            Require(decoded.mipCount == 1 && decoded.allocatedMipCount == 1 && decoded.baseLevel == 0 && decoded.lastLevel == 0, "native multisampled depth retained sample counts as mip levels");
+            auto wrongTile = nativeDepth;
+            wrongTile.tileModeRaw = 27;
+            rejectFields(wrongTile, "ITERATE_256");
+            auto wrongFormat = nativeDepth;
+            wrongFormat.format = 56;
+            rejectFields(wrongFormat, "ITERATE_256");
+            auto wrongType = nativeDepth;
+            wrongType.typeRaw = 9;
+            rejectFields(wrongType, "ITERATE_256");
+            wrongType.typeRaw = 15;
+            rejectFields(wrongType, "ITERATE_256");
+            auto mismatchedSamples = nativeDepth;
+            mismatchedSamples.maxMip = log2 - 1u;
+            rejectFields(mismatchedSamples, "same sample count");
+        }
+    }
     Fields badType = base;
     badType.typeRaw = 0;
     rejectFields(badType, "unsupported image type");
@@ -354,7 +386,7 @@ void RunGuestTextureResourceTests() {
 
     Fields badMsaa = base;
     badMsaa.msaaDepth = true;
-    rejectFields(badMsaa, "MSAA");
+    rejectFields(badMsaa, "ITERATE_256");
 
     Fields blockSize = base;
     blockSize.maxUncompBlkSize = 1;

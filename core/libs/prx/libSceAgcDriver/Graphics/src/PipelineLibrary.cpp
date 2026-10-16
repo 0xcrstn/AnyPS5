@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCreationTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
@@ -432,7 +433,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         const auto libraryLayout = fullLayout;
         const bool feedback = context.pipelineCreationFeedback;
         const auto enqueued = ShaderCompileTrace::Clock::now();
-        enqueue(store, context.device, [slot, createPipelines, cache, cacheSynchronization, libraryLayout, libraries, &store, devicePointer = &device, feedback, enqueued] {
+        std::function<void()> relink = [slot, createPipelines, cache, cacheSynchronization, libraryLayout, libraries, &store, devicePointer = &device, feedback, enqueued] {
             PipelineCreationTrace trace("pipeline.lto", feedback, 0u);
             trace.Event().Queued(enqueued).Number("libraries", libraries.size());
             if (slot->released.load()) {
@@ -469,7 +470,13 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             }
             std::lock_guard lock(store.mutex);
             ++devicePointer->counters.optimized;
-        });
+        };
+        if (PipelineJournalReplaying() || context.pipelineRecipeReplaying) {
+            slot->relink = std::move(relink);
+            slot->deferred.store(true, std::memory_order_release);
+        } else {
+            enqueue(store, context.device, std::move(relink));
+        }
     }
     lock.unlock();
     return pipeline;
@@ -477,8 +484,23 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
 
 void OptimizedPipeline::Release() noexcept {
     released.store(true);
+    if (deferred.exchange(false, std::memory_order_acq_rel)) {
+        auto& store = Libraries();
+        std::lock_guard lock(store.mutex);
+        relink = nullptr;
+        state.store(Released);
+    }
     if (state.load() == Ready) state.store(Released);
     if (const auto pipeline = handle.exchange(VK_NULL_HANDLE)) destroy(device, pipeline, nullptr);
+}
+
+void OptimizedPipeline::Schedule() {
+    if (!deferred.load(std::memory_order_acquire)) return;
+    auto& store = Libraries();
+    std::lock_guard lock(store.mutex);
+    if (!deferred.exchange(false, std::memory_order_acq_rel)) return;
+    if (relink && !released.load()) enqueue(store, device, std::move(relink));
+    relink = nullptr;
 }
 
 void WaitForOptimizedPipelines(VkDevice device) {

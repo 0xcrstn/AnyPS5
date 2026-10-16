@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
@@ -167,7 +169,7 @@ void Driver::run(std::uint32_t id) noexcept {
                         lock.lock();
                         if (ready()) break;
                         if (id == 0 && allQueuesIdle() && !completionsPending()
-                            && (!storeIdleResults || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck)) continue;
+                            && ((!storeIdleResults && Graphics::StorageTexture::AnyPending()) || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck)) continue;
                         if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
                         const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
                         changed.wait(lock, [&] { return ready() || (id == 0 && idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait); });
@@ -201,11 +203,19 @@ void Driver::run(std::uint32_t id) noexcept {
                     DrawTrace::Note("wait_reason", "queue_zero_prior_submission_order");
                     DrawTrace::Note("wait_received_serial", submission.received);
                     DrawTrace::Note("wait_dependency", "order_predicate_not_gpu_completion");
-                    orderHolders.fetch_add(1, std::memory_order_acq_rel);
-                    const auto released = [&] { return failure || stopping || orderReleased(id, submission.received); };
-                    while (!released()) poll(released);
+                    {
+                        struct OrderHold {
+                            std::atomic<std::uint32_t>& holders;
+                            explicit OrderHold(std::atomic<std::uint32_t>& holders) : holders(holders) { holders.fetch_add(1, std::memory_order_acq_rel); }
+                            ~OrderHold() { holders.fetch_sub(1, std::memory_order_acq_rel); }
+                            OrderHold(const OrderHold&) = delete;
+                            OrderHold& operator=(const OrderHold&) = delete;
+                        } hold{orderHolders};
+                        const auto released = [&] { return failure || stopping || orderReleased(id, submission.received); };
+                        StallWatch stall(id);
+                        while (!released() && !poll(released)) stall.Check("order behind queue 0 for event", submission.received);
+                    }
                     DrawTrace::Note("wait_outcome", failure != nullptr ? "failed" : stopping ? "cancelled" : "satisfied");
-                    orderHolders.fetch_sub(1, std::memory_order_acq_rel);
                     rethrowFailure();
                 }
                 if (APS5_ENABLE_TIMING_LOG) submission.orderedAt = std::chrono::steady_clock::now();

@@ -150,7 +150,11 @@ void Driver::execute(const Submission& submission) {
     auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
     ++packetProfile.submissions;
 
-    bumpEpoch(&EpochBumps::submissions);
+    static const bool epochEach = std::getenv("APS5_SUBMISSION_EPOCH_EACH") != nullptr;
+    if (epochEach || submission.enqueuedAt == std::chrono::steady_clock::time_point{} || submission.enqueuedAt > lastEpochBump()) {
+        if (!epochEach) noteReleasedTails(submission);
+        bumpEpoch(&EpochBumps::submissions);
+    }
     clearResolvedAhead();
     gateOpened() = true;
     struct ClearAhead {

@@ -357,6 +357,7 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     writer.WriteU8(info.quadPixelMask);
     for (const std::uint16_t mask : info.quadSampleMask) writer.WriteU32(mask);
     writer.WriteU32(info.extraLdsDwords);
+    writer.WriteU32(info.reversedBlend);
 }
 
 ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
@@ -419,6 +420,7 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
         }
     }
     if (version >= 30u) info.extraLdsDwords = reader.ReadU32();
+    if (version >= 33u) info.reversedBlend = reader.ReadU32();
     if (version < 5u) {
         const auto input = [](PixelInput value, bool present) { return present ? PixelInputBit(value) : 0u; };
         info.inputAddr = input(PixelInput::PerspectiveSample, info.hasPerspectiveCenterVgpr && inputAddrOrCenterVgpr == 2u) | input(PixelInput::PerspectiveCenter, info.hasPerspectiveCenterVgpr) |
@@ -532,6 +534,7 @@ void writeMeshConfiguration(Writer& writer, const MeshConfiguration& configurati
     writer.WriteU32(configuration.ldsSizeDwords);
     writer.WriteU32(configuration.provokingVertex);
     writer.WriteU32(configuration.esgsItemSize);
+    writer.WriteU32(configuration.outputPrimitiveSize);
 }
 
 MeshConfiguration readMeshConfiguration(Reader& reader, std::uint32_t version) {
@@ -545,6 +548,7 @@ MeshConfiguration readMeshConfiguration(Reader& reader, std::uint32_t version) {
     configuration.ldsSizeDwords = reader.ReadU32();
     configuration.provokingVertex = reader.ReadU32();
     configuration.esgsItemSize = version >= 4u ? reader.ReadU32() : 4u;
+    if (version >= 33u) configuration.outputPrimitiveSize = reader.ReadU32();
     return configuration;
 }
 
@@ -799,7 +803,7 @@ std::string RequestSerializer::SerializeBinary(const RecompileRequest& request) 
 void RequestSerializer::VisitSerialized(const RecompileRequest& request, const std::function<void(std::string_view)>& visitor) const {
     Writer writer(visitor);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(32u);
+    writer.WriteU32(33u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -837,7 +841,8 @@ DeserializedRequest RequestSerializer::DeserializeBinary(std::string_view bytes)
     Reader reader(bytes);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 32u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 33u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version == 30u || version == 31u) throw std::runtime_error("RequestSerializer: versions 30 and 31 have ambiguous historical schemas; re-capture or regenerate the request");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);

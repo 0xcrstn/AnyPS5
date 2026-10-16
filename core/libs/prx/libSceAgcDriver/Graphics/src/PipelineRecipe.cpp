@@ -39,7 +39,7 @@ constexpr std::size_t expectedStateFields() {
 
 static_assert(fieldCount<State>() == expectedStateFields<State>(), "State changed: update the canonical pipeline recipe codec");
 static_assert(fieldCount<ShaderStages>() == 8, "ShaderStages changed: update the pipeline recipe codec");
-static_assert(fieldCount<ShaderRecompiler::MeshConfiguration>() == 9, "MeshConfiguration changed: update the pipeline recipe codec");
+static_assert(fieldCount<ShaderRecompiler::MeshConfiguration>() == 10, "MeshConfiguration changed: update the pipeline recipe codec");
 static_assert(fieldCount<ShaderRecompiler::TessellationConfiguration>() == 10, "TessellationConfiguration changed: update the pipeline recipe codec");
 static_assert(fieldCount<VkStencilOpState>() == 7 && fieldCount<VkPipelineColorBlendAttachmentState>() == 8, "Vulkan state changed: update the pipeline recipe codec");
 static_assert(fieldCount<VkVertexInputBindingDescription>() == 3 && fieldCount<VkVertexInputAttributeDescription>() == 4, "Vulkan vertex input changed: update the pipeline recipe codec");
@@ -251,7 +251,7 @@ void optional(TCodec& codec, std::optional<TValue>& value, TTransfer transfer) {
 
 template<typename TCodec>
 void mesh(TCodec& codec, ShaderRecompiler::MeshConfiguration& value) {
-    for (auto* field : {&value.inputPrimitive, &value.primitivesPerGroup, &value.verticesPerGroup, &value.maxVertices, &value.maxPrimitives, &value.threadsPerGroup, &value.ldsSizeDwords, &value.provokingVertex, &value.esgsItemSize}) codec.Value(*field);
+    for (auto* field : {&value.inputPrimitive, &value.primitivesPerGroup, &value.verticesPerGroup, &value.maxVertices, &value.maxPrimitives, &value.threadsPerGroup, &value.ldsSizeDwords, &value.provokingVertex, &value.esgsItemSize, &value.outputPrimitiveSize}) codec.Value(*field);
 }
 
 template<typename TCodec>

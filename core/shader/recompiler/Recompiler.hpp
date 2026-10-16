@@ -148,6 +148,21 @@ enum class RasterPrimitive : std::uint8_t {
     Rectangle
 };
 
+namespace ReversedBlendCode {
+
+inline constexpr std::uint32_t Enable = 1u;
+inline constexpr std::uint32_t ColorShift = 8u;
+inline constexpr std::uint32_t SecondShift = 16u;
+inline constexpr std::uint32_t RouteBits = 2u;
+inline constexpr std::uint32_t RouteMask = 3u;
+inline constexpr std::uint32_t Routes = 0xffu;
+inline constexpr std::uint32_t Own = 0u;
+inline constexpr std::uint32_t Component0 = 1u;
+inline constexpr std::uint32_t Zero = 2u;
+inline constexpr std::uint32_t One = 3u;
+
+}
+
 struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
@@ -184,6 +199,7 @@ struct ShaderPixelStageInfo {
     std::uint8_t quadPixelMask = 0xf;
     std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
     std::uint32_t extraLdsDwords = 0;
+    std::uint32_t reversedBlend = 0;
 };
 
 struct ShaderVertexBufferResource {
@@ -317,6 +333,7 @@ struct MeshConfiguration {
     std::uint32_t ldsSizeDwords;
     std::uint32_t provokingVertex;
     std::uint32_t esgsItemSize = 0;
+    std::uint32_t outputPrimitiveSize = 3;
 };
 
 struct TessellationConfiguration {
@@ -467,6 +484,7 @@ struct FragmentParameter {
     bool perVertex;
     bool custom = false;
     bool flatP10 = false;
+    bool vertexOrder = false;
 };
 
 struct BarycentricEmulation {
@@ -484,14 +502,9 @@ struct BarycentricEmulationLayout {
 
 [[nodiscard]] BarycentricEmulationLayout LayoutBarycentricEmulation(std::span<const FragmentParameter> parameters, const BarycentricEmulation& emulation);
 
-// Compiled SPIR-V shared between a cached variant and every result materialized from it: results
-// are copied per dispatch and draw, so the words are reference counted and only duplicated when a
-// holder writes to them (tests and tools patch modules in place). Reads look like a vector.
-// The non-const data(), operator[], begin() and end() count as writes: on a shared holder (every
-// cached result) they clone the module, so a consumer that only reads takes the result by const
-// reference, or the per-dispatch copy this class removes comes back without a compiler hint.
-struct SpilledSpirv;
-
+// A 128-bit hash of a module's words (SharedSpirv::ContentHash), zero for an empty module. The
+// mixing is pure integer arithmetic over the words in order, so the value is the same on every run,
+// platform and compiler: a pipeline journal names modules by it across runs.
 struct SpirvContentHash {
     std::uint64_t low = 0;
     std::uint64_t high = 0;
@@ -517,6 +530,14 @@ inline std::uint64_t HashSpirvWords(std::span<const std::uint32_t> words, std::u
     hash ^= hash >> 33u;
     return hash;
 }
+
+// Compiled SPIR-V shared between a cached variant and every result materialized from it: results
+// are copied per dispatch and draw, so the words are reference counted and only duplicated when a
+// holder writes to them (tests and tools patch modules in place). Reads look like a vector.
+// The non-const data(), operator[], begin() and end() count as writes: on a shared holder (every
+// cached result) they clone the module, so a consumer that only reads takes the result by const
+// reference, or the per-dispatch copy this class removes comes back without a compiler hint.
+struct SpilledSpirv;
 
 class SharedSpirv {
 public:
@@ -676,6 +697,20 @@ private:
     std::atomic<std::shared_ptr<const std::string>> identity;
 };
 
+// What a Vulkan pipeline built from a result depends on besides the fixed-function state and the
+// descriptor set layouts: the module words, the specialization constants handed to the driver, the
+// subgroup width the module was laid out for, the workgroup memory slice and the bindings' shape.
+// Two results with equal identities build equal pipelines, in this run or another: unlike the
+// process-lifetime variant ids, the identity is the same on every run, so the pipeline stores key on
+// it and a pipeline journal can name a stage across runs. Empty for a result without a module.
+struct PipelineIdentity {
+    std::uint64_t low = 0;
+    std::uint64_t high = 0;
+    [[nodiscard]] bool Empty() const { return low == 0 && high == 0; }
+    bool operator==(const PipelineIdentity&) const = default;
+    auto operator<=>(const PipelineIdentity&) const = default;
+};
+
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     std::shared_ptr<ShaderInputProvenance> inputProvenance = std::make_shared<ShaderInputProvenance>();
     std::shared_ptr<ShaderTraceMetadataCache> traceMetadata = MakeShaderTraceMetadataCache();
@@ -688,6 +723,24 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     std::vector<std::uint32_t> shaderDataUserWords;
     std::vector<std::array<std::uint32_t, 3>> bufferBaseSlots;
     [[nodiscard]] std::uint64_t PipelineVariantId() const { return specializationId != 0 ? specializationId : variantId; }
+    [[nodiscard]] PipelineIdentity Identity() const {
+        const auto hash = spirv.ContentHash();
+        if (hash == SpirvContentHash{}) return {};
+        PipelineIdentity identity{hash.low, hash.high};
+        const auto mix = [&](std::uint64_t value) {
+            identity.low = (identity.low ^ value) * 0x9e3779b97f4a7c15ull;
+            identity.low ^= identity.low >> 29u;
+            identity.high = (identity.high ^ (value + 0x7f4a7c159e3779b9ull)) * 0xc2b2ae3d27d4eb4full;
+            identity.high ^= identity.high >> 31u;
+        };
+        mix(specialization.size());
+        for (const auto& constant : specialization) mix(constant.id | (static_cast<std::uint64_t>(constant.value) << 32u));
+        mix(hostSubgroupSize | (static_cast<std::uint64_t>(workgroupMemoryDwords) << 32u));
+        mix(bindings.size());
+        for (const auto& binding : bindings) mix(binding.descriptorSet | (static_cast<std::uint64_t>(binding.binding) << 16u) | (static_cast<std::uint64_t>(binding.kind) << 40u) | (static_cast<std::uint64_t>(binding.count) << 48u));
+        if (identity.Empty()) identity.low = 1;
+        return identity;
+    }
 };
 
 [[nodiscard]] RecompileResult Recompile(const RecompileRequest& request);

@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibraryNotes.hpp"
 #include <array>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <cstddef>
 #include <cstdint>
@@ -40,7 +41,13 @@ struct OptimizedPipeline {
     std::atomic<bool> released{false};
     std::atomic<int> state{Pending};
     std::atomic<VkResult> failure{VK_SUCCESS};
+    // The relink of a pipeline the journal replay built waits for the first draw that binds it
+    // (Schedule), so the relink thread serves the title's own pipelines first and a replayed
+    // pipeline the title never draws is never relinked.
+    std::atomic<bool> deferred{false};
+    std::function<void()> relink;
     void Release() noexcept;
+    void Schedule();
 };
 
 struct PipelineLibraryPartsMissing {};

@@ -1,3 +1,5 @@
+#include "prx/libc/include/HostThreadLocal.hpp"
+#include <unordered_map>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include <algorithm>
@@ -51,7 +53,7 @@ void forEachKeyedUserWord(const QueueState& queue, bool allUserWords, TVisit&& v
 
 }
 
-std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental, std::uint64_t* shapeKey) {
+std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental, std::uint64_t* shapeKey, RegisterStateKeyParts* parts) {
     const auto& masks = registerMasks();
     const auto fingerprint = [&](const Registers& registers, Graphics::RegisterBank bank) {
         const auto& mask = masks[static_cast<std::size_t>(bank)];
@@ -62,10 +64,18 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
     shape = (shape ^ fingerprint(queue.userConfig, Graphics::RegisterBank::UserConfig)) * 0x100000001b3ull;
     if (shapeKey != nullptr) *shapeKey = shape;
     auto exact = shape;
+    std::uint64_t userData = 0xcbf29ce484222325ull;
+    std::uint64_t auxiliary = 0xcbf29ce484222325ull;
     forEachKeyedUserWord(queue, allUserWords, [&](std::uint32_t offset, std::uint32_t value) {
         exact = (exact ^ offset) * 0x100000001b3ull;
         exact = (exact ^ value) * 0x100000001b3ull;
+        if (parts != nullptr) {
+            auto& part = offset == 0x082u || offset == 0x083u || offset == 0x102u || offset == 0x103u ? auxiliary : userData;
+            part = (part ^ offset) * 0x100000001b3ull;
+            part = (part ^ value) * 0x100000001b3ull;
+        }
     });
+    if (parts != nullptr) *parts = {shape, userData, auxiliary};
     return exact;
 }
 
@@ -108,6 +118,23 @@ std::uint64_t Driver::drawDecodeKey(const QueueState& queue, const ShaderRegistr
     return key == 0 ? 1 : key;
 }
 
+std::uint64_t DrawShaderSetKey(const QueueState& queue, const ShaderRegistry& registry) {
+    std::uint64_t key = 0xcbf29ce484222325ull;
+    const auto mix = [&](std::uint64_t value) { key = (key ^ value) * 0x100000001b3ull; };
+    for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
+        const auto low = queue.shader.find(base);
+        const auto high = queue.shader.find(base + 1);
+        if (low == queue.shader.end() || high == queue.shader.end()) { mix(0); continue; }
+        const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
+        auto it = registry.upper_bound(address);
+        if (it == registry.begin()) { mix(1); continue; }
+        --it;
+        for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+        mix(address - it->first);
+    }
+    return key;
+}
+
 std::uint64_t Driver::drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry) {
     std::uint64_t key = 0x84222325cbf29ce4ull;
     const auto mix = [&](std::uint64_t value) {
@@ -138,7 +165,7 @@ std::uint64_t Driver::drawIdentityKey(const QueueState& queue, const ShaderRegis
     return key == 0 ? 1 : key;
 }
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape, const DrawRelocation* relocation, DrawAliasKeys* aliases) {
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape, const DrawRelocation* relocation, DrawAliasKeys* aliases, std::array<std::uint64_t, 5>* components) {
     const bool aliased = aliases != nullptr && relocation != nullptr && !relocation->words.empty();
     std::array<std::uint64_t, DrawAliasKeys::Stages> content{};
     bool readable = true;
@@ -150,7 +177,15 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
     static const bool verify = std::getenv("APS5_VERIFY_REGISTER_KEYS") != nullptr;
     std::uint64_t registerShape = 0;
-    auto key = RegisterStateKey(queue, allUserWords, true, &registerShape);
+    RegisterStateKeyParts keyParts;
+    auto key = RegisterStateKey(queue, allUserWords, true, &registerShape, components != nullptr ? &keyParts : nullptr);
+    if (components != nullptr) {
+        (*components)[0] = keyParts.stableRegisters;
+        (*components)[1] = keyParts.userDataRegisters;
+        (*components)[2] = keyParts.auxiliaryRegisters;
+        (*components)[3] = deviceSerial;
+        (*components)[4] = DrawShaderSetKey(queue, registry);
+    }
     std::uint64_t shapeKey = registerShape;
     if (verify && key != RegisterStateKey(queue, allUserWords, false)) throw std::runtime_error("incremental register fingerprint disagrees with full state");
     const bool diagnose = aliased && drawMissDiagnosisEnabled();
@@ -211,6 +246,25 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     return key;
 }
 
+void Driver::traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss) {
+    if (!traceDrawCache()) return;
+    struct Previous { std::array<std::uint64_t, 4> parts{}; };
+    struct PreviousStorage {};
+    auto& previous = HostThreadLocal<std::unordered_map<std::uint64_t, Previous>, PreviousStorage>();
+    const auto shaderSet = components[4];
+    if (previous.size() >= 2048 && previous.find(shaderSet) == previous.end()) previous.clear();
+    const auto [it, inserted] = previous.try_emplace(shaderSet);
+    if (!cacheMiss) { it->second.parts = {components[0], components[1], components[2], components[3]}; return; }
+    auto& counters = drawEntryCounters;
+    if (inserted) ++counters.registerKeyMissChanges[4];
+    else {
+        bool changed = false;
+        for (std::size_t i = 0; i < 4; ++i) if (it->second.parts[i] != components[i]) { ++counters.registerKeyMissChanges[i]; changed = true; }
+        if (!changed) ++counters.registerKeyMissChanges[5];
+    }
+    it->second.parts = {components[0], components[1], components[2], components[3]};
+}
+
 bool Driver::sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b) {
     if (a.resourcesNum != b.resourcesNum || a.fetchAttribReg != b.fetchAttribReg || a.fetchBufferReg != b.fetchBufferReg || a.fetchEmbedded != b.fetchEmbedded || a.paClVsOutCntl != b.paClVsOutCntl) return false;
     for (std::uint32_t i = 0; i < a.resourcesNum && i < a.resources.size(); ++i) {
@@ -234,7 +288,7 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
     const auto sameMesh = [](const std::optional<ShaderRecompiler::MeshConfiguration>& x, const std::optional<ShaderRecompiler::MeshConfiguration>& y) {
         if (x.has_value() != y.has_value()) return false;
         if (!x) return true;
-        return x->inputPrimitive == y->inputPrimitive && x->primitivesPerGroup == y->primitivesPerGroup && x->verticesPerGroup == y->verticesPerGroup && x->maxVertices == y->maxVertices && x->maxPrimitives == y->maxPrimitives && x->threadsPerGroup == y->threadsPerGroup && x->ldsSizeDwords == y->ldsSizeDwords && x->provokingVertex == y->provokingVertex && x->esgsItemSize == y->esgsItemSize;
+        return x->inputPrimitive == y->inputPrimitive && x->primitivesPerGroup == y->primitivesPerGroup && x->verticesPerGroup == y->verticesPerGroup && x->maxVertices == y->maxVertices && x->maxPrimitives == y->maxPrimitives && x->threadsPerGroup == y->threadsPerGroup && x->ldsSizeDwords == y->ldsSizeDwords && x->provokingVertex == y->provokingVertex && x->esgsItemSize == y->esgsItemSize && x->outputPrimitiveSize == y->outputPrimitiveSize;
     };
     const auto sameTess = [](const std::optional<ShaderRecompiler::TessellationConfiguration>& x, const std::optional<ShaderRecompiler::TessellationConfiguration>& y) {
         if (x.has_value() != y.has_value()) return false;
@@ -260,7 +314,7 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
         const auto& y = b.programs[i];
         if (x.binary.stage != y.binary.stage || x.binary.codeAddress != y.binary.codeAddress || x.userDataBase != y.userDataBase || x.firstUserSgpr != y.firstUserSgpr || x.userData != y.userData || x.snapshot != y.snapshot || x.codeOffset != y.codeOffset || x.tailContinuation != y.tailContinuation) return false;
     }
-    if (p.targetExportPacking != q.targetExportPacking || p.dualSourceBlend != q.dualSourceBlend || p.alphaToCoverage != q.alphaToCoverage || p.rasterPrimitive != q.rasterPrimitive || p.ditheredAlphaToCoverage != q.ditheredAlphaToCoverage || p.quadPixelMask != q.quadPixelMask || p.quadSampleMask != q.quadSampleMask || p.extraLdsDwords != q.extraLdsDwords) return false;
+    if (p.targetExportPacking != q.targetExportPacking || p.dualSourceBlend != q.dualSourceBlend || p.reversedBlend != q.reversedBlend || p.alphaToCoverage != q.alphaToCoverage || p.rasterPrimitive != q.rasterPrimitive || p.ditheredAlphaToCoverage != q.ditheredAlphaToCoverage || p.quadPixelMask != q.quadPixelMask || p.quadSampleMask != q.quadSampleMask || p.extraLdsDwords != q.extraLdsDwords) return false;
     if (s.samples != t.samples || s.quadSampleMask != t.quadSampleMask || s.pixelEarlyZ != t.pixelEarlyZ) return false;
     return true;
 }

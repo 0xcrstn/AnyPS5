@@ -67,6 +67,7 @@ public:
     ~Driver();
     void Shutdown();
     void WaitIdle();
+    std::uint64_t DispatchesAdoptedAhead() const;
     void CheckFailure();
     void ReportFailure(std::exception_ptr error);
     void Submit(const Packet* packet, std::uint32_t queue);
@@ -95,6 +96,7 @@ public:
     };
     DispatchCacheFootprint DispatchCacheSize();
     static std::uint64_t DispatchCacheBytes();
+    std::shared_ptr<const ShaderRegistry> RegisteredShaders();
 
 private:
     friend class SampledReadScope;
@@ -118,6 +120,7 @@ private:
     void enqueue(Submission submission);
     void noteHeldAtSubmit(Submission& submission, std::size_t cursor);
     static void forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission);
+    static void forgetUnfinishedWrites(QueueWorker& worker, std::span<const std::uint64_t> labelWrites);
     static bool waitFree(const Submission& submission);
     bool queue0Before(std::uint64_t received) const;
     bool orderReleased(std::uint32_t queue, std::uint64_t received) const;
@@ -191,7 +194,7 @@ private:
     void maybeReportDrawCache(bool profile);
     void reportDrawCache(DrawEntryCounters& counters, bool profile);
     std::string profileDrawCacheLines(const DrawEntryCounters& counters);
-    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape = nullptr, const DrawRelocation* relocation = nullptr, DrawAliasKeys* aliases = nullptr);
+    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape = nullptr, const DrawRelocation* relocation = nullptr, DrawAliasKeys* aliases = nullptr, std::array<std::uint64_t, 5>* components = nullptr);
     static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
     static bool drawRelocationEnabled();
     static std::uint64_t relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable, std::vector<std::uint32_t>* raw = nullptr);
@@ -212,6 +215,7 @@ private:
     static std::shared_ptr<DispatchVariant> patchBufferWords(const DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint32_t>> live);
     void learnPendingRelocation();
     void relocateDrawEntry(const QueueState& queue, const DrawAliasKeys& aliases, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
+    void traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss);
     void reportDrawRelocation();
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
@@ -328,6 +332,7 @@ private:
     static bool traceCopy();
     void traceCopyPending(const char* what, std::uint64_t address, std::size_t bytes, std::uint64_t source, std::uint64_t destination, std::size_t copyBytes, const std::shared_ptr<VulkanDevice>& localDevice);
     static void countIndirect(int path, double readMs);
+    static int indirectArgumentsPath(std::span<const std::uint32_t> packet, std::uint64_t arguments);
     void dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
     static bool& sampledRead();
     static bool writeEvidenceEnabled();
@@ -357,6 +362,7 @@ private:
     static void appendWrittenRanges(const ShaderRecompiler::RecompileResult& compiled, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
     void noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint32_t queue);
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
+    static std::vector<std::pair<std::uint64_t, std::uint64_t>> drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages);
     std::optional<WrittenBuffer> newestWriterLocked(std::uint64_t begin, std::uint64_t end) const;
     std::optional<WrittenBuffer> newestWriter(std::uint64_t begin, std::uint64_t end);
     std::string describeWriters(std::uint64_t begin, std::uint64_t end);
@@ -430,6 +436,9 @@ private:
     static Graphics::Recorder::LateStatistics& lateCountsSeen();
     static EpochBumps& epochBumps();
     static void bumpEpoch(std::uint64_t EpochBumps::*counter);
+    static std::chrono::steady_clock::time_point& lastEpochBump();
+    static std::deque<const std::uint32_t*>& releasedTails();
+    void noteReleasedTails(const Submission& submission);
     static bool packetEpoch();
     static bool labelTryEachPacket();
     static std::chrono::microseconds labelFlushDeadline();
@@ -600,6 +609,7 @@ private:
 
     std::atomic<std::uint64_t> evidenceReads{0};
     std::atomic<std::uint64_t> evidenceValidations{0};
+    std::atomic<std::uint64_t> dispatchesAdoptedAhead{0};
 
     std::mutex writtenBuffersMutex;
     std::deque<WrittenBuffer> writtenBuffers;

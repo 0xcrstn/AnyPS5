@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -14,6 +15,8 @@
 #include <span>
 #include <utility>
 #include <vector>
+#include "ThreadOwned.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -77,6 +80,33 @@ DrawTrace::Context Submission::TraceAt(std::size_t offset) const {
     if (!DrawTrace::Enabled()) return {};
     if (const auto found = tracePackets.find(offset); found != tracePackets.end()) return found->second;
     return traceContext;
+}
+
+std::deque<const std::uint32_t*>& Driver::releasedTails() {
+    struct ReleasedTailsStorage {};
+    return HostThreadLocal<std::deque<const std::uint32_t*>, ReleasedTailsStorage>();
+}
+
+void Driver::noteReleasedTails(const Submission& submission) {
+    auto& released = releasedTails();
+    released.clear();
+    thread_local Submission* scratchSlot = nullptr;
+    auto& scratch = ShaderRecompiler::ThreadOwned(scratchSlot);
+    const std::uint32_t* tail = submission.rewindTail;
+    std::size_t words = submission.rewindWords;
+    for (std::size_t chunk = 0; chunk < 256 && tail != nullptr; ++chunk) {
+        if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(tail - 1)).load(std::memory_order_acquire) & 0x80000000u) == 0) break;
+        released.push_back(tail - 1);
+        scratch.rewindTail = nullptr;
+        scratch.rewindWords = 0;
+        try {
+            copyCommands(scratch, tail, words);
+        } catch (const std::exception&) {
+            break;
+        }
+        tail = scratch.rewindTail;
+        words = scratch.rewindWords;
+    }
 }
 
 void Driver::copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words) {
@@ -336,6 +366,8 @@ void Driver::reserveOutputs(Submission& submission) {
 
 void Driver::executeRewindTail(const Submission& stalled) {
     PerformanceTimer timing("Driver.Rewind");
+    static const bool ring = ReadSubmissionRingSettings();
+    if (ring) PrepareSubmissionRing(stalled.queue);
     std::atomic_ref<std::uint32_t> control(*const_cast<std::uint32_t*>(stalled.rewindTail - 1));
     if ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
         DrawTrace::Span rewindWait("Driver.RewindControlWait");
@@ -347,10 +379,12 @@ void Driver::executeRewindTail(const Submission& stalled) {
             std::uint32_t queue;
             ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
         } blocked{*this, stalled.queue};
+        StallWatch stall(stalled.queue);
         while ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
             CheckFailure();
             checkStopping();
             noteAwaitingTitle(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1));
+            stall.Check("REWIND at", reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1));
             PollSleep();
         }
         DrawTrace::Note("wait_outcome", "satisfied");
@@ -362,6 +396,14 @@ void Driver::executeRewindTail(const Submission& stalled) {
     DrawTrace::ContextScope traceContext(tail.traceContext);
     DrawTrace::Record(DrawTrace::EventKind::Segment, tail.traceContext.segment, stalled.traceContext.segment);
     DrawTrace::Link(stalled.traceContext.segment, tail.traceContext.segment, "rewinds_to");
+    auto& released = releasedTails();
+    if (!released.empty() && released.front() == stalled.rewindTail - 1) {
+        released.pop_front();
+        tail.enqueuedAt = lastEpochBump();
+    } else {
+        released.clear();
+        tail.enqueuedAt = std::chrono::steady_clock::now();
+    }
     copyCommands(tail, stalled.rewindTail, stalled.rewindWords);
     DrawTrace::RecordCounter("command_copy_bytes", tail.commands.size() * sizeof(std::uint32_t), "bytes", tail.traceContext.segment);
     if (APS5_ENABLE_TIMING_LOG) tail.copiedAt = std::chrono::steady_clock::now();
@@ -382,6 +424,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
         tail.serial = stalled.serial;
         tail.received = ++eventSerial;
         if (capture != nullptr) capture->Take(captured, tail.serial, captureTime(), tail.heldAtSubmit);
+        if (ring) RecordSubmission(tail.queue, tail.serial, tail.commands, stalled.rewindTail, true);
     }
     if (capture != nullptr) writeCaptured(*this, *capture, captured);
     if (APS5_ENABLE_TIMING_LOG) tail.enqueuedAt = tail.dequeuedAt = tail.orderedAt = std::chrono::steady_clock::now();
@@ -401,7 +444,9 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     DrawTrace::Record(DrawTrace::EventKind::Segment, submission.traceContext.segment);
     const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CheckFailure();
-    require(queue == 0 || (queue >= 0x20 && queue < 0x58), "unsupported compute queue");
+    require(queue == 0 || (queue >= 0x20 && queue < SubmissionQueueEnd), "unsupported compute queue");
+    static const bool ring = ReadSubmissionRingSettings();
+    if (ring) PrepareSubmissionRing(queue);
     GuestMemory::CheckRange(packet, sizeof(Packet), alignof(Packet));
     const auto descriptor = *packet;
     require(descriptor.flags == 0, "nonzero submission flags are not implemented");
@@ -449,10 +494,11 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         DrawTrace::Note("submission_serial", submission.serial);
 
         submission.received = ++eventSerial;
+        const auto now = std::chrono::steady_clock::now();
+        submission.enqueuedAt = now;
         if (capture != nullptr) capture->Take(captured, submission.serial, captureTime(), submission.heldAtSubmit);
+        if (ring) RecordSubmission(queue, submission.serial, submission.commands, descriptor.addr, false);
         if (profile) {
-            const auto now = std::chrono::steady_clock::now();
-            submission.enqueuedAt = now;
             ++costs.submissions;
             costs.validateNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(validated - copied).count());
             costs.copyNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>((copied - start) + (now - validated)).count());
@@ -612,7 +658,11 @@ void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
 }
 
 void Driver::forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission) {
-    for (const auto dword : submission.labelWrites) {
+    forgetUnfinishedWrites(worker, submission.labelWrites);
+}
+
+void Driver::forgetUnfinishedWrites(QueueWorker& worker, std::span<const std::uint64_t> labelWrites) {
+    for (const auto dword : labelWrites) {
         const auto found = worker.unfinishedWrites.find(dword);
         if (found == worker.unfinishedWrites.end()) continue;
         if (--found->second == 0) worker.unfinishedWrites.erase(found);

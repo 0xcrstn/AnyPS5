@@ -297,10 +297,6 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
         if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
     } else {
-        if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
-            const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
-            Graphics::NoteHtileDepthClear(htile, static_cast<std::size_t>(threads * 16u));
-        }
         if (indirectArguments == 0 && (packet[4] & 0x20u) == 0) {
             if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
         }
@@ -312,6 +308,12 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
             DrawTrace::Note("dispatch_path", "fill_hle");
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
+        }
+        if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
+            const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
+            if (frozenSink() == nullptr && drawRecordState().active) waitDrawRecords();
+            const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
+            Graphics::NoteHtileDepthClear(htile, static_cast<std::size_t>(threads * 16u), nativeBytes);
         }
         if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
             if (drawRecordState().active) {
@@ -485,6 +487,7 @@ void Driver::dispatchNow(QueueState& queue, std::span<const std::uint32_t> packe
         cached = ahead.cached;
         validated = ahead.validated;
         ++groupStats.adopted;
+        ++dispatchesAdoptedAhead;
         const auto age = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ahead.resolvedAt).count();
         groupStats.ageMs += age;
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);

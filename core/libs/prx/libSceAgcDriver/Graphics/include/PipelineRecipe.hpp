@@ -11,7 +11,7 @@
 
 namespace AgcDriver::Graphics {
 
-inline constexpr std::uint32_t PipelineRecipeVersion = 1;
+inline constexpr std::uint32_t PipelineRecipeVersion = 2;
 inline constexpr std::size_t PipelineRecipeMaxBytes = 16u * 1024u * 1024u;
 
 struct PipelineRecipe {

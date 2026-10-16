@@ -18,6 +18,16 @@ target_link_libraries(libSceAudioOut PRIVATE libc libkernel libScePad SDL2-stati
 configure_windows_unwind(libSceAudioOut)
 
 if(BUILD_TESTING)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test_executable(audio_out_resampling_tests tests/AudioOutResampling.cpp)
+        target_include_directories(audio_out_resampling_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR})
+        target_link_libraries(audio_out_resampling_tests PRIVATE libSceAudioOut libc)
+        set_target_properties(audio_out_resampling_tests PROPERTIES ENABLE_EXPORTS ON)
+        add_test(NAME audio_out_resampling COMMAND audio_out_resampling_tests)
+        set_tests_properties(audio_out_resampling PROPERTIES TIMEOUT 10)
+
+    endif()
+
     add_test_executable(audio_out2_pad_mix_tests tests/AudioOut2PadMix.cpp src/AudioOut2PadMix.cpp)
     target_include_directories(audio_out2_pad_mix_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(audio_out2_pad_mix_tests PRIVATE libc)

@@ -19,7 +19,7 @@ public:
     static constexpr int SaveIntervalSeconds = 10;
     static constexpr int BusyRetryMilliseconds = 100;
 
-    PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool background = true);
+    PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool background = true, bool loadFromFile = true);
     ~PipelineCache();
 
     PipelineCache(const PipelineCache&) = delete;
@@ -28,6 +28,7 @@ public:
     PipelineCacheSynchronization& Synchronization() { return synchronization; }
     bool TrySave() { return save(false); }
     bool Flush();
+    void SaveNow();
 
 private:
     struct FileHeader {
@@ -59,6 +60,7 @@ private:
     VkPipelineCache cache = VK_NULL_HANDLE;
     PipelineCacheSynchronization synchronization;
     std::filesystem::path path;
+    bool holdsFile = false;
     std::size_t loadedBytes = 0;
     std::size_t settledBytes = 0;
     std::optional<FileHeader> settledFile;

@@ -16,7 +16,7 @@
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-inline constexpr std::uint32_t FormatVersion = 39;
+inline constexpr std::uint32_t FormatVersion = 40;
 inline constexpr std::size_t EntryHeaderBytes = 48;
 
 enum class LoadStatus {
@@ -67,7 +67,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, s
 [[nodiscard]] std::string EntryName(std::span<const std::byte> key);
 
 void EncodeResult(const RecompileResult& result, std::vector<std::byte>& out);
-[[nodiscard]] bool DecodeResult(std::span<const std::byte> bytes, RecompileResult& result);
+[[nodiscard]] bool DecodeResult(std::span<const std::byte> bytes, RecompileResult& result, std::shared_ptr<const void> owner = nullptr);
 
 [[nodiscard]] std::vector<std::byte> EncodeEntry(std::span<const std::byte> key, const CompiledVariant& variant);
 [[nodiscard]] std::span<const std::byte> EntryKey(std::span<const std::byte> file);

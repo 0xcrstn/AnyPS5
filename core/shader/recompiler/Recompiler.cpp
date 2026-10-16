@@ -733,6 +733,12 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
     const bool nativeSampleOffsets = request.target.nonConstantImageOffsets && std::find(request.target.supportedCapabilities.begin(), request.target.supportedCapabilities.end(), spv::CapabilityImageGatherExtended) != request.target.supportedCapabilities.end();
     resourceMaterializer.ApplyStaticInterface(program, nativeSampleOffsets);
 
+    constexpr ConstantFolder constantFolder;
+    if (request.shader.stage == ShaderStage::Vertex && constantFolder.FoldVertexLaneBounds(program, HostSubgroupSize(request), request.target.spirvVersion)) {
+        constantFolder.Fold(program);
+        ResolveControlFlowIdentities(program);
+    }
+
     deadCodeEliminator.RemoveIdentities(program);
     constexpr RedundantValueEliminator redundantValueEliminator;
     static_cast<void>(redundantValueEliminator.Eliminate(program));
@@ -1150,6 +1156,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(values.size());
         for (const auto& value : values) {
             mix(value.dwordCount);
+            mix(value.availableDwordMask);
             for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
         }
     };
@@ -1192,6 +1199,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         for (const auto mapping : request.context.pixel->targetExportMapping) mix(mapping);
         for (const auto packing : request.context.pixel->targetExportPacking) mix(static_cast<std::uint64_t>(packing));
         mix(request.context.pixel->dualSourceBlend);
+        mix(request.context.pixel->reversedBlend);
         mix(static_cast<std::uint64_t>(request.context.pixel->rasterPrimitive));
         mix(request.context.pixel->layerExported);
     }
@@ -1407,6 +1415,8 @@ std::uint64_t EstimatePlanBytes(const IrResourcePlan& plan, std::uint64_t* value
     }
     bytes += plan.memoryInfo.size() * sizeof(MemoryInfo) + plan.descriptorSources.size() * sizeof(DescriptorSource) + plan.controlFlow.size() * sizeof(ResourceBlock) + plan.srtReads.size() * sizeof(SrtRead);
     bytes += (plan.materializationSources.size() + plan.guardedSrtSlots.size()) * sizeof(std::uint32_t) + plan.cleanFlatSlots.size() + plan.pureFlatSlots.size();
+    bytes += plan.compact.values.capacity() * sizeof(CompactPlanValue);
+    bytes += (plan.compact.arguments.capacity() + plan.compact.sourceDwords.capacity() + plan.compact.srtReads.capacity() + plan.compact.conditions.capacity()) * sizeof(std::uint32_t);
     if (values != nullptr) *values = count;
     return bytes;
 }
@@ -1734,6 +1744,7 @@ void specializationKeyWords(const CompiledVariant& variant, const RecompileReque
         key.push_back(1);
         for (const auto packing : pixel.targetExportPacking) key.push_back(static_cast<std::uint64_t>(packing));
         key.push_back(pixel.dualSourceBlend);
+        key.push_back(pixel.reversedBlend);
         key.push_back(static_cast<std::uint64_t>(pixel.rasterPrimitive));
         key.push_back(pixel.layerExported);
     } else {

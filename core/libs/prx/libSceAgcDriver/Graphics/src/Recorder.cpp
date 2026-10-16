@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Coherence.hpp"
@@ -194,7 +195,7 @@ constexpr std::uint32_t SegmentFoldCapacity = 1024;
 constexpr std::uint32_t DumpFoldCapacity = 1024;
 constexpr std::uint32_t SampleDumpBytes = 15 * 16 + 8;
 constexpr VkDeviceSize DumpListOffset = 16 + 8 * SegmentFoldCapacity;
-constexpr std::uint32_t SampleDumpPushBytes = 32;
+constexpr std::uint32_t SampleDumpPushBytes = 40;
 std::atomic<std::uint64_t> dumpsQueued{0}, dumpsQueuedInPass{0}, dumpsAtOnce{0}, segmentsClosed{0}, dumpFolds{0};
 
 struct SamplePoolCache {
@@ -2282,7 +2283,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
             }
             const auto before = dumpIndex;
             foldQueuedDumps(commands, stores, first, end, dumpIndex, consumed);
-            if (dumpIndex != before) ++barriers;
+            if (dumpIndex != before) barriers += 3;
             first = end;
         }
         if (dumps) {
@@ -3142,7 +3143,8 @@ void Recorder::dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, 
         std::uint32_t dumps;
         std::uint32_t firstSegment;
         std::uint32_t lastSegment;
-    } parameters{sampleCounter->DeviceAddress(), sampleCounter->DeviceAddress() + DumpListOffset, firstDump, dumps, firstSegment, lastSegment};
+        std::uint32_t phase;
+    } parameters{sampleCounter->DeviceAddress(), sampleCounter->DeviceAddress() + DumpListOffset, firstDump, dumps, firstSegment, lastSegment, 0u};
     static_assert(sizeof(parameters) == SampleDumpPushBytes);
     const auto push = function(cmdPushConstants, "vkCmdPushConstants");
     const auto dispatch = function(cmdDispatch, "vkCmdDispatch");
@@ -3151,6 +3153,17 @@ void Recorder::dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, 
     const auto trace = BeginTraceCommand(this, commands, "internal_sample_dump_dispatch", 0, 1, false, tracePipeline);
     dispatch(commands, 1, 1, 1);
     EndTraceCommand(trace);
+    if (dumps == 0) return;
+    const auto publish = [&](std::uint32_t phase) {
+        recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        parameters.phase = phase;
+        push(commands, dumpLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleDumpPushBytes, &parameters);
+        const auto publishTrace = BeginTraceCommand(this, commands, "internal_sample_dump_publish_dispatch", phase, 1, false, tracePipeline);
+        dispatch(commands, 1, 1, 1);
+        EndTraceCommand(publishTrace);
+    };
+    publish(1u);
+    publish(2u);
 }
 
 void Recorder::foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes, std::size_t first, std::size_t end, std::uint32_t& dumpIndex, std::uint32_t& consumed) {
@@ -3218,9 +3231,21 @@ void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
         const auto trace = BeginTraceCommand(this, commands, "internal_sample_fold_dispatch", done, 1, false, tracePipeline);
         dispatch(commands, 1, 1, 1);
         EndTraceCommand(trace);
+        if (parameters.store == 1u) {
+            const auto publish = [&](std::uint32_t store) {
+                recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+                parameters.store = store;
+                push(commands, sampleLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleCounterPushBytes, &parameters);
+                const auto publishTrace = BeginTraceCommand(this, commands, "internal_sample_publish_dispatch", store, 1, false, tracePipeline);
+                dispatch(commands, 1, 1, 1);
+                EndTraceCommand(publishTrace);
+            };
+            publish(3u);
+            publish(2u);
+        }
     } while (done < pendingSamples.size());
     recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_HOST_READ_BIT);
-    CountBarriers(CommandClass::Copy, 2);
+    CountBarriers(CommandClass::Copy, target != 0 ? 4u : 2u);
     pendingSamples.clear();
 }
 
@@ -4689,6 +4714,13 @@ void Recorder::Submit() {
     }
     if (!open->slots.empty()) collectEmitUnits(*open);
     auto batch = std::move(open);
+    struct DiscardUnsubmitted {
+        Recorder& recorder;
+        std::unique_ptr<Batch>& batch;
+        ~DiscardUnsubmitted() {
+            if (batch != nullptr && !batch->submitted) recorder.discard(std::move(batch));
+        }
+    } discardUnsubmitted{*this, batch};
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
     std::vector<VkCommandBuffer> submitted;
     submitted.reserve(batch->slots.size() + 2);
@@ -4766,6 +4798,10 @@ void Recorder::Submit() {
     }
     const auto submitStart = std::chrono::steady_clock::now();
     const auto submitResult = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    if (submitResult == VK_ERROR_DEVICE_LOST) {
+        const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+        if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+    }
     if (submitResult != VK_SUCCESS && batch->detailBatch != 0 && (batch->detailHasContributors || batch->detailBatchDeclared)) {
         DrawTrace::ContextScope detailScope(batch->detailContext);
         DrawTrace::RecordBatch(batch->detailBatch, traceQueue, serial, DrawTrace::Status::Failed);
@@ -5380,7 +5416,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             try {
                 action();
             } catch (const std::exception& error) {
-                std::fprintf(stderr, "[gpu] deferred write-back failed: %s\n", error.what());
+                AgcDriver::LogCoalescedStderr_nid_no_patch("[gpu] deferred write-back failed: %s\n", error.what());
             }
         }
     }
@@ -5414,20 +5450,36 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     }
     // The batch's label entries leave the table (a later label to the same dword already replaced
     // its entry and belongs to another batch). Correctness never depended on this removal.
-    if (!batch->labelDwords.empty() || !batch->wideLabels.empty()) {
+    removeLabels(*batch);
+    release(*batch);
+}
+
+void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
+    removeLabels(*batch);
+    if (batch->completionLabelCount != 0) domain.completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
+    if (batch->writeBackCompletionCount != 0) domain.writeBackCompletions.fetch_sub(batch->writeBackCompletionCount, std::memory_order_acq_rel);
+    if (domain.active == this) domain.pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    release(*batch);
+    try {
+        publishPendingWrites();
+    } catch (...) {
+    }
+}
+
+void Recorder::removeLabels(Batch& batch) {
+    if (!batch.labelDwords.empty() || !batch.wideLabels.empty()) {
         std::lock_guard tableLock(domain.labelTableMutex);
-        for (const auto dword : batch->labelDwords) {
+        for (const auto dword : batch.labelDwords) {
             const auto found = labels.find(dword);
-            if (found != labels.end() && found->second.batch == batch.get()) labels.erase(found);
+            if (found != labels.end() && found->second.batch == &batch) labels.erase(found);
         }
-        for (const auto entry : batch->wideLabels) wideLabels.erase(entry);
+        for (const auto entry : batch.wideLabels) wideLabels.erase(entry);
         recordedLabels.store(labels.size(), std::memory_order_relaxed);
     }
-    batch->labelDwords.clear();
-    batch->wideLabels.clear();
-    LabelVersions::MarkAll(batch->labelStamps, LabelVersions::Milestone::Retired);
-    batch->labelStamps.clear();
-    release(*batch);
+    batch.labelDwords.clear();
+    batch.wideLabels.clear();
+    LabelVersions::MarkAll(batch.labelStamps, LabelVersions::Milestone::Retired);
+    batch.labelStamps.clear();
 }
 
 void Recorder::release(Batch& batch) noexcept {

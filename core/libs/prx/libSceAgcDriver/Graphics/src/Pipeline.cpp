@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelinePreparation.hpp"
 #include "ShaderInputInventory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCreationTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -123,7 +124,7 @@ void ValidateProvokingVertex(const Context& context, const State& state, std::sp
         if (shader.stage != ShaderRecompiler::ShaderStage::Fragment) continue;
         Require(shader.program != nullptr, "missing compiled fragment shader");
         Require(std::none_of(shader.program->fragmentParameters.begin(), shader.program->fragmentParameters.end(), [](const ShaderRecompiler::FragmentParameter& parameter) { return parameter.flat && parameter.perVertex; }), "last provoking vertex with explicit per-vertex flat interpolation is unsupported");
-        Require(state.topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || std::none_of(shader.program->fragmentParameters.begin(), shader.program->fragmentParameters.end(), [](const ShaderRecompiler::FragmentParameter& parameter) { return parameter.perVertex; }), "last provoking vertex with explicit per-vertex triangle-strip interpolation is unsupported");
+        Require(state.topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || std::none_of(shader.program->fragmentParameters.begin(), shader.program->fragmentParameters.end(), [](const ShaderRecompiler::FragmentParameter& parameter) { return parameter.vertexOrder; }), "last provoking vertex with explicit per-vertex triangle-strip interpolation is unsupported");
     }
 }
 
@@ -377,6 +378,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
     Require(!depthBounds || context.depthBounds, "device does not support the depth bounds test");
     Require(!depthBias || state.depthBiasClamp == 0.0f || context.depthBiasClamp, "device does not support depth bias clamping");
     Require(!state.dualSourceBlend || (context.dualSrcBlend && state.blends.size() <= context.limits.maxFragmentDualSrcAttachments), "device does not support dual-source blending into this many attachments");
+    Require(state.reversedBlend == 0 || (context.dualSrcBlend && state.blends.size() <= context.limits.maxFragmentDualSrcAttachments), "blending into a color target with a reversed component order through a second source color needs dual-source blending, which the device does not support");
     Require(!state.negativeOneToOne || context.depthClipControl, "negative-one-to-one depth clipping requires VK_EXT_depth_clip_control with depthClipControl enabled");
     Require(!state.perSampleShading || context.sampleRateShading, "per-sample pixel shading requires the sampleRateShading device feature");
     Require(state.conservativeRasterization == VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT || context.conservativeRasterization, "conservative rasterization requires VK_EXT_conservative_rasterization with at most 1/256 pixel of overestimation and degenerate triangles rasterized");
@@ -957,6 +959,7 @@ bool filterDrawState() {
 }
 
 void Pipeline::Continue(const CommandSink& commands, const State& state) const {
+    if (optimized != nullptr) optimized->Schedule();
     auto& recorded = recordedDrawState();
     apply(commands, state, filterDrawState() && libraries && recorded.identity == commands.Identity());
 }
@@ -1061,7 +1064,14 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
     append(key, shaders.size());
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
+        const auto identity = shader.program->Identity();
+        if (identity.Empty()) {
+            key.clear();
+            return;
+        }
         append(key, shader.stage);
+        append(key, identity.low);
+        append(key, identity.high);
         append(key, shader.pushConstantOffset);
         append(key, shader.program->spirv.ContentHash());
         append(key, shader.program->runtimeAbiVersion);
@@ -1119,6 +1129,7 @@ struct PipelineStore {
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
     std::uint64_t evicted = 0;
+    PipelineStoreCounters totals;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -1144,6 +1155,11 @@ std::list<PipelineStore::Entry>::iterator abandon(PipelineStore& store, std::lis
     return store.entries.erase(it);
 }
 
+std::size_t storeBound() {
+    static const auto bound = static_cast<std::size_t>(std::max<std::uint64_t>(1u, PipelineSwitch("APS5_PIPELINE_STORE_ENTRIES", 1024u)));
+    return bound;
+}
+
 void reportPipelines(PipelineStore& store) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -1166,7 +1182,9 @@ std::vector<ShaderRecompiler::SharedSpirv> pipelineModules(std::span<const Compi
     return modules;
 }
 
-void capturePipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) noexcept {
+void capturePipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    if (PipelineJournalReplaying() || context.pipelineRecipeReplaying) return;
+    if (PipelineJournalEnabled()) RecordGraphicsPipeline(MakeGraphicsPipelineRecipe(state, vertexInput, resources, shaders, attachmentLayout), shaders);
     if (const auto preparation = context.pipelinePreparation.lock()) {
         if (!preparation->CanCapture()) return;
         try {
@@ -1183,7 +1201,8 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     return CachedPipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout);
 }
 
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool* created) {
+    if (created != nullptr) *created = false;
     const auto build = [&] {
         if (context.pipelineBuildRunner == nullptr) {
             auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
@@ -1208,7 +1227,8 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     reportPipelines(store);
     if (key.empty()) {
         ++store.uncached;
-        if (context.pipelineBuildRunner != nullptr) lock.unlock();
+        ++store.totals.uncached;
+        lock.unlock();
         return build();
     }
     const auto hash = hashKey(key);
@@ -1220,6 +1240,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             if (alive(*it, context)) {
                 it->modules = modules;
                 ++store.hits;
+                ++store.totals.hits;
                 store.entries.splice(store.entries.end(), store.entries, it);
                 return it->pipeline;
             }
@@ -1227,6 +1248,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         } else {
             // A different configuration with the same hash keeps the resident entry; this one stays private.
             ++store.uncached;
+            ++store.totals.uncached;
             lock.unlock();
             return build();
         }
@@ -1234,6 +1256,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     if (const auto building = store.pending.find(hash); building != store.pending.end()) {
         if (building->second.key != key || building->second.modules != modules || GuestMemory::GpuMutex().HeldByThisThread() || context.pipelinePreparationNoWait) {
             ++store.uncached;
+            ++store.totals.uncached;
             ++store.duplicateBuilds;
             if (GuestMemory::GpuMutex().HeldByThisThread()) ++store.buildsUnderGpuMutex;
             const bool exact = building->second.key == key && building->second.modules == modules;
@@ -1243,15 +1266,24 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
                 lock.lock();
                 if (const auto found = store.index.find(hash); found != store.index.end() && found->second->key == key && found->second->modules == modules && alive(*found->second, context)) pipeline = found->second->pipeline;
                 else if (!store.index.contains(hash)) {
-                    store.entries.push_back({context.device, context.bufferPool, hash, key, modules, pipeline});
-                    store.index[hash] = std::prev(store.entries.end());
+                    const bool replaying = PipelineJournalReplaying() || context.pipelineRecipeReplaying;
+                    if (!replaying || store.entries.size() < storeBound()) {
+                        if (replaying) {
+                            store.entries.push_front({context.device, context.bufferPool, hash, key, modules, pipeline});
+                            store.index[hash] = store.entries.begin();
+                        } else {
+                            store.entries.push_back({context.device, context.bufferPool, hash, key, modules, pipeline});
+                            store.index[hash] = std::prev(store.entries.end());
+                        }
+                    }
                 }
-                while (store.entries.size() > 1024) {
+                while (store.entries.size() > storeBound()) {
                     const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
                     if (victim == store.entries.end()) break;
                     store.index.erase(victim->hash);
                     store.entries.erase(victim);
                     ++store.evicted;
+                    ++store.totals.evicted;
                 }
             }
             return pipeline;
@@ -1262,6 +1294,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         return result.get();
     }
     ++store.misses;
+    ++store.totals.misses;
     if (GuestMemory::GpuMutex().HeldByThisThread()) ++store.buildsUnderGpuMutex;
     // Entries of another device belong to one the driver replaced (it does so under the GpuMutex
     // before any draw reaches the new device), whose objects went with it: forget them.
@@ -1269,17 +1302,25 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
     }
     const auto publish = [&](const std::shared_ptr<Pipeline>& pipeline) {
+        const auto bound = storeBound();
+        const bool replaying = PipelineJournalReplaying() || context.pipelineRecipeReplaying;
+        if (replaying && store.entries.size() >= bound) return;
         if (!store.index.contains(hash)) {
-            store.entries.push_back({context.device, context.bufferPool, hash, key, modules, pipeline});
-            store.index[hash] = std::prev(store.entries.end());
+            if (replaying) {
+                store.entries.push_front({context.device, context.bufferPool, hash, key, modules, pipeline});
+                store.index[hash] = store.entries.begin();
+            } else {
+                store.entries.push_back({context.device, context.bufferPool, hash, key, modules, pipeline});
+                store.index[hash] = std::prev(store.entries.end());
+            }
         }
-        constexpr std::size_t bound = 1024;
         while (store.entries.size() > bound) {
             const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
             if (victim == store.entries.end()) break;
             store.index.erase(victim->hash);
             store.entries.erase(victim);
             ++store.evicted;
+            ++store.totals.evicted;
         }
     };
     std::promise<std::shared_ptr<Pipeline>> promise;
@@ -1300,25 +1341,36 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     store.pending.erase(hash);
     store.settled.notify_all();
     publish(pipeline);
+    const auto published = store.index.find(hash);
+    const bool retained = published != store.index.end() && published->second->pipeline == pipeline;
     lock.unlock();
     promise.set_value(pipeline);
+    if (created != nullptr) *created = retained;
     return pipeline;
 }
 
 namespace {
 
 void publishPipeline(PipelineStore& store, const Context& context, std::uint64_t hash, const std::vector<std::byte>& key, const std::shared_ptr<Pipeline>& pipeline, std::span<const CompiledShader> shaders) {
+    const auto bound = storeBound();
+    const bool replaying = PipelineJournalReplaying() || context.pipelineRecipeReplaying;
+    if (replaying && store.entries.size() >= bound) return;
     if (!store.index.contains(hash)) {
-        store.entries.push_back({context.device, context.bufferPool, hash, key, pipelineModules(shaders), pipeline});
-        store.index[hash] = std::prev(store.entries.end());
+        if (replaying) {
+            store.entries.push_front({context.device, context.bufferPool, hash, key, pipelineModules(shaders), pipeline});
+            store.index[hash] = store.entries.begin();
+        } else {
+            store.entries.push_back({context.device, context.bufferPool, hash, key, pipelineModules(shaders), pipeline});
+            store.index[hash] = std::prev(store.entries.end());
+        }
     }
-    constexpr std::size_t bound = 1024;
     while (store.entries.size() > bound) {
         const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
         if (victim == store.entries.end()) break;
         store.index.erase(victim->hash);
         store.entries.erase(victim);
         ++store.evicted;
+        ++store.totals.evicted;
     }
 }
 
@@ -1384,6 +1436,7 @@ std::shared_ptr<CompileTicket> TryCachedPipeline(const Context& context, const S
     }
     if (const auto building = store.pending.find(hash); building != store.pending.end()) return building->second.key == key && building->second.modules == pipelineModules(shaders) ? building->second.ticket : nullptr;
     ++store.misses;
+    ++store.totals.misses;
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
     }
@@ -1464,6 +1517,19 @@ std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, const State
 
 PipelineCacheProbeStatistics GraphicsPipelineCacheProbes() {
     return {pipelineCacheProbeHits.load(std::memory_order_relaxed), pipelineCacheProbeMisses.load(std::memory_order_relaxed)};
+}
+
+void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+}
+
+PipelineStoreCounters PipelineStoreTotals() {
+    auto& store = Pipelines();
+    std::lock_guard lock(store.mutex);
+    auto totals = store.totals;
+    totals.cached = store.entries.size();
+    totals.bound = storeBound();
+    return totals;
 }
 
 void ClearCachedPipelines(VkDevice device) {

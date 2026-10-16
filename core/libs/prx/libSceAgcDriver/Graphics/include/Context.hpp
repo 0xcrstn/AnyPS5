@@ -298,6 +298,10 @@ struct Context {
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
     VkQueue sparseQueue = VK_NULL_HANDLE;
     std::mutex* sparseQueueMutex = nullptr;
+    VkQueue settleQueue = VK_NULL_HANDLE;
+    VkCommandPool settlePool = VK_NULL_HANDLE;
+    std::uint32_t settleFamily = 0;
+    std::mutex* settleQueueMutex = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     RenderCache* renderCache = nullptr;
     DrawQueue* drawQueue = nullptr;
@@ -362,9 +366,11 @@ struct Context {
     VkSampleCountFlags sampleLocationSampleCounts = 0;
     VkSampleCountFlags sampleLocationGridSampleCounts = 0;
     PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
+    bool pipelineRecipeReplaying = false;
     void* pipelineBuildOwner = nullptr;
     void (*pipelineBuildRunner)(void* owner, std::size_t reservedBytes, const std::function<void()>& build) = nullptr;
     std::shared_ptr<CompileTicket> (*pipelineBuildSubmitter)(void* owner, std::size_t reservedBytes, std::function<void()> build) = nullptr;
+    bool shaderTerminateInvocation = false;
 
     PipelineCacheSynchronization::PipelineUseLock LockPipelineCacheForUse() const {
         return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
